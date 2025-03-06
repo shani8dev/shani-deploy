@@ -1,6 +1,6 @@
 #!/bin/bash
 # Self-update block: Always run the remote script from a temporary file.
-REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/deploy-image.sh"  # Update with your URL
+REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"  # Update with your URL
 TEMP_SCRIPT=$(mktemp)
 
 if curl -fsSL "$REMOTE_SCRIPT_URL" -o "$TEMP_SCRIPT"; then

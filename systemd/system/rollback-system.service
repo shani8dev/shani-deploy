@@ -1,0 +1,19 @@
+[Unit]
+Description=Rollback System on Boot Failure for Shani OS
+Documentation=man:shani-deploy(1)
+Conflicts=rescue.service emergency.service
+After=systemd-boot-failed.service
+Before=shutdown.target
+ConditionPathExists=/data/boot_failure
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/shani-deploy rollback
+RemainAfterExit=true
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

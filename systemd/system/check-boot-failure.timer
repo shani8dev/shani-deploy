@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Boot Failure Check 15 Minutes After Boot
+
+[Timer]
+OnBootSec=15m
+Persistent=true
+Unit=check-boot-failure.service
+
+[Install]
+WantedBy=timers.target

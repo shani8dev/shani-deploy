@@ -1,0 +1,7 @@
+[Unit]
+Description=Check Boot Success and Create Boot Failure Marker if Needed
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/check-boot-failure

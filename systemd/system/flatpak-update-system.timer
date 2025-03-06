@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic Flatpak Update (System)
+
+[Timer]
+OnBootSec=5m
+OnUnitInactiveSec=12h
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

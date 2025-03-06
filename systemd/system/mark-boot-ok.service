@@ -1,0 +1,11 @@
+[Unit]
+Description=Mark Boot Success for Shani OS
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/touch /data/boot-ok
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

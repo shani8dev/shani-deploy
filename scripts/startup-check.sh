@@ -41,7 +41,7 @@ Do you want to rollback to the previous version?
 
     if [ $RET -eq 0 ]; then
         logger -t startup-check "User confirmed rollback. Executing rollback process."
-        pkexec /usr/local/bin/shani-deploy.sh --rollback >> "$LOGFILE" 2>&1
+        pkexec /usr/local/bin/shani-deploy --rollback >> "$LOGFILE" 2>&1
         yad --info --title="Rollback Completed" --text="Rollback process completed." --width=400
     else
         logger -t startup-check "User canceled rollback. Boot failure remains unresolved."

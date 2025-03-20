@@ -4,7 +4,7 @@ After=mark-boot-success.service data.mount
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/check-boot-failure.sh
+ExecStart=/usr/local/bin/check-boot-failure
 
 [Install]
 WantedBy=multi-user.target

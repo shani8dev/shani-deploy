@@ -35,7 +35,7 @@ else
 Do you want to update?" --width=400
     if [ $? -eq 0 ]; then
         # User accepted; run shani-deploy via pkexec
-        pkexec /usr/local/bin/shani-deploy.sh
+        pkexec /usr/local/bin/shani-deploy
     else
         yad --info --title="Update Cancelled" --text="Update cancelled." --width=400
     fi

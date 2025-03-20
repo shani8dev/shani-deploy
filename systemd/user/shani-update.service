@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=oneshot
 # For Wayland, if using XWayland, DISPLAY may still be set.
 Environment=DISPLAY=:0
-ExecStart=/usr/local/bin/shani-update.sh
+ExecStart=/usr/local/bin/shani-update
 TimeoutSec=0
 
 [Install]

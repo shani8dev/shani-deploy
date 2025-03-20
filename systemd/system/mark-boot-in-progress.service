@@ -1,0 +1,13 @@
+[Unit]
+Description=Mark Boot In Progress for Shani OS
+DefaultDependencies=no
+After=data.mount
+Before=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/touch /data/boot_in_progress
+RemainAfterExit=yes
+
+[Install]
+WantedBy=local-fs.target

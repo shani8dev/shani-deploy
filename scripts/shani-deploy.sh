@@ -1,32 +1,39 @@
 #!/bin/bash
-# Self-update block: Always run the remote script from a temporary file.
-REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"  # Update with your URL
-TEMP_SCRIPT=$(mktemp)
+# This script must be run as root (via sudo).
+# It performs self-update, checks for internet connectivity,
+# and deploys updates on a Blue/Green Btrfs system with rollback support.
 
-if curl -fsSL "$REMOTE_SCRIPT_URL" -o "$TEMP_SCRIPT"; then
-    chmod +x "$TEMP_SCRIPT"
-    echo "Running remote version from temporary file..."
-    exec "$TEMP_SCRIPT" "$@"
-else
-    echo "Warning: Could not fetch remote script. Proceeding with local version." >&2
+# --- Ensure running as sudo ---
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: This script must be run as root (use sudo)." >&2
+    exit 1
 fi
-rm -f "$TEMP_SCRIPT"
 
-# --- Original deploy-image.sh code follows ---
-# deploy-image.sh – Combined Deployment and Rollback for Blue/Green Btrfs Systems
-# with Update Channel Selection, Boot Failure Detection, Overlay Mount for /etc,
-# UKI Generation, and Cleanup of Old Backups and Downloads.
-#
-# Usage:
-#   deploy-image.sh              # Deploy update (default: latest channel)
-#   deploy-image.sh latest       # Deploy update from latest channel
-#   deploy-image.sh stable       # Deploy update from stable channel
-#   deploy-image.sh rollback     # Force a rollback
-#
-# (Run as root.)
+# --- Check for internet connectivity ---
+if ! ping -c 1 -W 2 google.com &>/dev/null; then
+    echo "Error: No internet connection. Please check your network." >&2
+    exit 1
+fi
 
+# --- Strict error handling & environment ---
 set -Eeuo pipefail
 IFS=$'\n\t'
+
+# --- Self-update block: Always run the remote script from a temporary file ---
+# Prevent infinite self-update loops by checking if SELF_UPDATE_DONE is set.
+if [ -z "${SELF_UPDATE_DONE:-}" ]; then
+    export SELF_UPDATE_DONE=1
+    REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"  # Update with your URL
+    TEMP_SCRIPT=$(mktemp)
+    if curl -fsSL "$REMOTE_SCRIPT_URL" -o "$TEMP_SCRIPT"; then
+        chmod +x "$TEMP_SCRIPT"
+        echo "Running remote version from temporary file..."
+        exec "$TEMP_SCRIPT" "$@"
+    else
+        echo "Warning: Could not fetch remote script. Proceeding with local version." >&2
+    fi
+    rm -f "$TEMP_SCRIPT"
+fi
 
 # --- Configuration ---
 OS_NAME="shanios"
@@ -43,27 +50,19 @@ GENEFI_SCRIPT="/usr/local/bin/gen-efi"  # Ensure this script is present
 # Marker file to indicate an update was deployed but not yet finalized.
 DEPLOY_PENDING="/data/deployment_pending"
 
+# Global variable declarations (optional but explicit)
 declare -g BACKUP_NAME=""
 declare -g CURRENT_SLOT=""
 declare -g CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION=""
 declare -g REMOTE_PROFILE=""
 declare -g IMAGE_NAME=""
-declare -g UPDATE_CHANNEL="stable"  # Default channel
+declare -g UPDATE_CHANNEL="stable"   # Default channel is stable
+rollback_mode="no"
+manual_cleanup="no"
+dry_run="no"
 
-# --- Parameter Parsing ---
-if [[ "${1:-}" == "rollback" ]]; then
-    rollback_mode="yes"
-else
-    rollback_mode="no"
-    if [[ "${1:-}" == "stable" ]]; then
-        UPDATE_CHANNEL="stable"
-    elif [[ "${1:-}" == "latest" ]]; then
-        UPDATE_CHANNEL="latest"
-    fi
-fi
-
-# --- Common Functions ---
+# --- Logging and helper functions ---
 log() {
     echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY] $*"
 }
@@ -98,30 +97,50 @@ get_booted_subvol() {
 }
 
 cleanup_old_backups() {
-    # For each slot, keep at least one backup and delete older ones.
+    # For each slot (blue and green), keep only the latest backup and delete the rest.
     for slot in blue green; do
-        local backup_list count retention to_remove backup
-        backup_list=$(btrfs subvolume list "$MOUNT_DIR" | awk -v slot="$slot" '$0 ~ slot"_backup" {print $NF}' | sort)
-        count=$(echo "$backup_list" | wc -l)
-        retention=1
-        if [ "$count" -gt "$retention" ]; then
-            to_remove=$(echo "$backup_list" | head -n $(($count - $retention)))
-            for backup in $to_remove; do
-                btrfs subvolume delete "$MOUNT_DIR/@${backup}" && log "Deleted old backup: @${backup}"
+        local backups count backup
+        # List backup subvolumes matching the naming scheme: <slot>_backup_YYYYMMDDHHMM.
+        # Sorting in reverse order ensures the newest backup appears first.
+        backups=$(btrfs subvolume list "$MOUNT_DIR" | awk -v slot="$slot" '$0 ~ slot"_backup_" {print $NF}' | sort -r)
+        count=$(echo "$backups" | wc -l)
+        if [ "$count" -gt 1 ]; then
+            # Keep the first backup (the latest) and delete the rest.
+            echo "$backups" | tail -n +2 | while read -r backup; do
+                if btrfs subvolume delete "$MOUNT_DIR/@${backup}"; then
+                    log "Deleted old backup: @${backup}"
+                else
+                    log "Failed to delete backup: @${backup}"
+                fi
             done
+        else
+            log "Only the latest backup exists for slot $slot; skipping cleanup."
         fi
     done
 }
 
 cleanup_downloads() {
-    # Remove downloaded image files older than 7 days, but keep at least one.
-    local count
-    count=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" | wc -l)
+    # Remove downloaded image files older than 7 days, but keep the latest one.
+    local files count latest_file
+    # Find files older than 7 days, outputting the modification timestamp and path.
+    files=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" -mtime +7 -printf "%T@ %p\n" | sort -n)
+    count=$(echo "$files" | wc -l)
     if [ "$count" -gt 1 ]; then
-        find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" -mtime +7 -exec rm -f {} \;
-        log "Cleaned up downloaded images older than 7 days."
+        # Get the newest file (last line in the sorted list).
+        latest_file=$(echo "$files" | tail -n 1 | cut -d' ' -f2-)
+        # Loop through the list and delete each file except the latest.
+        echo "$files" | while read -r line; do
+            file=$(echo "$line" | cut -d' ' -f2-)
+            if [ "$file" != "$latest_file" ]; then
+                if rm -f "$file"; then
+                    log "Deleted old download: $file"
+                else
+                    log "Failed to delete old download: $file"
+                fi
+            fi
+        done
     else
-        log "Only one downloaded image remains; skipping downloads cleanup."
+        log "Less than two downloaded images older than 7 days remain; skipping downloads cleanup."
     fi
 }
 
@@ -182,6 +201,78 @@ rollback_system() {
     reboot
 }
 
+# --- Parameter Parsing using getopt ---
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  -h, --help           Show this help message.
+  -r, --rollback       Force a rollback.
+  -c, --cleanup        Run manual cleanup.
+  -t, --channel <chan> Specify update channel: latest or stable (default: stable).
+  -d, --dry-run        Dry run (simulate actions without making changes).
+EOF
+}
+
+ARGS=$(getopt -o hrct:d --long help,rollback,cleanup,channel:,dry-run -n "$0" -- "$@")
+if [ $? -ne 0 ]; then
+    usage
+    exit 1
+fi
+eval set -- "$ARGS"
+while true; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -r|--rollback)
+            rollback_mode="yes"
+            shift
+            ;;
+        -c|--cleanup)
+            manual_cleanup="yes"
+            shift
+            ;;
+        -t|--channel)
+            UPDATE_CHANNEL="$2"
+            shift 2
+            ;;
+        -d|--dry-run)
+            dry_run="yes"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# --- Manual Cleanup Mode ---
+if [ "$manual_cleanup" = "yes" ]; then
+    log "Initiating manual cleanup..."
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || die "Failed to mount root device for cleanup"
+    cleanup_old_backups
+    safe_umount "$MOUNT_DIR" || true
+    cleanup_downloads
+    exit 0
+fi
+
+# --- Dry Run Mode Function ---
+run_cmd() {
+    if [ "$dry_run" = "yes" ]; then
+        log "[Dry Run] $*"
+    else
+        eval "$@" || die "Command failed: $*"
+    fi
+}
+
 # --- Boot Failure Check ---
 if [ ! -f /data/boot-ok ]; then
     log "Boot failure detected: /data/boot-ok marker missing. Initiating rollback..."
@@ -189,37 +280,35 @@ if [ ! -f /data/boot-ok ]; then
 fi
 
 # --- Resume Pending Deployment if Marker Exists ---
-# If a previous run left the deployment pending (e.g. candidate update exists but finalization wasn’t done)
 if [ -f "$DEPLOY_PENDING" ]; then
     log "Found deployment pending marker. Resuming finalization (Phase 5)."
     skip_deployment="yes"
 fi
 
 # --- Main Execution (Deployment) ---
-if [[ "${rollback_mode}" == "yes" ]]; then
+if [ "$rollback_mode" = "yes" ]; then
     rollback_system
     exit 0
 fi
 
+log "Starting deployment procedure..."
+log "Deploying update from channel: ${UPDATE_CHANNEL}"
+CHANNEL_URL="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
 
-    log "Starting deployment procedure..."
-    log "Deploying update from channel: ${UPDATE_CHANNEL}"
-    CHANNEL_URL="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
-    
-    # Phase 1: Boot Validation & Candidate Selection
-    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null || echo "blue")
-    BOOTED_SLOT=$(get_booted_subvol)
-    if [[ "$BOOTED_SLOT" != "$CURRENT_SLOT" ]]; then
-        die "System booted @${BOOTED_SLOT} but expected slot is @${CURRENT_SLOT}. Reboot into the correct slot first."
-    fi
-    if [[ "$CURRENT_SLOT" == "blue" ]]; then
-        CANDIDATE_SLOT="green"
-    else
-        CANDIDATE_SLOT="blue"
-    fi
-    log "System booted from @${CURRENT_SLOT}. Preparing deployment to candidate slot @${CANDIDATE_SLOT}."
-    
-if [[ "${skip_deployment:-}" != "yes" ]]; then
+# Phase 1: Boot Validation & Candidate Selection
+CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null || echo "blue")
+BOOTED_SLOT=$(get_booted_subvol)
+if [ "$BOOTED_SLOT" != "$CURRENT_SLOT" ]; then
+    die "System booted @${BOOTED_SLOT} but expected slot is @${CURRENT_SLOT}. Reboot into the correct slot first."
+fi
+if [ "$CURRENT_SLOT" = "blue" ]; then
+    CANDIDATE_SLOT="green"
+else
+    CANDIDATE_SLOT="blue"
+fi
+log "System booted from @${CURRENT_SLOT}. Preparing deployment to candidate slot @${CANDIDATE_SLOT}."
+
+if [ "${skip_deployment:-}" != "yes" ]; then
     # Phase 2: Pre-update Checks
     log "Checking available disk space on /data..."
     free_space_mb=$(df --output=avail "/data" | tail -n1)
@@ -241,8 +330,7 @@ if [[ "${skip_deployment:-}" != "yes" ]]; then
         die "Unexpected format in ${UPDATE_CHANNEL}.txt: $IMAGE_NAME"
     fi
     
-    # If system is already up-to-date, check for a pending candidate update
-    if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
+    if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ] && [ "$LOCAL_PROFILE" = "$REMOTE_PROFILE" ]; then
         log "System is already up-to-date (v${REMOTE_VERSION})."
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
@@ -276,7 +364,7 @@ if [[ "${skip_deployment:-}" != "yes" ]]; then
         fi
     fi
     
-    if [[ -f "$IMAGE_NAME" ]]; then
+    if [ -f "$IMAGE_NAME" ]; then
         log "Found existing image file $IMAGE_NAME. Checking completeness..."
         EXPECTED_SIZE=$(wget -q --spider -L -S "$IMAGE_FILE_URL" 2>&1 | grep -i "Length:" | awk '{print $2}' | tr -d '\r')
         if [[ -n "${EXPECTED_SIZE:-}" && "$EXPECTED_SIZE" =~ ^[0-9]+$ ]]; then
@@ -285,9 +373,7 @@ if [[ "${skip_deployment:-}" != "yes" ]]; then
                 log "Incomplete file detected: local size ($ACTUAL_SIZE bytes) is less than expected ($EXPECTED_SIZE bytes). Attempting to resume download..."
                 if ! zsync -i "$IMAGE_NAME" "$IMAGE_ZSYNC_URL"; then
                     log "Zsync resume failed; trying wget to resume download..."
-                    wget -L --continue --show-progress --retry-connrefused --waitretry=1 \
-                         --read-timeout=20 --timeout=15 --tries=10 -O "$IMAGE_NAME" "$IMAGE_FILE_URL" \
-                         || die "Failed to resume incomplete download"
+                    run_cmd "wget -L --continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10 -O '$IMAGE_NAME' '$IMAGE_FILE_URL'"
                 fi
             else
                 log "Existing file appears complete (size: $ACTUAL_SIZE bytes)."
@@ -297,54 +383,44 @@ if [[ "${skip_deployment:-}" != "yes" ]]; then
         fi
     fi
     
-    if [[ ! -f "$IMAGE_NAME" ]]; then
+    if [ ! -f "$IMAGE_NAME" ]; then
         log "No valid image found; downloading update image..."
         OLD_IMAGE=""
-        if [[ -f "old.txt" ]]; then
+        if [ -f "old.txt" ]; then
             OLD_IMAGE=$(<old.txt)
         fi
-        if [[ -n "$OLD_IMAGE" && -f "$OLD_IMAGE" ]]; then
+        if [ -n "$OLD_IMAGE" ] && [ -f "$OLD_IMAGE" ]; then
             log "Resuming download using existing file: $OLD_IMAGE"
             if ! zsync -i "$OLD_IMAGE" "$IMAGE_ZSYNC_URL"; then
                 log "Zsync download failed; falling back to full download via wget."
-                wget -L --continue --show-progress --retry-connrefused --waitretry=1 \
-                     --read-timeout=20 --timeout=15 --tries=10 -O "$IMAGE_NAME" "$IMAGE_FILE_URL" \
-                     || die "Full download failed"
+                run_cmd "wget -L --continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10 -O '$IMAGE_NAME' '$IMAGE_FILE_URL'"
             fi
         else
             log "No previous image found; performing full zsync download."
             if ! zsync "$IMAGE_ZSYNC_URL"; then
                 log "Zsync download failed; falling back to full download via wget."
-                wget -L --continue --show-progress --retry-connrefused --waitretry=1 \
-                     --read-timeout=20 --timeout=15 --tries=10 -O "$IMAGE_NAME" "$IMAGE_FILE_URL" \
-                     || die "Full download failed"
+                run_cmd "wget -L --continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10 -O '$IMAGE_NAME' '$IMAGE_FILE_URL'"
             fi
         fi
     fi
     
-    wget -L --continue --show-progress --retry-connrefused --waitretry=1 \
-         --read-timeout=20 --timeout=15 --tries=10 -O "${IMAGE_NAME}.sha256" "$SHA256_URL" \
-         || die "Failed to download SHA256 file"
-    wget -L --continue --show-progress --retry-connrefused --waitretry=1 \
-         --read-timeout=20 --timeout=15 --tries=10 -O "${IMAGE_NAME}.asc" "$ASC_URL" \
-         || die "Failed to download PGP signature file"
+    run_cmd "wget -L --continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10 -O '${IMAGE_NAME}.sha256' '$SHA256_URL'"
+    run_cmd "wget -L --continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10 -O '${IMAGE_NAME}.asc' '$ASC_URL'"
     
     if ! sha256sum -c "${IMAGE_NAME}.sha256"; then
         log "SHA256 checksum verification failed"
     fi
     
-    # Create a temporary GnuPG home directory
+    # Create a temporary GnuPG home directory for signature verification.
     GNUPGHOME=$(mktemp -d /tmp/gnupg-XXXXXX)
     GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
     export GNUPGHOME
     chmod 700 "$GNUPGHOME"
     gpg --recv-keys "$GPG_KEY_ID"
     echo -e "trust\n5\ny\nsave\n" | gpg --homedir "$GNUPGHOME" --batch --command-fd 0 --edit-key "$GPG_KEY_ID"
-    # Perform GPG verification
     if ! gpg --verify "${IMAGE_NAME}.asc" "$IMAGE_NAME"; then
         log "PGP signature verification failed"
     fi
-    # Clean up the temporary GnuPG home directory
     rm -rf "$GNUPGHOME"
     log "Image verified successfully."
     touch "$MARKER_FILE"
@@ -366,18 +442,17 @@ if [[ "${skip_deployment:-}" != "yes" ]]; then
     fi
     
     TEMP_SUBVOL="$MOUNT_DIR/temp_update"
-    # Before creating the temporary subvolume, check if it already exists
     if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "temp_update"; then
-    log "Found existing temporary subvolume temp_update. Attempting to delete it..."
+        log "Found existing temporary subvolume temp_update. Attempting to delete it..."
         if btrfs subvolume show "$TEMP_SUBVOL/shanios_base" &>/dev/null; then
             btrfs subvolume delete "$TEMP_SUBVOL/shanios_base" || log "Failed to delete nested subvolume shanios_base"
         fi
-    btrfs subvolume delete "$MOUNT_DIR/temp_update" || log "Failed to delete existing temporary subvolume temp_update"
+        btrfs subvolume delete "$MOUNT_DIR/temp_update" || log "Failed to delete existing temporary subvolume temp_update"
     fi
 
     btrfs subvolume create "$TEMP_SUBVOL" || die "Failed to create temporary subvolume"
     log "Receiving update image into temporary subvolume..."
-    zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | btrfs receive "$TEMP_SUBVOL" || die "Image extraction failed"
+    run_cmd "zstd -d --long=31 -T0 '$DOWNLOAD_DIR/$IMAGE_NAME' -c | btrfs receive '$TEMP_SUBVOL'" || die "Image extraction failed"
     log "Creating candidate snapshot from update image..."
     btrfs subvolume snapshot "$TEMP_SUBVOL/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Snapshot creation for candidate slot failed"
     btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true || die "Failed to set candidate slot to read-only"
@@ -390,7 +465,7 @@ if [[ "${skip_deployment:-}" != "yes" ]]; then
     btrfs subvolume delete "$TEMP_SUBVOL" || log "Failed to delete temporary subvolume"
     safe_umount "$MOUNT_DIR"
     
-    # Create marker so next run knows to resume finalization
+    # Create marker so next run knows to resume finalization.
     touch "$DEPLOY_PENDING"
 fi
 
@@ -399,49 +474,43 @@ log "Mounting candidate subvolume for UKI update..."
 mkdir -p "$MOUNT_DIR"
 safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvol=@${CANDIDATE_SLOT}"
 
-# Mount EFI partition: if already mounted on /boot/efi, use a bind mount.
 if mountpoint -q /boot/efi; then
     log "EFI partition already mounted on /boot/efi. Using bind mount for $MOUNT_DIR/boot/efi."
     mkdir -p "$MOUNT_DIR/boot/efi"
-    mount --bind /boot/efi "$MOUNT_DIR/boot/efi" || die "Bind mount failed: /boot/efi → $MOUNT_DIR/boot/efi"
+    run_cmd "mount --bind /boot/efi '$MOUNT_DIR/boot/efi'" || die "Bind mount failed: /boot/efi → $MOUNT_DIR/boot/efi"
 else
     safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi"
 fi
 
-# Bind mount /data into the candidate environment.
 if mountpoint -q "$MOUNT_DIR/data"; then
     log "$MOUNT_DIR/data is already mounted. Unmounting first..."
     umount -R "$MOUNT_DIR/data" || die "Failed to unmount $MOUNT_DIR/data"
 fi
-mount --bind /data "$MOUNT_DIR/data" || die "Data bind mount failed"
+run_cmd "mount --bind /data '$MOUNT_DIR/data'" || die "Data bind mount failed"
 log "Bind mounted /data to $MOUNT_DIR/data"
 
-# Bind mount /etc from host into candidate.
 if mountpoint -q "$MOUNT_DIR/etc"; then
     log "$MOUNT_DIR/etc is already mounted. Unmounting first..."
     umount -R "$MOUNT_DIR/etc" || die "Failed to unmount $MOUNT_DIR/etc"
 fi
 mkdir -p "$MOUNT_DIR/etc"
-mount --bind /etc "$MOUNT_DIR/etc" || die "Failed to bind mount /etc"
+run_cmd "mount --bind /etc '$MOUNT_DIR/etc'" || die "Failed to bind mount /etc"
 log "Bind mounted /etc to $MOUNT_DIR/etc"
 
-# Bind mount /var from host into candidate.
 if mountpoint -q "$MOUNT_DIR/var"; then
     log "$MOUNT_DIR/var is already mounted. Unmounting first..."
     umount -R "$MOUNT_DIR/var" || die "Failed to unmount $MOUNT_DIR/var"
 fi
 mkdir -p "$MOUNT_DIR/var"
-mount --bind /var "$MOUNT_DIR/var" || die "Failed to bind mount /var"
+run_cmd "mount --bind /var '$MOUNT_DIR/var'" || die "Failed to bind mount /var"
 log "Bind mounted /var to $MOUNT_DIR/var"
 
-# Bind essential directories for chroot
 target_dirs=("/dev" "/proc" "/sys" "/run" "/tmp" "/sys/firmware/efi/efivars")
 for dir in "${target_dirs[@]}"; do
     mkdir -p "$MOUNT_DIR$dir"
-    mount --bind "$dir" "$MOUNT_DIR$dir" || die "Failed to bind mount $dir"
+    run_cmd "mount --bind '$dir' '$MOUNT_DIR$dir'" || die "Failed to bind mount $dir"
 done
 
-# Proceed with UKI generation.
 log "Regenerating Secure Boot UKI..."
 chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$CANDIDATE_SLOT" || { 
     for dir in "${target_dirs[@]}"; do safe_umount "$MOUNT_DIR$dir"; done
@@ -453,7 +522,6 @@ chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$CANDIDATE_SLOT" || {
     die "UKI generation failed"; 
 }
 
-# Clean up: unmount bind mounts in reverse order.
 for dir in "${target_dirs[@]}"; do safe_umount "$MOUNT_DIR$dir"; done
 safe_umount "$MOUNT_DIR/etc"
 safe_umount "$MOUNT_DIR/var"
@@ -461,8 +529,6 @@ safe_umount "$MOUNT_DIR/data"
 safe_umount "$MOUNT_DIR/boot/efi"
 safe_umount "$MOUNT_DIR"
 
-
-# Finalize by removing the pending marker.
 if [ -f "$DEPLOY_PENDING" ]; then
     rm -f "$DEPLOY_PENDING"
     log "Removed deployment pending marker."
@@ -474,7 +540,7 @@ echo "$CURRENT_SLOT" > "/data/previous-slot"
 echo "$CANDIDATE_SLOT" > "/data/current-slot"
 mkdir -p "$MOUNT_DIR"
 safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-if [[ -n "$BACKUP_NAME" ]]; then
+if [ -n "$BACKUP_NAME" ]; then
     btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" &>/dev/null && log "Deleted backup @${BACKUP_NAME}"
 fi
 cleanup_old_backups

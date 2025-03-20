@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Exec=/usr/local/bin/startup-check
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Name=Boot Fallback Check
+Comment=Check if booted from fallback slot and offer rollback
+

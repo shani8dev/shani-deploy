@@ -8,3 +8,4 @@ Unit=check-boot-failure.service
 
 [Install]
 WantedBy=timers.target
+

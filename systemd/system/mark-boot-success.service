@@ -1,11 +1,12 @@
 [Unit]
 Description=Mark Boot Success for Shani OS
-After=multi-user.target
+After=multi-user.target data.mount
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/touch /data/boot-ok
+ExecStart=/bin/sh -c 'touch /data/boot-ok && rm -f /data/boot_in_progress'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
+

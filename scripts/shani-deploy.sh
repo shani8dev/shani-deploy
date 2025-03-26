@@ -276,11 +276,12 @@ rollback_system() {
     local failed_path backup_path
     failed_path="$MOUNT_DIR/@${failed_slot}"
     backup_path="$MOUNT_DIR/@${BACKUP_NAME}"
+    btrfs property set -ts "$failed_path" ro false &>/dev/null || true
     btrfs subvolume delete "$failed_path" || die "Failed to delete slot ${failed_slot}"
     btrfs subvolume snapshot "$backup_path" "$failed_path" || die "Failed to restore slot ${failed_slot}"
+    btrfs property set -ts "$failed_path" ro true
     log "Updating active slot marker to previous slot: ${previous_slot}..."
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
-    bootctl set-default "shanios-${previous_slot}.conf" || log "bootctl update failed; please verify manually"
     safe_umount "$MOUNT_DIR"
     generate_uki_common "$previous_slot"
     log "Rollback complete. Rebooting system..."
@@ -482,6 +483,7 @@ deploy_btrfs_update() {
     btrfs subvolume snapshot "$temp_subvol/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Snapshot creation failed"
     btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true || die "Failed to set candidate slot to read-only"
     log "Deleting temporary subvolume..."
+    [[ -d "$temp_subvol/shanios_base" ]] && btrfs subvolume delete "$temp_subvol/shanios_base" || log "Failed to delete nested subvolume shanios_base"
     btrfs subvolume delete "$temp_subvol" || log "Failed to delete temporary subvolume"
     safe_umount "$MOUNT_DIR"
     touch "$DEPLOY_PENDING"

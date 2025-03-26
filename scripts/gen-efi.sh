@@ -7,6 +7,10 @@
 # to generate a new UKI image, signing it for Secure Boot.
 # The command line includes "rootflags=subvol=@<target_slot>".
 #
+# It then updates the boot menu configuration for both slots:
+# the active slot (from /data/current-slot) is labeled " (Active)"
+# while the other is labeled " (Candidate)". The active boot entry is set as default.
+#
 # Must be run as root.
 
 set -Eeuo pipefail
@@ -120,6 +124,28 @@ generate_cmdline() {
     fi
 }
 
+# update_slot_conf updates the boot entry configuration for a given slot.
+update_slot_conf() {
+    local slot="$1"
+    local active_slot=""
+    if [ -f /data/current-slot ]; then
+        active_slot=$(cat /data/current-slot)
+    fi
+    local suffix=""
+    if [[ "$slot" == "$active_slot" ]]; then
+        suffix=" (Active)"
+    else
+        suffix=" (Candidate)"
+    fi
+    local conf_file="$BOOT_ENTRIES/${OS_NAME}-${slot}.conf"
+    cat > "$conf_file" <<EOF
+title   ${OS_NAME}-${slot}${suffix}
+efi     /EFI/${OS_NAME}/${OS_NAME}-${slot}.efi
+EOF
+    log "Updated boot entry: $conf_file"
+}
+
+# generate_uki generates the UKI image and then updates the boot entries for both slots.
 generate_uki() {
     local slot="$1"
     local kernel_ver
@@ -133,11 +159,20 @@ generate_uki() {
     fi
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
-    cat > "$BOOT_ENTRIES/${OS_NAME}-${slot}.conf" <<EOF
-title   ${OS_NAME}-${slot}
-efi     /EFI/${OS_NAME}/${OS_NAME}-${slot}.efi
-EOF
-    bootctl set-default "${OS_NAME}-${slot}.conf" || error_exit "bootctl set-default failed"
+
+    # Update both slots' boot entries.
+    update_slot_conf "$slot"
+    local other_slot=$([[ "$slot" == "blue" ]] && echo "green" || echo "blue")
+    update_slot_conf "$other_slot"
+
+    # Set the active slot (from /data/current-slot, if available) as default.
+    local active
+    if [ -f /data/current-slot ]; then
+        active=$(cat /data/current-slot)
+    else
+        active="$slot"
+    fi
+    bootctl set-default "${OS_NAME}-${active}.conf" || error_exit "bootctl set-default failed"
 }
 
 case "${1:-}" in

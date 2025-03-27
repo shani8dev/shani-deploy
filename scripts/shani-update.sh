@@ -7,10 +7,11 @@
 #  • If an update is available, displays a dialog with three buttons:
 #         "Update", "Toggle Terminal", and "Remind Me Later".
 #  • "Update" launches the update process (shani-deploy) using systemd-inhibit
-#    to block events (shutdown, sleep, idle, lid-switch, power-key) so that
-#    the update is uninterrupted. Its output is redirected to a log file.
-#  • "Toggle Terminal" only toggles the log window (opening it if closed,
-#    or closing it if open) but does NOT start a new update if one is not running.
+#    to block events (shutdown, sleep, idle, lid-switch, power-key, suspend-key,
+#    and hibernate-key) so that the update is uninterrupted. Its output is
+#    redirected to a log file.
+#  • "Toggle Terminal" toggles the log window (opening it if closed, or closing
+#    it if open) without starting a new update.
 #  • "Remind Me Later" defers the update prompt via systemd-run.
 #
 # Dependencies: curl, yad, systemd-run, systemd-inhibit, pkexec, nohup, mktemp, pgrep
@@ -65,13 +66,17 @@ is_update_running() {
 }
 
 # Start the update process using systemd-inhibit (blocking shutdown, sleep, idle,
-# lid-switch, and power-key events). Output goes to TMP_LOG.
+# lid-switch, power-key, suspend-key, and hibernate-key events). It uses the
+# SYSTEMD_INHIBITED environment variable to ensure the inhibitor is applied only once.
 start_update() {
     if is_update_running; then
         return
     fi
     : > "$TMP_LOG"  # Clear or create the log file.
-    nohup systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch:handle-power-key \
+    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
+        export SYSTEMD_INHIBITED=1
+    fi
+    nohup systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch:handle-power-key:handle-suspend-key:handle-hibernate-key \
          --who="Shani OS Update" --why="Running system update" \
          pkexec /usr/local/bin/shani-deploy >>"$TMP_LOG" 2>&1 &
 }

@@ -68,6 +68,21 @@ set_environment() {
 }
 
 #####################################
+### Systemd Inhibit Function  #######
+#####################################
+
+# If not already running under systemd-inhibit, re-execute the script with an inhibitor
+# that prevents idle, sleep, shutdown, power key, suspend key, hibernate key, and lid switch events.
+inhibit_system() {
+    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
+        export SYSTEMD_INHIBITED=1
+        log "Inhibiting all system interruptions during update..."
+        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" --why="Updating system" "$0" "$@"
+    fi
+}
+
+#####################################
 ### Self-Update Section  ############
 #####################################
 
@@ -555,6 +570,7 @@ main() {
     check_root
     check_internet
     set_environment
+    inhibit_system "$@"
     self_update "$@"
 
     if [[ "$manual_cleanup" == "yes" ]]; then

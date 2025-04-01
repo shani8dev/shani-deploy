@@ -108,6 +108,16 @@ generate_cmdline() {
         fi
 
         local cmdline="quiet splash systemd.volatile=state ro lsm=landlock,lockdown,yama,integrity,apparmor,bpf rootfstype=btrfs rootflags=subvol=@${slot},ro,noatime,compress=zstd,space_cache=v2,autodefrag${encryption_params} root=${rootdev}"
+
+		# Append keyboard mapping parameter from /etc/vconsole.conf if available
+		if [[ -f /etc/vconsole.conf ]]; then
+			local keymap
+			keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf | cut -d= -f2)
+			if [[ -n "$keymap" ]]; then
+				cmdline+=" rd.vconsole.keymap=$keymap"
+			fi
+		fi
+
         if [ -f /swap/swapfile ]; then
             local swap_offset
             swap_offset=$(btrfs inspect-internal map-swapfile -r /swap/swapfile | awk '{print $NF}' 2>/dev/null || true)

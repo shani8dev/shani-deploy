@@ -41,12 +41,13 @@ cleanup() {
     [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
 
     # Cleanup only after two self-updates
-    if [[ -n "$SELF_UPDATE_IN_PROGRESS" && "$self_update_count" -lt 2 ]]; then
+    if [[ -n "${SELF_UPDATE_IN_PROGRESS:-}" && "$self_update_count" -lt 2 ]]; then
         return
     fi
 
     rm -rf "$STATE_DIR"
 }
+
 
 
 trap cleanup EXIT
@@ -195,7 +196,6 @@ self_update() {
 
     rm -f "$temp_script"
 }
-
 
 #####################################
 ### Logging & Helper Functions    ###

@@ -34,20 +34,12 @@ STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
 export STATE_DIR
 
 # Cleanup trap to remove the state directory on exit
+# Cleanup trap to remove the state directory on exit
 cleanup() {
-    local self_update_count_file="${STATE_DIR}/self_update_count"
-    local self_update_count=0
-
-    [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
-
-    # Allow cleanup only after the second self-update
-    if (( self_update_count < 2 )); then
-        return
+    if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
+        rm -rf "${STATE_DIR}"
     fi
-
-    rm -rf "$STATE_DIR"
 }
-
 trap cleanup EXIT
 
 persist_state() {

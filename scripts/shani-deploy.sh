@@ -162,7 +162,7 @@ self_update() {
         if curl -fsSL "$remote_url" -o "$temp_script"; then
             chmod +x "$temp_script"
             log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
-            exec "$temp_script" "${ORIGINAL_ARGS[@]}"
+            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
         else
             log "Warning: Unable to fetch remote script; continuing with local version." >&2
         fi

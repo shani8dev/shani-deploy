@@ -308,19 +308,28 @@ rollback_system() {
 #####################################
 
 boot_validation_and_candidate_selection() {
-    CURRENT_SLOT=$(< /data/current-slot 2>/dev/null || echo "blue")
+    # Read the current slot from file and trim whitespace.
+    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null)
+    CURRENT_SLOT=$(echo "$CURRENT_SLOT" | xargs)  # Trim leading/trailing whitespace
+    if [[ -z "$CURRENT_SLOT" ]]; then
+        CURRENT_SLOT="blue"
+    fi
+
     local booted
     booted=$(get_booted_subvol)
     if [[ "$booted" != "$CURRENT_SLOT" ]]; then
         die "System booted from @$booted but expected @$CURRENT_SLOT. Reboot into the correct slot first."
     fi
+
     if [[ "$CURRENT_SLOT" == "blue" ]]; then
         CANDIDATE_SLOT="green"
     else
         CANDIDATE_SLOT="blue"
     fi
+
     log "System booted from @$CURRENT_SLOT. Preparing deployment to candidate slot @${CANDIDATE_SLOT}."
 }
+
 
 pre_update_checks() {
     local free_space_mb

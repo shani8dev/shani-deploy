@@ -4,6 +4,8 @@
 # Blue/Green Btrfs deployment with rollback support, Secure Boot UKI regeneration,
 # and cleanup. It supports rollback, manual cleanup, dry-run mode, and update-channel selection.
 
+# Capture the original arguments passed to the script.
+ORIGINAL_ARGS=("$@")
 ###############################
 ### Global Configuration  #####
 ###############################
@@ -87,6 +89,7 @@ inhibit_system() {
 #####################################
 # Capture the original arguments passed to the script.
 ORIGINAL_ARGS=("$@")
+
 self_update() {
     if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
         export SELF_UPDATE_DONE=1

@@ -152,26 +152,46 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    # Remove SELF_UPDATE_DONE check to allow multiple updates
-    # Persist state before updating
+    SELF_UPDATE_COUNT="${SELF_UPDATE_COUNT:-0}"
+
+    # Final check (third run)
+    if [[ "$SELF_UPDATE_COUNT" -ge 2 ]]; then
+        local temp_script
+        temp_script=$(mktemp)
+        log "Final version check..."
+        
+        if curl -fsSL "https://raw.githubusercontent.com/.../shani-deploy.sh" -o "$temp_script"; then
+            if ! diff -q "$0" "$temp_script"; then
+                log "Version difference detected but update limit reached"
+                log "Current: $(md5sum "$0")"
+                log "Remote:  $(md5sum "$temp_script")"
+            else
+                log "Verified: Current version matches remote"
+                # Clear state to prevent further runs
+                unset SELF_UPDATE_COUNT
+                rm -f "${SHANIOS_DEPLOY_STATE_FILE:-/dev/null}"
+            fi
+        else
+            log "Version check failed"
+        fi
+        rm -f "$temp_script"
+        return  # Critical: Stop execution flow after final check
+    fi
+
+    # First two runs: forced update
+    ((SELF_UPDATE_COUNT++))
     persist_state
 
-    local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     local temp_script
     temp_script=$(mktemp)
-
-    if curl -fsSL "$remote_url" -o "$temp_script"; then
-        if ! diff -q "$0" "$temp_script" >/dev/null; then
-            chmod +x "$temp_script"
-            log "Self-update: New version detected. Restarting..."
-            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
-        else
-            log "Self-update: Already running latest version."
-        fi
+    
+    if curl -fsSL "https://raw.githubusercontent.com/.../shani-deploy.sh" -o "$temp_script"; then
+        log "Update cycle $SELF_UPDATE_COUNT/2 - Restarting..."
+        chmod +x "$temp_script"
+        exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
     else
-        log "Warning: Update check failed; continuing with current version." >&2
+        die "Failed mandatory update $SELF_UPDATE_COUNT/2"
     fi
-    rm -f "$temp_script"
 }
 
 #####################################

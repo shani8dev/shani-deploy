@@ -172,17 +172,27 @@ self_update() {
     local temp_script
     temp_script=$(mktemp)
 
+    # Attempt to download the updated script
     if curl -fsSL "$remote_url" -o "$temp_script"; then
         ((current_attempt++))
         echo "$current_attempt" > "$attempt_file"
         chmod +x "$temp_script"
         log "Self-update: Restarting with new version (attempt ${current_attempt}/2)..."
+
+        # Preserve STATE_DIR so the new process retains its state
+        export STATE_DIR
+
+        # Restart with the new script
         exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
     else
-        log "Warning: Update check ${current_attempt} failed; continuing with current version." >&2
+        ((current_attempt++))
+        echo "$current_attempt" > "$attempt_file"
+        log "Warning: Update check ${current_attempt} failed; retrying later." >&2
     fi
+
     rm -f "$temp_script"
 }
+
 
 #####################################
 ### Logging & Helper Functions    ###

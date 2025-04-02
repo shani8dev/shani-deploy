@@ -152,44 +152,36 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    # Track update attempts via state file
-    local update_attempts_file="${STATE_DIR}/update_attempts"
+    # State tracking file for update attempts
+    local attempt_file="${STATE_DIR}/self_update_attempts"
     local current_attempt=0
     
     # Read previous attempts
-    [[ -f "$update_attempts_file" ]] && current_attempt=$(<"$update_attempts_file")
+    [[ -f "$attempt_file" ]] && current_attempt=$(<"$attempt_file")
 
-    # First update attempt
-    if (( current_attempt < 1 )); then
-        log "Initial update check (Attempt $((current_attempt + 1))"
-        persist_state
-        local temp_script=$(mktemp)
-        
-        if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
-            chmod +x "$temp_script"
-            echo $((current_attempt + 1)) > "$update_attempts_file"
-            log "Restarting with updated script..."
-            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
-        fi
-        rm -f "$temp_script"
-    
-    # Second attempt + version validation
-    elif (( current_attempt == 1 )); then
-        log "Final version validation check"
-        local temp_script=$(mktemp)
-        
-        if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
-            if diff -q "$0" "$temp_script" >/dev/null; then
-                log "Success: Running latest version after 2 updates"
-                rm -f "$update_attempts_file"
-            else
-                log "Warning: Version mismatch after 2 updates"
-                log "Diff output:"
-                diff --color=always "$0" "$temp_script"
-            fi
-        fi
-        rm -f "$temp_script"
+    # Stop after 2 attempts
+    if (( current_attempt >= 2 )); then
+        log "Maximum update checks reached (2). Proceeding with deployment."
+        return
     fi
+
+    # Persist state before updating
+    persist_state
+
+    local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
+    local temp_script
+    temp_script=$(mktemp)
+
+    if curl -fsSL "$remote_url" -o "$temp_script"; then
+        ((current_attempt++))
+        echo "$current_attempt" > "$attempt_file"
+        chmod +x "$temp_script"
+        log "Self-update: Restarting with new version (attempt ${current_attempt}/2)..."
+        exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
+    else
+        log "Warning: Update check ${current_attempt} failed; continuing with current version." >&2
+    fi
+    rm -f "$temp_script"
 }
 
 #####################################

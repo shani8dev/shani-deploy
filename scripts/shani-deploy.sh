@@ -29,6 +29,17 @@ fi
 #####################################
 ### State Persistence Function    ###
 #####################################
+# Create a temporary directory for state files
+STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
+export STATE_DIR
+
+# Cleanup trap to remove the state directory on exit
+cleanup() {
+    if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
+        rm -rf "${STATE_DIR}"
+    fi
+}
+trap cleanup EXIT
 
 persist_state() {
     local state_file
@@ -44,7 +55,6 @@ persist_state() {
         echo "export MIN_FREE_SPACE_MB=$(printf '%q' "$MIN_FREE_SPACE_MB")"
         echo "export GENEFI_SCRIPT=$(printf '%q' "$GENEFI_SCRIPT")"
         echo "export DEPLOY_PENDING=$(printf '%q' "$DEPLOY_PENDING")"
-        echo "export UPDATE_CHANNEL=$(printf '%q' "$UPDATE_CHANNEL")"
         echo "export GPG_KEY_ID=$(printf '%q' "$GPG_KEY_ID")"
         echo "export WGET_OPTS=$(printf '%q' "$WGET_OPTS")"
         echo "export LOCAL_VERSION=$(printf '%q' "$LOCAL_VERSION")"
@@ -55,10 +65,7 @@ persist_state() {
         echo "export REMOTE_VERSION=$(printf '%q' "$REMOTE_VERSION")"
         echo "export REMOTE_PROFILE=$(printf '%q' "$REMOTE_PROFILE")"
         echo "export IMAGE_NAME=$(printf '%q' "$IMAGE_NAME")"
-        echo "export rollback_mode=$(printf '%q' "$rollback_mode")"
-        echo "export manual_cleanup=$(printf '%q' "$manual_cleanup")"
-        echo "export dry_run=$(printf '%q' "$dry_run")"
-        echo "export skip_deployment=$(printf '%q' "$skip_deployment")"
+        echo "export STATE_DIR=$(printf '%q' "${STATE_DIR}")" >> "$state_file"
         echo "export MARKER_FILE=$(printf '%q' "$MARKER_FILE")"
         # Persist arrays using declare -p
         declare -p CHROOT_BIND_DIRS
@@ -80,7 +87,6 @@ readonly ROOT_DEV="/dev/disk/by-label/${ROOTLABEL}"
 readonly MIN_FREE_SPACE_MB=10240
 readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"  # External script for UKI generation
 readonly DEPLOY_PENDING="/data/deployment_pending"
-UPDATE_CHANNEL="stable"   # Default update channel
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 
 # Common wget options for downloads
@@ -95,10 +101,6 @@ declare -g CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION=""
 declare -g REMOTE_PROFILE=""
 declare -g IMAGE_NAME=""
-rollback_mode="no"
-manual_cleanup="no"
-dry_run="no"
-skip_deployment="no"
 MARKER_FILE=""
 
 # Arrays for chroot bind mounts (persisted via declare -p)
@@ -500,15 +502,17 @@ download_and_verify() {
     fi
 
     local gnupg_home
-    gnupg_home=$(mktemp -d /tmp/gnupg-XXXXXX)
-    export GNUPGHOME="$gnupg_home"
-    chmod 700 "$GNUPGHOME"
-    gpg --recv-keys "$GPG_KEY_ID" || die "Failed to import GPG key $GPG_KEY_ID"
-    echo -e "trust\n5\ny\nsave\n" | gpg --homedir "$GNUPGHOME" --batch --command-fd 0 --edit-key "$GPG_KEY_ID"
-    if ! gpg --verify "${IMAGE_NAME}.asc" "$IMAGE_NAME"; then
-        die "PGP signature verification failed for $IMAGE_NAME"
-    fi
-    rm -rf "$gnupg_home"
+	gnupg_home=$(mktemp -d /tmp/gnupg-XXXXXX)
+	export GNUPGHOME="$gnupg_home"
+	chmod 700 "$GNUPGHOME"
+
+	gpg --quiet --no-tty --recv-keys "$GPG_KEY_ID" >/dev/null 2>&1 || die "Failed to import key"
+	echo -e "trust\n5\ny\nsave\n" | gpg --batch --command-fd 0 --no-tty --quiet --edit-key "$GPG_KEY_ID" >/dev/null 2>&1
+
+	gpg --verify "${IMAGE_NAME}.asc" "$IMAGE_NAME" || die "Signature verification failed"
+
+	rm -rf "$gnupg_home"
+
     log "Image verified successfully."
     touch "$MARKER_FILE"
 }
@@ -545,7 +549,7 @@ fetch_update_info_and_download() {
 
                 if [[ "$CANDIDATE_VERSION" == "$REMOTE_VERSION" && "$CANDIDATE_PROFILE" == "$REMOTE_PROFILE" ]]; then
                     log "Candidate update matches. Proceeding to finalization."
-                    skip_deployment="yes"
+                    touch "${STATE_DIR}/skip-deployment"
                 else
                     log "Candidate mismatch (Found: v${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Deploying new update."
                 fi
@@ -657,19 +661,19 @@ while true; do
             exit 0
             ;;
         -r|--rollback)
-            rollback_mode="yes"
+            touch "${STATE_DIR}/rollback"
             shift
             ;;
         -c|--cleanup)
-            manual_cleanup="yes"
+            touch "${STATE_DIR}/cleanup"
             shift
             ;;
         -t|--channel)
-            UPDATE_CHANNEL="$2"
+            echo "$2" > "${STATE_DIR}/channel"
             shift 2
             ;;
         -d|--dry-run)
-            dry_run="yes"
+            touch "${STATE_DIR}/dry-run"
             shift
             ;;
         --)
@@ -692,42 +696,51 @@ main() {
     check_root
     check_internet
     set_environment
+    
+	dry_run=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
+    
+	if [[ -f "${STATE_DIR}/channel" ]]; then
+		UPDATE_CHANNEL=$(cat "${STATE_DIR}/channel")
+	else
+		UPDATE_CHANNEL="stable"
+	fi
+	
     inhibit_system "$@"
     self_update "$@"
 
-    if [[ "$manual_cleanup" == "yes" ]]; then
-        log "Initiating manual cleanup..."
+	if [[ -f "${STATE_DIR}/cleanup" ]]; then
+		log "Initiating manual cleanup..."
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || die "Failed to mount for cleanup"
         cleanup_old_backups
         safe_umount "$MOUNT_DIR" || true
         cleanup_downloads
         exit 0
-    fi
+	fi
 
     if [[ ! -f /data/boot-ok ]]; then
         log "Boot failure detected: /data/boot-ok missing. Initiating rollback..."
         rollback_system
     fi
+    
+	if [[ -f "${STATE_DIR}/rollback" ]]; then
+		rollback_system
+		exit 0
+	fi
 
-    if [[ -f "$DEPLOY_PENDING" ]]; then
-        log "Deployment pending marker found. Resuming finalization."
-        skip_deployment="yes"
-    fi
-
-    if [[ "$rollback_mode" == "yes" ]]; then
-        rollback_system
-        exit 0
-    fi
+	if [[ -f "${DEPLOY_PENDING}" ]]; then
+		log "Deployment pending marker found. Resuming finalization."
+		touch "${STATE_DIR}/skip-deployment"
+	fi
 
     boot_validation_and_candidate_selection
 
-    if [[ "$skip_deployment" != "yes" ]]; then
+	if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
+		log "Skipping download/deployment; resuming finalization."
+	else
         pre_update_checks
         fetch_update_info_and_download
         deploy_btrfs_update
-    else
-        log "Skipping download/deployment; resuming finalization."
     fi
 
     generate_uki_update

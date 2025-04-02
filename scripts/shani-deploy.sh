@@ -4,8 +4,6 @@
 # Blue/Green Btrfs deployment with rollback support, Secure Boot UKI regeneration,
 # and cleanup. It supports rollback, manual cleanup, dry-run mode, and update-channel selection.
 
-# Capture the original arguments passed to the script.
-ORIGINAL_ARGS=("$@")
 ###############################
 ### Global Configuration  #####
 ###############################
@@ -397,10 +395,19 @@ fallback_download() {
         log "Starting fresh download with wget for $target_file..."
         run_cmd "wget $WGET_OPTS '$IMAGE_FILE_URL'"
     fi
+
+    # Extract the downloaded file name from the URL.
     downloaded=$(basename "$IMAGE_FILE_URL")
     downloaded="${downloaded%%\?*}"
+    
+    # Only rename if the names differ.
     if [[ "$downloaded" != "$(basename "$target_file")" ]]; then
-        [[ -f "$downloaded" ]] && mv "$downloaded" "$target_file"
+        if [[ -f "$downloaded" ]]; then
+            log "Renaming downloaded file from $downloaded to $target_file"
+            mv "$downloaded" "$target_file"
+        fi
+    else
+        log "Downloaded file name matches target file name; no renaming required."
     fi
 }
 
@@ -421,7 +428,12 @@ download_and_verify() {
         downloaded_file=$(basename "$url")
         downloaded_file="${downloaded_file%%\?*}"
         if [[ -f "$downloaded_file" ]]; then
-            mv "$downloaded_file" "$target_name"
+            if [[ "$downloaded_file" != "$(basename "$target_name")" ]]; then
+                log "Renaming downloaded file from $downloaded_file to $target_name"
+                mv "$downloaded_file" "$target_name"
+            else
+                log "Downloaded file name ($downloaded_file) matches target name; no renaming required."
+            fi
         else
             die "Download failed for ${file} file."
         fi
@@ -459,6 +471,7 @@ fetch_update_info_and_download() {
     else
         die "Unexpected format in ${UPDATE_CHANNEL}.txt: $IMAGE_NAME"
     fi
+
     if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
         log "System is already up-to-date (v${REMOTE_VERSION})."
         mkdir -p "$MOUNT_DIR"
@@ -472,7 +485,10 @@ fetch_update_info_and_download() {
             exit 0
         fi
         safe_umount "$MOUNT_DIR"
+        # Exit early: no need to download update image if system is up-to-date.
+        return 0
     fi
+
     cd "$DOWNLOAD_DIR" || die "Failed to access download directory: $DOWNLOAD_DIR"
     base_url="https://downloads.sourceforge.net/project/shanios/${REMOTE_PROFILE}/${REMOTE_VERSION}"
     IMAGE_ZSYNC_URL="${base_url}/${IMAGE_NAME}.zsync?use_mirror=autoselect"
@@ -483,6 +499,7 @@ fetch_update_info_and_download() {
     MARKER_FILE="$DOWNLOAD_DIR/${IMAGE_NAME}.verified"
     download_and_verify
 }
+
 
 deploy_btrfs_update() {
     log "Deploying update via Btrfs..."
@@ -555,24 +572,44 @@ Options:
 EOF
 }
 
+# Capture the original arguments passed to the script.
+ORIGINAL_ARGS=("$@")
+
+# Parse command-line options
 args=$(getopt -o hrct:d --long help,rollback,cleanup,channel:,dry-run -n "$0" -- "$@") || { usage; exit 1; }
 eval set -- "$args"
+
 while true; do
     case "$1" in
         -h|--help)
-            usage && exit 0 ;;
+            usage
+            exit 0
+            ;;
         -r|--rollback)
-            rollback_mode="yes"; shift ;;
+            rollback_mode="yes"
+            shift
+            ;;
         -c|--cleanup)
-            manual_cleanup="yes"; shift ;;
+            manual_cleanup="yes"
+            shift
+            ;;
         -t|--channel)
-            UPDATE_CHANNEL="$2"; shift 2 ;;
+            UPDATE_CHANNEL="$2"
+            shift 2
+            ;;
         -d|--dry-run)
-            dry_run="yes"; shift ;;
+            dry_run="yes"
+            shift
+            ;;
         --)
-            shift; break ;;
+            shift
+            break
+            ;;
         *)
-            break ;;
+            echo "Invalid option: $1"
+            usage
+            exit 1
+            ;;
     esac
 done
 

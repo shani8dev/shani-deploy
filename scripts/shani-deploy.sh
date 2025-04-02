@@ -85,7 +85,8 @@ inhibit_system() {
 #####################################
 ### Self-Update Section  ############
 #####################################
-
+# Capture the original arguments passed to the script.
+ORIGINAL_ARGS=("$@")
 self_update() {
     if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
         export SELF_UPDATE_DONE=1
@@ -95,7 +96,8 @@ self_update() {
         if curl -fsSL "$remote_url" -o "$temp_script"; then
             chmod +x "$temp_script"
             log "Self-update: running remote version from temporary file..."
-            exec "$temp_script" "$@"
+            # Pass along the original arguments to the remote script.
+            exec "$temp_script" "${ORIGINAL_ARGS[@]}"
         else
             log "Warning: Unable to fetch remote script; continuing with local version." >&2
         fi

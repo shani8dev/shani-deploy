@@ -152,45 +152,43 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    SELF_UPDATE_COUNT="${SELF_UPDATE_COUNT:-0}"
+    # Track update attempts via state file
+    local update_attempts_file="${STATE_DIR}/update_attempts"
+    local current_attempt=0
+    
+    # Read previous attempts
+    [[ -f "$update_attempts_file" ]] && current_attempt=$(<"$update_attempts_file")
 
-    # Final check (third run)
-    if [[ "$SELF_UPDATE_COUNT" -ge 2 ]]; then
-        local temp_script
-        temp_script=$(mktemp)
-        log "Final version check..."
+    # First update attempt
+    if (( current_attempt < 1 )); then
+        log "Initial update check (Attempt $((current_attempt + 1))"
+        persist_state
+        local temp_script=$(mktemp)
         
         if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
-            if ! diff -q "$0" "$temp_script"; then
-                log "Version difference detected but update limit reached"
-                log "Current: $(md5sum "$0")"
-                log "Remote:  $(md5sum "$temp_script")"
-            else
-                log "Verified: Current version matches remote"
-                # Clear state to prevent further runs
-                unset SELF_UPDATE_COUNT
-                rm -f "${SHANIOS_DEPLOY_STATE_FILE:-/dev/null}"
-            fi
-        else
-            log "Version check failed"
+            chmod +x "$temp_script"
+            echo $((current_attempt + 1)) > "$update_attempts_file"
+            log "Restarting with updated script..."
+            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
         fi
         rm -f "$temp_script"
-        return  # Critical: Stop execution flow after final check
-    fi
-
-    # First two runs: forced update
-    ((SELF_UPDATE_COUNT++))
-    persist_state
-
-    local temp_script
-    temp_script=$(mktemp)
     
-    if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
-        log "Update cycle $SELF_UPDATE_COUNT/2 - Restarting..."
-        chmod +x "$temp_script"
-        exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
-    else
-        die "Failed mandatory update $SELF_UPDATE_COUNT/2"
+    # Second attempt + version validation
+    elif (( current_attempt == 1 )); then
+        log "Final version validation check"
+        local temp_script=$(mktemp)
+        
+        if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
+            if diff -q "$0" "$temp_script" >/dev/null; then
+                log "Success: Running latest version after 2 updates"
+                rm -f "$update_attempts_file"
+            else
+                log "Warning: Version mismatch after 2 updates"
+                log "Diff output:"
+                diff --color=always "$0" "$temp_script"
+            fi
+        fi
+        rm -f "$temp_script"
     fi
 }
 

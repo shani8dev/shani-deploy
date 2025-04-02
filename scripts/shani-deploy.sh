@@ -35,10 +35,16 @@ export STATE_DIR
 
 # Cleanup trap to remove the state directory on exit
 cleanup() {
+    # Skip cleanup if self-update is in progress
+    if [[ -n "$SELF_UPDATE_IN_PROGRESS" ]]; then
+        return
+    fi
+
     if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
         rm -rf "${STATE_DIR}"
     fi
 }
+
 trap cleanup EXIT
 
 persist_state() {
@@ -179,7 +185,8 @@ self_update() {
         chmod +x "$temp_script"
         log "Self-update: Restarting with new version (attempt ${current_attempt}/2)..."
 
-        # Preserve STATE_DIR so the new process retains its state
+        # Prevent cleanup from removing STATE_DIR
+        export SELF_UPDATE_IN_PROGRESS=1
         export STATE_DIR
 
         # Restart with the new script
@@ -192,7 +199,6 @@ self_update() {
 
     rm -f "$temp_script"
 }
-
 
 #####################################
 ### Logging & Helper Functions    ###

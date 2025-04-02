@@ -160,7 +160,7 @@ self_update() {
         temp_script=$(mktemp)
         log "Final version check..."
         
-        if curl -fsSL "https://raw.githubusercontent.com/.../shani-deploy.sh" -o "$temp_script"; then
+        if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
             if ! diff -q "$0" "$temp_script"; then
                 log "Version difference detected but update limit reached"
                 log "Current: $(md5sum "$0")"
@@ -185,7 +185,7 @@ self_update() {
     local temp_script
     temp_script=$(mktemp)
     
-    if curl -fsSL "https://raw.githubusercontent.com/.../shani-deploy.sh" -o "$temp_script"; then
+    if curl -fsSL "https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh" -o "$temp_script"; then
         log "Update cycle $SELF_UPDATE_COUNT/2 - Restarting..."
         chmod +x "$temp_script"
         exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"

@@ -40,15 +40,13 @@ cleanup() {
 
     [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
 
-    # Cleanup only after two self-updates
-    if [[ -n "${SELF_UPDATE_IN_PROGRESS:-}" && "$self_update_count" -lt 2 ]]; then
+    # Allow cleanup only after the second self-update
+    if (( self_update_count < 2 )); then
         return
     fi
 
     rm -rf "$STATE_DIR"
 }
-
-
 
 trap cleanup EXIT
 
@@ -163,9 +161,11 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
+self_update() {
     local self_update_count_file="${STATE_DIR}/self_update_count"
     local self_update_count=0
 
+    # Read previous count
     [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
 
     if (( self_update_count >= 2 )); then
@@ -173,7 +173,7 @@ self_update() {
         return
     fi
 
-    persist_state
+    persist_state  # Ensure all variables are stored
 
     local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     local temp_script
@@ -185,10 +185,10 @@ self_update() {
         chmod +x "$temp_script"
         log "Self-update: Restarting with new version (attempt ${self_update_count}/2)..."
 
-        # Keep state directory until the second self-update
-        export SELF_UPDATE_IN_PROGRESS=1
-        export STATE_DIR
+        # Save state so that the new process can detect ongoing self-updates
+        echo "export SELF_UPDATE_IN_PROGRESS=1" >> "$SHANIOS_DEPLOY_STATE_FILE"
 
+        # Restart with the new script
         exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
     else
         log "Warning: Self-update attempt ${self_update_count} failed; retrying later." >&2
@@ -196,6 +196,7 @@ self_update() {
 
     rm -f "$temp_script"
 }
+
 
 #####################################
 ### Logging & Helper Functions    ###

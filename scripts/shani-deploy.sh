@@ -152,24 +152,26 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
-        export SELF_UPDATE_DONE=1
-        # Persist state before updating
-        persist_state
+    # Remove SELF_UPDATE_DONE check to allow multiple updates
+    # Persist state before updating
+    persist_state
 
-        local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
-        local temp_script
-        temp_script=$(mktemp)
+    local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
+    local temp_script
+    temp_script=$(mktemp)
 
-        if curl -fsSL "$remote_url" -o "$temp_script"; then
+    if curl -fsSL "$remote_url" -o "$temp_script"; then
+        if ! diff -q "$0" "$temp_script" >/dev/null; then
             chmod +x "$temp_script"
-            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
+            log "Self-update: New version detected. Restarting..."
             exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
         else
-            log "Warning: Unable to fetch remote script; continuing with local version." >&2
+            log "Self-update: Already running latest version."
         fi
-        rm -f "$temp_script"
+    else
+        log "Warning: Update check failed; continuing with current version." >&2
     fi
+    rm -f "$temp_script"
 }
 
 #####################################
@@ -409,6 +411,77 @@ pre_update_checks() {
     mkdir -p "$DOWNLOAD_DIR" "$ZSYNC_CACHE_DIR"
 }
 
+fetch_update_info() {
+    local channel_url
+    channel_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
+    
+    log "Checking for updates from: ${channel_url}..."
+    
+    # Fetch and validate update information
+    IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || die "Failed to fetch update info"
+    
+    # Parse image name components
+    if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
+        REMOTE_VERSION="${BASH_REMATCH[1]}"
+        REMOTE_PROFILE="${BASH_REMATCH[2]}"
+        log "Update available: ${IMAGE_NAME} (v${REMOTE_VERSION}, ${REMOTE_PROFILE})"
+    else
+        die "Invalid update format in ${UPDATE_CHANNEL}.txt: '${IMAGE_NAME}'"
+    fi
+
+    # Check if update is needed
+    if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
+        log "System is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Checking candidate slot..."
+        
+        mkdir -p "$MOUNT_DIR"
+        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+
+        # Verify candidate slot status
+        if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "@${CANDIDATE_SLOT}"; then
+            CANDIDATE_RELEASE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-version"
+            CANDIDATE_PROFILE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-profile"
+
+            if [[ -f "$CANDIDATE_RELEASE_FILE" && -f "$CANDIDATE_PROFILE_FILE" ]]; then
+                CANDIDATE_VERSION=$(cat "$CANDIDATE_RELEASE_FILE")
+                CANDIDATE_PROFILE=$(cat "$CANDIDATE_PROFILE_FILE")
+
+                if [[ "$CANDIDATE_VERSION" == "$REMOTE_VERSION" && "$CANDIDATE_PROFILE" == "$REMOTE_PROFILE" ]]; then
+                    log "Candidate update matches. Proceeding to finalization."
+                    touch "${STATE_DIR}/skip-deployment"
+                else
+                    log "Candidate mismatch (Found: v${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Deploying new update."
+                fi
+            else
+                log "Candidate slot missing version/profile info. Deploying new update."
+            fi
+        else
+            log "No candidate update found. Exiting."
+            safe_umount "$MOUNT_DIR"
+            exit 0
+        fi
+        safe_umount "$MOUNT_DIR"
+    fi
+}
+
+download_update() {
+    log "Downloading update: ${IMAGE_NAME}"
+    cd "$DOWNLOAD_DIR" || die "Failed to access download directory: ${DOWNLOAD_DIR}"
+    
+    # Construct download URLs
+    local base_url="https://downloads.sourceforge.net/project/shanios/${REMOTE_PROFILE}/${REMOTE_VERSION}"
+    IMAGE_ZSYNC_URL="${base_url}/${IMAGE_NAME}.zsync?use_mirror=autoselect"
+    IMAGE_FILE_URL="${base_url}/${IMAGE_NAME}?use_mirror=autoselect"
+    SHA256_URL="${base_url}/${IMAGE_NAME}.sha256?use_mirror=autoselect"
+    ASC_URL="${base_url}/${IMAGE_NAME}.asc?use_mirror=autoselect"
+
+    # Write channel file
+    echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/${UPDATE_CHANNEL}.txt"
+    MARKER_FILE="$DOWNLOAD_DIR/${IMAGE_NAME}.verified"
+    
+    # Start download process
+    download_and_verify
+}
+
 download_update_image() {
     local expected_size actual_size download_file zsync_url_clean
     download_file="$IMAGE_NAME"
@@ -515,69 +588,6 @@ download_and_verify() {
 
     log "Image verified successfully."
     touch "$MARKER_FILE"
-}
-
-fetch_update_info_and_download() {
-    local channel_url base_url
-    channel_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
-    
-    log "Checking for updates from: ${channel_url}..."
-    
-    IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || die "Failed to fetch update info"
-    
-    if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
-        REMOTE_VERSION="${BASH_REMATCH[1]}"
-        REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        log "Update available: ${IMAGE_NAME} (v${REMOTE_VERSION}, ${REMOTE_PROFILE})"
-    else
-        die "Invalid update format in ${UPDATE_CHANNEL}.txt: '${IMAGE_NAME}'"
-    fi
-
-    if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-        log "System is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Checking candidate slot..."
-
-        mkdir -p "$MOUNT_DIR"
-        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-
-        if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "@${CANDIDATE_SLOT}"; then
-            CANDIDATE_RELEASE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-version"
-            CANDIDATE_PROFILE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-profile"
-
-            if [[ -f "$CANDIDATE_RELEASE_FILE" && -f "$CANDIDATE_PROFILE_FILE" ]]; then
-                CANDIDATE_VERSION=$(cat "$CANDIDATE_RELEASE_FILE")
-                CANDIDATE_PROFILE=$(cat "$CANDIDATE_PROFILE_FILE")
-
-                if [[ "$CANDIDATE_VERSION" == "$REMOTE_VERSION" && "$CANDIDATE_PROFILE" == "$REMOTE_PROFILE" ]]; then
-                    log "Candidate update matches. Proceeding to finalization."
-                    touch "${STATE_DIR}/skip-deployment"
-                else
-                    log "Candidate mismatch (Found: v${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Deploying new update."
-                fi
-            else
-                log "Candidate slot missing version/profile info. Deploying new update."
-            fi
-        else
-            log "No candidate update found. Exiting."
-            safe_umount "$MOUNT_DIR"
-            exit 0
-        fi
-
-        safe_umount "$MOUNT_DIR"
-    fi
-
-    log "Downloading update: ${IMAGE_NAME}"
-    cd "$DOWNLOAD_DIR" || die "Failed to access download directory: ${DOWNLOAD_DIR}"
-    
-    base_url="https://downloads.sourceforge.net/project/shanios/${REMOTE_PROFILE}/${REMOTE_VERSION}"
-    IMAGE_ZSYNC_URL="${base_url}/${IMAGE_NAME}.zsync?use_mirror=autoselect"
-    IMAGE_FILE_URL="${base_url}/${IMAGE_NAME}?use_mirror=autoselect"
-    SHA256_URL="${base_url}/${IMAGE_NAME}.sha256?use_mirror=autoselect"
-    ASC_URL="${base_url}/${IMAGE_NAME}.asc?use_mirror=autoselect"
-
-    echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/${UPDATE_CHANNEL}.txt"
-    MARKER_FILE="$DOWNLOAD_DIR/${IMAGE_NAME}.verified"
-    
-    download_and_verify
 }
 
 deploy_btrfs_update() {
@@ -734,12 +744,13 @@ main() {
 	fi
 
     boot_validation_and_candidate_selection
-
+    pre_update_checks
+    fetch_update_info
+    
 	if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
 		log "Skipping download/deployment; resuming finalization."
 	else
-        pre_update_checks
-        fetch_update_info_and_download
+		download_update
         deploy_btrfs_update
     fi
 

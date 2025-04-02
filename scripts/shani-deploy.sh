@@ -35,19 +35,10 @@ export STATE_DIR
 
 # Cleanup trap to remove the state directory on exit
 cleanup() {
-    local self_update_count_file="${STATE_DIR}/self_update_count"
-    local self_update_count=0
-
-    [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
-
-    # Allow cleanup only after the second self-update
-    if (( self_update_count < 2 )); then
-        return
+    if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
+        rm -rf "${STATE_DIR}"
     fi
-
-    rm -rf "$STATE_DIR"
 }
-
 trap cleanup EXIT
 
 persist_state() {
@@ -161,41 +152,25 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    local self_update_count_file="${STATE_DIR}/self_update_count"
-    local self_update_count=0
+    if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
+        export SELF_UPDATE_DONE=1
+        # Persist state before updating
+        persist_state
 
-    # Read previous count
-    [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
+        local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
+        local temp_script
+        temp_script=$(mktemp)
 
-    if (( self_update_count >= 2 )); then
-        log "Maximum update checks reached (2). Proceeding with deployment."
-        return
+        if curl -fsSL "$remote_url" -o "$temp_script"; then
+            chmod +x "$temp_script"
+            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
+            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
+        else
+            log "Warning: Unable to fetch remote script; continuing with local version." >&2
+        fi
+        rm -f "$temp_script"
     fi
-
-    persist_state  # Ensure all variables are stored
-
-    local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
-    local temp_script
-    temp_script=$(mktemp)
-
-    if curl -fsSL "$remote_url" -o "$temp_script"; then
-        ((self_update_count++))
-        echo "$self_update_count" > "$self_update_count_file"
-        chmod +x "$temp_script"
-        log "Self-update: Restarting with new version (attempt ${self_update_count}/2)..."
-
-        # Save state so that the new process can detect ongoing self-updates
-        echo "export SELF_UPDATE_IN_PROGRESS=1" >> "$SHANIOS_DEPLOY_STATE_FILE"
-
-        # Restart with the new script
-        exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
-    else
-        log "Warning: Self-update attempt ${self_update_count} failed; retrying later." >&2
-    fi
-
-    rm -f "$temp_script"
 }
-
 
 #####################################
 ### Logging & Helper Functions    ###

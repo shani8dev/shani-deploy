@@ -486,7 +486,7 @@ fetch_update_info_and_download() {
         fi
         safe_umount "$MOUNT_DIR"
         # Exit early: no need to download update image if system is up-to-date.
-        return 0
+        exit 0
     fi
 
     cd "$DOWNLOAD_DIR" || die "Failed to access download directory: $DOWNLOAD_DIR"

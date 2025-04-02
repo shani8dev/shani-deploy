@@ -1,12 +1,75 @@
 #!/bin/bash
-# Improved Blue/Green Btrfs Deployment Script for shanios (Consolidated & Refactored)
-# This script performs self-update, connectivity checks, update download/verification,
-# Blue/Green Btrfs deployment with rollback support, Secure Boot UKI regeneration,
-# and cleanup. It supports rollback, manual cleanup, dry-run mode, and update-channel selection.
+################################################################################
+# shanios-deploy.sh
+#
+# Improved Blue/Green Btrfs Deployment Script for shanios
+# Performs self‑update with complete state persistence (including arrays)
+# so that nothing is missed during the update.
+#
+# Usage: ./shanios-deploy.sh [OPTIONS]
+#
+# Options:
+#   -h, --help             Show this help message.
+#   -r, --rollback         Force a full rollback.
+#   -c, --cleanup          Run manual cleanup.
+#   -t, --channel <chan>   Specify update channel: latest or stable (default: stable).
+#   -d, --dry-run          Dry run (simulate actions without making changes).
+################################################################################
 
-###############################
-### Global Configuration  #####
-###############################
+#####################################
+### State Restoration (if needed) ###
+#####################################
+
+if [ -n "$SHANIOS_DEPLOY_STATE_FILE" ] && [ -f "$SHANIOS_DEPLOY_STATE_FILE" ]; then
+    # Restore all persisted variables (scalars and arrays)
+    source "$SHANIOS_DEPLOY_STATE_FILE"
+    rm -f "$SHANIOS_DEPLOY_STATE_FILE"
+fi
+
+#####################################
+### State Persistence Function    ###
+#####################################
+
+persist_state() {
+    local state_file
+    state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
+    {
+        # Persist scalar variables using printf %q to handle quoting
+        echo "export OS_NAME=$(printf '%q' "$OS_NAME")"
+        echo "export DOWNLOAD_DIR=$(printf '%q' "$DOWNLOAD_DIR")"
+        echo "export ZSYNC_CACHE_DIR=$(printf '%q' "$ZSYNC_CACHE_DIR")"
+        echo "export MOUNT_DIR=$(printf '%q' "$MOUNT_DIR")"
+        echo "export ROOTLABEL=$(printf '%q' "$ROOTLABEL")"
+        echo "export ROOT_DEV=$(printf '%q' "$ROOT_DEV")"
+        echo "export MIN_FREE_SPACE_MB=$(printf '%q' "$MIN_FREE_SPACE_MB")"
+        echo "export GENEFI_SCRIPT=$(printf '%q' "$GENEFI_SCRIPT")"
+        echo "export DEPLOY_PENDING=$(printf '%q' "$DEPLOY_PENDING")"
+        echo "export UPDATE_CHANNEL=$(printf '%q' "$UPDATE_CHANNEL")"
+        echo "export GPG_KEY_ID=$(printf '%q' "$GPG_KEY_ID")"
+        echo "export WGET_OPTS=$(printf '%q' "$WGET_OPTS")"
+        echo "export LOCAL_VERSION=$(printf '%q' "$LOCAL_VERSION")"
+        echo "export LOCAL_PROFILE=$(printf '%q' "$LOCAL_PROFILE")"
+        echo "export BACKUP_NAME=$(printf '%q' "$BACKUP_NAME")"
+        echo "export CURRENT_SLOT=$(printf '%q' "$CURRENT_SLOT")"
+        echo "export CANDIDATE_SLOT=$(printf '%q' "$CANDIDATE_SLOT")"
+        echo "export REMOTE_VERSION=$(printf '%q' "$REMOTE_VERSION")"
+        echo "export REMOTE_PROFILE=$(printf '%q' "$REMOTE_PROFILE")"
+        echo "export IMAGE_NAME=$(printf '%q' "$IMAGE_NAME")"
+        echo "export rollback_mode=$(printf '%q' "$rollback_mode")"
+        echo "export manual_cleanup=$(printf '%q' "$manual_cleanup")"
+        echo "export dry_run=$(printf '%q' "$dry_run")"
+        echo "export skip_deployment=$(printf '%q' "$skip_deployment")"
+        echo "export MARKER_FILE=$(printf '%q' "$MARKER_FILE")"
+        # Persist arrays using declare -p
+        declare -p CHROOT_BIND_DIRS
+        declare -p CHROOT_STATIC_DIRS
+    } > "$state_file"
+    export SHANIOS_DEPLOY_STATE_FILE="$state_file"
+}
+
+#####################################
+### Global Configuration          ###
+#####################################
 
 readonly OS_NAME="shanios"
 readonly DOWNLOAD_DIR="/data/downloads"
@@ -38,12 +101,12 @@ dry_run="no"
 skip_deployment="no"
 MARKER_FILE=""
 
-# Directories to bind mount in chroot
+# Arrays for chroot bind mounts (persisted via declare -p)
 CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp /sys/firmware/efi/efivars)
 CHROOT_STATIC_DIRS=(data etc var)
 
 #####################################
-### Preliminary & Environment  ####
+### Preliminary & Environment     ###
 #####################################
 
 check_root() {
@@ -68,11 +131,9 @@ set_environment() {
 }
 
 #####################################
-### Systemd Inhibit Function  #######
+### Systemd Inhibit Function      ###
 #####################################
 
-# If not already running under systemd-inhibit, re-execute the script with an inhibitor
-# that prevents idle, sleep, shutdown, power key, suspend key, hibernate key, and lid switch events.
 inhibit_system() {
     if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
         export SYSTEMD_INHIBITED=1
@@ -83,37 +144,34 @@ inhibit_system() {
 }
 
 #####################################
-### Self-Update Section  ############
+### Self-Update Section           ###
 #####################################
-# Capture the original arguments passed to the script.
+
 ORIGINAL_ARGS=("$@")
 
 self_update() {
     if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
         export SELF_UPDATE_DONE=1
+        # Persist state before updating
+        persist_state
+
         local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
         local temp_script
         temp_script=$(mktemp)
 
         if curl -fsSL "$remote_url" -o "$temp_script"; then
             chmod +x "$temp_script"
-            log "Self-update: Running updated script directly (filesystem is read-only)..."
-            
-            # Export all variables to ensure they persist in the new script
-            export $(compgen -v | tr '\n' ' ')
-            
-            # Replace current process with the new script while preserving the environment
+            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
             exec "$temp_script" "${ORIGINAL_ARGS[@]}"
         else
             log "Warning: Unable to fetch remote script; continuing with local version." >&2
-
-         fi
-         rm -f "$temp_script"
+        fi
+        rm -f "$temp_script"
     fi
 }
 
 #####################################
-### Logging & Helper Functions ######
+### Logging & Helper Functions    ###
 #####################################
 
 log() {
@@ -161,7 +219,7 @@ get_booted_subvol() {
 }
 
 #####################################
-### Backup & Cleanup Functions ######
+### Backup & Cleanup Functions    ###
 #####################################
 
 cleanup_old_backups() {
@@ -206,7 +264,7 @@ cleanup_downloads() {
 }
 
 #####################################
-### Chroot Environment Functions  ####
+### Chroot Environment Functions  ###
 #####################################
 
 prepare_chroot_env() {
@@ -313,13 +371,12 @@ rollback_system() {
 }
 
 #####################################
-### Deployment Phase Functions  #####
+### Deployment Phase Functions    ###
 #####################################
 
 boot_validation_and_candidate_selection() {
-    # Read the current slot from file and trim whitespace.
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null)
-    CURRENT_SLOT=$(echo "$CURRENT_SLOT" | xargs)  # Trim leading/trailing whitespace
+    CURRENT_SLOT=$(echo "$CURRENT_SLOT" | xargs)
     if [[ -z "$CURRENT_SLOT" ]]; then
         CURRENT_SLOT="blue"
     fi
@@ -339,7 +396,6 @@ boot_validation_and_candidate_selection() {
     log "System booted from @$CURRENT_SLOT. Preparing deployment to candidate slot @${CANDIDATE_SLOT}."
 }
 
-
 pre_update_checks() {
     local free_space_mb
     free_space_mb=$(df --output=avail "/data" | tail -n1)
@@ -355,13 +411,11 @@ download_update_image() {
     local expected_size actual_size download_file zsync_url_clean
     download_file="$IMAGE_NAME"
 
-    # Get expected file size via wget spider mode.
     expected_size=$(wget -q --spider -L -S "$IMAGE_FILE_URL" 2>&1 | awk '/Length:/ {print $2}' | tr -d '\r')
     if [[ -z "$expected_size" || ! "$expected_size" =~ ^[0-9]+$ ]]; then
         die "Could not determine a valid expected file size from server."
     fi
 
-    # Check if the target file exists and is complete.
     if [[ -f "$download_file" ]]; then
         actual_size=$(stat -c%s "$download_file")
         if (( actual_size >= expected_size )); then
@@ -372,7 +426,6 @@ download_update_image() {
         fi
     fi
 
-    # Attempt zsync resume if available.
     zsync_url_clean="${IMAGE_ZSYNC_URL%%\?*}"
     if command -v zsync &>/dev/null && [[ -n "$zsync_url_clean" ]]; then
         if ! zsync -i "$download_file" "$zsync_url_clean"; then
@@ -402,11 +455,9 @@ fallback_download() {
         run_cmd "wget $WGET_OPTS '$IMAGE_FILE_URL'"
     fi
 
-    # Extract the downloaded file name from the URL.
     downloaded=$(basename "$IMAGE_FILE_URL")
     downloaded="${downloaded%%\?*}"
     
-    # Only rename if the names differ.
     if [[ "$downloaded" != "$(basename "$target_file")" ]]; then
         if [[ -f "$downloaded" ]]; then
             log "Renaming downloaded file from $downloaded to $target_file"
@@ -420,7 +471,6 @@ fallback_download() {
 download_and_verify() {
     download_update_image
 
-    # Download checksum and signature files.
     for file in "sha256" "asc"; do
         local url target_name downloaded_file
         if [[ "$file" == "sha256" ]]; then
@@ -445,12 +495,10 @@ download_and_verify() {
         fi
     done
 
-    # Verify SHA256 checksum.
     if ! sha256sum -c "${IMAGE_NAME}.sha256"; then
         die "SHA256 checksum verification failed for $IMAGE_NAME"
     fi
 
-    # Verify PGP signature.
     local gnupg_home
     gnupg_home=$(mktemp -d /tmp/gnupg-XXXXXX)
     export GNUPGHOME="$gnupg_home"
@@ -583,7 +631,7 @@ finalize_update() {
 }
 
 #####################################
-### Usage & Parameter Parsing #######
+### Usage & Parameter Parsing     ###
 #####################################
 
 usage() {
@@ -599,10 +647,6 @@ Options:
 EOF
 }
 
-# Capture the original arguments passed to the script.
-ORIGINAL_ARGS=("$@")
-
-# Parse command-line options
 args=$(getopt -o hrct:d --long help,rollback,cleanup,channel:,dry-run -n "$0" -- "$@") || { usage; exit 1; }
 eval set -- "$args"
 
@@ -641,7 +685,7 @@ while true; do
 done
 
 #####################################
-### Main Execution Flow  ############
+### Main Execution Flow           ###
 #####################################
 
 main() {
@@ -686,11 +730,9 @@ main() {
         log "Skipping download/deployment; resuming finalization."
     fi
 
-    # Phase 5: UKI Generation (via generate_uki_update)
     generate_uki_update
     finalize_update
 }
 
-# Execute main function
 main "$@"
 

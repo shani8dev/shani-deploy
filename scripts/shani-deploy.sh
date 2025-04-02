@@ -35,15 +35,19 @@ export STATE_DIR
 
 # Cleanup trap to remove the state directory on exit
 cleanup() {
-    # Skip cleanup if self-update is in progress
-    if [[ -n "$SELF_UPDATE_IN_PROGRESS" ]]; then
+    local self_update_count_file="${STATE_DIR}/self_update_count"
+    local self_update_count=0
+
+    [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
+
+    # Cleanup only after two self-updates
+    if [[ -n "$SELF_UPDATE_IN_PROGRESS" && "$self_update_count" -lt 2 ]]; then
         return
     fi
 
-    if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
-        rm -rf "${STATE_DIR}"
-    fi
+    rm -rf "$STATE_DIR"
 }
+
 
 trap cleanup EXIT
 
@@ -158,47 +162,40 @@ inhibit_system() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    # State tracking file for update attempts
-    local attempt_file="${STATE_DIR}/self_update_attempts"
-    local current_attempt=0
-    
-    # Read previous attempts
-    [[ -f "$attempt_file" ]] && current_attempt=$(<"$attempt_file")
+    local self_update_count_file="${STATE_DIR}/self_update_count"
+    local self_update_count=0
 
-    # Stop after 2 attempts
-    if (( current_attempt >= 2 )); then
+    [[ -f "$self_update_count_file" ]] && self_update_count=$(<"$self_update_count_file")
+
+    if (( self_update_count >= 2 )); then
         log "Maximum update checks reached (2). Proceeding with deployment."
         return
     fi
 
-    # Persist state before updating
     persist_state
 
     local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     local temp_script
     temp_script=$(mktemp)
 
-    # Attempt to download the updated script
     if curl -fsSL "$remote_url" -o "$temp_script"; then
-        ((current_attempt++))
-        echo "$current_attempt" > "$attempt_file"
+        ((self_update_count++))
+        echo "$self_update_count" > "$self_update_count_file"
         chmod +x "$temp_script"
-        log "Self-update: Restarting with new version (attempt ${current_attempt}/2)..."
+        log "Self-update: Restarting with new version (attempt ${self_update_count}/2)..."
 
-        # Prevent cleanup from removing STATE_DIR
+        # Keep state directory until the second self-update
         export SELF_UPDATE_IN_PROGRESS=1
         export STATE_DIR
 
-        # Restart with the new script
         exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
     else
-        ((current_attempt++))
-        echo "$current_attempt" > "$attempt_file"
-        log "Warning: Update check ${current_attempt} failed; retrying later." >&2
+        log "Warning: Self-update attempt ${self_update_count} failed; retrying later." >&2
     fi
 
     rm -f "$temp_script"
 }
+
 
 #####################################
 ### Logging & Helper Functions    ###

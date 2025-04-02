@@ -106,8 +106,9 @@ self_update() {
             exec "$temp_script" "${ORIGINAL_ARGS[@]}"
         else
             log "Warning: Unable to fetch remote script; continuing with local version." >&2
-            rm -f "$temp_script"
-        fi
+
+         fi
+         rm -f "$temp_script"
     fi
 }
 

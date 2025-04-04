@@ -473,7 +473,7 @@ download_update() {
     mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR" "Could not create download directory"; return 1; }
     cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
 
-    # Base wget options (without -O)
+    # Configuration
     local WGET_OPTS=(
         --retry-connrefused
         --waitretry=30
@@ -484,33 +484,56 @@ download_update() {
         --dns-timeout=30
         --connect-timeout=30
         --prefer-family=IPv4
+        --continue
     )
     [[ -t 2 ]] && WGET_OPTS+=(--show-progress)
 
     local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
+    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
     local MAX_ATTEMPTS=10
     local RETRY_BASE_DELAY=5
     local RETRY_MAX_DELAY=120
     local GPG_KEYSERVERS=("hkps://keys.openpgp.org" "keyserver.ubuntu.com")
 
-    # Define file paths
+    # File paths
     local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
     local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
     local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
+    local image_file_part="${image_file}.part"
     local sha_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.sha256"
     local asc_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.asc"
 
-    # Skip download if already verified
+    # Skip if already verified
     if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
         log "INFO" "Found existing verified download: ${IMAGE_NAME}"
         return 0
     fi
 
-    # Query remote file size
-    log "INFO" "Querying remote file size"
-    local image_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
-    local expected_size
-    expected_size=$(wget -q --spider -S "${image_url}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
+    # Discover and store mirror URL if not exists
+    if [[ ! -f "${MIRROR_FILE}" ]]; then
+        log "INFO" "Performing initial mirror discovery"
+        local initial_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
+        local spider_output=$(wget -q --spider -S "${initial_url}" 2>&1)
+        
+        # Extract effective mirror URL
+        local final_url=$(echo "$spider_output" | grep -oE '--[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}--  (http|https)://[^ ]+' | awk '{print $NF}' | tail -1)
+        
+        if [[ -n "${final_url}" ]]; then
+            echo "${final_url}" > "${MIRROR_FILE}"
+            log "INFO" "Stored mirror URL: ${final_url}"
+        else
+            log "ERROR" "Failed to discover mirror URL"
+            return 1
+        fi
+    fi
+
+    # Get stored mirror URL
+    local mirror_url=$(cat "${MIRROR_FILE}")
+    log "INFO" "Using mirror URL: ${mirror_url}"
+
+    # Verify remote file size
+    log "INFO" "Checking remote file size"
+    local expected_size=$(wget -q --spider -S "${mirror_url}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
     if [[ ! "${expected_size}" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
         log "ERROR" "Invalid remote file size: ${expected_size}"
         return 1
@@ -520,30 +543,31 @@ download_update() {
     # Update channel tracking
     echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR" "Failed to write channel file"; return 1; }
 
-    # Download loop with retries
+    # Download loop
     local attempt=0 current_size=0
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
-
-        # Remove any incomplete file
-        if [[ -f "${image_file}" ]]; then
-            current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
-            if (( current_size != expected_size )); then
-                rm -f "${image_file}"
-            fi
+        
+        # Resume partial download if exists
+        if [[ -f "${image_file_part}" ]]; then
+            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
+            log "INFO" "Resuming download from ${current_size}/${expected_size} bytes"
         fi
 
-        # Download the image using -O to force the filename
-        wget "${WGET_OPTS[@]}" -O "${image_file}" "${image_url}"
-        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+        # Download using stored mirror URL
+        wget "${WGET_OPTS[@]}" -O "${image_file_part}" "${mirror_url}"
+
+        # Verify download completion
+        current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
         if (( current_size == expected_size )); then
             log "INFO" "Download completed successfully"
+            mv "${image_file_part}" "${image_file}" || { log "ERROR" "File rename failed"; return 1; }
             break
         else
             log "WARN" "Download incomplete (${current_size}/${expected_size})"
         fi
 
-        # Retry delay
+        # Retry delay with exponential backoff
         if (( attempt < MAX_ATTEMPTS )); then
             local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt-1)) ))
             (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
@@ -556,46 +580,36 @@ download_update() {
 
     if (( current_size != expected_size )); then
         log "ERROR" "Failed to complete download after ${MAX_ATTEMPTS} attempts"
-        rm -f "${image_file}"
         return 1
     fi
 
-    # Fetch verification files
+    # Fetch verification files from original source
     log "INFO" "Fetching verification files"
     local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
     wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}" || { log "ERROR" "SHA256 fetch failed"; return 1; }
     wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}" || { log "ERROR" "ASC fetch failed"; return 1; }
 
-    # Validate SHA256 checksum
-	log "INFO" "Validating SHA256 checksum"
-	if ! sha256sum -c "${sha_file}" --status; then
-		log "ERROR" "Checksum validation failed"
-		sha256sum "${image_file}"
-		return 1
-	fi
+    # Validate checksum
+    log "INFO" "Verifying SHA256 checksum"
+    if ! sha256sum -c "${sha_file}" --status; then
+        log "ERROR" "Checksum validation failed"
+        return 1
+    fi
 
-    # GPG Verification
-    local gpg_temp
-    gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
+    # GPG verification
+    local gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
     trap 'rm -rf "${gpg_temp}"' EXIT
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"
 
     log "INFO" "Importing GPG key ${GPG_KEY_ID}"
-    local key_found=
     for keyserver in "${GPG_KEYSERVERS[@]}"; do
         if gpg --batch --quiet --keyserver "${keyserver}" --recv-keys "${GPG_KEY_ID}"; then
-            key_found=true
+            log "INFO" "Imported key from ${keyserver}"
             break
         fi
-        log "WARN" "Failed to import key from ${keyserver}"
     done
-
-    if [[ -z "${key_found}" ]]; then
-        log "ERROR" "Failed to import GPG key from all servers"
-        return 1
-    fi
 
     log "INFO" "Verifying GPG signature"
     if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
@@ -603,9 +617,12 @@ download_update() {
         return 1
     fi
 
-    # Finalization
+    # Final cleanup on success
+    log "INFO" "Removing mirror reference after successful verification"
+    rm -f "${MIRROR_FILE}"
+
     touch "${MARKER_FILE}" || { log "ERROR" "Failed to create verification marker"; return 1; }
-    log "INFO" "Download and verification successful. Marker created at ${MARKER_FILE}"
+    log "INFO" "Download and verification successful"
     return 0
 }
 
@@ -643,25 +660,34 @@ deploy_btrfs_update() {
     touch "$DEPLOY_PENDING"
 }
 
-generate_uki_update() {
+finalize_update() {
+    log "Finalizing deployment..."
+
+    # Update slot metadata
+    echo "$CURRENT_SLOT" > /data/previous-slot
+    echo "$CANDIDATE_SLOT" > /data/current-slot
+
+    # Generate UKI for the new deployment
     log "Generating Secure Boot UKI for new deployment..."
     generate_uki_common "$CANDIDATE_SLOT"
     [[ -f "$DEPLOY_PENDING" ]] && { rm -f "$DEPLOY_PENDING"; log "Removed deployment pending marker."; }
-}
 
-finalize_update() {
-    log "Finalizing deployment..."
-    echo "$CURRENT_SLOT" > /data/previous-slot
-    echo "$CANDIDATE_SLOT" > /data/current-slot
+    # Cleanup backup and downloads
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    [[ -n "$BACKUP_NAME" ]] && { btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" &>/dev/null && log "Deleted backup @${BACKUP_NAME}"; }
+    [[ -n "$BACKUP_NAME" ]] && {
+        btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" &>/dev/null
+        log "Deleted backup @${BACKUP_NAME}"
+    }
     cleanup_old_backups
     safe_umount "$MOUNT_DIR"
+
     echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/old.txt"
     cleanup_downloads
+
     log "Deployment finalized. Next boot will use @${CANDIDATE_SLOT} (version: ${REMOTE_VERSION})"
 }
+
 
 #####################################
 ### Usage & Parameter Parsing     ###
@@ -773,7 +799,6 @@ main() {
         deploy_btrfs_update
     fi
 
-    generate_uki_update
     finalize_update
 }
 

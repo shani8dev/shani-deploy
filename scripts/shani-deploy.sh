@@ -475,9 +475,17 @@ download_update() {
     mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR" "Could not create download directory"; return 1; }
     cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
 
-    # Configuration
-    local WGET_OPTS="--continue --retry-connrefused --waitretry=10 --read-timeout=60 --timeout=60 --tries=10"
-    [[ -t 2 ]] && WGET_OPTS+=" --show-progress" # Only show progress if interactive
+    # Configuration - using array for wget options
+    local WGET_OPTS=(
+        --continue
+        --retry-connrefused
+        --waitretry=30
+        --read-timeout=60
+        --timeout=60
+        --tries=999999
+    )
+    [[ -t 2 ]] && WGET_OPTS+=(--show-progress) # Only show progress if interactive
+    
     local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
     local SF_URL="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}"
     local MAX_ATTEMPTS=10
@@ -521,7 +529,7 @@ download_update() {
         # ---- Zsync Attempt ----
         if command -v zsync &> /dev/null; then
             log "INFO" "Attempting zsync transfer"
-            if wget ${WGET_OPTS} -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
+            if wget "${WGET_OPTS[@]}" -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
                 mv -f "${zsync_file}.tmp" "${zsync_file}" 2>/dev/null
                 zsync -i "${image_file}" -k "${zsync_file}" -u "${SF_URL}/" >/dev/null 2>&1
                 zsync_exit=$?
@@ -533,7 +541,7 @@ download_update() {
         current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
         if (( current_size < expected_size )); then
             log "INFO" "Resuming download via wget (current: ${current_size}/${expected_size})"
-            wget ${WGET_OPTS} -O "${image_file}.tmp" "${SF_URL}/${IMAGE_NAME}"
+            wget "${WGET_OPTS[@]}" -O "${image_file}.tmp" "${SF_URL}/${IMAGE_NAME}"
             mv -f "${image_file}.tmp" "${image_file}" 2>/dev/null
         fi
 
@@ -561,8 +569,8 @@ download_update() {
 
     # --- Verification Phase ---
     log "INFO" "Fetching verification files"
-    wget ${WGET_OPTS} -O "${sha_file}" "${SF_URL}/${IMAGE_NAME}.sha256" || { log "ERROR" "SHA256 fetch failed"; return 1; }
-    wget ${WGET_OPTS} -O "${asc_file}" "${SF_URL}/${IMAGE_NAME}.asc" || { log "ERROR" "ASC fetch failed"; return 1; }
+    wget "${WGET_OPTS[@]}" -O "${sha_file}" "${SF_URL}/${IMAGE_NAME}.sha256" || { log "ERROR" "SHA256 fetch failed"; return 1; }
+    wget "${WGET_OPTS[@]}" -O "${asc_file}" "${SF_URL}/${IMAGE_NAME}.asc" || { log "ERROR" "ASC fetch failed"; return 1; }
 
     log "INFO" "Validating SHA256 checksum"
     sed -i "s/.*\b${IMAGE_NAME}\$/${IMAGE_NAME}/" "${sha_file}"
@@ -579,6 +587,7 @@ download_update() {
     chmod 700 "${gpg_temp}"
 
     log "INFO" "Importing GPG key ${GPG_KEY_ID}"
+    local key_found=
     for keyserver in "${GPG_KEYSERVERS[@]}"; do
         if gpg --batch --quiet --keyserver "${keyserver}" --recv-keys "${GPG_KEY_ID}"; then
             key_found=true

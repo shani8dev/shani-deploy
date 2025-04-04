@@ -461,7 +461,7 @@ fetch_update_info() {
 download_update() {
     local exit_code=0
     log "INFO" "Starting download process for ${IMAGE_NAME}"
-    
+
     # Check essential commands are available
     local required_commands=("wget" "sha256sum" "gpg")
     for cmd in "${required_commands[@]}"; do
@@ -484,23 +484,24 @@ download_update() {
         --timeout=60
         --tries=999999
         --no-verbose
+        --dns-timeout=30
+        --connect-timeout=30
+        --prefer-family=IPv4
     )
     [[ -t 2 ]] && WGET_OPTS+=(--show-progress) # Only show progress if interactive
-    
+
     local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
-    local SF_URL="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}"
     local MAX_ATTEMPTS=10
     local RETRY_BASE_DELAY=5
     local RETRY_MAX_DELAY=120
     local GPG_KEYSERVERS=("hkps://keys.openpgp.org" "keyserver.ubuntu.com")
 
-    # File paths
+    # File paths (based on expected server filenames)
     local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
     local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
     local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
     local sha_file="${image_file}.sha256"
     local asc_file="${image_file}.asc"
-    local zsync_file="${image_file}.zsync"
 
     # Check for existing valid download
     if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
@@ -510,8 +511,9 @@ download_update() {
 
     # --- File Size Validation ---
     log "INFO" "Querying remote file size"
+    local image_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
     local expected_size
-    expected_size=$(wget -q --spider -S "${SF_URL}/${IMAGE_NAME}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
+    expected_size=$(wget -q --spider -S "${image_url}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
     if [[ ! "${expected_size}" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
         log "ERROR" "Invalid remote file size: ${expected_size}"
         return 1
@@ -526,21 +528,28 @@ download_update() {
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
 
-        # ---- Wget ----
-        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+        # Clean up any empty files
+        if [[ -f "${IMAGE_NAME}" ]] && ! [[ -s "${IMAGE_NAME}" ]]; then
+            rm -f "${IMAGE_NAME}"
+        fi
+
+        # ---- Wget Download ----
+        current_size=$(stat -c%s "${IMAGE_NAME}" 2>/dev/null || echo 0)
         if (( current_size < expected_size )); then
-            log "INFO" "Resuming download via wget (current: ${current_size}/${expected_size})"
-            if wget "${WGET_OPTS[@]}" -O "${image_file}.tmp" "${SF_URL}/${IMAGE_NAME}"; then
-                mv -f "${image_file}.tmp" "${image_file}" 2>/dev/null
-                log "INFO" "Wget download progress: $(stat -c%s "${image_file}")/${expected_size}"
-            else
-                log "WARN" "Wget download failed, exit code: $?"
-                rm -f "${image_file}.tmp"
+            log "INFO" "Resuming download (current: ${current_size}/${expected_size})"
+            if ! wget "${WGET_OPTS[@]}" "${image_url}"; then
+                log "WARN" "Download failed, exit code: $?"
+                # Remove partial file if no progress
+                new_size=$(stat -c%s "${IMAGE_NAME}" 2>/dev/null || echo 0)
+                if (( new_size <= current_size )); then
+                    rm -f "${IMAGE_NAME}"
+                    log "WARN" "Removed stalled partial download"
+                fi
             fi
         fi
 
         # ---- Size Verification ----
-        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+        current_size=$(stat -c%s "${IMAGE_NAME}" 2>/dev/null || echo 0)
         if (( current_size == expected_size )); then
             log "INFO" "Download completed successfully"
             break
@@ -560,13 +569,17 @@ download_update() {
 
     if (( current_size != expected_size )); then
         log "ERROR" "Failed to complete download after ${MAX_ATTEMPTS} attempts"
+        rm -f "${IMAGE_NAME}"
         return 1
     fi
 
     # --- Verification Phase ---
     log "INFO" "Fetching verification files"
-    wget "${WGET_OPTS[@]}" -O "${sha_file}" "${SF_URL}/${IMAGE_NAME}.sha256" || { log "ERROR" "SHA256 fetch failed"; return 1; }
-    wget "${WGET_OPTS[@]}" -O "${asc_file}" "${SF_URL}/${IMAGE_NAME}.asc" || { log "ERROR" "ASC fetch failed"; return 1; }
+    local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
+    local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
+    
+    wget "${WGET_OPTS[@]}" "${sha_url}" || { log "ERROR" "SHA256 fetch failed"; return 1; }
+    wget "${WGET_OPTS[@]}" "${asc_url}" || { log "ERROR" "ASC fetch failed"; return 1; }
 
     log "INFO" "Validating SHA256 checksum"
     sed -i "s/.*\b${IMAGE_NAME}\$/${IMAGE_NAME}/" "${sha_file}"

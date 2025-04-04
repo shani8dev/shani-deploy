@@ -525,7 +525,7 @@ download_update() {
     echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR" "Failed to write channel file"; return 1; }
 
     # --- Download Function with Retries ---
-    local attempt=0 current_size=0
+    local attempt=0 current_size=0 candidate_file=""
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
 
@@ -535,25 +535,67 @@ download_update() {
         fi
 
         # ---- Wget Download ----
-        current_size=$(stat -c%s "${IMAGE_NAME}" 2>/dev/null || echo 0)
+        # Determine current size from the file that exists (either the exact name or one with a query string)
+        candidate_file=""
+        if [[ -f "${IMAGE_NAME}" ]]; then
+            candidate_file="${IMAGE_NAME}"
+        else
+            for file in ${IMAGE_NAME}*; do
+                if [[ -f "$file" ]]; then
+                    candidate_file="$file"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "${candidate_file}" ]]; then
+            current_size=$(stat -c%s "${candidate_file}" 2>/dev/null || echo 0)
+        else
+            current_size=0
+        fi
+
         if (( current_size < expected_size )); then
             log "INFO" "Resuming download (current: ${current_size}/${expected_size})"
             if ! wget "${WGET_OPTS[@]}" "${image_url}"; then
                 log "WARN" "Download failed, exit code: $?"
                 # Remove partial file if no progress
-                new_size=$(stat -c%s "${IMAGE_NAME}" 2>/dev/null || echo 0)
+                new_size=0
+                if [[ -n "${candidate_file}" ]]; then
+                    new_size=$(stat -c%s "${candidate_file}" 2>/dev/null || echo 0)
+                fi
                 if (( new_size <= current_size )); then
-                    rm -f "${IMAGE_NAME}"
+                    [[ -n "${candidate_file}" ]] && rm -f "${candidate_file}"
                     log "WARN" "Removed stalled partial download"
                 fi
             fi
         fi
 
-        # ---- Size Verification ----
-        current_size=$(stat -c%s "${IMAGE_NAME}" 2>/dev/null || echo 0)
-        if (( current_size == expected_size )); then
-            log "INFO" "Download completed successfully"
-            break
+        # ---- Size Verification: Check both exact and query-variant names ----
+        candidate_file=""
+        if [[ -f "${IMAGE_NAME}" ]]; then
+            candidate_file="${IMAGE_NAME}"
+        else
+            for file in ${IMAGE_NAME}*; do
+                if [[ -f "$file" ]]; then
+                    candidate_file="$file"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "${candidate_file}" ]]; then
+            current_size=$(stat -c%s "${candidate_file}" 2>/dev/null || echo 0)
+            if (( current_size == expected_size )); then
+                # If the candidate file includes a query string, rename it.
+                if [[ "${candidate_file}" != "${IMAGE_NAME}" ]]; then
+                    mv "${candidate_file}" "${IMAGE_NAME}"
+                    log "INFO" "Renamed file from '${candidate_file}' to '${IMAGE_NAME}'"
+                fi
+                log "INFO" "Download completed successfully"
+                break
+            fi
+        else
+            current_size=0
         fi
 
         # ---- Retry Logic ----
@@ -613,7 +655,7 @@ download_update() {
     fi
 
     log "INFO" "Verifying GPG signature"
-    if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
+    if ! gpg --batch --verify "${asc_file}" "${IMAGE_NAME}"; then
         log "ERROR" "GPG signature verification failed"
         return 1
     fi

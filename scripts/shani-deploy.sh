@@ -459,25 +459,22 @@ fetch_update_info() {
 }
 
 download_update() {
-    local exit_code=0
     log "INFO" "Starting download process for ${IMAGE_NAME}"
 
-    # Check essential commands are available
-    local required_commands=("wget" "sha256sum" "gpg")
-    for cmd in "${required_commands[@]}"; do
+    # Check essential commands
+    for cmd in wget sha256sum gpg; do
         if ! command -v "$cmd" &> /dev/null; then
             log "ERROR" "Required command not found: $cmd"
             return 1
         fi
     done
 
-    # Validate directory first
+    # Validate and switch to download directory
     mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR" "Could not create download directory"; return 1; }
     cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
 
-    # Configuration - using array for wget options
+    # Base wget options (without -O)
     local WGET_OPTS=(
-        --continue
         --retry-connrefused
         --waitretry=30
         --read-timeout=60
@@ -487,9 +484,8 @@ download_update() {
         --dns-timeout=30
         --connect-timeout=30
         --prefer-family=IPv4
-        --content-disposition
     )
-    [[ -t 2 ]] && WGET_OPTS+=(--show-progress) # Only show progress if interactive
+    [[ -t 2 ]] && WGET_OPTS+=(--show-progress)
 
     local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
     local MAX_ATTEMPTS=10
@@ -497,20 +493,20 @@ download_update() {
     local RETRY_MAX_DELAY=120
     local GPG_KEYSERVERS=("hkps://keys.openpgp.org" "keyserver.ubuntu.com")
 
-    # File paths (based on expected server filenames)
+    # Define file paths
     local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
     local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
     local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
-    local sha_file="${image_file}.sha256"
-    local asc_file="${image_file}.asc"
+    local sha_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.sha256"
+    local asc_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.asc"
 
-    # Check for existing valid download
+    # Skip download if already verified
     if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
         log "INFO" "Found existing verified download: ${IMAGE_NAME}"
         return 0
     fi
 
-    # --- File Size Validation ---
+    # Query remote file size
     log "INFO" "Querying remote file size"
     local image_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
     local expected_size
@@ -521,109 +517,57 @@ download_update() {
     fi
     log "INFO" "Expected file size: ${expected_size} bytes"
 
-    # --- Update Channel Tracking ---
+    # Update channel tracking
     echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR" "Failed to write channel file"; return 1; }
 
-    # --- Download Function with Retries ---
-    local attempt=0 current_size=0 candidate_file=""
+    # Download loop with retries
+    local attempt=0 current_size=0
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
 
-        # Clean up any empty files
-        if [[ -f "${IMAGE_NAME}" ]] && ! [[ -s "${IMAGE_NAME}" ]]; then
-            rm -f "${IMAGE_NAME}"
-        fi
-
-        # ---- Wget Download ----
-        # Determine current size from the file that exists (either the exact name or one with a query string)
-        candidate_file=""
-        if [[ -f "${IMAGE_NAME}" ]]; then
-            candidate_file="${IMAGE_NAME}"
-        else
-            for file in ${IMAGE_NAME}*; do
-                if [[ -f "$file" ]]; then
-                    candidate_file="$file"
-                    break
-                fi
-            done
-        fi
-
-        if [[ -n "${candidate_file}" ]]; then
-            current_size=$(stat -c%s "${candidate_file}" 2>/dev/null || echo 0)
-        else
-            current_size=0
-        fi
-
-        if (( current_size < expected_size )); then
-            log "INFO" "Resuming download (current: ${current_size}/${expected_size})"
-            if ! wget "${WGET_OPTS[@]}" "${image_url}"; then
-                log "WARN" "Download failed, exit code: $?"
-                # Remove partial file if no progress
-                new_size=0
-                if [[ -n "${candidate_file}" ]]; then
-                    new_size=$(stat -c%s "${candidate_file}" 2>/dev/null || echo 0)
-                fi
-                if (( new_size <= current_size )); then
-                    [[ -n "${candidate_file}" ]] && rm -f "${candidate_file}"
-                    log "WARN" "Removed stalled partial download"
-                fi
+        # Remove any incomplete file
+        if [[ -f "${image_file}" ]]; then
+            current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+            if (( current_size != expected_size )); then
+                rm -f "${image_file}"
             fi
         fi
 
-        # ---- Size Verification: Check both exact and query-variant names ----
-        candidate_file=""
-        if [[ -f "${IMAGE_NAME}" ]]; then
-            candidate_file="${IMAGE_NAME}"
+        # Download the image using -O to force the filename
+        wget "${WGET_OPTS[@]}" -O "${image_file}" "${image_url}"
+        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+        if (( current_size == expected_size )); then
+            log "INFO" "Download completed successfully"
+            break
         else
-            for file in ${IMAGE_NAME}*; do
-                if [[ -f "$file" ]]; then
-                    candidate_file="$file"
-                    break
-                fi
-            done
+            log "WARN" "Download incomplete (${current_size}/${expected_size})"
         fi
 
-        if [[ -n "${candidate_file}" ]]; then
-            current_size=$(stat -c%s "${candidate_file}" 2>/dev/null || echo 0)
-            if (( current_size == expected_size )); then
-                # If the candidate file includes a query string, rename it.
-                if [[ "${candidate_file}" != "${IMAGE_NAME}" ]]; then
-                    mv "${candidate_file}" "${IMAGE_NAME}"
-                    log "INFO" "Renamed file from '${candidate_file}' to '${IMAGE_NAME}'"
-                fi
-                log "INFO" "Download completed successfully"
-                break
-            fi
-        else
-            current_size=0
-        fi
-
-        # ---- Retry Logic ----
+        # Retry delay
         if (( attempt < MAX_ATTEMPTS )); then
             local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt-1)) ))
             (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
             delay=$(( delay + (RANDOM % 10 - 5) ))
             (( delay < 1 )) && delay=1
-            
-            log "WARN" "Download incomplete (${current_size}/${expected_size}), retrying in ${delay}s"
+            log "WARN" "Retrying in ${delay}s"
             sleep "${delay}"
         fi
     done
 
     if (( current_size != expected_size )); then
         log "ERROR" "Failed to complete download after ${MAX_ATTEMPTS} attempts"
-        rm -f "${IMAGE_NAME}"
+        rm -f "${image_file}"
         return 1
     fi
 
-    # --- Verification Phase ---
+    # Fetch verification files
     log "INFO" "Fetching verification files"
     local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
-    
-    wget "${WGET_OPTS[@]}" "${sha_url}" || { log "ERROR" "SHA256 fetch failed"; return 1; }
-    wget "${WGET_OPTS[@]}" "${asc_url}" || { log "ERROR" "ASC fetch failed"; return 1; }
+    wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}" || { log "ERROR" "SHA256 fetch failed"; return 1; }
+    wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}" || { log "ERROR" "ASC fetch failed"; return 1; }
 
+    # Validate SHA256 checksum
     log "INFO" "Validating SHA256 checksum"
     sed -i "s/.*\b${IMAGE_NAME}\$/${IMAGE_NAME}/" "${sha_file}"
     if ! sha256sum -c --status "${sha_file}"; then
@@ -632,7 +576,7 @@ download_update() {
         return 1
     fi
 
-    # --- GPG Verification ---
+    # GPG Verification
     local gpg_temp
     gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
     trap 'rm -rf "${gpg_temp}"' EXIT
@@ -655,12 +599,12 @@ download_update() {
     fi
 
     log "INFO" "Verifying GPG signature"
-    if ! gpg --batch --verify "${asc_file}" "${IMAGE_NAME}"; then
+    if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
         log "ERROR" "GPG signature verification failed"
         return 1
     fi
 
-    # --- Final Validation ---
+    # Finalization
     touch "${MARKER_FILE}" || { log "ERROR" "Failed to create verification marker"; return 1; }
     log "INFO" "Download and verification successful. Marker created at ${MARKER_FILE}"
     return 0

@@ -525,40 +525,8 @@ download_update() {
     local attempt=0 current_size=0
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
-        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
 
-        # ---- Zsync Attempt ----
-        if command -v zsync &> /dev/null; then
-            log "INFO" "Attempting zsync transfer"
-            
-            # Follow the redirect chain to get the final mirror URL
-            local mirror_zsync_url
-            mirror_zsync_url=$(wget --max-redirect=20 --spider -S "${SF_URL}/${IMAGE_NAME}.zsync/download" 2>&1 \
-                | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
-            
-            if [ -z "${mirror_zsync_url}" ]; then
-                log "WARN" "Failed to resolve mirror URL via wget; using base URL"
-                mirror_zsync_url="${SF_URL}/${IMAGE_NAME}.zsync/download"
-            else
-                log "DEBUG" "Resolved mirror URL: ${mirror_zsync_url}"
-            fi
-
-            if wget "${WGET_OPTS[@]}" -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
-                mv -f "${zsync_file}.tmp" "${zsync_file}" 2>/dev/null
-                log "DEBUG" "Running zsync: -i '${image_file}' -k '${zsync_file}' -u '${mirror_zsync_url}'"
-                zsync -i "${image_file}" -k "${zsync_file}" -u "${mirror_zsync_url}"
-                local zsync_exit=$?
-                if (( zsync_exit == 0 )); then
-                    log "INFO" "Zsync completed successfully"
-                else
-                    log "WARN" "Zsync failed with exit code ${zsync_exit}"
-                fi
-            else
-                log "WARN" "Failed to download zsync file"
-            fi
-        fi
-
-        # ---- Wget Fallback ----
+        # ---- Wget ----
         current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
         if (( current_size < expected_size )); then
             log "INFO" "Resuming download via wget (current: ${current_size}/${expected_size})"

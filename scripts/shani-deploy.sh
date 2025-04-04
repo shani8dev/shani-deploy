@@ -530,16 +530,24 @@ download_update() {
         # ---- Zsync Attempt ----
         if command -v zsync &> /dev/null; then
             log "INFO" "Attempting zsync transfer"
-
-            # Get mirror URL for .zsync using curl
+            
+            # Follow the redirect chain to get the final mirror URL
             local mirror_zsync_url
-            mirror_zsync_url=$(curl -sI "${SF_URL}/${IMAGE_NAME}.zsync" 2>/dev/null | grep -i '^Location: ' | awk '{print $2}' | tr -d '\r')
+            mirror_zsync_url=$(wget --max-redirect=20 --spider -S "${SF_URL}/${IMAGE_NAME}.zsync/download" 2>&1 \
+                | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+            
+            if [ -z "${mirror_zsync_url}" ]; then
+                log "WARN" "Failed to resolve mirror URL via wget; using base URL"
+                mirror_zsync_url="${SF_URL}/${IMAGE_NAME}.zsync/download"
+            else
+                log "DEBUG" "Resolved mirror URL: ${mirror_zsync_url}"
+            fi
 
             if wget "${WGET_OPTS[@]}" -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
                 mv -f "${zsync_file}.tmp" "${zsync_file}" 2>/dev/null
-                log "DEBUG" "Running zsync: -i '${image_file}' -k '${zsync_file}' -u '${mirror_zsync_url}' '${mirror_zsync_url}'"
-                zsync -i "${image_file}" -k "${zsync_file}" -u "${mirror_zsync_url}" "${mirror_zsync_url}"
-                zsync_exit=$?
+                log "DEBUG" "Running zsync: -i '${image_file}' -k '${zsync_file}' -u '${mirror_zsync_url}'"
+                zsync -i "${image_file}" -k "${zsync_file}" -u "${mirror_zsync_url}"
+                local zsync_exit=$?
                 if (( zsync_exit == 0 )); then
                     log "INFO" "Zsync completed successfully"
                 else
@@ -601,7 +609,8 @@ download_update() {
     fi
 
     # --- GPG Verification ---
-    local gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
+    local gpg_temp
+    gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
     trap 'rm -rf "${gpg_temp}"' EXIT
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"

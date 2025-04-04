@@ -530,10 +530,15 @@ download_update() {
         # ---- Zsync Attempt ----
         if command -v zsync &> /dev/null; then
             log "INFO" "Attempting zsync transfer"
+
+            # Get mirror URL for .zsync using curl
+            local mirror_zsync_url
+            mirror_zsync_url=$(curl -sI "${SF_URL}/${IMAGE_NAME}.zsync" 2>/dev/null | grep -i '^Location: ' | awk '{print $2}' | tr -d '\r')
+
             if wget "${WGET_OPTS[@]}" -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
                 mv -f "${zsync_file}.tmp" "${zsync_file}" 2>/dev/null
-                log "DEBUG" "Running zsync: -i '${image_file}' -k '${zsync_file}' -u '${SF_URL}/'"
-                zsync -i "${image_file}" -k "${zsync_file}" -u "${SF_URL}/"
+                log "DEBUG" "Running zsync: -i '${image_file}' -k '${zsync_file}' -u '${mirror_zsync_url}' '${mirror_zsync_url}'"
+                zsync -i "${image_file}" -k "${zsync_file}" -u "${mirror_zsync_url}" "${mirror_zsync_url}"
                 zsync_exit=$?
                 if (( zsync_exit == 0 )); then
                     log "INFO" "Zsync completed successfully"

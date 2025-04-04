@@ -89,9 +89,6 @@ readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"  # External script for UKI gener
 readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 
-# Common wget options for downloads
-readonly WGET_OPTS="--continue --show-progress --retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60 --tries=999999"
-
 # Global state variables
 declare -g LOCAL_VERSION
 declare -g LOCAL_PROFILE
@@ -462,219 +459,149 @@ fetch_update_info() {
 }
 
 download_update() {
-    log "Initiating update process for ${IMAGE_NAME}"
-    cd "$DOWNLOAD_DIR" || die "Failed to access download directory: ${DOWNLOAD_DIR}"
-
-    local base_url="https://downloads.sourceforge.net/project/shanios/${REMOTE_PROFILE}/${REMOTE_VERSION}"
-    IMAGE_ZSYNC_URL="${base_url}/${IMAGE_NAME}.zsync?use_mirror=autoselect"
-    IMAGE_FILE_URL="${base_url}/${IMAGE_NAME}?use_mirror=autoselect"
-    SHA256_URL="${base_url}/${IMAGE_NAME}.sha256?use_mirror=autoselect"
-    ASC_URL="${base_url}/${IMAGE_NAME}.asc?use_mirror=autoselect"
-
-    echo "$IMAGE_NAME" > "${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.txt"
-    MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
-
-    download_and_verify
-}
-
-# Download the main image file with multiple attempts and fallback strategies.
-download_update_image() {
-    local download_file="${IMAGE_NAME}"
-    local temp_file=".tmp.${IMAGE_NAME}"
-    local expected_size
-
-    # Obtain the expected file size from the server.
-    expected_size=$(get_remote_file_size)
-    if [[ -z "$expected_size" || ! "$expected_size" =~ ^[0-9]+$ ]]; then
-        die "Could not determine a valid file size for ${IMAGE_NAME}"
-    fi
-
-    # If file exists and is complete, skip download.
-    if [[ -f "$download_file" ]]; then
-        local actual_size
-        actual_size=$(stat -c%s "$download_file" 2>/dev/null || echo 0)
-        if (( actual_size >= expected_size )); then
-            log "File ${download_file} already exists and is complete (${actual_size} bytes)."
-            return 0
+    local exit_code=0
+    log "INFO" "Starting download process for ${IMAGE_NAME}"
+    
+    # Check essential commands are available
+    local required_commands=("wget" "sha256sum" "gpg")
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            log "ERROR" "Required command not found: $cmd"
+            return 1
         fi
-        log "Found incomplete file ${download_file} (${actual_size} vs ${expected_size} bytes); attempting resume."
-    fi
+    done
 
+    # Validate directory first
+    mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR" "Could not create download directory"; return 1; }
+    cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
+
+    # Configuration
+    local WGET_OPTS="--continue --retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60 --tries=999999"
+    [[ -t 2 ]] && WGET_OPTS+=" --show-progress" # Only show progress if interactive
+    local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
+    local SF_URL="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}"
     local MAX_ATTEMPTS=10
-    for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-        log "Download attempt ${attempt}/${MAX_ATTEMPTS} for ${IMAGE_NAME}"
+    local RETRY_BASE_DELAY=5
+    local RETRY_MAX_DELAY=120
+    local GPG_KEYSERVERS=("hkps://keys.openpgp.org" "keyserver.ubuntu.com")
 
-        # 1. Try zsync first if available.
-        if attempt_zsync_download "$download_file" "$expected_size"; then
-            return 0
-        fi
+    # File paths
+    local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
+    local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
+    local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
+    local sha_file="${image_file}.sha256"
+    local asc_file="${image_file}.asc"
+    local zsync_file="${image_file}.zsync"
 
-        # 2. Fall back to wget download.
-        if attempt_wget_download "$download_file" "$temp_file" "$expected_size"; then
-            return 0
-        fi
+    # Check for existing valid download
+    if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
+        log "INFO" "Found existing verified download: ${IMAGE_NAME}"
+        return 0
+    fi
 
-        # Clean up temporary and intermediary files.
-        rm -f "$temp_file" "${download_file}.zsync" "$(basename "${IMAGE_FILE_URL%%\?*}")" 2>/dev/null
-        sleep $(( attempt * 5 ))
-    done
-
-    die "Failed to download ${IMAGE_NAME} after ${MAX_ATTEMPTS} attempts"
-}
-
-# Retrieve the expected file size with retries.
-get_remote_file_size() {
-    local size
-    for i in {1..5}; do
-        size=$(wget -q --spider -S "$IMAGE_FILE_URL" 2>&1 | awk '/Length:/ {print $2}' | tr -d '\r')
-        if [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]]; then
-            echo "$size"
-            return 0
-        fi
-        sleep $(( i * 2 ))
-    done
-    die "Could not obtain valid file size after 5 attempts"
-}
-
-# Try to download via zsync using SourceForge workarounds.
-attempt_zsync_download() {
-    local download_file="$1"
-    local expected_size="$2"
-
-    if ! command -v zsync >/dev/null 2>&1; then
-        log "zsync not available; skipping zsync attempt."
+    # --- File Size Validation ---
+    log "INFO" "Querying remote file size"
+    local expected_size
+    expected_size=$(wget -q --spider -S "${SF_URL}/${IMAGE_NAME}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
+    if [[ ! "${expected_size}" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
+        log "ERROR" "Invalid remote file size: ${expected_size}"
         return 1
     fi
+    log "INFO" "Expected file size: ${expected_size} bytes"
 
-    log "Attempting zsync download for ${download_file}"
-    if ! wget $WGET_OPTS "${IMAGE_ZSYNC_URL}" -O "${download_file}.zsync"; then
-        log "Failed to download .zsync file."
-        return 1
-    fi
+    # --- Update Channel Tracking ---
+    echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR" "Failed to write channel file"; return 1; }
 
-    # Fix SourceForge URLs in the .zsync file.
-    sed -i 's|https://[^/]*/project/|/project/|g' "${download_file}.zsync"
+    # --- Download Function with Retries ---
+    local attempt=0 current_size=0
+    while (( attempt++ < MAX_ATTEMPTS )); do
+        log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
+        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
 
-    # Attempt zsync download with URL workaround.
-    if zsync -i "$download_file" -k "${download_file}.zsync" -u "${IMAGE_FILE_URL}" -s "${IMAGE_FILE_URL}"; then
-        if validate_downloaded_file "$download_file" "$expected_size"; then
-            return 0
-        fi
-    fi
-    log "zsync attempt failed."
-    return 1
-}
-
-# Download the file using wget, with resume support.
-attempt_wget_download() {
-    local download_file="$1"
-    local temp_file="$2"
-    local expected_size="$3"
-    local success=false
-
-    log "Attempting wget download for ${download_file}"
-
-    # If a partial file exists, try to resume it.
-    if [[ -f "$temp_file" ]]; then
-        log "Resuming partial download from ${temp_file}"
-        if wget $WGET_OPTS "${IMAGE_FILE_URL}" -O "$temp_file"; then
-            mv "$temp_file" "$download_file"
-            if validate_downloaded_file "$download_file" "$expected_size"; then
-                success=true
+        # ---- Zsync Attempt ----
+        if command -v zsync &> /dev/null; then
+            log "INFO" "Attempting zsync transfer"
+            if wget ${WGET_OPTS} -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
+                mv -f "${zsync_file}.tmp" "${zsync_file}" 2>/dev/null
+                zsync -i "${image_file}" -k "${zsync_file}" -u "${SF_URL}/" >/dev/null 2>&1
+                zsync_exit=$?
+                (( zsync_exit == 0 )) && log "INFO" "Zsync completed successfully"
             fi
         fi
-    fi
 
-    # If resume did not succeed, start a fresh download.
-    if [[ "$success" = false ]]; then
-        log "Starting fresh download for ${download_file}"
-        if wget $WGET_OPTS "${IMAGE_FILE_URL}" -O "$temp_file"; then
-            mv "$temp_file" "$download_file"
-            if validate_downloaded_file "$download_file" "$expected_size"; then
-                success=true
-            fi
+        # ---- Wget Fallback ----
+        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+        if (( current_size < expected_size )); then
+            log "INFO" "Resuming download via wget (current: ${current_size}/${expected_size})"
+            wget ${WGET_OPTS} -O "${image_file}.tmp" "${SF_URL}/${IMAGE_NAME}"
+            mv -f "${image_file}.tmp" "${image_file}" 2>/dev/null
         fi
-    fi
 
-    $success && return 0 || return 1
-}
+        # ---- Size Verification ----
+        current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+        if (( current_size == expected_size )); then
+            log "INFO" "Download completed successfully"
+            break
+        fi
 
-# Validate that the downloaded file matches the expected file size.
-validate_downloaded_file() {
-    local file="$1"
-    local expected="$2"
+        # ---- Retry Logic ----
+        local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt-1)) ))
+        (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
+        delay=$(( delay + (RANDOM % 10 - 5) ))
+        (( delay < 1 )) && delay=1
+        
+        log "WARN" "Download incomplete (${current_size}/${expected_size}), retrying in ${delay}s"
+        sleep "${delay}"
+    done
 
-    if [[ ! -f "$file" ]]; then
-        log "File ${file} does not exist."
+    if (( current_size != expected_size )); then
+        log "ERROR" "Failed to complete download after ${MAX_ATTEMPTS} attempts"
         return 1
     fi
 
-    local actual
-    actual=$(stat -c%s "$file" 2>/dev/null || echo 0)
-    if (( actual != expected )); then
-        log "Validation failed for ${file}: ${actual} bytes vs expected ${expected} bytes."
-        rm -f "$file"
+    # --- Verification Phase ---
+    log "INFO" "Fetching verification files"
+    wget ${WGET_OPTS} -O "${sha_file}" "${SF_URL}/${IMAGE_NAME}.sha256" || { log "ERROR" "SHA256 fetch failed"; return 1; }
+    wget ${WGET_OPTS} -O "${asc_file}" "${SF_URL}/${IMAGE_NAME}.asc" || { log "ERROR" "ASC fetch failed"; return 1; }
+
+    log "INFO" "Validating SHA256 checksum"
+    sed -i "s/.*\b${IMAGE_NAME}\$/${IMAGE_NAME}/" "${sha_file}"
+    if ! sha256sum -c --status "${sha_file}"; then
+        log "ERROR" "Checksum validation failed"
+        sha256sum "${sha_file}"
         return 1
     fi
 
-    log "Validation successful: ${file} is ${actual} bytes."
+    # --- GPG Verification ---
+    local gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
+    trap 'rm -rf "${gpg_temp}"' EXIT
+    export GNUPGHOME="${gpg_temp}"
+    chmod 700 "${gpg_temp}"
+
+    log "INFO" "Importing GPG key ${GPG_KEY_ID}"
+    for keyserver in "${GPG_KEYSERVERS[@]}"; do
+        if gpg --batch --quiet --keyserver "${keyserver}" --recv-keys "${GPG_KEY_ID}"; then
+            key_found=true
+            break
+        fi
+        log "WARN" "Failed to import key from ${keyserver}"
+    done
+
+    if [[ -z "${key_found}" ]]; then
+        log "ERROR" "Failed to import GPG key from all servers"
+        return 1
+    fi
+
+    log "INFO" "Verifying GPG signature"
+    if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
+        log "ERROR" "GPG signature verification failed"
+        return 1
+    fi
+
+    # --- Final Validation ---
+    touch "${MARKER_FILE}" || { log "ERROR" "Failed to create verification marker"; return 1; }
+    log "INFO" "Download and verification successful. Marker created at ${MARKER_FILE}"
     return 0
-}
-
-# Download verification files, then perform SHA256 and GPG signature verification.
-download_and_verify() {
-    download_update_image
-
-    # Loop through verification files (SHA256 and ASC).
-    for suffix in "sha256" "asc"; do
-        local url target_file downloaded_file
-        if [[ "$suffix" == "sha256" ]]; then
-            url="${SHA256_URL}"
-            target_file="${IMAGE_NAME}.sha256"
-        else
-            url="${ASC_URL}"
-            target_file="${IMAGE_NAME}.asc"
-        fi
-
-        log "Downloading verification file ${target_file}"
-        if ! wget $WGET_OPTS "$url"; then
-            die "Failed to download ${suffix} verification file."
-        fi
-        downloaded_file=$(basename "${url%%\?*}")
-        if [[ "$downloaded_file" != "$target_file" ]]; then
-            mv "$downloaded_file" "$target_file"
-        fi
-    done
-
-    # Verify the SHA256 checksum.
-    if ! sha256sum -c "${IMAGE_NAME}.sha256"; then
-        die "SHA256 checksum verification failed for ${IMAGE_NAME}"
-    fi
-
-    # Set up a temporary GPG home for signature verification.
-    local gnupg_home
-    gnupg_home=$(mktemp -d /tmp/gnupg-XXXXXX)
-    export GNUPGHOME="$gnupg_home"
-    chmod 700 "$GNUPGHOME"
-
-    log "Importing GPG key ${GPG_KEY_ID}"
-    if ! gpg --quiet --keyserver hkps://keyserver.ubuntu.com --recv-keys "$GPG_KEY_ID"; then
-        rm -rf "$gnupg_home"
-        die "Failed to import GPG key ${GPG_KEY_ID}"
-    fi
-
-    # Set trust level for the imported key.
-    echo -e "trust\n5\ny\nsave\n" | gpg --batch --command-fd 0 --yes --quiet --edit-key "$GPG_KEY_ID"
-
-    log "Verifying GPG signature for ${IMAGE_NAME}"
-    if ! gpg --verify "${IMAGE_NAME}.asc" "$IMAGE_NAME"; then
-        rm -rf "$gnupg_home"
-        die "GPG signature verification failed for ${IMAGE_NAME}"
-    fi
-
-    rm -rf "$gnupg_home"
-    touch "$MARKER_FILE"
-    log "Verification completed successfully for ${IMAGE_NAME}"
 }
 
 deploy_btrfs_update() {

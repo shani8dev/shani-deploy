@@ -483,6 +483,7 @@ download_update() {
         --read-timeout=60
         --timeout=60
         --tries=999999
+        --no-verbose
     )
     [[ -t 2 ]] && WGET_OPTS+=(--show-progress) # Only show progress if interactive
     
@@ -531,9 +532,16 @@ download_update() {
             log "INFO" "Attempting zsync transfer"
             if wget "${WGET_OPTS[@]}" -O "${zsync_file}.tmp" "${SF_URL}/${IMAGE_NAME}.zsync"; then
                 mv -f "${zsync_file}.tmp" "${zsync_file}" 2>/dev/null
-                zsync -i "${image_file}" -k "${zsync_file}" -u "${SF_URL}/" >/dev/null 2>&1
+                log "DEBUG" "Running zsync: -i '${image_file}' -k '${zsync_file}' -u '${SF_URL}/'"
+                zsync -i "${image_file}" -k "${zsync_file}" -u "${SF_URL}/"
                 zsync_exit=$?
-                (( zsync_exit == 0 )) && log "INFO" "Zsync completed successfully"
+                if (( zsync_exit == 0 )); then
+                    log "INFO" "Zsync completed successfully"
+                else
+                    log "WARN" "Zsync failed with exit code ${zsync_exit}"
+                fi
+            else
+                log "WARN" "Failed to download zsync file"
             fi
         fi
 
@@ -541,8 +549,13 @@ download_update() {
         current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
         if (( current_size < expected_size )); then
             log "INFO" "Resuming download via wget (current: ${current_size}/${expected_size})"
-            wget "${WGET_OPTS[@]}" -O "${image_file}.tmp" "${SF_URL}/${IMAGE_NAME}"
-            mv -f "${image_file}.tmp" "${image_file}" 2>/dev/null
+            if wget "${WGET_OPTS[@]}" -O "${image_file}.tmp" "${SF_URL}/${IMAGE_NAME}"; then
+                mv -f "${image_file}.tmp" "${image_file}" 2>/dev/null
+                log "INFO" "Wget download progress: $(stat -c%s "${image_file}")/${expected_size}"
+            else
+                log "WARN" "Wget download failed, exit code: $?"
+                rm -f "${image_file}.tmp"
+            fi
         fi
 
         # ---- Size Verification ----
@@ -553,13 +566,15 @@ download_update() {
         fi
 
         # ---- Retry Logic ----
-        local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt-1)) ))
-        (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
-        delay=$(( delay + (RANDOM % 10 - 5) ))
-        (( delay < 1 )) && delay=1
-        
-        log "WARN" "Download incomplete (${current_size}/${expected_size}), retrying in ${delay}s"
-        sleep "${delay}"
+        if (( attempt < MAX_ATTEMPTS )); then
+            local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt-1)) ))
+            (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
+            delay=$(( delay + (RANDOM % 10 - 5) ))
+            (( delay < 1 )) && delay=1
+            
+            log "WARN" "Download incomplete (${current_size}/${expected_size}), retrying in ${delay}s"
+            sleep "${delay}"
+        fi
     done
 
     if (( current_size != expected_size )); then

@@ -476,7 +476,7 @@ download_update() {
     cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
 
     # Configuration
-    local WGET_OPTS="--continue --retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60 --tries=999999"
+    local WGET_OPTS="--continue --show-progress --retry-connrefused --waitretry=10 --read-timeout=20 --timeout=15 --tries=10"
     [[ -t 2 ]] && WGET_OPTS+=" --show-progress" # Only show progress if interactive
     local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
     local SF_URL="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}"

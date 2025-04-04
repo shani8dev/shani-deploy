@@ -90,7 +90,7 @@ readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 
 # Common wget options for downloads
-readonly WGET_OPTS="--trust-server-names --content-disposition --continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10"
+readonly WGET_OPTS="--continue --show-progress --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=10"
 
 # Global state variables
 declare -g LOCAL_VERSION
@@ -465,18 +465,18 @@ download_update() {
     log "Downloading update: ${IMAGE_NAME}"
     cd "$DOWNLOAD_DIR" || die "Failed to access download directory: ${DOWNLOAD_DIR}"
     
-    # Construct download URLs
+    # Construct download URLs using a fixed base URL.
     local base_url="https://downloads.sourceforge.net/project/shanios/${REMOTE_PROFILE}/${REMOTE_VERSION}"
     IMAGE_ZSYNC_URL="${base_url}/${IMAGE_NAME}.zsync?use_mirror=autoselect"
     IMAGE_FILE_URL="${base_url}/${IMAGE_NAME}?use_mirror=autoselect"
     SHA256_URL="${base_url}/${IMAGE_NAME}.sha256?use_mirror=autoselect"
     ASC_URL="${base_url}/${IMAGE_NAME}.asc?use_mirror=autoselect"
 
-    # Write channel file
+    # Write the channel file and set marker filename.
     echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/${UPDATE_CHANNEL}.txt"
     MARKER_FILE="$DOWNLOAD_DIR/${IMAGE_NAME}.verified"
     
-    # Start download process
+    # Start download and verification process.
     download_and_verify
 }
 
@@ -484,11 +484,13 @@ download_update_image() {
     local expected_size actual_size download_file zsync_url_clean
     download_file="$IMAGE_NAME"
 
+    # Query the server for the expected file size.
     expected_size=$(wget -q --spider -L -S "$IMAGE_FILE_URL" 2>&1 | awk '/Length:/ {print $2}' | tr -d '\r')
     if [[ -z "$expected_size" || ! "$expected_size" =~ ^[0-9]+$ ]]; then
         die "Could not determine a valid expected file size from server."
     fi
 
+    # Check if the file exists and is complete.
     if [[ -f "$download_file" ]]; then
         actual_size=$(stat -c%s "$download_file")
         if (( actual_size >= expected_size )); then
@@ -499,6 +501,7 @@ download_update_image() {
         fi
     fi
 
+    # Attempt to resume download using zsync if available.
     zsync_url_clean="${IMAGE_ZSYNC_URL%%\?*}"
     if command -v zsync &>/dev/null && [[ -n "$zsync_url_clean" ]]; then
         if ! zsync -i "$download_file" "$zsync_url_clean"; then
@@ -510,6 +513,7 @@ download_update_image() {
         fallback_download "$download_file"
     fi
 
+    # Re-check the file size after the download/resume attempt.
     actual_size=$(stat -c%s "$download_file" 2>/dev/null || echo 0)
     if (( actual_size >= expected_size )); then
         log "Download completed successfully: $download_file (size: $actual_size bytes)"
@@ -519,31 +523,35 @@ download_update_image() {
 }
 
 fallback_download() {
-    local target_file="$1" downloaded
-    if [[ -f "$target_file" ]]; then
-        log "Resuming download with wget for $target_file..."
-        run_cmd "wget -c $WGET_OPTS '$IMAGE_FILE_URL'"
-    else
-        log "Starting fresh download with wget for $target_file..."
-        run_cmd "wget $WGET_OPTS '$IMAGE_FILE_URL'"
-    fi
+    local target_file="$1"
+    log "Using resume mode with wget for $target_file..."
+    # Always invoke wget with the -c flag to resume any partial download.
+    run_cmd "wget -c $WGET_OPTS '$IMAGE_FILE_URL'"
 
+    # Determine the filename produced from the URL.
+    local downloaded
     downloaded=$(basename "$IMAGE_FILE_URL")
     downloaded="${downloaded%%\?*}"
     
+    # If the downloaded file's name differs from the expected target, rename it.
     if [[ "$downloaded" != "$(basename "$target_file")" ]]; then
         if [[ -f "$downloaded" ]]; then
             log "Renaming downloaded file from $downloaded to $target_file"
             mv "$downloaded" "$target_file"
+        else
+            log "Expected downloaded file $downloaded not found."
         fi
     else
         log "Downloaded file name matches target file name; no renaming required."
     fi
 }
 
+
 download_and_verify() {
+    # Download the main image file.
     download_update_image
 
+    # Download SHA256 and ASC files and rename if needed.
     for file in "sha256" "asc"; do
         local url target_name downloaded_file
         if [[ "$file" == "sha256" ]]; then
@@ -553,7 +561,9 @@ download_and_verify() {
             url="$ASC_URL"
             target_name="${IMAGE_NAME}.asc"
         fi
-        run_cmd "wget -L $WGET_OPTS '$url'"
+
+        log "Downloading ${file} file..."
+        run_cmd "wget -c $WGET_OPTS '$url'"
         downloaded_file=$(basename "$url")
         downloaded_file="${downloaded_file%%\?*}"
         if [[ -f "$downloaded_file" ]]; then
@@ -568,21 +578,30 @@ download_and_verify() {
         fi
     done
 
+    # Verify the SHA256 checksum.
     if ! sha256sum -c "${IMAGE_NAME}.sha256"; then
         die "SHA256 checksum verification failed for $IMAGE_NAME"
     fi
 
+    # Set up a temporary GNUPG home for signature verification.
     local gnupg_home
-	gnupg_home=$(mktemp -d /tmp/gnupg-XXXXXX)
-	export GNUPGHOME="$gnupg_home"
-	chmod 700 "$GNUPGHOME"
+    gnupg_home=$(mktemp -d /tmp/gnupg-XXXXXX)
+    export GNUPGHOME="$gnupg_home"
+    chmod 700 "$GNUPGHOME"
 
-	gpg --quiet --no-tty --recv-keys "$GPG_KEY_ID" >/dev/null 2>&1 || die "Failed to import key"
-	echo -e "trust\n5\ny\nsave\n" | gpg --batch --command-fd 0 --no-tty --quiet --edit-key "$GPG_KEY_ID" >/dev/null 2>&1
+    # Import the GPG key and set trust.
+    if ! gpg --quiet --no-tty --recv-keys "$GPG_KEY_ID" >/dev/null 2>&1; then
+        die "Failed to import key: $GPG_KEY_ID"
+    fi
+    echo -e "trust\n5\ny\nsave\n" | gpg --batch --command-fd 0 --no-tty --quiet --edit-key "$GPG_KEY_ID" >/dev/null 2>&1
 
-	gpg --verify "${IMAGE_NAME}.asc" "$IMAGE_NAME" || die "Signature verification failed"
+    # Verify the signature.
+    if ! gpg --verify "${IMAGE_NAME}.asc" "$IMAGE_NAME"; then
+        die "Signature verification failed"
+    fi
 
-	rm -rf "$gnupg_home"
+    # Clean up temporary GNUPG directory.
+    rm -rf "$gnupg_home"
 
     log "Image verified successfully."
     touch "$MARKER_FILE"

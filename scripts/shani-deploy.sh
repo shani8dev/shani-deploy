@@ -568,13 +568,12 @@ download_update() {
     wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}" || { log "ERROR" "ASC fetch failed"; return 1; }
 
     # Validate SHA256 checksum
-    log "INFO" "Validating SHA256 checksum"
-    sed -i "s/.*\b${IMAGE_NAME}\$/${IMAGE_NAME}/" "${sha_file}"
-    if ! sha256sum -c --status "${sha_file}"; then
-        log "ERROR" "Checksum validation failed"
-        sha256sum "${sha_file}"
-        return 1
-    fi
+	log "INFO" "Validating SHA256 checksum"
+	if ! sha256sum -c "${sha_file}" --status; then
+		log "ERROR" "Checksum validation failed"
+		sha256sum "${image_file}"
+		return 1
+	fi
 
     # GPG Verification
     local gpg_temp

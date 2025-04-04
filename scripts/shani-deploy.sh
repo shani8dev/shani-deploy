@@ -487,6 +487,7 @@ download_update() {
         --dns-timeout=30
         --connect-timeout=30
         --prefer-family=IPv4
+        --content-disposition
     )
     [[ -t 2 ]] && WGET_OPTS+=(--show-progress) # Only show progress if interactive
 

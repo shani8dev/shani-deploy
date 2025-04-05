@@ -130,19 +130,6 @@ set_environment() {
 }
 
 #####################################
-### Systemd Inhibit Function      ###
-#####################################
-
-inhibit_system() {
-    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
-        export SYSTEMD_INHIBITED=1
-        log "Inhibiting all system interruptions during update..."
-        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="Updating system" "$0" "$@"
-    fi
-}
-
-#####################################
 ### Self-Update Section           ###
 #####################################
 
@@ -166,6 +153,19 @@ self_update() {
             log "Warning: Unable to fetch remote script; continuing with local version." >&2
         fi
         rm -f "$temp_script"
+    fi
+}
+
+#####################################
+### Systemd Inhibit Function      ###
+#####################################
+
+inhibit_system() {
+    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
+        export SYSTEMD_INHIBITED=1
+        log "Inhibiting all system interruptions during update..."
+        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" --why="Updating system" "$0" "$@"
     fi
 }
 
@@ -258,26 +258,27 @@ cleanup_old_backups() {
     done
 }
 
-
 cleanup_downloads() {
     local files latest_file count
-    files=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" -mtime +7 -printf "%T@ %p\n" | sort -n)
+    # Find files with names starting with "shanios-" and an extension beginning with ".zst"
+    files=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst*" -mtime +7 -printf "%T@ %p\n" | sort -n)
     count=$(echo "$files" | wc -l)
     if (( count > 1 )); then
         latest_file=$(echo "$files" | tail -n 1 | cut -d' ' -f2-)
         echo "$files" | while read -r line; do
             local file
             file=$(echo "$line" | cut -d' ' -f2-)
+            # Delete all files except for the latest one
             if [[ "$file" != "$latest_file" ]]; then
                 if rm -f "$file"; then
-                    log "Deleted old download: $file"
+                    log "INFO" "Deleted old download: $file"
                 else
-                    log "Failed to delete old download: $file"
+                    log "ERROR" "Failed to delete old download: $file"
                 fi
             fi
         done
     else
-        log "No old downloads to clean up."
+        log "INFO" "No old downloads to clean up."
     fi
 }
 
@@ -808,7 +809,9 @@ main() {
     check_root
     check_internet
     set_environment
-    
+ 	self_update "$@"
+    inhibit_system "$@"
+   
 	dry_run=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
     
 	if [[ -f "${STATE_DIR}/channel" ]]; then
@@ -816,9 +819,6 @@ main() {
 	else
 		UPDATE_CHANNEL="stable"
 	fi
-	
-    inhibit_system "$@"
-    self_update "$@"
 
 	if [[ -f "${STATE_DIR}/cleanup" ]]; then
 		log "Initiating manual cleanup..."

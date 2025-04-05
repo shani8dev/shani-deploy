@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/flatpak update --noninteractive --assumeyes --system
+ExecStart=/bin/bash -c '/usr/bin/flatpak update --noninteractive --assumeyes --system && /usr/bin/flatpak uninstall --unused --delete-data --noninteractive --assumeyes --system && /usr/bin/flatpak repair --noninteractive --system'
 
 [Install]
 WantedBy=multi-user.target

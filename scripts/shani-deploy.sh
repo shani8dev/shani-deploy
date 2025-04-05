@@ -633,7 +633,7 @@ download_update() {
     local gpg_temp
     gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
     # Save previous GNUPGHOME to restore later (if needed)
-    local old_gnupghome="${GNUPGHOME}"
+    local old_gnupghome="${GNUPGHOME:-}"
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"
     # Set a trap to clean up the temporary directory
@@ -677,7 +677,6 @@ download_update() {
     log "INFO" "Download and verification successful"
     return 0
 }
-
 
 deploy_btrfs_update() {
     log "Deploying update via Btrfs..."

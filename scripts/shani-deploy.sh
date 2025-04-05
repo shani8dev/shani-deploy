@@ -439,14 +439,14 @@ fetch_update_info() {
     if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
         REMOTE_VERSION="${BASH_REMATCH[1]}"
         REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        log "Parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
+        log "parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
     else
         die "Error: Invalid update format in ${UPDATE_CHANNEL}.txt. Received: '${IMAGE_NAME}'"
     fi
 
     # Check if update is needed
     if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-        log "Local system is current (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Proceeding to verify candidate update slot..."
+        log "Local system is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Proceeding to verify candidate update slot..."
         
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"

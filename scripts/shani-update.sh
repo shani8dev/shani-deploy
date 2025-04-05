@@ -39,7 +39,8 @@ LOCAL_PROFILE=$( (cat "$LOCAL_PROFILE_FILE" 2>/dev/null || echo "default") | tr 
 
 ### Fetch Remote Update Info
 CHANNEL_URL="$BASE_URL/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
-REMOTE_IMAGE=$(curl --fail --silent --max-time 30 "$CHANNEL_URL" | tr -d '[:space:]')
+# Added -L flag to follow redirects from SourceForge
+REMOTE_IMAGE=$(curl -L --fail --silent --max-time 30 "$CHANNEL_URL" | tr -d '[:space:]')
 if [ -z "$REMOTE_IMAGE" ]; then
     echo "ERROR: Failed to retrieve update info from $CHANNEL_URL" >&2
     exit 1

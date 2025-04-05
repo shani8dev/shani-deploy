@@ -223,22 +223,41 @@ get_booted_subvol() {
 
 cleanup_old_backups() {
     for slot in blue green; do
-        local backups count backup
-        backups=$(btrfs subvolume list "$MOUNT_DIR" | awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' | sort -r)
-        count=$(echo "$backups" | wc -l)
-        if (( count > 1 )); then
-            echo "$backups" | tail -n +2 | while read -r backup; do
-                if btrfs subvolume delete "$MOUNT_DIR/@${backup}"; then
-                    log "Deleted old backup: @${backup}"
+        log "Checking for old backups in slot '${slot}'..."
+        # Gather backups whose names contain the slot and follow the naming pattern
+        mapfile -t backups < <(btrfs subvolume list "$MOUNT_DIR" | \
+            awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' | sort -r)
+        
+        if [ ${#backups[@]} -gt 0 ]; then
+            log "Found backups for slot '${slot}': ${backups[*]}"
+        else
+            log "No backups found for slot '${slot}'."
+            continue
+        fi
+        
+        backup_count=${#backups[@]}
+        if (( backup_count > 1 )); then
+            log "Keeping the most recent backup and deleting the older $((backup_count-1)) backup(s) for slot '${slot}'."
+            # Loop over all but the first (most recent) backup
+            for (( i=1; i<backup_count; i++ )); do
+                backup="${backups[i]}"
+                # Validate backup name against expected pattern: e.g., blue_backup_202304271530
+                if [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]]; then
+                    if btrfs subvolume delete "$MOUNT_DIR/@${backup}"; then
+                        log "Deleted old backup: @${backup}"
+                    else
+                        log "Failed to delete backup: @${backup}"
+                    fi
                 else
-                    log "Failed to delete backup: @${backup}"
+                    log "Skipping deletion for backup with unexpected name format: ${backup}"
                 fi
             done
         else
-            log "Only the latest backup exists for slot $slot; no cleanup needed."
+            log "Only the latest backup exists for slot '${slot}'; no cleanup needed."
         fi
     done
 }
+
 
 cleanup_downloads() {
     local files latest_file count
@@ -410,23 +429,24 @@ fetch_update_info() {
     local channel_url
     channel_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
     
-    log "Checking for updates from: ${channel_url}..."
+    log "Initiating update check: retrieving update info from ${channel_url}..."
     
     # Fetch and validate update information
-    IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || die "Failed to fetch update info"
+    IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || die "Error: Unable to fetch update info from ${channel_url}"
+    log "Fetched update info: '${IMAGE_NAME}'"
     
     # Parse image name components
     if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
         REMOTE_VERSION="${BASH_REMATCH[1]}"
         REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        log "Update available: ${IMAGE_NAME} (v${REMOTE_VERSION}, ${REMOTE_PROFILE})"
+        log "Parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
     else
-        die "Invalid update format in ${UPDATE_CHANNEL}.txt: '${IMAGE_NAME}'"
+        die "Error: Invalid update format in ${UPDATE_CHANNEL}.txt. Received: '${IMAGE_NAME}'"
     fi
 
     # Check if update is needed
     if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-        log "System is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Checking candidate slot..."
+        log "Local system is current (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Proceeding to verify candidate update slot..."
         
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
@@ -441,20 +461,22 @@ fetch_update_info() {
                 CANDIDATE_PROFILE=$(cat "$CANDIDATE_PROFILE_FILE")
 
                 if [[ "$CANDIDATE_VERSION" == "$REMOTE_VERSION" && "$CANDIDATE_PROFILE" == "$REMOTE_PROFILE" ]]; then
-                    log "Candidate update matches. Proceeding to finalization."
+                    log "Candidate slot is up-to-date (${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Skipping deployment."
                     touch "${STATE_DIR}/skip-deployment"
                 else
-                    log "Candidate mismatch (Found: v${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Deploying new update."
+                    log "Mismatch detected in candidate slot: found ${CANDIDATE_VERSION} (${CANDIDATE_PROFILE}) vs expected ${REMOTE_VERSION} (${REMOTE_PROFILE}). Deploying new update."
                 fi
             else
-                log "Candidate slot missing version/profile info. Deploying new update."
+                log "Candidate slot missing version/profile details. Deploying new update."
             fi
         else
-            log "No candidate update found. Exiting."
+            log "No candidate subvolume '@${CANDIDATE_SLOT}' found. Exiting update process."
             safe_umount "$MOUNT_DIR"
             exit 0
         fi
         safe_umount "$MOUNT_DIR"
+    else
+        log "Local system version (${LOCAL_VERSION}, ${LOCAL_PROFILE}) differs from remote update (${REMOTE_VERSION}, ${REMOTE_PROFILE}). Initiating update process."
     fi
 }
 
@@ -630,23 +652,28 @@ deploy_btrfs_update() {
     log "Deploying update via Btrfs..."
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    
     if mountpoint -q "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         safe_umount "$MOUNT_DIR"
         die "Candidate slot @${CANDIDATE_SLOT} is currently mounted. Aborting deployment."
     fi
+    
     if btrfs subvolume list "$MOUNT_DIR" | grep -q "path @${CANDIDATE_SLOT}\$"; then
+        # Create backup using the expected naming pattern
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
         log "Creating backup of candidate slot @${CANDIDATE_SLOT} as @${BACKUP_NAME}..."
         btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || die "Backup snapshot failed"
         btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false || die "Failed to clear read-only property"
         btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Failed to delete candidate slot"
     fi
+    
     local temp_subvol="$MOUNT_DIR/temp_update"
     if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "temp_update"; then
         log "Deleting existing temporary subvolume temp_update..."
         [[ -d "$temp_subvol/shanios_base" ]] && btrfs subvolume delete "$temp_subvol/shanios_base" || log "Failed to delete nested subvolume shanios_base"
         btrfs subvolume delete "$temp_subvol" || log "Failed to delete temporary subvolume temp_update"
     fi
+    
     btrfs subvolume create "$temp_subvol" || die "Failed to create temporary subvolume"
     log "Receiving update image into temporary subvolume..."
     run_cmd "zstd -d --long=31 -T0 '$DOWNLOAD_DIR/$IMAGE_NAME' -c | btrfs receive '$temp_subvol'" || die "Image extraction failed"
@@ -783,23 +810,23 @@ main() {
 		exit 0
 	fi
 
-	if [[ -f "${DEPLOY_PENDING}" ]]; then
-		log "Deployment pending marker found. Resuming finalization."
-		touch "${STATE_DIR}/skip-deployment"
-	fi
-
     boot_validation_and_candidate_selection
     pre_update_checks
     fetch_update_info
     
 	if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
-		log "Skipping download/deployment; resuming finalization."
+		log "Skipping download and deployment (system is up-to-date)."
 	else
-		download_update
-        deploy_btrfs_update
-    fi
+		log "System deployment is outdated. Starting download and deployment..."
+		download_update || die "Download update failed."
+		deploy_btrfs_update || die "Deployment of update failed."
+	fi
 
-    finalize_update
+	if [[ -f "${DEPLOY_PENDING}" ]]; then
+		log "Deployment pending marker found. Resuming finalization..."
+		finalize_update || die "Finalization of update failed."
+	fi
+
 }
 
 main "$@"

@@ -495,7 +495,7 @@ download_update() {
     mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR" "Could not create download directory"; return 1; }
     cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
 
-    # Configuration
+    # Configuration for wget options
     local WGET_OPTS=(
         --retry-connrefused
         --waitretry=30
@@ -517,7 +517,7 @@ download_update() {
     local RETRY_MAX_DELAY=120
     local GPG_KEYSERVERS=("hkps://keys.openpgp.org" "keyserver.ubuntu.com")
 
-    # File paths
+    # File paths for tracking and verification
     local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
     local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
     local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
@@ -525,21 +525,21 @@ download_update() {
     local sha_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.sha256"
     local asc_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.asc"
 
-    # Skip if already verified
+    # Skip download if already verified and exists
     if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
         log "INFO" "Found existing verified download: ${IMAGE_NAME}"
         return 0
     fi
 
-    # Discover and store mirror URL if not exists
+    # Discover and store mirror URL if not already present
     if [[ ! -f "${MIRROR_FILE}" ]]; then
         log "INFO" "Performing initial mirror discovery"
         local initial_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
-        local spider_output=$(wget -q --spider -S "${initial_url}" 2>&1)
-        
-        # Extract effective mirror URL
-        local final_url=$(echo "$spider_output" | grep -oE '--[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}--  (http|https)://[^ ]+' | awk '{print $NF}' | tail -1)
-        
+        local spider_output
+        spider_output=$(wget --max-redirect=20 --spider -S "${initial_url}" 2>&1)
+        # Extract the effective mirror URL using the Location header
+        local final_url
+        final_url=$(echo "$spider_output" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
         if [[ -n "${final_url}" ]]; then
             echo "${final_url}" > "${MIRROR_FILE}"
             log "INFO" "Stored mirror URL: ${final_url}"
@@ -549,13 +549,15 @@ download_update() {
         fi
     fi
 
-    # Get stored mirror URL
-    local mirror_url=$(cat "${MIRROR_FILE}")
+    # Retrieve stored mirror URL
+    local mirror_url
+    mirror_url=$(cat "${MIRROR_FILE}")
     log "INFO" "Using mirror URL: ${mirror_url}"
 
     # Verify remote file size
     log "INFO" "Checking remote file size"
-    local expected_size=$(wget -q --spider -S "${mirror_url}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
+    local expected_size
+    expected_size=$(wget -q --spider -S "${mirror_url}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
     if [[ ! "${expected_size}" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
         log "ERROR" "Invalid remote file size: ${expected_size}"
         return 1
@@ -565,33 +567,35 @@ download_update() {
     # Update channel tracking
     echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR" "Failed to write channel file"; return 1; }
 
-    # Download loop
-    local attempt=0 current_size=0
+    # Download loop with resume and exponential backoff
+    local attempt=0
+    local current_size=0
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
-        
-        # Resume partial download if exists
+
+        # Resume download if partial file exists
         if [[ -f "${image_file_part}" ]]; then
             current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
             log "INFO" "Resuming download from ${current_size}/${expected_size} bytes"
         fi
 
-        # Download using stored mirror URL
         wget "${WGET_OPTS[@]}" -O "${image_file_part}" "${mirror_url}"
 
-        # Verify download completion
         current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
         if (( current_size == expected_size )); then
             log "INFO" "Download completed successfully"
-            mv "${image_file_part}" "${image_file}" || { log "ERROR" "File rename failed"; return 1; }
+            if ! mv "${image_file_part}" "${image_file}"; then
+                log "ERROR" "File rename failed"
+                return 1
+            fi
             break
         else
             log "WARN" "Download incomplete (${current_size}/${expected_size})"
         fi
 
-        # Retry delay with exponential backoff
+        # Calculate delay with exponential backoff and a slight random offset
         if (( attempt < MAX_ATTEMPTS )); then
-            local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt-1)) ))
+            local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
             (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
             delay=$(( delay + (RANDOM % 10 - 5) ))
             (( delay < 1 )) && delay=1
@@ -605,33 +609,49 @@ download_update() {
         return 1
     fi
 
-    # Fetch verification files from original source
+    # Fetch verification files from the original source
     log "INFO" "Fetching verification files"
     local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
-    wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}" || { log "ERROR" "SHA256 fetch failed"; return 1; }
-    wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}" || { log "ERROR" "ASC fetch failed"; return 1; }
+    if ! wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}"; then
+        log "ERROR" "SHA256 fetch failed"
+        return 1
+    fi
+    if ! wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}"; then
+        log "ERROR" "ASC fetch failed"
+        return 1
+    fi
 
-    # Validate checksum
+    # Validate SHA256 checksum
     log "INFO" "Verifying SHA256 checksum"
     if ! sha256sum -c "${sha_file}" --status; then
         log "ERROR" "Checksum validation failed"
         return 1
     fi
 
-    # GPG verification
-    local gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
-    trap 'rm -rf "${gpg_temp}"' EXIT
+    # GPG verification using a temporary GNUPGHOME
+    local gpg_temp
+    gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
+    # Save previous GNUPGHOME to restore later (if needed)
+    local old_gnupghome="${GNUPGHOME}"
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"
+    # Set a trap to clean up the temporary directory
+    trap 'rm -rf "${gpg_temp}"' EXIT
 
     log "INFO" "Importing GPG key ${GPG_KEY_ID}"
+    local key_imported=0
     for keyserver in "${GPG_KEYSERVERS[@]}"; do
         if gpg --batch --quiet --keyserver "${keyserver}" --recv-keys "${GPG_KEY_ID}"; then
             log "INFO" "Imported key from ${keyserver}"
+            key_imported=1
             break
         fi
     done
+    if [[ ${key_imported} -ne 1 ]]; then
+        log "ERROR" "Failed to import GPG key ${GPG_KEY_ID} from all keyservers"
+        return 1
+    fi
 
     log "INFO" "Verifying GPG signature"
     if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
@@ -639,14 +659,25 @@ download_update() {
         return 1
     fi
 
-    # Final cleanup on success
+    # Clear the GPG cleanup trap now that we're done with GPG operations
+    trap - EXIT
+    rm -rf "${gpg_temp}"
+    # Optionally restore previous GNUPGHOME if needed
+    export GNUPGHOME="${old_gnupghome}"
+
+    # Final cleanup on success: remove mirror reference and mark download as verified
     log "INFO" "Removing mirror reference after successful verification"
     rm -f "${MIRROR_FILE}"
 
-    touch "${MARKER_FILE}" || { log "ERROR" "Failed to create verification marker"; return 1; }
+    if ! touch "${MARKER_FILE}"; then
+        log "ERROR" "Failed to create verification marker"
+        return 1
+    fi
+
     log "INFO" "Download and verification successful"
     return 0
 }
+
 
 deploy_btrfs_update() {
     log "Deploying update via Btrfs..."

@@ -1,51 +1,110 @@
-#!/bin/bash
-# startup-check.sh – Check if booted from fallback slot and prompt user for rollback.
+#!/usr/bin/env bash
+#
+# startup-check: detect fallback boot and prompt for rollback on Shani OS
+# Invoked at user startup to ensure correct slot rollback if needed.
 
+IFS=$'\n\t'
+
+# Configuration
 CURRENT_SLOT_FILE="/data/current-slot"
-CURRENT_SLOT=$(cat "$CURRENT_SLOT_FILE" 2>/dev/null || echo "blue")
+BOOT_FAILURE_FILE="/data/boot_failure"
+LOG_TAG="startup-check"
 
-# Extract the booted slot from kernel parameters.
-BOOTED_SLOT=$(grep -o 'subvol=[^, ]*' /proc/cmdline | cut -d= -f2)
-BOOTED_SLOT="${BOOTED_SLOT#@}"
-[ -z "$BOOTED_SLOT" ] && BOOTED_SLOT="$CURRENT_SLOT"
+# Logging functions
+log() {
+  echo "[$(date '+%F %T')] $*"
+  logger -t "$LOG_TAG" "$*"
+}
+err() {
+  log "ERROR: $*"
+  exit 1
+}
+trap 'log "Exiting."' EXIT
 
-# Check if boot failure was detected
-if [ -f /data/boot_failure ]; then
-    FAILED_SLOT=$(cat /data/boot_failure)
-    if [ "$FAILED_SLOT" != "$BOOTED_SLOT" ]; then
-        logger -t startup-check "Boot failure recorded for slot '$FAILED_SLOT', but system booted into '$BOOTED_SLOT'. No rollback needed."
-        exit 0
-    fi
+# Detect terminal emulator
+find_terminal() {
+  [[ -n "${TERMINAL_EMULATOR-}" ]] && command -v "$TERMINAL_EMULATOR" &>/dev/null && { echo "$TERMINAL_EMULATOR"; return; }
+  [[ -n "${COLORTERM-}"      ]] && command -v "$COLORTERM"      &>/dev/null && { echo "$COLORTERM";      return; }
 
-    # Log boot failure detection
-    logger -t startup-check "System booted from fallback slot '$BOOTED_SLOT' (expected: '$CURRENT_SLOT'). Prompting user for rollback."
+  local terms=(
+    kgx gnome-terminal tilix xfce4-terminal konsole lxterminal mate-terminal
+    deepin-terminal alacritty kitty wezterm foot terminator guake tilda
+    hyper xterm urxvt st screen tmux
+  )
+  for term in "${terms[@]}"; do
+    command -v "$term" &>/dev/null && { echo "$term"; return; }
+  done
+  err "No supported terminal found. Install one of: ${terms[*]}"
+}
+TERMINAL=$(find_terminal)
+log "Using terminal: $TERMINAL"
 
-    # Create a temporary logfile for rollback progress
-    LOGFILE=$(mktemp /tmp/rollback.log.XXXXXX)
+# Helper: build a terminal invocation string
+build_cmd() {
+  local emu="$1"; shift
+  local cmd="$*"
+  case "$emu" in
+    kgx|gnome-terminal|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
+      echo "$emu -- bash -lc '$cmd'";;
+    konsole)
+      echo "konsole --hold -e bash -lc '$cmd'";;
+    alacritty|kitty|wezterm|foot|xterm|urxvt|st)
+      echo "$emu -e bash -lc '$cmd'";;
+    terminator)
+      echo "terminator -x bash -lc '$cmd'";;
+    hyper)
+      echo "hyper --command bash -lc '$cmd'";;
+    screen|tmux)
+      echo "bash -lc '$cmd'";;
+    *) err "Unhandled terminal: $emu";;
+  esac
+}
 
-    # Prepare rollback prompt message
-    PROMPT_MSG="The system booted from fallback slot ($BOOTED_SLOT) instead of the expected slot ($CURRENT_SLOT).
-Do you want to rollback to the previous version?
+# Determine current and booted slots
+CURRENT_SLOT=$(<"$CURRENT_SLOT_FILE" 2>/dev/null || echo "blue")
+BOOTED_SLOT=$(grep -o 'subvol=[^, ]*' /proc/cmdline | cut -d= -f2 | sed 's/^@//')
+[[ -z "$BOOTED_SLOT" ]] && BOOTED_SLOT="$CURRENT_SLOT"
 
-(You can switch to the 'Terminal Output' tab for live progress.)"
-
-    # Launch YAD UI with a rollback prompt
-    CHOICE=$(yad --notebook \
-        --notebook-tab="Rollback Prompt" \
-        --form --field=" " "$PROMPT_MSG" \
-        --button="Rollback:0" --button="Cancel:1" \
-        --notebook-tab="Terminal Output" \
-        --text-info --tail --filename="$LOGFILE" \
-        --width=600 --height=400)
-    RET=$?
-
-    if [ $RET -eq 0 ]; then
-        logger -t startup-check "User confirmed rollback. Executing rollback process."
-        pkexec /usr/local/bin/shani-deploy --rollback >> "$LOGFILE" 2>&1
-        yad --info --title="Rollback Completed" --text="Rollback process completed." --width=400
-    else
-        logger -t startup-check "User canceled rollback. Boot failure remains unresolved."
-        yad --info --title="Rollback Cancelled" --text="Rollback was cancelled. Please investigate the boot issue." --width=400
-    fi
+# Exit early if booted slot matches expected slot
+if [[ "$BOOTED_SLOT" == "$CURRENT_SLOT" ]]; then
+  log "Booted slot matches current slot ('$CURRENT_SLOT'). No action needed."
+  exit 0
 fi
+
+# Rollback prompt if boot failure detected
+if [[ -f "$BOOT_FAILURE_FILE" ]]; then
+  FAILED_SLOT=$(<"$BOOT_FAILURE_FILE")
+  if [[ "$FAILED_SLOT" != "$BOOTED_SLOT" ]]; then
+    log "Failure recorded for '$FAILED_SLOT', but booted into '$BOOTED_SLOT'. No rollback needed."
+    exit 0
+  fi
+
+  log "Boot detected fallback slot '$BOOTED_SLOT' (expected: '$CURRENT_SLOT'). Prompting rollback."
+
+  # Prompt user for rollback without embedding terminal in YAD
+  if command -v yad &>/dev/null; then
+    yad --question --title="Rollback Prompt" \
+        --text="The system booted from fallback slot ($BOOTED_SLOT) instead of expected ($CURRENT_SLOT).\n\nDo you want to rollback now?" \
+        --ok-label="Rollback" --cancel-label="Cancel"
+    RET=$?
+  elif command -v zenity &>/dev/null; then
+    zenity --question --title="Rollback Prompt" \
+           --text="The system booted from fallback slot ($BOOTED_SLOT) instead of expected ($CURRENT_SLOT).\n\nDo you want to rollback now?"
+    RET=$?
+  else
+    err "YAD or Zenity required for rollback prompt."
+  fi
+
+  if [[ $RET -eq 0 ]]; then
+    log "User confirmed rollback."
+    CMD="pkexec /usr/local/bin/shani-deploy --rollback"
+    TERMINAL_CMD=$(build_cmd "$TERMINAL" "$CMD")
+    log "Launching rollback in new terminal."
+    eval "$TERMINAL_CMD" & || err "Failed to launch rollback in terminal."
+  else
+    log "User cancelled rollback."
+  fi
+fi
+
+exit 0
 

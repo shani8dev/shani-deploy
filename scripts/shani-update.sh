@@ -1,164 +1,153 @@
-#!/bin/bash
-# shani-update: Robust update check for Shani OS with persistent log display,
-# suspend and event inhibition, and safe terminal toggling.
+#!/usr/bin/env bash
 #
-# Functionality:
-#  • Checks local and remote version info.
-#  • If an update is available, displays a dialog with three buttons:
-#         "Update", "Toggle Terminal", and "Remind Me Later".
-#  • "Update" launches the update process (shani-deploy) using systemd-inhibit
-#    to block events (shutdown, sleep, idle, lid-switch, power-key, suspend-key,
-#    and hibernate-key) so that the update is uninterrupted. Its output is
-#    redirected to a log file.
-#  • "Toggle Terminal" toggles the log window (opening it if closed, or closing
-#    it if open) without starting a new update.
-#  • "Remind Me Later" defers the update prompt via systemd-run.
-#
-# Dependencies: curl, yad, systemd-run, systemd-inhibit, pkexec, nohup, mktemp, pgrep
+# shani-update: per-user update checker for Shani OS
+# Invoked by systemd --user via timer or manually.
 
-### Configuration
-DEFER_DELAY=300                       # Defer delay in seconds (5 minutes)
+IFS=$'\n\t'
+
+# Configuration
+DEFER_DELAY=300
 UPDATE_CHANNEL="stable"
 BASE_URL="https://sourceforge.net/projects/shanios/files"
 LOCAL_VERSION_FILE="/etc/shani-version"
 LOCAL_PROFILE_FILE="/etc/shani-profile"
-TMP_LOG="/tmp/shani_update_log"         # Log file for update output
-TMP_PID="/tmp/shani_update_terminal.pid"  # File to store log window PID
+LOG_TAG="shani-update"
 
-### Dependency Check
-for cmd in curl yad systemd-run systemd-inhibit pkexec nohup mktemp pgrep; do
-    command -v "$cmd" >/dev/null || { echo "ERROR: $cmd is not installed. Exiting." >&2; exit 1; }
-done
+# Logging functions
+log(){
+  echo "[$(date '+%F %T')] $*"
+  logger -t "$LOG_TAG" "$*"
+}
+err(){ log "ERROR: $*"; exit 1; }
+trap 'log "Exiting."' EXIT
 
-### Ensure DISPLAY is set
-[ -z "$DISPLAY" ] && export DISPLAY=:0
+# Detect terminal emulator
+define find_terminal() {
+  [[ -n "${TERMINAL_EMULATOR-}" ]] && command -v "$TERMINAL_EMULATOR" &>/dev/null && { echo "$TERMINAL_EMULATOR"; return; }
+  [[ -n "${COLORTERM-}" ]]      && command -v "$COLORTERM"      &>/dev/null && { echo "$COLORTERM";      return; }
 
-### Read Local Version and Profile
-LOCAL_VERSION=$( (cat "$LOCAL_VERSION_FILE" 2>/dev/null || echo "0") | tr -d '[:space:]' )
-LOCAL_PROFILE=$( (cat "$LOCAL_PROFILE_FILE" 2>/dev/null || echo "default") | tr -d '[:space:]' )
+  local terms=(
+    kgx gnome-terminal tilix xfce4-terminal konsole lxterminal mate-terminal
+    deepin-terminal alacritty kitty wezterm foot terminator guake tilda
+    hyper xterm urxvt st screen tmux
+  )
+  for term in "${terms[@]}"; do
+    command -v "$term" &>/dev/null && { echo "$term"; return; }
+  done
+  err "No supported terminal found. Install one of: ${terms[*]}"
+}
+TERMINAL=$(find_terminal)
+log "Using terminal: $TERMINAL"
 
-### Fetch Remote Update Info
+# Helper: build a terminal invocation string
+build_cmd() {
+  local emu="$1"; shift
+  local cmd="$*"
+  case "$emu" in
+    kgx|gnome-terminal|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
+      echo "$emu -- bash -c '${cmd}'";;
+    konsole)
+      echo "konsole --hold -e bash -c '${cmd}'";;
+    alacritty|kitty|wezterm|foot|xterm|urxvt|st)
+      echo "$emu -e bash -c '${cmd}'";;
+    terminator)
+      echo "terminator -x bash -c '${cmd}'";;
+    guake|tilda)
+      echo "bash -c '${cmd}'";;
+    hyper)
+      echo "hyper --command bash -c '${cmd}'";;
+    screen|tmux)
+      echo "bash -c '${cmd}'";;
+    *) err "Unhandled terminal: $emu";;
+  esac
+}
+
+# Read local version/profile
+LOCAL_VERSION=$(<"$LOCAL_VERSION_FILE" 2>/dev/null || echo 0)
+LOCAL_PROFILE=$(<"$LOCAL_PROFILE_FILE" 2>/dev/null || echo default)
+# sanitize
+LOCAL_VERSION=${LOCAL_VERSION//[^0-9]/}
+LOCAL_PROFILE=${LOCAL_PROFILE//[^A-Za-z]/}
+
+# Fetch remote info
 CHANNEL_URL="$BASE_URL/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
-# Added -L flag to follow redirects from SourceForge
-REMOTE_IMAGE=$(curl -L --fail --silent --max-time 30 "$CHANNEL_URL" | tr -d '[:space:]')
-if [ -z "$REMOTE_IMAGE" ]; then
-    echo "ERROR: Failed to retrieve update info from $CHANNEL_URL" >&2
-    exit 1
+REMOTE_IMAGE=$(curl -fSLs --retry 3 --retry-delay 5 --max-time 30 "$CHANNEL_URL") 
+if [[ $? -ne 0 ]]; then
+  err "Failed fetching info from $CHANNEL_URL"
 fi
 
-if [[ "$REMOTE_IMAGE" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
-    REMOTE_VERSION="${BASH_REMATCH[1]}"
-    REMOTE_PROFILE="${BASH_REMATCH[2]}"
-else
-    echo "ERROR: Unexpected update info format: $REMOTE_IMAGE" >&2
-    exit 1
+# Expect format: shanios-<version>-<profile>.zst
+if [[ ! $REMOTE_IMAGE =~ ^shanios-([0-9]+)-([A-Za-z]+)\.zst$ ]]; then
+  err "Bad remote info format: $REMOTE_IMAGE"
+fi
+REMOTE_VERSION="${BASH_REMATCH[1]}"
+REMOTE_PROFILE="${BASH_REMATCH[2]}"
+
+# Exit if already up-to-date
+if [[ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
+  log "Up-to-date (v$LOCAL_VERSION-$LOCAL_PROFILE)."
+  exit 0
 fi
 
-### Exit Silently if Up-To-Date
-if [ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" ] && [ "$LOCAL_PROFILE" = "$REMOTE_PROFILE" ]; then
-    exit 0
-fi
-
-### Functions
-
-# Check if the update process (shani-deploy) is already running.
-is_update_running() {
-    pgrep -f "shani-deploy" >/dev/null 2>&1
+# Prompt user
+prompt_choice() {
+  if command -v yad &>/dev/null; then
+    yad --title="Shani OS Update" --width=400 --center \
+        --text="New update available!\nCurrent: v$LOCAL_VERSION-$LOCAL_PROFILE\nRemote: v$REMOTE_VERSION-$REMOTE_PROFILE\nChoose:" \
+        --button="Update Now":0 --button="Remind Me Later":1 \
+        --timeout=60 --timeout-label="Remind Me Later"
+  elif command -v zenity &>/dev/null; then
+    zenity --question --title="Shani OS Update" \
+           --text="Current: v$LOCAL_VERSION-$LOCAL_PROFILE\nRemote: v$REMOTE_VERSION-$REMOTE_PROFILE" \
+           --ok-label="Update Now" --cancel-label="Remind Me Later"
+    return $?
+  else
+    notify-send "Shani OS: v$LOCAL_VERSION → v$REMOTE_VERSION" || true
+    return 1
+  fi
 }
 
-# Start the update process using systemd-inhibit (blocking shutdown, sleep, idle,
-# lid-switch, power-key, suspend-key, and hibernate-key events). It uses the
-# SYSTEMD_INHIBITED environment variable to ensure the inhibitor is applied only once.
-start_update() {
-    if is_update_running; then
-        return
-    fi
-    : > "$TMP_LOG"  # Clear or create the log file.
-    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
-        export SYSTEMD_INHIBITED=1
-    fi
-    nohup systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch:handle-power-key:handle-suspend-key:handle-hibernate-key \
-         --who="Shani OS Update" --why="Running system update" \
-         pkexec /usr/local/bin/shani-deploy >>"$TMP_LOG" 2>&1 &
-}
+action() { prompt_choice; echo $?; }
+ACTION=$(action)
 
-# Open the persistent log window if not already open.
-open_log_window() {
-    yad --text-info --title="Update Progress (v$REMOTE_VERSION)" \
-        --filename="$TMP_LOG" --follow --undecorated --width=600 --height=400 &
-    echo $! > "$TMP_PID"
-}
+case $ACTION in
+  0)
+    log "Starting update to v$REMOTE_VERSION..."
+    # build the update command with elevated privileges
+    UPDATE_CMD="systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch:handle-power-key:handle-suspend-key:handle-hibernate-key \
+      --who='Shani OS Update' --why='Applying system update' \
+      /usr/local/bin/shani-deploy || read -p 'Press Enter to continue…'"
 
-# Close the log window if it is open and running.
-close_log_window() {
-    if [ -f "$TMP_PID" ]; then
-        TERM_PID=$(cat "$TMP_PID")
-        if kill -0 "$TERM_PID" 2>/dev/null; then
-            kill "$TERM_PID" 2>/dev/null
-        fi
-        rm -f "$TMP_PID"
-    fi
-}
+    # wrap with pkexec to preserve GUI context
+    FULL_CMD="pkexec env DISPLAY=\"$DISPLAY\" XAUTHORITY=\"$XAUTHORITY\" bash -c '$UPDATE_CMD'"
+    TERMINAL_CMD=$(build_cmd "$TERMINAL" "$FULL_CMD")
 
-# Toggle the log window ONLY if an update is running.
-toggle_terminal() {
-    # Clean up stale PID file.
-    if [ -f "$TMP_PID" ] && ! kill -0 "$(cat "$TMP_PID")" 2>/dev/null; then
-        rm -f "$TMP_PID"
-    fi
-    if is_update_running; then
-        if [ -f "$TMP_PID" ]; then
-            close_log_window
-        else
-            open_log_window
-        fi
+    eval "$TERMINAL_CMD" || err "Deployment failed."
+
+    # Notify/reboot prompt
+    if command -v yad &>/dev/null; then
+      yad --title="Update Complete" --width=300 \
+          --text="Update to v$REMOTE_VERSION complete." \
+          --button="Restart Now":0 --button="Close":1
+      CHOICE=$?
     else
-        yad --info --title="No Update Running" \
-            --text="There is no update currently running." --width=300
+      notify-send "Update v$REMOTE_VERSION complete." || true
+      read -p "Reboot now? [y/N]: " yn; [[ $yn =~ ^[Yy] ]] && CHOICE=0 || CHOICE=1
     fi
-}
 
-# Defer the update prompt.
-defer_update() {
-    systemd-run --user --on-active="$DEFER_DELAY" "$0"
-}
+    if [[ $CHOICE -eq 0 ]]; then
+      log "Rebooting system..."
+      pkexec shutdown -r now
+    else
+      log "Update applied; reboot postponed."
+    fi
+    ;;
 
-# Wait until the update process finishes.
-wait_for_update() {
-    while is_update_running; do
-        sleep 1
-    done
-}
+  *)
+    log "Deferring update by $DEFER_DELAY seconds."
+    systemd-run --user --unit="${LOG_TAG}-defer" --on-active="$DEFER_DELAY" "$0"
+    ;;
 
-# Show a modal completion dialog.
-show_completion_dialog() {
-    yad --info --title="Update Complete" \
-        --text="The update has completed. Click OK to close the log window." \
-        --button="OK":0
-}
-
-### Main Dialog
-ACTION=$(yad --title="Shani OS Update" --width=400 --center \
-         --text="New update available (v$REMOTE_VERSION).\n\nChoose an action:" \
-         --button="Update":0 --button="Toggle Terminal":1 --button="Remind Me Later":2)
-
-case $? in
-    0)
-        # "Update" pressed.
-        start_update
-        open_log_window
-        wait_for_update
-        show_completion_dialog
-        close_log_window
-        ;;
-    1)
-        # "Toggle Terminal" pressed.
-        toggle_terminal
-        ;;
-    *)
-        # "Remind Me Later" pressed.
-        defer_update
-        ;;
 esac
 
 exit 0

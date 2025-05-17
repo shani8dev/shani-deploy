@@ -6,34 +6,47 @@
 IFS=$'\n\t'
 
 # Configuration
-DEFER_DELAY=300
-UPDATE_CHANNEL="stable"
-BASE_URL="https://sourceforge.net/projects/shanios/files"
-LOCAL_VERSION_FILE="/etc/shani-version"
-LOCAL_PROFILE_FILE="/etc/shani-profile"
-LOG_TAG="shani-update"
+declare -r DEFER_DELAY=300
+declare -r UPDATE_CHANNEL="stable"
+declare -r BASE_URL="https://sourceforge.net/projects/shanios/files"
+declare -r LOCAL_VERSION_FILE="/etc/shani-version"
+declare -r LOCAL_PROFILE_FILE="/etc/shani-profile"
+declare -r LOG_TAG="shani-update"
 
 # Logging functions
-log(){
-  echo "[$(date '+%F %T')] $*"
-  logger -t "$LOG_TAG" "$*"
+log() {
+  local msg="$*"
+  echo "[$(date '+%F %T')] $msg"
+  logger -t "$LOG_TAG" "$msg"
 }
-err(){ log "ERROR: $*"; exit 1; }
+err() {
+  log "ERROR: $*"
+  exit 1
+}
 trap 'log "Exiting."' EXIT
 
 # Detect terminal emulator
-define find_terminal() {
-  [[ -n "${TERMINAL_EMULATOR-}" ]] && command -v "$TERMINAL_EMULATOR" &>/dev/null && { echo "$TERMINAL_EMULATOR"; return; }
-  [[ -n "${COLORTERM-}" ]]      && command -v "$COLORTERM"      &>/dev/null && { echo "$COLORTERM";      return; }
+find_terminal() {
+  # Prioritize environment variables
+  for var in TERMINAL_EMULATOR COLORTERM; do
+    local emu=${!var-}
+    if [[ -n "$emu" ]] && command -v "$emu" &>/dev/null; then
+      echo "$emu"; return
+    fi
+  done
 
+  # Fallback list
   local terms=(
     kgx gnome-terminal tilix xfce4-terminal konsole lxterminal mate-terminal
     deepin-terminal alacritty kitty wezterm foot terminator guake tilda
     hyper xterm urxvt st screen tmux
   )
   for term in "${terms[@]}"; do
-    command -v "$term" &>/dev/null && { echo "$term"; return; }
+    if command -v "$term" &>/dev/null; then
+      echo "$term"; return
+    fi
   done
+
   err "No supported terminal found. Install one of: ${terms[*]}"
 }
 TERMINAL=$(find_terminal)
@@ -45,36 +58,39 @@ build_cmd() {
   local cmd="$*"
   case "$emu" in
     kgx|gnome-terminal|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
-      echo "$emu -- bash -c '${cmd}'";;
+      echo "$emu -- bash -ic '$cmd'" ;;
     konsole)
-      echo "konsole --hold -e bash -c '${cmd}'";;
+      echo "$emu --hold -e bash -ic '$cmd'" ;;
     alacritty|kitty|wezterm|foot|xterm|urxvt|st)
-      echo "$emu -e bash -c '${cmd}'";;
+      echo "$emu -e bash -ic '$cmd'" ;;
     terminator)
-      echo "terminator -x bash -c '${cmd}'";;
+      echo "$emu -x bash -ic '$cmd'" ;;
     guake|tilda)
-      echo "bash -c '${cmd}'";;
+      echo "bash -ic '$cmd'" ;;
     hyper)
-      echo "hyper --command bash -c '${cmd}'";;
+      echo "$emu --command bash -ic '$cmd'" ;;
     screen|tmux)
-      echo "bash -c '${cmd}'";;
-    *) err "Unhandled terminal: $emu";;
+      echo "bash -ic '$cmd'" ;;
+    *) err "Unhandled terminal: $emu" ;;
   esac
 }
 
 # Read local version/profile
-LOCAL_VERSION=$(<"$LOCAL_VERSION_FILE" 2>/dev/null || echo 0)
-LOCAL_PROFILE=$(<"$LOCAL_PROFILE_FILE" 2>/dev/null || echo default)
-# sanitize
+defaults() {
+  local file=$1 default=$2
+  [[ -r "$file" ]] && read -r val < "$file" || val="$default"
+  echo "$val"
+}
+LOCAL_VERSION=$(defaults "$LOCAL_VERSION_FILE" 0)
+LOCAL_PROFILE=$(defaults "$LOCAL_PROFILE_FILE" default)
+
+# Sanitize
 LOCAL_VERSION=${LOCAL_VERSION//[^0-9]/}
 LOCAL_PROFILE=${LOCAL_PROFILE//[^A-Za-z]/}
 
 # Fetch remote info
-CHANNEL_URL="$BASE_URL/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
-REMOTE_IMAGE=$(curl -fSLs --retry 3 --retry-delay 5 --max-time 30 "$CHANNEL_URL") 
-if [[ $? -ne 0 ]]; then
-  err "Failed fetching info from $CHANNEL_URL"
-fi
+CHANNEL_URL="$BASE_URL/$LOCAL_PROFILE/$UPDATE_CHANNEL.txt"
+REMOTE_IMAGE=$(curl -fSLs --retry 3 --retry-delay 5 --max-time 30 "$CHANNEL_URL") || err "Failed fetching info from $CHANNEL_URL"
 
 # Expect format: shanios-<version>-<profile>.zst
 if [[ ! $REMOTE_IMAGE =~ ^shanios-([0-9]+)-([A-Za-z]+)\.zst$ ]]; then
@@ -89,13 +105,14 @@ if [[ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PRO
   exit 0
 fi
 
-# Prompt user
-prompt_choice() {
+# Prompt user for action
+decide_action() {
   if command -v yad &>/dev/null; then
     yad --title="Shani OS Update" --width=400 --center \
         --text="New update available!\nCurrent: v$LOCAL_VERSION-$LOCAL_PROFILE\nRemote: v$REMOTE_VERSION-$REMOTE_PROFILE\nChoose:" \
         --button="Update Now":0 --button="Remind Me Later":1 \
         --timeout=60 --timeout-label="Remind Me Later"
+    return $?
   elif command -v zenity &>/dev/null; then
     zenity --question --title="Shani OS Update" \
            --text="Current: v$LOCAL_VERSION-$LOCAL_PROFILE\nRemote: v$REMOTE_VERSION-$REMOTE_PROFILE" \
@@ -107,48 +124,44 @@ prompt_choice() {
   fi
 }
 
-action() { prompt_choice; echo $?; }
-ACTION=$(action)
+if decide_action; then
+  log "Starting update to v$REMOTE_VERSION..."
 
-case $ACTION in
-  0)
-    log "Starting update to v$REMOTE_VERSION..."
-    # build the update command with elevated privileges
-    UPDATE_CMD="systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch:handle-power-key:handle-suspend-key:handle-hibernate-key \
+  # Build update command with elevated privileges
+  UPDATE_CMD=(
+    systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch:handle-power-key:handle-suspend-key:handle-hibernate-key \
       --who='Shani OS Update' --why='Applying system update' \
-      /usr/local/bin/shani-deploy || read -p 'Press Enter to continue…'"
+      /usr/local/bin/shani-deploy || read -p 'Press Enter to continue…'
+  )
 
-    # wrap with pkexec to preserve GUI context
-    FULL_CMD="pkexec env DISPLAY=\"$DISPLAY\" XAUTHORITY=\"$XAUTHORITY\" bash -c '$UPDATE_CMD'"
-    TERMINAL_CMD=$(build_cmd "$TERMINAL" "$FULL_CMD")
+  # Wrap with pkexec to preserve GUI context
+  FULL_CMD="pkexec env DISPLAY=\"$DISPLAY\" XAUTHORITY=\"$XAUTHORITY\" bash -c '${UPDATE_CMD[*]}'"
+  TERMINAL_CMD=$(build_cmd "$TERMINAL" "$FULL_CMD")
 
-    eval "$TERMINAL_CMD" || err "Deployment failed."
+  eval "$TERMINAL_CMD" || err "Deployment failed."
 
-    # Notify/reboot prompt
-    if command -v yad &>/dev/null; then
-      yad --title="Update Complete" --width=300 \
-          --text="Update to v$REMOTE_VERSION complete." \
-          --button="Restart Now":0 --button="Close":1
-      CHOICE=$?
-    else
-      notify-send "Update v$REMOTE_VERSION complete." || true
-      read -p "Reboot now? [y/N]: " yn; [[ $yn =~ ^[Yy] ]] && CHOICE=0 || CHOICE=1
-    fi
+  # Notify & optionally reboot
+  if command -v yad &>/dev/null; then
+    yad --title="Update Complete" --width=300 \
+        --text="Update to v$REMOTE_VERSION complete." \
+        --button="Restart Now":0 --button="Close":1
+    CHOICE=$?
+  else
+    notify-send "Update v$REMOTE_VERSION complete." || true
+    read -rp "Reboot now? [y/N]: " yn
+    [[ $yn =~ ^[Yy] ]] && CHOICE=0 || CHOICE=1
+  fi
 
-    if [[ $CHOICE -eq 0 ]]; then
-      log "Rebooting system..."
-      pkexec shutdown -r now
-    else
-      log "Update applied; reboot postponed."
-    fi
-    ;;
-
-  *)
-    log "Deferring update by $DEFER_DELAY seconds."
-    systemd-run --user --unit="${LOG_TAG}-defer" --on-active="$DEFER_DELAY" "$0"
-    ;;
-
-esac
+  if [[ $CHOICE -eq 0 ]]; then
+    log "Rebooting system..."
+    pkexec shutdown -r now
+  else
+    log "Update applied; reboot postponed."
+  fi
+else
+  log "Deferring update by $DEFER_DELAY seconds."
+  systemd-run --user --unit="${LOG_TAG}-defer" --on-active="$DEFER_DELAY" "$0"
+fi
 
 exit 0
 

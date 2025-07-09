@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# The script auto-detects DISPLAY; override here if necessary.
-# Environment=DISPLAY=:0
 ExecStart=/usr/local/bin/shani-update
+Environment=XDG_RUNTIME_DIR=%t
 TimeoutSec=300
 
 [Install]
-WantedBy=graphical.target
+WantedBy=graphical-session.target
+
 

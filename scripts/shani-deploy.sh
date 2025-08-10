@@ -574,12 +574,24 @@ download_update() {
     while (( attempt++ < MAX_ATTEMPTS )); do
         log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
 
-        # Resume download if partial file exists
-        if [[ -f "${image_file_part}" ]]; then
-            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-            log "INFO" "Resuming download from ${current_size}/${expected_size} bytes"
-        fi
+		# Check partial file before resuming
+		if [[ -f "${image_file_part}" ]]; then
+			current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
+			
+			if (( current_size > expected_size )); then
+				log "WARN" "Partial file size (${current_size}) exceeds expected (${expected_size}) — deleting"
+				rm -f "${image_file_part}"
+				current_size=0
+			elif (( current_size > 0 )); then
+				log "INFO" "Partial file found: ${current_size}/${expected_size} bytes — resuming"
+			else
+				log "WARN" "Partial file exists but is empty — deleting"
+				rm -f "${image_file_part}"
+				current_size=0
+			fi
+		fi
 
+		# Resume or fresh download
         wget "${WGET_OPTS[@]}" -O "${image_file_part}" "${mirror_url}"
 
         current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
@@ -625,10 +637,11 @@ download_update() {
 
     # Validate SHA256 checksum
     log "INFO" "Verifying SHA256 checksum"
-    if ! sha256sum -c "${sha_file}" --status; then
-        log "ERROR" "Checksum validation failed"
-        return 1
-    fi
+	if ! sha256sum -c "${sha_file}" --status; then
+		log "ERROR" "Checksum validation failed — removing corrupt files"
+		rm -f "${image_file}" "${image_file_part}"
+		return 1
+	fi
 
     # GPG verification using a temporary GNUPGHOME
     local gpg_temp
@@ -655,10 +668,11 @@ download_update() {
     fi
 
     log "INFO" "Verifying GPG signature"
-    if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
-        log "ERROR" "GPG signature verification failed"
-        return 1
-    fi
+	if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
+		log "ERROR" "GPG signature verification failed — removing corrupt files"
+		rm -f "${image_file}" "${image_file_part}"
+		return 1
+	fi
 
     # Clear the GPG cleanup trap now that we're done with GPG operations
     trap - EXIT

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # shani-update: per-user update checker for Shani OS via systemd --user
-# Improved version with better error handling, security, and robustness
+# Fixed version - resolves early exit after comparison
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 # Constants
-readonly SCRIPT_VERSION="2.1"
+readonly SCRIPT_VERSION="2.2"
 readonly DEFER_DELAY=300
 readonly UPDATE_CHANNEL="stable"
 readonly BASE_URL="https://sourceforge.net/projects/shanios/files"
@@ -61,18 +61,24 @@ cleanup_and_exit() {
     exit "${1:-0}"
 }
 
-# Enhanced logging with log rotation (fixed to not interfere with function output)
+# Enhanced logging with log rotation
 log() {
     local msg="$*"
     local timestamp
     timestamp=$(date '+%F %T')
 
     # Rotate log if it gets too large (>1MB)
-    if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 1048576 ]]; then
-        mv "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+    if [[ -f "$LOG_FILE" ]]; then
+        local file_size=0
+        if command -v stat >/dev/null 2>&1; then
+            file_size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        fi
+        if [[ $file_size -gt 1048576 ]]; then
+            mv "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+        fi
     fi
 
-    # Write to log file and stderr (not stdout to avoid capturing in command substitution)
+    # Write to log file and stderr
     echo "[$timestamp] $msg" >> "$LOG_FILE"
     echo "[$timestamp] $msg" >&2
 
@@ -95,12 +101,10 @@ warn() {
 
 # Validate environment
 validate_environment() {
-    # Check if we're running in a supported environment
     if [[ ! -d /etc ]] || [[ ! -d /usr ]]; then
         err "Invalid system environment"
     fi
 
-    # Check for required commands
     local required_cmds=(curl bash mkdir rm)
     for cmd in "${required_cmds[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -108,7 +112,6 @@ validate_environment() {
         fi
     done
 
-    # Validate systemd user session
     if ! systemctl --user status &>/dev/null; then
         warn "systemd user session not available, some features may not work"
     fi
@@ -224,9 +227,11 @@ fetch_remote_info() {
     fi
 
     # Validate file size (shouldn't be too large for a version string)
-    local file_size
-    file_size=$(stat -f%z "$temp_file" 2>/dev/null || stat -c%s "$temp_file" 2>/dev/null || echo 0)
-    if [[ "$file_size" -gt 1024 ]]; then
+    local file_size=0
+    if command -v stat >/dev/null 2>&1; then
+        file_size=$(stat -f%z "$temp_file" 2>/dev/null || stat -c%s "$temp_file" 2>/dev/null || echo 0)
+    fi
+    if [[ $file_size -gt 1024 ]]; then
         rm -f "$temp_file"
         log "ERROR: Remote response too large: $file_size bytes"
         return 1
@@ -244,7 +249,7 @@ fetch_remote_info() {
     echo "$content"
 }
 
-# Validate date format version
+# FIXED: Validate date format version - prevent octal interpretation
 validate_version_format() {
     local version="$1"
 
@@ -257,16 +262,16 @@ validate_version_format() {
     local month="${version:4:2}"
     local day="${version:6:2}"
 
-    # Basic date validation
-    if [[ "$year" -lt 2020 ]] || [[ "$year" -gt 2030 ]]; then
+    # FIXED: Use string comparisons to avoid octal interpretation issues
+    if [[ "$year" < "2020" ]] || [[ "$year" > "2030" ]]; then
         return 1
     fi
 
-    if [[ "$month" -lt 1 ]] || [[ "$month" -gt 12 ]]; then
+    if [[ "$month" < "01" ]] || [[ "$month" > "12" ]]; then
         return 1
     fi
 
-    if [[ "$day" -lt 1 ]] || [[ "$day" -gt 31 ]]; then
+    if [[ "$day" < "01" ]] || [[ "$day" > "31" ]]; then
         return 1
     fi
 
@@ -300,72 +305,161 @@ version_compare() {
     fi
 }
 
-# GUI decision with timeout and accessibility
+# GUI decision with timeout and accessibility - COMPLETELY FIXED
 decide_action() {
     local current="v$LOCAL_VERSION-$LOCAL_PROFILE"
     local remote="v$REMOTE_VERSION-$REMOTE_PROFILE"
     local message="Update available!\nCurrent: $current\nNew: $remote\n\nWould you like to update now?"
 
-    # Try modern dialog first
-    if command -v yad &>/dev/null; then
-        if yad --title="Shani OS Update" \
-               --width=450 --height=200 \
-               --center --on-top \
-               --text="$message" \
-               --image="software-update-available" \
-               --button="Update Now!gtk-yes:0" \
-               --button="Remind Later!gtk-cancel:1" \
-               --timeout=120 \
-               --timeout-label="Remind Later" \
-               --no-escape 2>/dev/null; then
-            return 0
-        else
-            return 1
+    # Detect session type for better dialog selection
+    local session_type="${XDG_SESSION_TYPE:-unknown}"
+    log "Session type: $session_type, Desktop: ${XDG_CURRENT_DESKTOP:-unknown}"
+    log "Available GUI tools: yad=$(command -v yad || echo 'not found'), zenity=$(command -v zenity || echo 'not found'), kdialog=$(command -v kdialog || echo 'not found')"
+
+    # For Wayland sessions, prefer native Wayland dialogs
+    if [[ "$session_type" == "wayland" ]]; then
+        log "Detected Wayland session"
+        # Try KDE dialog first on Wayland (most reliable for KDE Plasma)
+        if [[ "${XDG_CURRENT_DESKTOP,,}" =~ kde ]] && command -v kdialog &>/dev/null; then
+            log "Using kdialog for KDE Wayland session..."
+            if kdialog --title "Shani OS Update" \
+                       --yesno "$(echo -e "$message")" \
+                       --yes-label "Update Now" \
+                       --no-label "Remind Later" 2>/dev/null; then
+                log "kdialog: user chose Update Now"
+                return 0
+            else
+                log "kdialog: user chose Remind Later"
+                return 1
+            fi
+        # Try GNOME dialog for GNOME Wayland
+        elif [[ "${XDG_CURRENT_DESKTOP,,}" =~ gnome ]] && command -v zenity &>/dev/null; then
+            log "Using zenity for GNOME Wayland session..."
+            if zenity --question \
+                      --title="Shani OS Update" \
+                      --width=400 \
+                      --text="$(echo -e "$message")" \
+                      --ok-label="Update Now" \
+                      --cancel-label="Remind Later" \
+                      --timeout=120 2>/dev/null; then
+                log "zenity dialog: user chose Update Now"
+                return 0
+            else
+                log "zenity dialog: user chose Remind Later or timeout"
+                return 1
+            fi
         fi
-    elif command -v zenity &>/dev/null; then
+        log "No native Wayland dialog available, trying yad with different backends..."
+    fi
+
+    # Try yad with explicit backend selection
+    if command -v yad &>/dev/null; then
+        log "Attempting to show yad dialog..."
+
+        # Try different GDK backends for better compatibility
+        local backends=("x11" "wayland" "")
+
+        for backend in "${backends[@]}"; do
+            local env_cmd=""
+            if [[ -n "$backend" ]]; then
+                env_cmd="GDK_BACKEND=$backend "
+                log "Trying yad with GDK_BACKEND=$backend"
+            else
+                log "Trying yad with default backend"
+            fi
+
+            if eval "${env_cmd}yad --title='Shani OS Update' \
+                   --width=450 --height=200 \
+                   --center \
+                   --text='$(echo -e \"$message\")' \
+                   --image='software-update-available' \
+                   --button='Update Now:0' \
+                   --button='Remind Later:1' \
+                   --timeout=120" 2>/dev/null; then
+                log "yad dialog: user chose Update Now (backend: ${backend:-default})"
+                return 0
+            else
+                local exit_code=$?
+                log "yad with backend '${backend:-default}' failed with exit code: $exit_code"
+                if [[ $exit_code -eq 1 ]]; then
+                    log "yad dialog: user chose Remind Later (backend: ${backend:-default})"
+                    return 1
+                elif [[ $exit_code -eq 70 ]]; then
+                    log "yad dialog timed out, treating as 'Remind Later'"
+                    return 1
+                fi
+                # Continue to try next backend
+            fi
+        done
+
+        log "All yad attempts failed, trying other dialog methods"
+    fi
+
+    # Try zenity if available
+    if command -v zenity &>/dev/null; then
+        log "Attempting to show zenity dialog..."
         if zenity --question \
                   --title="Shani OS Update" \
                   --width=400 \
-                  --text="$message" \
+                  --text="$(echo -e "$message")" \
                   --ok-label="Update Now" \
                   --cancel-label="Remind Later" \
                   --timeout=120 2>/dev/null; then
+            log "zenity dialog: user chose Update Now"
             return 0
         else
+            log "zenity dialog: user chose Remind Later or timeout"
             return 1
         fi
-    elif command -v kdialog &>/dev/null; then
+    fi
+
+    # Try kdialog if available
+    if command -v kdialog &>/dev/null; then
+        log "Attempting to show kdialog..."
         if kdialog --title "Shani OS Update" \
-                   --yesno "$message" \
+                   --yesno "$(echo -e "$message")" \
                    --yes-label "Update Now" \
                    --no-label "Remind Later" 2>/dev/null; then
+            log "kdialog: user chose Update Now"
             return 0
         else
+            log "kdialog: user chose Remind Later"
             return 1
         fi
-    else
-        # Fallback to notification
-        if command -v notify-send &>/dev/null; then
-            notify-send -u critical \
-                       -i software-update-available \
-                       "Shani OS Update Available" \
-                       "Current: $current → New: $remote\nClick to view update options" 2>/dev/null || true
-        fi
-
-        # Console fallback if no GUI available
-        if [[ -t 0 ]] && [[ -t 1 ]]; then
-            echo "=== Shani OS Update Available ===" >&2
-            echo "Current: $current" >&2
-            echo "New: $remote" >&2
-            read -rp "Update now? [y/N]: " -t 60 response || response="n"
-            case "$response" in
-                [Yy]*) return 0 ;;
-                *) return 1 ;;
-            esac
-        fi
-
-        return 1
     fi
+
+    # Fallback to notification + console
+    log "No GUI dialog tools worked, trying fallback methods"
+    if command -v notify-send &>/dev/null; then
+        log "Sending notification..."
+        notify-send -u critical \
+                   -i software-update-available \
+                   "Shani OS Update Available" \
+                   "Current: $current → New: $remote. Check terminal for options." 2>/dev/null || true
+    fi
+
+    # Console fallback if no GUI available
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        log "Using console fallback for user interaction"
+        echo "=== Shani OS Update Available ===" >&2
+        echo "Current: $current" >&2
+        echo "New: $remote" >&2
+        read -rp "Update now? [y/N]: " -t 60 response || response="n"
+        case "$response" in
+            [Yy]*)
+                log "Console: user chose to update"
+                return 0
+                ;;
+            *)
+                log "Console: user chose not to update"
+                return 1
+                ;;
+        esac
+    else
+        log "No interactive terminal available, defaulting to 'Remind Later'"
+    fi
+
+    return 1
 }
 
 # Enhanced terminal command builder with better escaping
@@ -382,7 +476,7 @@ build_terminal_cmd() {
             echo "$terminal --title='Shani OS Update' --geometry=100x30 -- bash -c $escaped_cmd"
             ;;
         konsole)
-            echo "$terminal --title 'Shani OS Update' --hold -e bash -c $escaped_cmd"
+            echo "$terminal --title 'Shani OS Update' -e bash -c $escaped_cmd"
             ;;
         alacritty)
             echo "$terminal --title 'Shani OS Update' -e bash -c $escaped_cmd"
@@ -427,12 +521,11 @@ handle_post_update() {
         if yad --title="Update Complete" \
                --width=400 --height=150 \
                --center --on-top \
-               --text="$reboot_message" \
+               --text="$(echo -e "$reboot_message")" \
                --image="system-restart" \
-               --button="Restart Now!gtk-yes:0" \
-               --button="Restart Later!gtk-no:1" \
-               --timeout=300 \
-               --timeout-label="Restart Later" 2>/dev/null; then
+               --button="Restart Now:0" \
+               --button="Restart Later:1" \
+               --timeout=300 2>/dev/null; then
             reboot_now=true
         else
             reboot_now=false
@@ -440,10 +533,19 @@ handle_post_update() {
     elif command -v zenity &>/dev/null; then
         if zenity --question \
                   --title="Update Complete" \
-                  --text="$reboot_message" \
+                  --text="$(echo -e "$reboot_message")" \
                   --ok-label="Restart Now" \
                   --cancel-label="Restart Later" \
                   --timeout=300 2>/dev/null; then
+            reboot_now=true
+        else
+            reboot_now=false
+        fi
+    elif command -v kdialog &>/dev/null; then
+        if kdialog --title "Update Complete" \
+                   --yesno "$(echo -e "$reboot_message")" \
+                   --yes-label "Restart Now" \
+                   --no-label "Restart Later" 2>/dev/null; then
             reboot_now=true
         else
             reboot_now=false
@@ -470,10 +572,15 @@ handle_post_update() {
 
     if [[ "$reboot_now" == "true" ]]; then
         log "Initiating system restart..."
-        if pkexec shutdown -r now 2>/dev/null; then
+        if pkexec systemctl reboot 2>/dev/null; then
             log "Restart initiated successfully"
         else
-            warn "Failed to initiate restart - user may need to restart manually"
+            warn "Failed to initiate reboot via systemctl, trying shutdown command..."
+            if pkexec shutdown -r now 2>/dev/null; then
+                log "Restart initiated successfully via shutdown"
+            else
+                warn "Failed to initiate restart - user may need to restart manually"
+            fi
         fi
     else
         log "User chose to restart later"
@@ -486,7 +593,43 @@ handle_post_update() {
     fi
 }
 
-# Main execution flow
+# FIXED: Check if update is needed (separate function for clarity)
+is_update_needed() {
+    local local_ver="$1"
+    local local_prof="$2"
+    local remote_ver="$3"
+    local remote_prof="$4"
+
+    # Compare versions first
+    version_compare "$local_ver" "$remote_ver"
+    local comparison_result=$?
+
+    case $comparison_result in
+        0)
+            # Versions are equal - check if profile changed
+            if [[ "$local_prof" == "$remote_prof" ]]; then
+                log "System is up-to-date (v$local_ver-$local_prof)"
+                return 1  # No update needed
+            else
+                log "Profile change detected: $local_prof → $remote_prof (same version date)"
+                return 0  # Update needed for profile change
+            fi
+            ;;
+        1)
+            log "Update available: v$local_ver → v$remote_ver (newer version found)"
+            return 0  # Update needed
+            ;;
+        2)
+            log "Local version v$local_ver is newer than remote v$remote_ver - no update needed"
+            return 1  # No update needed
+            ;;
+        *)
+            err "Version comparison failed with unexpected result: $comparison_result"
+            ;;
+    esac
+}
+
+# FIXED: Main execution flow with proper continuation
 main() {
     log "Starting Shani OS update checker (version $SCRIPT_VERSION)"
 
@@ -540,44 +683,27 @@ main() {
 
     log "Remote version: v$REMOTE_VERSION-$REMOTE_PROFILE"
 
-    # Compare versions
-    log "Comparing versions: local=$LOCAL_VERSION vs remote=$REMOTE_VERSION"
+    # Check if update is needed
+    log "Checking if update is needed..."
+    if ! is_update_needed "$LOCAL_VERSION" "$LOCAL_PROFILE" "$REMOTE_VERSION" "$REMOTE_PROFILE"; then
+        log "No update needed, exiting"
+        cleanup_and_exit 0
+    fi
 
-    version_compare "$LOCAL_VERSION" "$REMOTE_VERSION"
-    local comparison_result=$?
+    log "Update is needed, proceeding to user decision..."
 
-    case $comparison_result in
-        0)
-            if [[ "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-                log "System is up-to-date (v$LOCAL_VERSION-$LOCAL_PROFILE)"
-                cleanup_and_exit 0
-            else
-                log "Profile change detected: $LOCAL_PROFILE → $REMOTE_PROFILE (same version date)"
-            fi
-            ;;
-        1)
-            log "Update available: v$LOCAL_VERSION → v$REMOTE_VERSION (newer version found)"
-            ;;
-        2)
-            log "Local version v$LOCAL_VERSION is newer than remote v$REMOTE_VERSION - no update needed"
-            cleanup_and_exit 0
-            ;;
-        *)
-            err "Version comparison failed with unexpected result: $comparison_result"
-            ;;
-    esac
-
-    # User decision
+    # User decision - FIXED: Handle the decision properly without exiting early
     if ! decide_action; then
         log "Update deferred by user. Scheduling reminder in $DEFER_DELAY seconds..."
 
         if systemctl --user status &>/dev/null; then
+            local defer_unit="$LOG_TAG-defer-$(date +%s)"
             if systemd-run --user \
-                          --unit="$LOG_TAG-defer-$(date +%s)" \
+                          --unit="$defer_unit" \
                           --description="Deferred Shani OS update reminder" \
                           --on-active="${DEFER_DELAY}s" \
                           "$0" 2>/dev/null; then
-                log "Reminder scheduled successfully"
+                log "Reminder scheduled successfully as unit: $defer_unit"
             else
                 warn "Failed to schedule reminder"
             fi
@@ -599,28 +725,45 @@ main() {
     # Build update command with proper error handling
     local update_cmd='/usr/local/bin/shani-deploy'
     local inhibit_cmd="systemd-inhibit --what=shutdown:sleep:idle:handle-power-key:handle-suspend-key:handle-hibernate-key --who='Shani OS Update' --why='System update in progress'"
-    local env_cmd="env DISPLAY='$display_env' XAUTHORITY='$xauth_env'"
 
+    # Create the complete command to run
+    local complete_cmd="$inhibit_cmd bash -c '$update_cmd || (echo \"Update failed. Press Enter to continue...\"; read)'"
+
+    # For pkexec, we need to preserve environment variables
+    local env_vars="DISPLAY='$display_env' XAUTHORITY='$xauth_env'"
     if [[ -n "$wayland_display" ]]; then
-        env_cmd="$env_cmd WAYLAND_DISPLAY='$wayland_display'"
+        env_vars="$env_vars WAYLAND_DISPLAY='$wayland_display'"
     fi
 
-    local full_cmd="$inhibit_cmd bash -c '$update_cmd || (echo \"Update failed. Press Enter to continue...\"; read)'"
-    local pkexec_cmd="pkexec $env_cmd bash -c \"$full_cmd\""
+    local pkexec_cmd="pkexec env $env_vars $complete_cmd"
+
     local terminal_cmd
     terminal_cmd=$(build_terminal_cmd "$TERMINAL" "$pkexec_cmd")
 
     log "Launching update in terminal..."
-    log "Command: $terminal_cmd"
+    log "Terminal command: $terminal_cmd"
 
     # Execute update
-    if bash -c "$terminal_cmd" 2>/dev/null; then
+    if eval "$terminal_cmd" 2>/dev/null; then
         log "Update process completed successfully"
 
         # Post-update actions
         handle_post_update
     else
-        err "Update process failed or was cancelled"
+        local exit_code=$?
+        warn "Update process failed or was cancelled (exit code: $exit_code)"
+
+        # Clean up temp script if it exists
+        if [[ -f "$LOG_DIR/temp_update_script" ]]; then
+            local temp_script
+            temp_script=$(cat "$LOG_DIR/temp_update_script" 2>/dev/null || echo "")
+            if [[ -n "$temp_script" ]] && [[ -f "$temp_script" ]]; then
+                rm -f "$temp_script" 2>/dev/null || true
+            fi
+            rm -f "$LOG_DIR/temp_update_script" 2>/dev/null || true
+        fi
+
+        cleanup_and_exit 1
     fi
 }
 

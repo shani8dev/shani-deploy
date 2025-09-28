@@ -56,7 +56,6 @@ persist_state() {
         echo "export GENEFI_SCRIPT=$(printf '%q' "$GENEFI_SCRIPT")"
         echo "export DEPLOY_PENDING=$(printf '%q' "$DEPLOY_PENDING")"
         echo "export GPG_KEY_ID=$(printf '%q' "$GPG_KEY_ID")"
-        echo "export WGET_OPTS=$(printf '%q' "$WGET_OPTS")"
         echo "export LOCAL_VERSION=$(printf '%q' "$LOCAL_VERSION")"
         echo "export LOCAL_PROFILE=$(printf '%q' "$LOCAL_PROFILE")"
         echo "export BACKUP_NAME=$(printf '%q' "$BACKUP_NAME")"
@@ -390,6 +389,73 @@ rollback_system() {
 }
 
 #####################################
+### Mirror Selection Function     ###
+#####################################
+
+find_fastest_mirror() {
+    local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
+    local test_mirrors=()
+    local fastest_mirror=""
+    local best_time=999999
+    
+    log "INFO" "Finding fastest SourceForge mirror..."
+    
+    # Get list of available mirrors by following redirects multiple times
+    for i in {1..5}; do
+        local mirror_url
+        mirror_url=$(wget --max-redirect=1 --spider -S "${base_url}" 2>&1 | 
+                    grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+        
+        if [[ -n "${mirror_url}" && "${mirror_url}" != *"sourceforge.net"* ]]; then
+            # Extract just the base mirror domain
+            local mirror_base
+            mirror_base=$(echo "${mirror_url}" | sed 's|/.*||')
+            if [[ ! " ${test_mirrors[*]} " =~ " ${mirror_base} " ]]; then
+                test_mirrors+=("${mirror_url}")
+            fi
+        fi
+        
+        # Add small delay between requests
+        sleep 1
+    done
+    
+    # If we didn't find any mirrors, fall back to original method
+    if [[ ${#test_mirrors[@]} -eq 0 ]]; then
+        log "WARN" "No mirrors found, using direct SourceForge URL"
+        echo "${base_url}" > "${MIRROR_FILE}"
+        return 0
+    fi
+    
+    # Test each mirror with a small HEAD request
+    for mirror in "${test_mirrors[@]}"; do
+        local start_time end_time duration
+        start_time=$(date +%s%N)
+        
+        if timeout 10 wget --spider --quiet "${mirror}" 2>/dev/null; then
+            end_time=$(date +%s%N)
+            duration=$(( (end_time - start_time) / 1000000 )) # Convert to milliseconds
+            
+            log "INFO" "Mirror test: ${mirror} - ${duration}ms"
+            
+            if (( duration < best_time )); then
+                best_time=$duration
+                fastest_mirror="${mirror}"
+            fi
+        else
+            log "WARN" "Mirror failed: ${mirror}"
+        fi
+    done
+    
+    if [[ -n "${fastest_mirror}" ]]; then
+        echo "${fastest_mirror}" > "${MIRROR_FILE}"
+        log "INFO" "Selected fastest mirror (${best_time}ms): ${fastest_mirror}"
+    else
+        log "WARN" "All mirrors failed, using direct SourceForge URL"
+        echo "${base_url}" > "${MIRROR_FILE}"
+    fi
+}
+
+#####################################
 ### Deployment Phase Functions    ###
 #####################################
 
@@ -532,22 +598,9 @@ download_update() {
         return 0
     fi
 
-    # Discover and store mirror URL if not already present
+    # Find fastest mirror if not already present
     if [[ ! -f "${MIRROR_FILE}" ]]; then
-        log "INFO" "Performing initial mirror discovery"
-        local initial_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
-        local spider_output
-        spider_output=$(wget --max-redirect=20 --spider -S "${initial_url}" 2>&1)
-        # Extract the effective mirror URL using the Location header
-        local final_url
-        final_url=$(echo "$spider_output" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
-        if [[ -n "${final_url}" ]]; then
-            echo "${final_url}" > "${MIRROR_FILE}"
-            log "INFO" "Stored mirror URL: ${final_url}"
-        else
-            log "ERROR" "Failed to discover mirror URL"
-            return 1
-        fi
+        find_fastest_mirror
     fi
 
     # Retrieve stored mirror URL
@@ -874,4 +927,3 @@ main() {
 }
 
 main "$@"
-

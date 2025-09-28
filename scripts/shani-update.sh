@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # shani-update: per-user update checker for Shani OS via systemd --user
-# Fixed version - resolves early exit after comparison
+# Enhanced version with candidate slot detection and user-friendly messaging
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 # Constants
-readonly SCRIPT_VERSION="2.2"
+readonly SCRIPT_VERSION="2.4"
 readonly DEFER_DELAY=300
 readonly UPDATE_CHANNEL="stable"
 readonly BASE_URL="https://sourceforge.net/projects/shanios/files"
 readonly LOCAL_VERSION_FILE="/etc/shani-version"
 readonly LOCAL_PROFILE_FILE="/etc/shani-profile"
+readonly CURRENT_SLOT_FILE="/data/current-slot"
 readonly LOG_TAG="shani-update"
 readonly LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
 readonly LOG_FILE="$LOG_DIR/shani-update.log"
@@ -18,6 +19,7 @@ readonly LOCK_FILE="$LOG_DIR/shani-update.lock"
 readonly NETWORK_TIMEOUT=30
 readonly CURL_RETRIES=3
 readonly CURL_RETRY_DELAY=5
+readonly UPDATE_STATUS_FILE="$LOG_DIR/shani-update-status"
 
 # Global variables
 LOCAL_VERSION=""
@@ -25,6 +27,8 @@ LOCAL_PROFILE=""
 REMOTE_VERSION=""
 REMOTE_PROFILE=""
 TERMINAL=""
+CURRENT_SLOT=""
+BOOTED_SLOT=""
 
 # Ensure log directory exists
 mkdir -p "$LOG_DIR"
@@ -57,11 +61,12 @@ acquire_lock() {
 
 cleanup_and_exit() {
     rm -rf "$LOCK_FILE" 2>/dev/null || true
+    rm -f "$UPDATE_STATUS_FILE" 2>/dev/null || true
     log "Exiting (script version $SCRIPT_VERSION)"
     exit "${1:-0}"
 }
 
-# Enhanced logging with log rotation
+# Logging function
 log() {
     local msg="$*"
     local timestamp
@@ -99,6 +104,76 @@ warn() {
     log "WARNING: $*"
 }
 
+# Get booted subvolume - adapted from shanios-deploy.sh
+get_booted_subvol() {
+    local rootflags subvol
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2-)
+    subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
+    subvol="${subvol#@}"
+    if [[ -z "$subvol" ]]; then
+        subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    fi
+    echo "${subvol:-blue}"
+}
+
+# Check if system is booted into candidate slot
+check_boot_slot_validity() {
+    # Read current slot from system state
+    if [[ -r "$CURRENT_SLOT_FILE" ]]; then
+        CURRENT_SLOT=$(cat "$CURRENT_SLOT_FILE" 2>/dev/null | xargs)
+    fi
+    
+    # Default to blue if current slot is not set
+    if [[ -z "$CURRENT_SLOT" ]]; then
+        CURRENT_SLOT="blue"
+        log "No active slot marker found, using default: blue"
+    fi
+    
+    # Get the actual booted subvolume
+    BOOTED_SLOT=$(get_booted_subvol)
+    
+    log "Boot validation: Active slot is '$CURRENT_SLOT', currently running from '$BOOTED_SLOT'"
+    
+    # Check if booted into candidate slot
+    if [[ "$BOOTED_SLOT" != "$CURRENT_SLOT" ]]; then
+        # Determine what the candidate slot would be
+        local candidate_slot
+        if [[ "$CURRENT_SLOT" == "blue" ]]; then
+            candidate_slot="green"
+        else
+            candidate_slot="blue"
+        fi
+        
+        # If booted into candidate slot, this is likely a test boot
+        if [[ "$BOOTED_SLOT" == "$candidate_slot" ]]; then
+            log "Candidate boot detected: Running from candidate subvol"
+            log "Update checking temporarily disabled during system validation period"
+            log "User should verify system stability before next update cycle"
+            
+            # Send user-friendly notification
+            if command -v notify-send &>/dev/null; then
+                notify-send -u normal \
+                           -i software-update-available \
+                           "Shani OS - System Testing" \
+                           "You're running a newly updated system. Please test all your applications and restart when ready to make this version permanent." 2>/dev/null || true
+            fi
+            
+            log "Exiting gracefully - system in post-update validation state"
+            cleanup_and_exit 0
+        else
+            # Booted into some other slot - this shouldn't happen normally
+            warn "Unexpected boot configuration detected"
+            warn "Running from '$BOOTED_SLOT' but expected '$CURRENT_SLOT' or '$candidate_slot'"
+            warn "System may need manual inspection - continuing with caution"
+            
+            # Still allow update checking but log the anomaly
+            log "Proceeding with update check despite unusual boot state"
+        fi
+    else
+        log "Boot validation successful: Running from expected system partition"
+    fi
+}
+
 # Validate environment
 validate_environment() {
     if [[ ! -d /etc ]] || [[ ! -d /usr ]]; then
@@ -114,6 +189,11 @@ validate_environment() {
 
     if ! systemctl --user status &>/dev/null; then
         warn "systemd user session not available, some features may not work"
+    fi
+    
+    # Check for btrfs command availability for slot detection
+    if ! command -v btrfs &>/dev/null; then
+        warn "btrfs command not available, slot detection may be limited"
     fi
 }
 
@@ -189,16 +269,42 @@ read_file_or_default() {
     fi
 }
 
-# Enhanced network check
+# Enhanced network check with multiple methods
 check_network() {
-    local test_urls=("https://google.com" "https://github.com" "8.8.8.8")
+    log "Verifying internet connectivity for update check..."
 
-    for url in "${test_urls[@]}"; do
-        if curl -fsSL --connect-timeout 5 --max-time 10 "$url" &>/dev/null; then
+    # Method 1: Try ping to common DNS servers (most reliable)
+    local dns_servers=("8.8.8.8" "1.1.1.1" "208.67.222.222")
+    for dns in "${dns_servers[@]}"; do
+        if ping -c 1 -W 5 "$dns" &>/dev/null; then
+            log "Network connectivity confirmed via DNS server $dns"
             return 0
         fi
     done
 
+    # Method 2: Try connecting to HTTP endpoints
+    local test_urls=("https://www.google.com" "https://github.com" "https://httpbin.org/status/200")
+    for url in "${test_urls[@]}"; do
+        if curl -fsSL --connect-timeout 5 --max-time 10 --head "$url" &>/dev/null; then
+            log "Network connectivity confirmed via web endpoint"
+            return 0
+        fi
+    done
+
+    # Method 3: Try DNS resolution
+    if nslookup google.com &>/dev/null || dig +short google.com &>/dev/null || host google.com &>/dev/null; then
+        log "Network connectivity confirmed via DNS resolution"
+        return 0
+    fi
+
+    # Method 4: Check if we can reach the actual update server
+    local channel_url="$BASE_URL/$LOCAL_PROFILE/$UPDATE_CHANNEL.txt"
+    if curl -fsSL --connect-timeout 10 --max-time 20 --head "$channel_url" &>/dev/null; then
+        log "Network connectivity confirmed - update server is reachable"
+        return 0
+    fi
+
+    log "Unable to connect to the internet - all connectivity tests failed"
     return 1
 }
 
@@ -249,7 +355,7 @@ fetch_remote_info() {
     echo "$content"
 }
 
-# FIXED: Validate date format version - prevent octal interpretation
+# Validate date format version - prevent octal interpretation
 validate_version_format() {
     local version="$1"
 
@@ -262,7 +368,7 @@ validate_version_format() {
     local month="${version:4:2}"
     local day="${version:6:2}"
 
-    # FIXED: Use string comparisons to avoid octal interpretation issues
+    # Use string comparisons to avoid octal interpretation issues
     if [[ "$year" < "2020" ]] || [[ "$year" > "2030" ]]; then
         return 1
     fi
@@ -305,56 +411,56 @@ version_compare() {
     fi
 }
 
-# GUI decision with timeout and accessibility - COMPLETELY FIXED
+# GUI decision with timeout and accessibility
 decide_action() {
     local current="v$LOCAL_VERSION-$LOCAL_PROFILE"
     local remote="v$REMOTE_VERSION-$REMOTE_PROFILE"
-    local message="Update available!\nCurrent: $current\nNew: $remote\n\nWould you like to update now?"
+    local message="A new system update is available!\n\nCurrent version: $current\nNew version: $remote\n\nWould you like to install the update now?\n\nNote: The system will download and install in the background. You can continue working during the update process."
 
     # Detect session type for better dialog selection
     local session_type="${XDG_SESSION_TYPE:-unknown}"
-    log "Session type: $session_type, Desktop: ${XDG_CURRENT_DESKTOP:-unknown}"
-    log "Available GUI tools: yad=$(command -v yad || echo 'not found'), zenity=$(command -v zenity || echo 'not found'), kdialog=$(command -v kdialog || echo 'not found')"
+    log "Desktop session: $session_type (${XDG_CURRENT_DESKTOP:-unknown})"
+    log "GUI tools available: yad=$(command -v yad || echo 'not found'), zenity=$(command -v zenity || echo 'not found'), kdialog=$(command -v kdialog || echo 'not found')"
 
     # For Wayland sessions, prefer native Wayland dialogs
     if [[ "$session_type" == "wayland" ]]; then
-        log "Detected Wayland session"
+        log "Using Wayland-native dialog system"
         # Try KDE dialog first on Wayland (most reliable for KDE Plasma)
         if [[ "${XDG_CURRENT_DESKTOP,,}" =~ kde ]] && command -v kdialog &>/dev/null; then
-            log "Using kdialog for KDE Wayland session..."
-            if kdialog --title "Shani OS Update" \
+            log "Showing KDE update dialog..."
+            if kdialog --title "Shani OS System Update" \
                        --yesno "$(echo -e "$message")" \
-                       --yes-label "Update Now" \
-                       --no-label "Remind Later" 2>/dev/null; then
-                log "kdialog: user chose Update Now"
+                       --yes-label "Install Update" \
+                       --no-label "Remind Me Later" 2>/dev/null; then
+                log "User chose to install update now"
                 return 0
             else
-                log "kdialog: user chose Remind Later"
+                log "User chose to postpone update"
                 return 1
             fi
         # Try GNOME dialog for GNOME Wayland
         elif [[ "${XDG_CURRENT_DESKTOP,,}" =~ gnome ]] && command -v zenity &>/dev/null; then
-            log "Using zenity for GNOME Wayland session..."
+            log "Showing GNOME update dialog..."
             if zenity --question \
-                      --title="Shani OS Update" \
-                      --width=400 \
+                      --title="Shani OS System Update" \
+                      --width=450 \
                       --text="$(echo -e "$message")" \
-                      --ok-label="Update Now" \
-                      --cancel-label="Remind Later" \
+                      --ok-label="Install Update" \
+                      --cancel-label="Remind Me Later" \
                       --timeout=120 2>/dev/null; then
-                log "zenity dialog: user chose Update Now"
+                log "User chose to install update now"
                 return 0
             else
-                log "zenity dialog: user chose Remind Later or timeout"
+                log "User chose to postpone update or dialog timed out"
                 return 1
             fi
         fi
-        log "No native Wayland dialog available, trying yad with different backends..."
+        log "Falling back to alternative dialog systems..."
     fi
 
     # Try yad with explicit backend selection
     if command -v yad &>/dev/null; then
-        log "Attempting to show yad dialog..."
+        log "Attempting yad update dialog..."
 
         # Try different GDK backends for better compatibility
         local backends=("x11" "wayland" "")
@@ -363,102 +469,198 @@ decide_action() {
             local env_cmd=""
             if [[ -n "$backend" ]]; then
                 env_cmd="GDK_BACKEND=$backend "
-                log "Trying yad with GDK_BACKEND=$backend"
+                log "Trying yad with $backend backend"
             else
-                log "Trying yad with default backend"
+                log "Trying yad with system default backend"
             fi
 
-            if eval "${env_cmd}yad --title='Shani OS Update' \
-                   --width=450 --height=200 \
+            if eval "${env_cmd}yad --title='Shani OS System Update' \
+                   --width=500 --height=220 \
                    --center \
                    --text='$(echo -e \"$message\")' \
                    --image='software-update-available' \
-                   --button='Update Now:0' \
-                   --button='Remind Later:1' \
+                   --button='Install Update:0' \
+                   --button='Remind Me Later:1' \
                    --timeout=120" 2>/dev/null; then
-                log "yad dialog: user chose Update Now (backend: ${backend:-default})"
+                log "User chose to install update (via yad - ${backend:-default})"
                 return 0
             else
                 local exit_code=$?
-                log "yad with backend '${backend:-default}' failed with exit code: $exit_code"
+                log "yad dialog result: exit code $exit_code (backend: ${backend:-default})"
                 if [[ $exit_code -eq 1 ]]; then
-                    log "yad dialog: user chose Remind Later (backend: ${backend:-default})"
+                    log "User chose to postpone update (via yad - ${backend:-default})"
                     return 1
                 elif [[ $exit_code -eq 70 ]]; then
-                    log "yad dialog timed out, treating as 'Remind Later'"
+                    log "Update dialog timed out, treating as postpone request"
                     return 1
                 fi
                 # Continue to try next backend
             fi
         done
 
-        log "All yad attempts failed, trying other dialog methods"
+        log "All yad backends failed, trying other dialog systems"
     fi
 
     # Try zenity if available
     if command -v zenity &>/dev/null; then
-        log "Attempting to show zenity dialog..."
+        log "Attempting zenity update dialog..."
         if zenity --question \
-                  --title="Shani OS Update" \
-                  --width=400 \
+                  --title="Shani OS System Update" \
+                  --width=450 \
                   --text="$(echo -e "$message")" \
-                  --ok-label="Update Now" \
-                  --cancel-label="Remind Later" \
+                  --ok-label="Install Update" \
+                  --cancel-label="Remind Me Later" \
                   --timeout=120 2>/dev/null; then
-            log "zenity dialog: user chose Update Now"
+            log "User chose to install update (via zenity)"
             return 0
         else
-            log "zenity dialog: user chose Remind Later or timeout"
+            log "User chose to postpone update or zenity dialog timed out"
             return 1
         fi
     fi
 
     # Try kdialog if available
     if command -v kdialog &>/dev/null; then
-        log "Attempting to show kdialog..."
-        if kdialog --title "Shani OS Update" \
+        log "Attempting kdialog update dialog..."
+        if kdialog --title "Shani OS System Update" \
                    --yesno "$(echo -e "$message")" \
-                   --yes-label "Update Now" \
-                   --no-label "Remind Later" 2>/dev/null; then
-            log "kdialog: user chose Update Now"
+                   --yes-label "Install Update" \
+                   --no-label "Remind Me Later" 2>/dev/null; then
+            log "User chose to install update (via kdialog)"
             return 0
         else
-            log "kdialog: user chose Remind Later"
+            log "User chose to postpone update (via kdialog)"
             return 1
         fi
     fi
 
     # Fallback to notification + console
-    log "No GUI dialog tools worked, trying fallback methods"
+    log "No GUI dialogs available, trying notification with console fallback"
     if command -v notify-send &>/dev/null; then
-        log "Sending notification..."
+        log "Sending update notification to user..."
         notify-send -u critical \
                    -i software-update-available \
                    "Shani OS Update Available" \
-                   "Current: $current → New: $remote. Check terminal for options." 2>/dev/null || true
+                   "System update ready: $current → $remote\nCheck your terminal for installation options." 2>/dev/null || true
     fi
 
     # Console fallback if no GUI available
     if [[ -t 0 ]] && [[ -t 1 ]]; then
-        log "Using console fallback for user interaction"
-        echo "=== Shani OS Update Available ===" >&2
-        echo "Current: $current" >&2
-        echo "New: $remote" >&2
-        read -rp "Update now? [y/N]: " -t 60 response || response="n"
+        log "Using console interface for update decision"
+        echo "" >&2
+        echo "========================================" >&2
+        echo "    Shani OS System Update Available" >&2
+        echo "========================================" >&2
+        echo "Current version: $current" >&2
+        echo "New version:     $remote" >&2
+        echo "" >&2
+        echo "This update will download and install in the background." >&2
+        echo "You can continue using your system during the process." >&2
+        echo "" >&2
+        read -rp "Install update now? [y/N]: " -t 60 response || response="n"
         case "$response" in
             [Yy]*)
-                log "Console: user chose to update"
+                log "User chose to install update (via console)"
                 return 0
                 ;;
             *)
-                log "Console: user chose not to update"
+                log "User chose to postpone update (via console)"
                 return 1
                 ;;
         esac
     else
-        log "No interactive terminal available, defaulting to 'Remind Later'"
+        log "No interactive interfaces available, defaulting to postpone update"
     fi
 
+    return 1
+}
+
+# Create wrapper script that signals completion
+create_update_wrapper() {
+    local wrapper_script
+    wrapper_script=$(mktemp)
+
+    cat > "$wrapper_script" << 'EOF'
+#!/bin/bash
+# Wrapper script to track shani-deploy completion
+
+readonly STATUS_FILE="$1"
+readonly LOG_FILE="$2"
+
+# Function to log messages
+log_message() {
+    echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"
+}
+
+# Signal that update is starting
+echo "RUNNING" > "$STATUS_FILE"
+log_message "Update started"
+
+# Run the actual update command with systemd-inhibit
+if systemd-inhibit --what=shutdown:sleep:idle:handle-power-key:handle-suspend-key:handle-hibernate-key \
+                   --who='Shani OS Update' \
+                   --why='System update in progress' \
+                   /usr/local/bin/shani-deploy; then
+    echo "SUCCESS" > "$STATUS_FILE"
+    log_message "Update completed successfully"
+    echo "Update completed successfully! You can now close this terminal."
+    echo "Press Enter to continue..."
+    read
+else
+    echo "FAILED" > "$STATUS_FILE"
+    log_message "Update failed"
+    echo "Update failed. Please check the logs."
+    echo "Press Enter to continue..."
+    read
+fi
+EOF
+
+    chmod +x "$wrapper_script"
+    echo "$wrapper_script"
+}
+
+# Wait for update completion by monitoring the status file
+wait_for_update_completion() {
+    local max_wait_time=7200  # 2 hours maximum wait time
+    local check_interval=5    # Check every 5 seconds
+    local elapsed=0
+
+    log "Monitoring system update progress (this may take 10-30 minutes)..."
+    
+    while [[ $elapsed -lt $max_wait_time ]]; do
+        if [[ -f "$UPDATE_STATUS_FILE" ]]; then
+            local status
+            status=$(cat "$UPDATE_STATUS_FILE" 2>/dev/null || echo "UNKNOWN")
+            
+            case "$status" in
+                "SUCCESS")
+                    log "System update completed successfully!"
+                    return 0
+                    ;;
+                "FAILED")
+                    log "System update encountered an error during installation"
+                    return 1
+                    ;;
+                "RUNNING")
+                    # Still running, continue waiting silently
+                    ;;
+                *)
+                    log "Update status unknown: $status"
+                    ;;
+            esac
+        fi
+        
+        sleep $check_interval
+        elapsed=$((elapsed + check_interval))
+        
+        # Log progress every 2 minutes to keep user informed
+        if [[ $((elapsed % 120)) -eq 0 ]]; then
+            local minutes=$((elapsed / 60))
+            log "Update still in progress... ($minutes minutes elapsed)"
+        fi
+    done
+    
+    warn "Update process timed out after $((max_wait_time / 60)) minutes - this may indicate a problem"
     return 1
 }
 
@@ -473,7 +675,7 @@ build_terminal_cmd() {
 
     case "$terminal" in
         gnome-terminal|kgx|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
-            echo "$terminal --title='Shani OS Update' --geometry=100x30 -- bash -c $escaped_cmd"
+            echo "$terminal --title='Shani OS Update' -- bash -c $escaped_cmd"
             ;;
         konsole)
             echo "$terminal --title 'Shani OS Update' -e bash -c $escaped_cmd"
@@ -511,15 +713,15 @@ build_terminal_cmd() {
 
 # Handle post-update actions
 handle_post_update() {
-    log "Handling post-update actions..."
+    log "System update installation completed - handling post-update tasks..."
 
     # Prompt for reboot
-    local reboot_message="Update completed successfully!\n\nA system restart is recommended to ensure all changes take effect."
+    local reboot_message="Congratulations! Your system has been successfully updated.\n\nTo complete the update and ensure all new features work properly, we recommend restarting your computer now.\n\nYou can also restart later, but some improvements may not be active until you do."
     local reboot_now=false
 
     if command -v yad &>/dev/null; then
-        if yad --title="Update Complete" \
-               --width=400 --height=150 \
+        if yad --title="Update Complete - Restart Recommended" \
+               --width=450 --height=180 \
                --center --on-top \
                --text="$(echo -e "$reboot_message")" \
                --image="system-restart" \
@@ -532,7 +734,8 @@ handle_post_update() {
         fi
     elif command -v zenity &>/dev/null; then
         if zenity --question \
-                  --title="Update Complete" \
+                  --title="Update Complete - Restart Recommended" \
+                  --width=450 \
                   --text="$(echo -e "$reboot_message")" \
                   --ok-label="Restart Now" \
                   --cancel-label="Restart Later" \
@@ -542,7 +745,7 @@ handle_post_update() {
             reboot_now=false
         fi
     elif command -v kdialog &>/dev/null; then
-        if kdialog --title "Update Complete" \
+        if kdialog --title "Update Complete - Restart Recommended" \
                    --yesno "$(echo -e "$reboot_message")" \
                    --yes-label "Restart Now" \
                    --no-label "Restart Later" 2>/dev/null; then
@@ -553,8 +756,11 @@ handle_post_update() {
     else
         # Console fallback
         if [[ -t 0 ]] && [[ -t 1 ]]; then
-            echo "Update completed successfully!" >&2
-            read -rp "Restart now to complete the update? [y/N]: " -t 60 response || response="n"
+            echo "" >&2
+            echo "✓ System update completed successfully!" >&2
+            echo "" >&2
+            echo "To activate all new features, a restart is recommended." >&2
+            read -rp "Would you like to restart now? [y/N]: " -t 60 response || response="n"
             case "$response" in
                 [Yy]*) reboot_now=true ;;
                 *) reboot_now=false ;;
@@ -562,38 +768,38 @@ handle_post_update() {
         else
             if command -v notify-send &>/dev/null; then
                 notify-send -u normal \
-                           -i system-restart \
+                           -i software-update-available \
                            "Shani OS Update Complete" \
-                           "System restart recommended to complete update" 2>/dev/null || true
+                           "System successfully updated! Restart when convenient to activate all new features." 2>/dev/null || true
             fi
             reboot_now=false
         fi
     fi
 
     if [[ "$reboot_now" == "true" ]]; then
-        log "Initiating system restart..."
+        log "User requested immediate restart to complete update"
         if pkexec systemctl reboot 2>/dev/null; then
-            log "Restart initiated successfully"
+            log "System restart initiated successfully"
         else
-            warn "Failed to initiate reboot via systemctl, trying shutdown command..."
+            warn "Unable to restart automatically - trying alternative method..."
             if pkexec shutdown -r now 2>/dev/null; then
-                log "Restart initiated successfully via shutdown"
+                log "System restart initiated via shutdown command"
             else
-                warn "Failed to initiate restart - user may need to restart manually"
+                warn "Automatic restart failed - user will need to restart manually"
             fi
         fi
     else
-        log "User chose to restart later"
+        log "User chose to restart later - update installation complete"
         if command -v notify-send &>/dev/null; then
             notify-send -u low \
-                       -i software-update-available \
-                       "Shani OS" \
-                       "Remember to restart your system to complete the update" 2>/dev/null || true
+                       -i dialog-information \
+                       "Shani OS Update Complete" \
+                       "Your system has been updated successfully. Remember to restart when convenient to activate all new features." 2>/dev/null || true
         fi
     fi
 }
 
-# FIXED: Check if update is needed (separate function for clarity)
+# Check if update is needed
 is_update_needed() {
     local local_ver="$1"
     local local_prof="$2"
@@ -608,40 +814,43 @@ is_update_needed() {
         0)
             # Versions are equal - check if profile changed
             if [[ "$local_prof" == "$remote_prof" ]]; then
-                log "System is up-to-date (v$local_ver-$local_prof)"
+                log "Your system is current - no updates available (v$local_ver-$local_prof)"
                 return 1  # No update needed
             else
-                log "Profile change detected: $local_prof → $remote_prof (same version date)"
+                log "Profile update available: switching from '$local_prof' to '$remote_prof' profile (same version date)"
                 return 0  # Update needed for profile change
             fi
             ;;
         1)
-            log "Update available: v$local_ver → v$remote_ver (newer version found)"
+            log "System update available: v$local_ver → v$remote_ver (newer version found)"
             return 0  # Update needed
             ;;
         2)
-            log "Local version v$local_ver is newer than remote v$remote_ver - no update needed"
+            log "Your system is ahead of the available release (v$local_ver vs v$remote_ver)"
             return 1  # No update needed
             ;;
         *)
-            err "Version comparison failed with unexpected result: $comparison_result"
+            err "Unable to compare versions properly (comparison result: $comparison_result)"
             ;;
     esac
 }
 
-# FIXED: Main execution flow with proper continuation
+# Main execution flow with proper continuation and process waiting
 main() {
-    log "Starting Shani OS update checker (version $SCRIPT_VERSION)"
+    log "Shani OS Update Checker starting (v$SCRIPT_VERSION)"
 
     # Initialize
     acquire_lock
     validate_environment
+    
+    # Check boot slot validity early - exit if booted into candidate slot
+    check_boot_slot_validity
 
     # Find terminal early
     if ! TERMINAL=$(find_terminal); then
         err "No suitable terminal emulator found. Please install: gnome-terminal, alacritty, kitty, or xterm"
     fi
-    log "Using terminal: $TERMINAL"
+    log "Terminal for updates: $TERMINAL"
 
     # Read local version info with validation
     LOCAL_VERSION=$(read_file_or_default "$LOCAL_VERSION_FILE" "19700101" "0-9")
@@ -649,23 +858,32 @@ main() {
 
     # Validate local version format
     if ! validate_version_format "$LOCAL_VERSION"; then
-        warn "Invalid local version format: $LOCAL_VERSION, treating as very old version (19700101)"
+        warn "System version format appears corrupted, treating as outdated (fallback: 19700101)"
         LOCAL_VERSION="19700101"
     fi
 
-    log "Local version: v$LOCAL_VERSION-$LOCAL_PROFILE"
+    log "Current system: v$LOCAL_VERSION-$LOCAL_PROFILE"
 
     # Check network connectivity
     if ! check_network; then
-        err "No network connectivity available"
+        warn "Internet connection not available - retrying in 30 seconds..."
+        sleep 30
+        if ! check_network; then
+            err "Unable to connect to the internet after retry - update check cannot proceed"
+        else
+            log "Connection restored - continuing with update check"
+        fi
+    else
+        log "Internet connection confirmed"
     fi
 
     # Fetch remote version info
     local channel_url="$BASE_URL/$LOCAL_PROFILE/$UPDATE_CHANNEL.txt"
     local remote_image
 
+    log "Checking for available updates from Shani OS servers..."
     if ! remote_image=$(fetch_remote_info "$channel_url"); then
-        err "Failed to fetch update information from $channel_url"
+        err "Unable to retrieve update information from server"
     fi
 
     # Parse remote version with enhanced validation
@@ -675,26 +893,26 @@ main() {
 
         # Validate remote version format
         if ! validate_version_format "$REMOTE_VERSION"; then
-            err "Invalid remote version format: $REMOTE_VERSION (not a valid date: YYYYMMDD)"
+            err "Server provided invalid version information: $REMOTE_VERSION (expected format: YYYYMMDD)"
         fi
     else
-        err "Invalid remote image format: '$remote_image' (expected: shanios-YYYYMMDD-PROFILE.zst)"
+        err "Server response format error: '$remote_image' (contact support if this persists)"
     fi
 
-    log "Remote version: v$REMOTE_VERSION-$REMOTE_PROFILE"
+    log "Latest available: v$REMOTE_VERSION-$REMOTE_PROFILE"
 
     # Check if update is needed
-    log "Checking if update is needed..."
+    log "Comparing your system version with available updates..."
     if ! is_update_needed "$LOCAL_VERSION" "$LOCAL_PROFILE" "$REMOTE_VERSION" "$REMOTE_PROFILE"; then
-        log "No update needed, exiting"
+        log "Update check complete - your system is current"
         cleanup_and_exit 0
     fi
 
-    log "Update is needed, proceeding to user decision..."
+    log "Update is recommended - asking for user confirmation..."
 
-    # User decision - FIXED: Handle the decision properly without exiting early
+    # User decision
     if ! decide_action; then
-        log "Update deferred by user. Scheduling reminder in $DEFER_DELAY seconds..."
+        log "Update postponed by user request - setting reminder for later"
 
         if systemctl --user status &>/dev/null; then
             local defer_unit="$LOG_TAG-defer-$(date +%s)"
@@ -703,31 +921,36 @@ main() {
                           --description="Deferred Shani OS update reminder" \
                           --on-active="${DEFER_DELAY}s" \
                           "$0" 2>/dev/null; then
-                log "Reminder scheduled successfully as unit: $defer_unit"
+                log "Update reminder scheduled successfully in $DEFER_DELAY seconds"
             else
-                warn "Failed to schedule reminder"
+                warn "Could not schedule automatic reminder"
             fi
         else
-            warn "Cannot schedule reminder: systemd user session unavailable"
+            warn "Reminder scheduling unavailable - please run update check manually later"
         fi
 
         cleanup_and_exit 0
     fi
 
     # Prepare for update
-    log "User approved update to v$REMOTE_VERSION-$REMOTE_PROFILE"
+    log "User approved update - preparing to install v$REMOTE_VERSION-$REMOTE_PROFILE"
+
+    # Initialize status file
+    echo "INITIALIZING" > "$UPDATE_STATUS_FILE"
+
+    # Create wrapper script for the update process
+    local wrapper_script
+    if ! wrapper_script=$(create_update_wrapper); then
+        err "Unable to prepare update process"
+    fi
 
     # Preserve GUI environment variables
     local display_env="${DISPLAY:-:0}"
     local xauth_env="${XAUTHORITY:-$HOME/.Xauthority}"
     local wayland_display="${WAYLAND_DISPLAY:-}"
 
-    # Build update command with proper error handling
-    local update_cmd='/usr/local/bin/shani-deploy'
-    local inhibit_cmd="systemd-inhibit --what=shutdown:sleep:idle:handle-power-key:handle-suspend-key:handle-hibernate-key --who='Shani OS Update' --why='System update in progress'"
-
-    # Create the complete command to run
-    local complete_cmd="$inhibit_cmd bash -c '$update_cmd || (echo \"Update failed. Press Enter to continue...\"; read)'"
+    # Build the command to run the wrapper script
+    local wrapper_cmd="$wrapper_script '$UPDATE_STATUS_FILE' '$LOG_FILE'"
 
     # For pkexec, we need to preserve environment variables
     local env_vars="DISPLAY='$display_env' XAUTHORITY='$xauth_env'"
@@ -735,33 +958,41 @@ main() {
         env_vars="$env_vars WAYLAND_DISPLAY='$wayland_display'"
     fi
 
-    local pkexec_cmd="pkexec env $env_vars $complete_cmd"
+    local pkexec_cmd="pkexec env $env_vars $wrapper_cmd"
 
     local terminal_cmd
     terminal_cmd=$(build_terminal_cmd "$TERMINAL" "$pkexec_cmd")
 
-    log "Launching update in terminal..."
-    log "Terminal command: $terminal_cmd"
+    log "Starting system update in new terminal window..."
 
-    # Execute update
-    if eval "$terminal_cmd" 2>/dev/null; then
-        log "Update process completed successfully"
+    # Execute update in background and get PID
+    eval "$terminal_cmd" &
+    local terminal_pid=$!
+
+    log "Update process launched (PID: $terminal_pid) - monitoring progress..."
+
+    # Wait for the update process to complete by monitoring the status file
+    if wait_for_update_completion; then
+        log "System update completed successfully!"
+
+        # Clean up wrapper script
+        rm -f "$wrapper_script" 2>/dev/null || true
 
         # Post-update actions
         handle_post_update
     else
-        local exit_code=$?
-        warn "Update process failed or was cancelled (exit code: $exit_code)"
+        local wait_exit_code=$?
+        warn "System update encountered an issue or timed out (code: $wait_exit_code)"
 
-        # Clean up temp script if it exists
-        if [[ -f "$LOG_DIR/temp_update_script" ]]; then
-            local temp_script
-            temp_script=$(cat "$LOG_DIR/temp_update_script" 2>/dev/null || echo "")
-            if [[ -n "$temp_script" ]] && [[ -f "$temp_script" ]]; then
-                rm -f "$temp_script" 2>/dev/null || true
-            fi
-            rm -f "$LOG_DIR/temp_update_script" 2>/dev/null || true
+        # Check if terminal process is still running
+        if kill -0 "$terminal_pid" 2>/dev/null; then
+            warn "Update terminal still active - user may be reviewing error messages"
+            # Give user some more time to see any error messages
+            sleep 10
         fi
+
+        # Clean up wrapper script
+        rm -f "$wrapper_script" 2>/dev/null || true
 
         cleanup_and_exit 1
     fi

@@ -392,6 +392,54 @@ rollback_system() {
 ### Mirror Discovery & Selection  ###
 #####################################
 
+# Known fast SourceForge mirrors (update based on your testing)
+declare -A KNOWN_MIRRORS=(
+    ["autoselect"]="autoselect"  # Let SourceForge choose
+    ["pilotfiber"]="pilotfiber.dl.sourceforge.net"
+    ["netcologne"]="netcologne.dl.sourceforge.net"
+    ["netix"]="netix.dl.sourceforge.net"
+    ["cfhcable"]="cfhcable.dl.sourceforge.net"
+    ["freefr"]="freefr.dl.sourceforge.net"
+    ["downloads"]="downloads.sourceforge.net"
+)
+
+test_mirror_speed() {
+    local mirror_url="$1"
+    local test_size=1048576  # Test with 1MB download
+    
+    log "Testing mirror speed: ${mirror_url}"
+    
+    local start_time end_time duration speed_kbps
+    start_time=$(date +%s%N)
+    
+    # Attempt a partial download to test speed
+    if wget --quiet --timeout=15 --tries=1 --spider "${mirror_url}" 2>/dev/null; then
+        end_time=$(date +%s%N)
+        duration=$(( (end_time - start_time) / 1000000 ))  # milliseconds
+        
+        if (( duration > 0 )); then
+            # Return response time in milliseconds
+            echo "${duration}"
+            return 0
+        fi
+    fi
+    
+    # Failed test
+    echo "999999"
+    return 1
+}
+
+build_mirror_url() {
+    local mirror_host="$1"
+    local file_path="${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}"
+    
+    if [[ "${mirror_host}" == "autoselect" ]]; then
+        echo "https://sourceforge.net/projects/shanios/files/${file_path}/download"
+    else
+        echo "https://${mirror_host}/project/shanios/${file_path}"
+    fi
+}
+
 discover_initial_mirror() {
     local base_url="${1:-}"
     
@@ -446,98 +494,69 @@ find_fastest_mirror() {
     fi
     
     local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
-    declare -A mirror_map
-    local test_mirrors=()
+    local MIRROR_PERF_FILE="${DOWNLOAD_DIR}/mirror_performance.txt"
+    
+    log "Testing SourceForge mirrors for best performance..."
+    
+    declare -A mirror_speeds
     local fastest_mirror=""
     local best_time=999999
     
-    log "Finding fastest SourceForge mirror..."
-    
-    # Discover multiple mirrors through repeated redirect attempts
-    local attempts=0
-    local max_attempts=8
-    
-    while (( attempts < max_attempts )); do
-        local mirror_url=""
+    # Test each known mirror
+    for mirror_name in "${!KNOWN_MIRRORS[@]}"; do
+        local mirror_host="${KNOWN_MIRRORS[$mirror_name]}"
+        local test_url
         
-        # Alternate between wget and curl for discovery
-        if (( attempts % 2 == 0 )); then
-            # Use wget
-            local spider_out
-            spider_out=$(wget --max-redirect=1 --spider -S "${base_url}" 2>&1 || true)
-            mirror_url=$(echo "$spider_out" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
-        else
-            # Use curl
-            mirror_url=$(curl -sL -w '%{url_effective}' -o /dev/null --max-time 10 --max-redirs 1 "${base_url}" 2>/dev/null || echo "")
-        fi
+        test_url=$(build_mirror_url "${mirror_host}")
         
-        # Validate and add mirror if it's unique and valid
-        if [[ -n "${mirror_url}" && "${mirror_url}" =~ ^https?:// ]]; then
-            # Must be an actual mirror, not sourceforge.net
-            if [[ "${mirror_url}" != *"sourceforge.net/projects/shanios/files"* ]]; then
-                local mirror_domain
-                mirror_domain=$(echo "${mirror_url}" | sed -E 's|(https?://[^/]+).*|\1|')
-                
-                if [[ -z "${mirror_map[${mirror_domain}]:-}" ]]; then
-                    mirror_map["${mirror_domain}"]=1
-                    test_mirrors+=("${mirror_url}")
-                    log "Discovered mirror $((${#test_mirrors[@]})): ${mirror_domain}"
-                fi
-            fi
-        fi
+        log "Testing ${mirror_name} mirror (${mirror_host})..."
         
-        ((attempts++))
+        local response_time
+        response_time=$(test_mirror_speed "${test_url}")
         
-        # Stop if we have enough mirrors
-        if (( ${#test_mirrors[@]} >= 5 )); then
-            break
-        fi
-        
-        sleep 1
-    done
-    
-    # If no mirrors found, fall back to direct URL
-    if [[ ${#test_mirrors[@]} -eq 0 ]]; then
-        log "No mirrors discovered, using direct SourceForge URL"
-        echo "${base_url}" > "${MIRROR_FILE}"
-        return 0
-    fi
-    
-    log "Testing ${#test_mirrors[@]} mirror(s) for response time..."
-    
-    # Test each mirror with a small download test
-    for mirror in "${test_mirrors[@]}"; do
-        local start_time end_time duration
-        start_time=$(date +%s%N)
-        
-        # Test with HEAD request and reasonable timeout
-        if wget --spider --quiet --timeout=10 --tries=1 "${mirror}" 2>/dev/null; then
-            end_time=$(date +%s%N)
-            duration=$(( (end_time - start_time) / 1000000 ))
+        if [[ "${response_time}" =~ ^[0-9]+$ ]] && (( response_time < 999999 )); then
+            mirror_speeds["${mirror_name}"]="${response_time}"
+            log "  ${mirror_name}: ${response_time}ms"
             
-            log "Mirror responded in ${duration}ms"
-            
-            if (( duration < best_time )); then
-                best_time=${duration}
-                fastest_mirror="${mirror}"
+            if (( response_time < best_time )); then
+                best_time=${response_time}
+                fastest_mirror="${test_url}"
             fi
         else
-            log "Mirror failed to respond: ${mirror}"
+            log "  ${mirror_name}: FAILED"
         fi
         
         sleep 0.5
     done
     
-    # Select fastest or fall back
-    if [[ -n "${fastest_mirror}" ]]; then
-        echo "${fastest_mirror}" > "${MIRROR_FILE}"
-        log "Selected fastest mirror (${best_time}ms): ${fastest_mirror}"
-    else
-        log "All mirrors failed, using direct SourceForge URL"
-        echo "${base_url}" > "${MIRROR_FILE}"
-    fi
+    # Save performance data for future reference
+    {
+        echo "# Mirror performance test - $(date)"
+        for mirror_name in "${!mirror_speeds[@]}"; do
+            echo "${mirror_name}: ${mirror_speeds[$mirror_name]}ms"
+        done
+    } > "${MIRROR_PERF_FILE}"
     
-    return 0
+    # Select fastest mirror or fall back
+    if [[ -n "${fastest_mirror}" && ${best_time} -lt 999999 ]]; then
+        echo "${fastest_mirror}" > "${MIRROR_FILE}"
+        log "Selected fastest mirror with ${best_time}ms response time"
+        log "Mirror URL: ${fastest_mirror}"
+        return 0
+    else
+        log "WARNING: All mirrors failed testing, trying auto-select fallback"
+        
+        # Try auto-select as last resort
+        local autoselect_url
+        autoselect_url=$(build_mirror_url "autoselect")
+        
+        if discover_initial_mirror "${autoselect_url}"; then
+            return 0
+        fi
+        
+        log "ERROR: All mirror selection methods failed"
+        return 1
+    fi
 }
 
 #####################################

@@ -423,8 +423,9 @@ discover_initial_mirror() {
         fi
     fi
     
-    # Fallback: Use direct URL if mirror discovery failed
-    log "Mirror discovery unsuccessful, using direct SourceForge URL"
+    # Last resort: Use direct URL but log warning
+    log "WARNING: Could not discover any actual mirrors, using direct SourceForge URL as fallback"
+    log "WARNING: Download may be slower than using a mirror"
     echo "${base_url}" > "${MIRROR_FILE}"
     return 0
 }
@@ -669,27 +670,40 @@ download_update() {
     fi
 
     # Discover or use cached mirror
-    if [[ ! -f "${MIRROR_FILE}" ]]; then
+    local mirror_url=""
+    if [[ -f "${MIRROR_FILE}" ]]; then
+        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null || echo "")
+        # Check if it's a direct SourceForge URL (not a mirror)
+        if [[ "${mirror_url}" == *"sourceforge.net/projects/shanios/files"* ]]; then
+            log "Previous mirror file contains direct URL, attempting to find faster mirror..."
+            rm -f "${MIRROR_FILE}"
+            mirror_url=""
+        else
+            log "Using cached mirror URL: ${mirror_url}"
+        fi
+    fi
+    
+    # If no valid mirror cached, discover one
+    if [[ -z "${mirror_url}" ]]; then
         # Try to find fastest mirror, fall back to initial discovery
         if ! find_fastest_mirror; then
             log "Fast mirror selection failed, trying simple discovery..."
-            discover_initial_mirror || {
+            if ! discover_initial_mirror; then
                 log "ERROR: All mirror discovery methods failed"
                 return 1
-            }
+            fi
         fi
+        
+        # Retrieve the discovered mirror URL
+        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null || echo "")
+        
+        if [[ -z "${mirror_url}" ]]; then
+            log "ERROR: No mirror URL available after discovery"
+            return 1
+        fi
+        
+        log "Using discovered mirror URL: ${mirror_url}"
     fi
-
-    # Retrieve stored mirror URL
-    local mirror_url
-    mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null || echo "")
-    
-    if [[ -z "${mirror_url}" ]]; then
-        log "ERROR: No mirror URL available"
-        return 1
-    fi
-    
-    log "Using mirror URL: ${mirror_url}"
 
     # Verify remote file size
     log "Checking remote file size..."

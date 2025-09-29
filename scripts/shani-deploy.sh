@@ -1054,7 +1054,7 @@ download_update() {
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"
     
-    local cleanup_gpg() {
+    cleanup_gpg() {
         export GNUPGHOME="${old_gnupghome}"
         rm -rf "${gpg_temp}"
     }

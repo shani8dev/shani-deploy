@@ -824,7 +824,7 @@ download_update() {
     fi
 
     local missing_cmds=()
-    for cmd in wget sha256sum gpg; do
+    for cmd in wget sha256sum ; do
         if ! command -v "$cmd" &> /dev/null; then
             missing_cmds+=("$cmd")
         fi
@@ -1050,12 +1050,24 @@ download_update() {
         return 1
     fi
     
-    local old_gnupghome="${GNUPGHOME:-}"
+    # Save current GNUPGHOME state properly
+    local old_gnupghome_set=false
+    local old_gnupghome_value=""
+    if [[ -n "${GNUPGHOME:-}" ]]; then
+        old_gnupghome_set=true
+        old_gnupghome_value="${GNUPGHOME}"
+    fi
+    
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"
     
     cleanup_gpg() {
-        export GNUPGHOME="${old_gnupghome}"
+        # Restore GNUPGHOME state properly
+        if [[ "${old_gnupghome_set}" == "true" ]]; then
+            export GNUPGHOME="${old_gnupghome_value}"
+        else
+            unset GNUPGHOME
+        fi
         rm -rf "${gpg_temp}"
     }
     trap cleanup_gpg RETURN

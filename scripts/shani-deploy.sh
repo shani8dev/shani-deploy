@@ -261,7 +261,7 @@ cleanup_downloads() {
     local files latest_file count
     # Find files with names starting with "shanios-" and an extension beginning with ".zst"
     files=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst*" -mtime +7 -printf "%T@ %p\n" | sort -n)
-    count=$(echo "$files" | wc -l)
+    count=$(echo "$files" | grep -c . || echo 0)
     if (( count > 1 )); then
         latest_file=$(echo "$files" | tail -n 1 | cut -d' ' -f2-)
         echo "$files" | while read -r line; do
@@ -393,7 +393,14 @@ rollback_system() {
 #####################################
 
 discover_initial_mirror() {
-    local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
+    local base_url="${1:-}"
+    
+    if [[ -z "${base_url}" ]]; then
+        log "ERROR: base_url is empty in discover_initial_mirror"
+        return 1
+    fi
+    
+    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
     
     log "Performing initial mirror discovery..."
     
@@ -431,8 +438,15 @@ discover_initial_mirror() {
 }
 
 find_fastest_mirror() {
-    local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
-    local -A mirror_map
+    local base_url="${1:-}"
+    
+    if [[ -z "${base_url}" ]]; then
+        log "ERROR: base_url is empty in find_fastest_mirror"
+        return 1
+    fi
+    
+    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
+    declare -A mirror_map
     local test_mirrors=()
     local fastest_mirror=""
     local best_time=999999
@@ -444,7 +458,7 @@ find_fastest_mirror() {
     local max_attempts=8
     
     while (( attempts < max_attempts )); do
-        local mirror_url
+        local mirror_url=""
         
         # Alternate between wget and curl for discovery
         if (( attempts % 2 == 0 )); then
@@ -464,7 +478,7 @@ find_fastest_mirror() {
                 local mirror_domain
                 mirror_domain=$(echo "${mirror_url}" | sed -E 's|(https?://[^/]+).*|\1|')
                 
-                if [[ -z "${mirror_map[${mirror_domain}]}" ]]; then
+                if [[ -z "${mirror_map[${mirror_domain}]:-}" ]]; then
                     mirror_map["${mirror_domain}"]=1
                     test_mirrors+=("${mirror_url}")
                     log "Discovered mirror $((${#test_mirrors[@]})): ${mirror_domain}"
@@ -531,7 +545,7 @@ find_fastest_mirror() {
 #####################################
 
 boot_validation_and_candidate_selection() {
-    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null)
+    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null || echo "")
     CURRENT_SLOT=$(echo "$CURRENT_SLOT" | xargs)
     if [[ -z "$CURRENT_SLOT" ]]; then
         CURRENT_SLOT="blue"
@@ -669,6 +683,9 @@ download_update() {
         return 0
     fi
 
+    # Construct base URL
+    local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
+
     # Discover or use cached mirror
     local mirror_url=""
     if [[ -f "${MIRROR_FILE}" ]]; then
@@ -686,9 +703,9 @@ download_update() {
     # If no valid mirror cached, discover one
     if [[ -z "${mirror_url}" ]]; then
         # Try to find fastest mirror, fall back to initial discovery
-        if ! find_fastest_mirror; then
+        if ! find_fastest_mirror "${base_url}"; then
             log "Fast mirror selection failed, trying simple discovery..."
-            if ! discover_initial_mirror; then
+            if ! discover_initial_mirror "${base_url}"; then
                 log "ERROR: All mirror discovery methods failed"
                 return 1
             fi
@@ -767,7 +784,7 @@ download_update() {
                 log "Attempting to discover new mirror (retry ${mirror_retry_count}/${max_mirror_retries})..."
                 rm -f "${MIRROR_FILE}"
                 
-                if discover_initial_mirror; then
+                if discover_initial_mirror "${base_url}"; then
                     mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null || echo "")
                     if [[ -n "${mirror_url}" ]]; then
                         log "Retrying with new mirror: ${mirror_url}"

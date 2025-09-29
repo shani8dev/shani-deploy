@@ -64,7 +64,7 @@ persist_state() {
         echo "export REMOTE_VERSION=$(printf '%q' "$REMOTE_VERSION")"
         echo "export REMOTE_PROFILE=$(printf '%q' "$REMOTE_PROFILE")"
         echo "export IMAGE_NAME=$(printf '%q' "$IMAGE_NAME")"
-        echo "export STATE_DIR=$(printf '%q' "${STATE_DIR}")" >> "$state_file"
+        echo "export STATE_DIR=$(printf '%q' "${STATE_DIR}")"
         echo "export MARKER_FILE=$(printf '%q' "$MARKER_FILE")"
         # Persist arrays using declare -p
         declare -p CHROOT_BIND_DIRS
@@ -129,46 +129,6 @@ set_environment() {
 }
 
 #####################################
-### Self-Update Section           ###
-#####################################
-
-ORIGINAL_ARGS=("$@")
-
-self_update() {
-    if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
-        export SELF_UPDATE_DONE=1
-        # Persist state before updating
-        persist_state
-
-        local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
-        local temp_script
-        temp_script=$(mktemp)
-
-        if curl -fsSL "$remote_url" -o "$temp_script"; then
-            chmod +x "$temp_script"
-            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
-            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
-        else
-            log "Warning: Unable to fetch remote script; continuing with local version." >&2
-        fi
-        rm -f "$temp_script"
-    fi
-}
-
-#####################################
-### Systemd Inhibit Function      ###
-#####################################
-
-inhibit_system() {
-    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
-        export SYSTEMD_INHIBITED=1
-        log "Inhibiting all system interruptions during update..."
-        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="Updating system" "$0" "$@"
-    fi
-}
-
-#####################################
 ### Logging & Helper Functions    ###
 #####################################
 
@@ -214,6 +174,46 @@ get_booted_subvol() {
         subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
     fi
     echo "${subvol:-blue}"
+}
+
+#####################################
+### Self-Update Section           ###
+#####################################
+
+ORIGINAL_ARGS=("$@")
+
+self_update() {
+    if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
+        export SELF_UPDATE_DONE=1
+        # Persist state before updating
+        persist_state
+
+        local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
+        local temp_script
+        temp_script=$(mktemp)
+
+        if curl -fsSL "$remote_url" -o "$temp_script"; then
+            chmod +x "$temp_script"
+            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
+            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
+        else
+            log "Warning: Unable to fetch remote script; continuing with local version." >&2
+        fi
+        rm -f "$temp_script"
+    fi
+}
+
+#####################################
+### Systemd Inhibit Function      ###
+#####################################
+
+inhibit_system() {
+    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
+        export SYSTEMD_INHIBITED=1
+        log "Inhibiting all system interruptions during update..."
+        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" --why="Updating system" "$0" "$@"
+    fi
 }
 
 #####################################
@@ -270,14 +270,14 @@ cleanup_downloads() {
             # Delete all files except for the latest one
             if [[ "$file" != "$latest_file" ]]; then
                 if rm -f "$file"; then
-                    log "INFO" "Deleted old download: $file"
+                    log "Deleted old download: $file"
                 else
-                    log "ERROR" "Failed to delete old download: $file"
+                    log "Failed to delete old download: $file"
                 fi
             fi
         done
     else
-        log "INFO" "No old downloads to clean up."
+        log "No old downloads to clean up."
     fi
 }
 
@@ -389,70 +389,140 @@ rollback_system() {
 }
 
 #####################################
-### Mirror Selection Function     ###
+### Mirror Discovery & Selection  ###
 #####################################
+
+discover_initial_mirror() {
+    local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
+    
+    log "Performing initial mirror discovery..."
+    
+    # Method 1: Try wget spider with extended redirect following
+    local spider_output final_url
+    spider_output=$(wget --max-redirect=20 --spider -S "${base_url}" 2>&1 || true)
+    final_url=$(echo "$spider_output" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+    
+    if [[ -n "${final_url}" && "${final_url}" =~ ^https?:// ]]; then
+        # Validate the URL actually points to a mirror (not sourceforge.net)
+        if [[ "${final_url}" != *"sourceforge.net/projects/shanios/files"* ]]; then
+            echo "${final_url}" > "${MIRROR_FILE}"
+            log "Discovered mirror via wget: ${final_url}"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Try curl if wget didn't work
+    log "Trying curl for mirror discovery..."
+    final_url=$(curl -sL -w '%{url_effective}' -o /dev/null --max-time 15 --max-redirs 20 "${base_url}" 2>/dev/null || echo "")
+    
+    if [[ -n "${final_url}" && "${final_url}" =~ ^https?:// ]]; then
+        if [[ "${final_url}" != *"sourceforge.net/projects/shanios/files"* ]]; then
+            echo "${final_url}" > "${MIRROR_FILE}"
+            log "Discovered mirror via curl: ${final_url}"
+            return 0
+        fi
+    fi
+    
+    # Fallback: Use direct URL if mirror discovery failed
+    log "Mirror discovery unsuccessful, using direct SourceForge URL"
+    echo "${base_url}" > "${MIRROR_FILE}"
+    return 0
+}
 
 find_fastest_mirror() {
     local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
+    local -A mirror_map
     local test_mirrors=()
     local fastest_mirror=""
     local best_time=999999
     
-    log "INFO" "Finding fastest SourceForge mirror..."
+    log "Finding fastest SourceForge mirror..."
     
-    # Get list of available mirrors by following redirects multiple times
-    for i in {1..5}; do
+    # Discover multiple mirrors through repeated redirect attempts
+    local attempts=0
+    local max_attempts=8
+    
+    while (( attempts < max_attempts )); do
         local mirror_url
-        mirror_url=$(wget --max-redirect=1 --spider -S "${base_url}" 2>&1 | 
-                    grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
         
-        if [[ -n "${mirror_url}" && "${mirror_url}" != *"sourceforge.net"* ]]; then
-            # Extract just the base mirror domain
-            local mirror_base
-            mirror_base=$(echo "${mirror_url}" | sed 's|/.*||')
-            if [[ ! " ${test_mirrors[*]} " =~ " ${mirror_base} " ]]; then
-                test_mirrors+=("${mirror_url}")
+        # Alternate between wget and curl for discovery
+        if (( attempts % 2 == 0 )); then
+            # Use wget
+            local spider_out
+            spider_out=$(wget --max-redirect=1 --spider -S "${base_url}" 2>&1 || true)
+            mirror_url=$(echo "$spider_out" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+        else
+            # Use curl
+            mirror_url=$(curl -sL -w '%{url_effective}' -o /dev/null --max-time 10 --max-redirs 1 "${base_url}" 2>/dev/null || echo "")
+        fi
+        
+        # Validate and add mirror if it's unique and valid
+        if [[ -n "${mirror_url}" && "${mirror_url}" =~ ^https?:// ]]; then
+            # Must be an actual mirror, not sourceforge.net
+            if [[ "${mirror_url}" != *"sourceforge.net/projects/shanios/files"* ]]; then
+                local mirror_domain
+                mirror_domain=$(echo "${mirror_url}" | sed -E 's|(https?://[^/]+).*|\1|')
+                
+                if [[ -z "${mirror_map[${mirror_domain}]}" ]]; then
+                    mirror_map["${mirror_domain}"]=1
+                    test_mirrors+=("${mirror_url}")
+                    log "Discovered mirror $((${#test_mirrors[@]})): ${mirror_domain}"
+                fi
             fi
         fi
         
-        # Add small delay between requests
+        ((attempts++))
+        
+        # Stop if we have enough mirrors
+        if (( ${#test_mirrors[@]} >= 5 )); then
+            break
+        fi
+        
         sleep 1
     done
     
-    # If we didn't find any mirrors, fall back to original method
+    # If no mirrors found, fall back to direct URL
     if [[ ${#test_mirrors[@]} -eq 0 ]]; then
-        log "WARN" "No mirrors found, using direct SourceForge URL"
+        log "No mirrors discovered, using direct SourceForge URL"
         echo "${base_url}" > "${MIRROR_FILE}"
         return 0
     fi
     
-    # Test each mirror with a small HEAD request
+    log "Testing ${#test_mirrors[@]} mirror(s) for response time..."
+    
+    # Test each mirror with a small download test
     for mirror in "${test_mirrors[@]}"; do
         local start_time end_time duration
         start_time=$(date +%s%N)
         
-        if timeout 10 wget --spider --quiet "${mirror}" 2>/dev/null; then
+        # Test with HEAD request and reasonable timeout
+        if wget --spider --quiet --timeout=10 --tries=1 "${mirror}" 2>/dev/null; then
             end_time=$(date +%s%N)
-            duration=$(( (end_time - start_time) / 1000000 )) # Convert to milliseconds
+            duration=$(( (end_time - start_time) / 1000000 ))
             
-            log "INFO" "Mirror test: ${mirror} - ${duration}ms"
+            log "Mirror responded in ${duration}ms"
             
             if (( duration < best_time )); then
-                best_time=$duration
+                best_time=${duration}
                 fastest_mirror="${mirror}"
             fi
         else
-            log "WARN" "Mirror failed: ${mirror}"
+            log "Mirror failed to respond: ${mirror}"
         fi
+        
+        sleep 0.5
     done
     
+    # Select fastest or fall back
     if [[ -n "${fastest_mirror}" ]]; then
         echo "${fastest_mirror}" > "${MIRROR_FILE}"
-        log "INFO" "Selected fastest mirror (${best_time}ms): ${fastest_mirror}"
+        log "Selected fastest mirror (${best_time}ms): ${fastest_mirror}"
     else
-        log "WARN" "All mirrors failed, using direct SourceForge URL"
+        log "All mirrors failed, using direct SourceForge URL"
         echo "${base_url}" > "${MIRROR_FILE}"
     fi
+    
+    return 0
 }
 
 #####################################
@@ -506,7 +576,7 @@ fetch_update_info() {
     if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
         REMOTE_VERSION="${BASH_REMATCH[1]}"
         REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        log "parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
+        log "Parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
     else
         die "Error: Invalid update format in ${UPDATE_CHANNEL}.txt. Received: '${IMAGE_NAME}'"
     fi
@@ -548,19 +618,19 @@ fetch_update_info() {
 }
 
 download_update() {
-    log "INFO" "Starting download process for ${IMAGE_NAME}"
+    log "Starting download process for ${IMAGE_NAME}"
 
     # Check essential commands
     for cmd in wget sha256sum gpg; do
         if ! command -v "$cmd" &> /dev/null; then
-            log "ERROR" "Required command not found: $cmd"
+            log "ERROR: Required command not found: $cmd"
             return 1
         fi
     done
 
     # Validate and switch to download directory
-    mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR" "Could not create download directory"; return 1; }
-    cd "${DOWNLOAD_DIR}" || { log "ERROR" "Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
+    mkdir -p "${DOWNLOAD_DIR}" || { log "ERROR: Could not create download directory"; return 1; }
+    cd "${DOWNLOAD_DIR}" || { log "ERROR: Could not access download directory: ${DOWNLOAD_DIR}"; return 1; }
 
     # Configuration for wget options
     local WGET_OPTS=(
@@ -594,155 +664,189 @@ download_update() {
 
     # Skip download if already verified and exists
     if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
-        log "INFO" "Found existing verified download: ${IMAGE_NAME}"
+        log "Found existing verified download: ${IMAGE_NAME}"
         return 0
     fi
 
-    # Find fastest mirror if not already present
+    # Discover or use cached mirror
     if [[ ! -f "${MIRROR_FILE}" ]]; then
-        find_fastest_mirror
+        # Try to find fastest mirror, fall back to initial discovery
+        if ! find_fastest_mirror; then
+            log "Fast mirror selection failed, trying simple discovery..."
+            discover_initial_mirror || {
+                log "ERROR: All mirror discovery methods failed"
+                return 1
+            }
+        fi
     fi
 
     # Retrieve stored mirror URL
     local mirror_url
-    mirror_url=$(cat "${MIRROR_FILE}")
-    log "INFO" "Using mirror URL: ${mirror_url}"
+    mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null || echo "")
+    
+    if [[ -z "${mirror_url}" ]]; then
+        log "ERROR: No mirror URL available"
+        return 1
+    fi
+    
+    log "Using mirror URL: ${mirror_url}"
 
     # Verify remote file size
-    log "INFO" "Checking remote file size"
+    log "Checking remote file size..."
     local expected_size
     expected_size=$(wget -q --spider -S "${mirror_url}" 2>&1 | awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r')
     if [[ ! "${expected_size}" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
-        log "ERROR" "Invalid remote file size: ${expected_size}"
+        log "ERROR: Invalid remote file size: ${expected_size}"
         return 1
     fi
-    log "INFO" "Expected file size: ${expected_size} bytes"
+    log "Expected file size: ${expected_size} bytes"
 
     # Update channel tracking
-    echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR" "Failed to write channel file"; return 1; }
+    echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR: Failed to write channel file"; return 1; }
 
     # Download loop with resume and exponential backoff
     local attempt=0
     local current_size=0
+    local mirror_retry_count=0
+    local max_mirror_retries=3
+    
     while (( attempt++ < MAX_ATTEMPTS )); do
-        log "INFO" "Download attempt ${attempt}/${MAX_ATTEMPTS}"
+        log "Download attempt ${attempt}/${MAX_ATTEMPTS}"
 
-		# Check partial file before resuming
-		if [[ -f "${image_file_part}" ]]; then
-			current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-			
-			if (( current_size > expected_size )); then
-				log "WARN" "Partial file size (${current_size}) exceeds expected (${expected_size}) — deleting"
-				rm -f "${image_file_part}"
-				current_size=0
-			elif (( current_size > 0 )); then
-				log "INFO" "Partial file found: ${current_size}/${expected_size} bytes — resuming"
-			else
-				log "WARN" "Partial file exists but is empty — deleting"
-				rm -f "${image_file_part}"
-				current_size=0
-			fi
-		fi
-
-		# Resume or fresh download
-        wget "${WGET_OPTS[@]}" -O "${image_file_part}" "${mirror_url}"
-
-        current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-        if (( current_size == expected_size )); then
-            log "INFO" "Download completed successfully"
-            if ! mv "${image_file_part}" "${image_file}"; then
-                log "ERROR" "File rename failed"
-                return 1
+        # Check partial file before resuming
+        if [[ -f "${image_file_part}" ]]; then
+            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
+            
+            if (( current_size > expected_size )); then
+                log "Partial file size (${current_size}) exceeds expected (${expected_size}) — deleting"
+                rm -f "${image_file_part}"
+                current_size=0
+            elif (( current_size > 0 )); then
+                log "Partial file found: ${current_size}/${expected_size} bytes — resuming"
+            else
+                log "Partial file exists but is empty — deleting"
+                rm -f "${image_file_part}"
+                current_size=0
             fi
-            break
-        else
-            log "WARN" "Download incomplete (${current_size}/${expected_size})"
         fi
 
-        # Calculate delay with exponential backoff and a slight random offset
+        # Attempt download with current mirror
+        if wget "${WGET_OPTS[@]}" -O "${image_file_part}" "${mirror_url}"; then
+            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
+            
+            if (( current_size == expected_size )); then
+                log "Download completed successfully"
+                if ! mv "${image_file_part}" "${image_file}"; then
+                    log "ERROR: File rename failed"
+                    return 1
+                fi
+                break
+            else
+                log "Download incomplete (${current_size}/${expected_size})"
+            fi
+        else
+            log "Download failed with mirror: ${mirror_url}"
+            
+            # Try to find a new mirror after multiple failures
+            if (( mirror_retry_count < max_mirror_retries )); then
+                ((mirror_retry_count++))
+                log "Attempting to discover new mirror (retry ${mirror_retry_count}/${max_mirror_retries})..."
+                rm -f "${MIRROR_FILE}"
+                
+                if discover_initial_mirror; then
+                    mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null || echo "")
+                    if [[ -n "${mirror_url}" ]]; then
+                        log "Retrying with new mirror: ${mirror_url}"
+                        continue
+                    fi
+                fi
+            fi
+        fi
+
+        # Calculate delay with exponential backoff
         if (( attempt < MAX_ATTEMPTS )); then
             local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
             (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
             delay=$(( delay + (RANDOM % 10 - 5) ))
             (( delay < 1 )) && delay=1
-            log "WARN" "Retrying in ${delay}s"
+            log "Retrying in ${delay}s..."
             sleep "${delay}"
         fi
     done
 
     if (( current_size != expected_size )); then
-        log "ERROR" "Failed to complete download after ${MAX_ATTEMPTS} attempts"
+        log "ERROR: Failed to complete download after ${MAX_ATTEMPTS} attempts"
         return 1
     fi
 
     # Fetch verification files from the original source
-    log "INFO" "Fetching verification files"
+    log "Fetching verification files..."
     local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
     if ! wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}"; then
-        log "ERROR" "SHA256 fetch failed"
+        log "ERROR: SHA256 fetch failed"
         return 1
     fi
     if ! wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}"; then
-        log "ERROR" "ASC fetch failed"
+        log "ERROR: ASC fetch failed"
         return 1
     fi
 
     # Validate SHA256 checksum
-    log "INFO" "Verifying SHA256 checksum"
-	if ! sha256sum -c "${sha_file}" --status; then
-		log "ERROR" "Checksum validation failed — removing corrupt files"
-		rm -f "${image_file}" "${image_file_part}"
-		return 1
-	fi
+    log "Verifying SHA256 checksum..."
+    if ! sha256sum -c "${sha_file}" --status; then
+        log "ERROR: Checksum validation failed — removing corrupt files"
+        rm -f "${image_file}" "${image_file_part}"
+        return 1
+    fi
 
     # GPG verification using a temporary GNUPGHOME
     local gpg_temp
-    gpg_temp=$(mktemp -d) || { log "ERROR" "Failed to create GPG temp dir"; return 1; }
+    gpg_temp=$(mktemp -d) || { log "ERROR: Failed to create GPG temp dir"; return 1; }
     # Save previous GNUPGHOME to restore later (if needed)
     local old_gnupghome="${GNUPGHOME:-}"
     export GNUPGHOME="${gpg_temp}"
     chmod 700 "${gpg_temp}"
     # Set a trap to clean up the temporary directory
-    trap 'rm -rf "${gpg_temp}"' EXIT
+    trap 'rm -rf "${gpg_temp}"' RETURN
 
-    log "INFO" "Importing GPG key ${GPG_KEY_ID}"
+    log "Importing GPG key ${GPG_KEY_ID}..."
     local key_imported=0
     for keyserver in "${GPG_KEYSERVERS[@]}"; do
         if gpg --batch --quiet --keyserver "${keyserver}" --recv-keys "${GPG_KEY_ID}"; then
-            log "INFO" "Imported key from ${keyserver}"
+            log "Imported key from ${keyserver}"
             key_imported=1
             break
         fi
     done
     if [[ ${key_imported} -ne 1 ]]; then
-        log "ERROR" "Failed to import GPG key ${GPG_KEY_ID} from all keyservers"
+        log "ERROR: Failed to import GPG key ${GPG_KEY_ID} from all keyservers"
         return 1
     fi
 
-    log "INFO" "Verifying GPG signature"
-	if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
-		log "ERROR" "GPG signature verification failed — removing corrupt files"
-		rm -f "${image_file}" "${image_file_part}"
-		return 1
-	fi
+    log "Verifying GPG signature..."
+    if ! gpg --batch --verify "${asc_file}" "${image_file}"; then
+        log "ERROR: GPG signature verification failed — removing corrupt files"
+        rm -f "${image_file}" "${image_file_part}"
+        return 1
+    fi
 
-    # Clear the GPG cleanup trap now that we're done with GPG operations
-    trap - EXIT
+    # Cleanup GPG temp directory
+    trap - RETURN
     rm -rf "${gpg_temp}"
-    # Optionally restore previous GNUPGHOME if needed
+    # Restore previous GNUPGHOME if needed
     export GNUPGHOME="${old_gnupghome}"
 
     # Final cleanup on success: remove mirror reference and mark download as verified
-    log "INFO" "Removing mirror reference after successful verification"
+    log "Removing mirror reference after successful verification..."
     rm -f "${MIRROR_FILE}"
 
     if ! touch "${MARKER_FILE}"; then
-        log "ERROR" "Failed to create verification marker"
+        log "ERROR: Failed to create verification marker"
         return 1
     fi
 
-    log "INFO" "Download and verification successful"
+    log "Download and verification successful"
     return 0
 }
 
@@ -813,7 +917,6 @@ finalize_update() {
     log "Deployment finalized. Next boot will use @${CANDIDATE_SLOT} (version: ${REMOTE_VERSION})"
 }
 
-
 #####################################
 ### Usage & Parameter Parsing     ###
 #####################################
@@ -876,54 +979,53 @@ main() {
     check_root
     check_internet
     set_environment
- 	self_update "$@"
+    self_update "$@"
     inhibit_system "$@"
    
-	dry_run=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
+    dry_run=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
     
-	if [[ -f "${STATE_DIR}/channel" ]]; then
-		UPDATE_CHANNEL=$(cat "${STATE_DIR}/channel")
-	else
-		UPDATE_CHANNEL="stable"
-	fi
+    if [[ -f "${STATE_DIR}/channel" ]]; then
+        UPDATE_CHANNEL=$(cat "${STATE_DIR}/channel")
+    else
+        UPDATE_CHANNEL="stable"
+    fi
 
-	if [[ -f "${STATE_DIR}/cleanup" ]]; then
-		log "Initiating manual cleanup..."
+    if [[ -f "${STATE_DIR}/cleanup" ]]; then
+        log "Initiating manual cleanup..."
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || die "Failed to mount for cleanup"
         cleanup_old_backups
         safe_umount "$MOUNT_DIR" || true
         cleanup_downloads
         exit 0
-	fi
+    fi
 
     if [[ ! -f /data/boot-ok ]]; then
         log "Boot failure detected: /data/boot-ok missing. Initiating rollback..."
         rollback_system
     fi
     
-	if [[ -f "${STATE_DIR}/rollback" ]]; then
-		rollback_system
-		exit 0
-	fi
+    if [[ -f "${STATE_DIR}/rollback" ]]; then
+        rollback_system
+        exit 0
+    fi
 
     boot_validation_and_candidate_selection
     pre_update_checks
     fetch_update_info
     
-	if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
-		log "Skipping download and deployment (system is up-to-date)."
-	else
-		log "System deployment is outdated. Starting download and deployment..."
-		download_update || die "Download update failed."
-		deploy_btrfs_update || die "Deployment of update failed."
-	fi
+    if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
+        log "Skipping download and deployment (system is up-to-date)."
+    else
+        log "System deployment is outdated. Starting download and deployment..."
+        download_update || die "Download update failed."
+        deploy_btrfs_update || die "Deployment of update failed."
+    fi
 
-	if [[ -f "${DEPLOY_PENDING}" ]]; then
-		log "Deployment pending marker found. Resuming finalization..."
-		finalize_update || die "Finalization of update failed."
-	fi
-
+    if [[ -f "${DEPLOY_PENDING}" ]]; then
+        log "Deployment pending marker found. Resuming finalization..."
+        finalize_update || die "Finalization of update failed."
+    fi
 }
 
 main "$@"

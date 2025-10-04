@@ -51,7 +51,6 @@ readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
 readonly STALL_THRESHOLD=3
-readonly MIN_DOWNLOAD_SIZE=104857600
 
 # Tool availability
 declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0
@@ -187,16 +186,17 @@ validate_nonempty() {
 validate_url() {
     local url="$1"
     [[ -n "$url" ]] || return 1
-    [[ "$url" =~ ^https?://[a-zA-Z0-9.-]+(/.*)?$ ]]
+    [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || return 1
+    [[ "${#url}" -ge 10 ]] || return 1
+    return 0
 }
 
 is_valid_mirror() {
     local url="$1"
     validate_url "$url" || return 1
-    # Exclude SourceForge project URLs (we want actual CDN mirrors)
     [[ "$url" != *"sourceforge.net/projects/shanios/files"* ]] || return 1
-    # URL should contain the image filename or end with /download
-    [[ "$url" == *"${IMAGE_NAME}"* || "$url" =~ /download$ ]]
+    [[ "$url" == *"${IMAGE_NAME}"* || "$url" =~ /download$ ]] || return 1
+    return 0
 }
 
 file_nonempty() {
@@ -290,7 +290,6 @@ discover_mirror_from_redirect() {
         effective_url=$(curl -sL -w '%{url_effective}' -o /dev/null --max-time 10 --max-redirs 5 "$base_url" 2>/dev/null)
         
         if [[ -n "$effective_url" ]] && validate_url "$effective_url" && [[ "$effective_url" != "$base_url" ]]; then
-            # Verify discovered mirror is not a SourceForge project URL
             if [[ "$effective_url" != *"/projects/shanios/files"* ]]; then
                 log_verbose "Discovered: $(echo "$effective_url" | sed -E 's|https://([^/]+).*|\1|')"
                 echo "$effective_url"
@@ -323,7 +322,6 @@ select_mirror() {
     validate_nonempty "$filepath" "file path"
     validate_nonempty "$filename" "filename"
     
-    # Check cache first
     local cache_file="$DOWNLOAD_DIR/.mirror_cache"
     if [[ -f "$cache_file" ]]; then
         local cached_mirror cached_time
@@ -339,7 +337,6 @@ select_mirror() {
         rm -f "$cache_file"
     fi
     
-    # Test static mirrors first (fast, predictable)
     local tested=0 max_tests=3
     
     for mirror_base in "${SF_MIRRORS[@]}"; do
@@ -358,7 +355,6 @@ select_mirror() {
         fi
     done
     
-    # Fallback: Use SourceForge's dynamic redirect
     log_warn "Static mirrors unresponsive, trying dynamic discovery"
     local sf_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
     
@@ -370,7 +366,6 @@ select_mirror() {
         return 0
     fi
     
-    # Final fallback: direct URL (SourceForge will redirect)
     log_warn "Dynamic discovery failed, using direct URL"
     echo "$sf_url"
 }
@@ -380,7 +375,7 @@ select_mirror() {
 #####################################
 
 validate_download() {
-    local file="$1" expected_min_size="${2:-$MIN_DOWNLOAD_SIZE}"
+    local file="$1" expected_min_size="${2:-10485760}"
     
     [[ -f "$file" ]] || { log_error "File does not exist: $file"; return 1; }
     
@@ -392,15 +387,13 @@ validate_download() {
         return 1
     fi
     
-    # Check for HTML error pages
     if file "$file" 2>/dev/null | grep -qi "html\|xml"; then
         log_error "Downloaded file appears to be HTML/XML (error page)"
         return 1
     fi
     
-    # Verify zstd format
-    if ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
-        log_warn "File may not be zstd compressed (check format)"
+    if [[ "$file" == *.zst ]] && ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
+        log_warn "File extension is .zst but content doesn't appear to be zstd compressed"
     fi
     
     log_verbose "Download validation passed: $(format_bytes $size)"

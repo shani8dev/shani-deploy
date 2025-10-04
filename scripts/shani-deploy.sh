@@ -971,7 +971,7 @@ verify_and_create_subvolumes() {
         log_success "All required subvolumes exist"
         safe_umount "$MOUNT_DIR"
         return 0
-    fi
+    }
     
     log "Creating ${#missing[@]} missing subvolume(s): ${missing[*]}"
     

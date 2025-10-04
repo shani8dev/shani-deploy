@@ -70,6 +70,7 @@ readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 readonly CHROOT_STATIC_DIRS=(data etc var)
 
 readonly -a SF_MIRRORS=(
+    "https://master.dl.sourceforge.net"
     "https://downloads.sourceforge.net"
     "https://netix.dl.sourceforge.net"
     "https://phoenixnap.dl.sourceforge.net"

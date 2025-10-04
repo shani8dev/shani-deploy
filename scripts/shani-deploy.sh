@@ -59,11 +59,12 @@ CHROOT_STATIC_DIRS=(data etc var)
 
 # Curated SourceForge mirrors (fast, reliable)
 readonly -a SF_MIRRORS=(
-    "https://downloads.sourceforge.net"
+    "https://master.dl.sourceforge.net"
     "https://netix.dl.sourceforge.net"
     "https://liquidtelecom.dl.sourceforge.net"
     "https://phoenixnap.dl.sourceforge.net"
     "https://gigenet.dl.sourceforge.net"
+    "https://downloads.sourceforge.net"
 )
 
 #####################################

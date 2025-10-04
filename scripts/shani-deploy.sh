@@ -3,7 +3,7 @@
 # shanios-deploy.sh
 #
 # Enhanced Blue/Green Btrfs Deployment Script for shanios
-# With native Btrfs deduplication for storage optimization
+# With native Btrfs deduplication and swapfile hibernation support
 #
 # Usage: ./shanios-deploy.sh [OPTIONS]
 #
@@ -21,7 +21,6 @@
 #####################################
 
 if [ -n "$SHANIOS_DEPLOY_STATE_FILE" ] && [ -f "$SHANIOS_DEPLOY_STATE_FILE" ]; then
-    # Restore all persisted variables (scalars and arrays)
     source "$SHANIOS_DEPLOY_STATE_FILE"
     rm -f "$SHANIOS_DEPLOY_STATE_FILE"
 fi
@@ -30,11 +29,9 @@ fi
 ### State Persistence Function    ###
 #####################################
 
-# Create a temporary directory for state files
 STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
 export STATE_DIR
 
-# Cleanup trap to remove the state directory on exit
 cleanup() {
     if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
         rm -rf "${STATE_DIR}"
@@ -46,7 +43,6 @@ persist_state() {
     local state_file
     state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
     {
-        # Persist scalar variables using printf %q to handle quoting
         [[ -v OS_NAME ]] && echo "export OS_NAME=$(printf '%q' "$OS_NAME")"
         [[ -v DOWNLOAD_DIR ]] && echo "export DOWNLOAD_DIR=$(printf '%q' "$DOWNLOAD_DIR")"
         [[ -v ZSYNC_CACHE_DIR ]] && echo "export ZSYNC_CACHE_DIR=$(printf '%q' "$ZSYNC_CACHE_DIR")"
@@ -68,7 +64,6 @@ persist_state() {
         [[ -v STATE_DIR ]] && echo "export STATE_DIR=$(printf '%q' "${STATE_DIR}")"
         [[ -v MARKER_FILE ]] && echo "export MARKER_FILE=$(printf '%q' "$MARKER_FILE")"
         [[ -v UPDATE_CHANNEL ]] && echo "export UPDATE_CHANNEL=$(printf '%q' "$UPDATE_CHANNEL")"
-        # Persist arrays by serializing to proper format
         if [[ -v CHROOT_BIND_DIRS ]]; then
             echo "CHROOT_BIND_DIRS=()"
             for dir in "${CHROOT_BIND_DIRS[@]}"; do
@@ -100,19 +95,12 @@ readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
 readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 
-# Mirror discovery configuration
 readonly MIRROR_DISCOVERY_TIMEOUT=15
 readonly MIRROR_TEST_TIMEOUT=10
 readonly MAX_MIRROR_DISCOVERIES=8
 readonly MIN_MIRRORS_NEEDED=3
-
-# Valid profiles (add more as needed)
-readonly -a VALID_PROFILES=("standard" "minimal" "server" "desktop")
-
-# Maximum recursion depth for systemd-inhibit
 readonly MAX_INHIBIT_DEPTH=2
 
-# Global state variables
 declare -g LOCAL_VERSION
 declare -g LOCAL_PROFILE
 declare -g BACKUP_NAME=""
@@ -122,9 +110,9 @@ declare -g REMOTE_VERSION=""
 declare -g REMOTE_PROFILE=""
 declare -g IMAGE_NAME=""
 declare -g UPDATE_CHANNEL="stable"
+declare -g DRY_RUN="no"
 MARKER_FILE=""
 
-# Arrays for chroot bind mounts
 CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp /sys/firmware/efi/efivars)
 CHROOT_STATIC_DIRS=(data etc var)
 
@@ -161,11 +149,6 @@ set_environment() {
     LOCAL_VERSION=$(< /etc/shani-version)
     LOCAL_PROFILE=$(< /etc/shani-profile)
     
-    # Validate version is numeric
-    if [[ ! "$LOCAL_VERSION" =~ ^[0-9]+$ ]]; then
-        die "LOCAL_VERSION must be numeric, got: $LOCAL_VERSION"
-    fi
-    
     if [[ -z "$LOCAL_VERSION" ]]; then
         die "LOCAL_VERSION is empty"
     fi
@@ -189,11 +172,11 @@ die() {
 }
 
 run_cmd() {
-    if [[ "${dry_run:-no}" == "yes" ]]; then
+    if [[ "${DRY_RUN}" == "yes" ]]; then
         log "[Dry Run] $*"
+        return 0
     else
         log "Executing: $*"
-        # Direct execution instead of eval for security
         "$@" || die "Command failed: $*"
     fi
 }
@@ -206,9 +189,7 @@ safe_mount() {
     fi
     
     if ! findmnt -M "$tgt" &>/dev/null; then
-        if ! mount -o "$opts" "$src" "$tgt"; then
-            die "Mount failed: $src -> $tgt (opts: $opts)"
-        fi
+        run_cmd mount -o "$opts" "$src" "$tgt"
         log "Mounted $tgt with options ($opts)"
     fi
 }
@@ -222,6 +203,11 @@ safe_umount() {
     fi
     
     if findmnt -M "$tgt" &>/dev/null; then
+        if [[ "${DRY_RUN}" == "yes" ]]; then
+            log "[Dry Run] Would unmount $tgt"
+            return 0
+        fi
+        
         if umount -R "$tgt"; then
             log "Unmounted $tgt"
             return 0
@@ -261,7 +247,7 @@ self_update() {
 
         if curl -fsSL "$remote_url" -o "$temp_script"; then
             chmod +x "$temp_script"
-            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
+            log "Self-update: Running updated script..."
             exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
         else
             log "Warning: Unable to fetch remote script; continuing with local version." >&2
@@ -275,7 +261,6 @@ self_update() {
 #####################################
 
 inhibit_system() {
-    # Track recursion depth to prevent infinite loops
     local inhibit_depth="${SYSTEMD_INHIBIT_DEPTH:-0}"
     
     if (( inhibit_depth >= MAX_INHIBIT_DEPTH )); then
@@ -310,17 +295,13 @@ cleanup_old_backups() {
         fi
         
         backup_count=${#backups[@]}
-        # Keep 2 most recent backups for safety
         if (( backup_count > 2 )); then
             log "Keeping the 2 most recent backups and deleting the older $((backup_count-2)) backup(s) for slot '${slot}'."
             for (( i=2; i<backup_count; i++ )); do
                 backup="${backups[i]}"
                 if [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]]; then
-                    if btrfs subvolume delete "$MOUNT_DIR/@${backup}"; then
-                        log "Deleted old backup: @${backup}"
-                    else
-                        log "Failed to delete backup: @${backup}"
-                    fi
+                    run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backup}"
+                    log "Deleted old backup: @${backup}"
                 else
                     log "Skipping deletion for backup with unexpected name format: ${backup}"
                 fi
@@ -342,11 +323,8 @@ cleanup_downloads() {
             local file
             file=$(echo "$line" | cut -d' ' -f2-)
             if [[ "$file" != "$latest_file" ]]; then
-                if rm -f "$file"; then
-                    log "Deleted old download: $file"
-                else
-                    log "Failed to delete old download: $file"
-                fi
+                run_cmd rm -f "$file"
+                log "Deleted old download: $file"
             fi
         done
     else
@@ -412,9 +390,13 @@ generate_uki_common() {
     prepare_chroot_env "$slot"
     log "Generating Secure Boot UKI for slot ${slot} using external gen-efi script..."
     
-    if ! chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot"; then
-        cleanup_chroot_env
-        die "UKI generation failed for slot ${slot}"
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would generate UKI for slot ${slot}"
+    else
+        if ! chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot"; then
+            cleanup_chroot_env
+            die "UKI generation failed for slot ${slot}"
+        fi
     fi
     
     cleanup_chroot_env
@@ -450,10 +432,9 @@ rollback_system() {
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     
     local failed_slot previous_slot
-    # Use consistent fallback logic
     if [[ -f "$MOUNT_DIR/@data/current-slot" ]]; then
         failed_slot=$(< "$MOUNT_DIR/@data/current-slot")
-        failed_slot="${failed_slot// /}"  # Trim whitespace
+        failed_slot="${failed_slot// /}"
     else
         log "WARNING: Current slot marker missing, using booted slot"
         failed_slot=$(get_booted_subvol)
@@ -461,7 +442,7 @@ rollback_system() {
     
     if [[ -f "$MOUNT_DIR/@data/previous-slot" ]]; then
         previous_slot=$(< "$MOUNT_DIR/@data/previous-slot")
-        previous_slot="${previous_slot// /}"  # Trim whitespace
+        previous_slot="${previous_slot// /}"
     else
         previous_slot=$([[ "$failed_slot" == "blue" ]] && echo "green" || echo "blue")
     fi
@@ -478,10 +459,10 @@ rollback_system() {
     failed_path="$MOUNT_DIR/@${failed_slot}"
     backup_path="$MOUNT_DIR/@${BACKUP_NAME}"
     
-    btrfs property set -ts "$failed_path" ro false &>/dev/null || true
-    btrfs subvolume delete "$failed_path" || die "Failed to delete slot ${failed_slot}"
-    btrfs subvolume snapshot "$backup_path" "$failed_path" || die "Failed to restore slot ${failed_slot}"
-    btrfs property set -ts "$failed_path" ro true
+    run_cmd btrfs property set -ts "$failed_path" ro false
+    run_cmd btrfs subvolume delete "$failed_path"
+    run_cmd btrfs subvolume snapshot "$backup_path" "$failed_path"
+    run_cmd btrfs property set -ts "$failed_path" ro true
     
     log "Updating active slot marker to previous slot: ${previous_slot}..."
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
@@ -489,7 +470,7 @@ rollback_system() {
     
     generate_uki_common "$previous_slot"
     log "Rollback complete. Rebooting system..."
-    reboot
+    [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 
 #####################################
@@ -764,7 +745,6 @@ optimize_storage() {
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     
-    # Verify both slots exist
     if ! btrfs subvolume show "$MOUNT_DIR/@blue" &>/dev/null || \
        ! btrfs subvolume show "$MOUNT_DIR/@green" &>/dev/null; then
         log "Skipping optimization: both slots not present"
@@ -772,27 +752,24 @@ optimize_storage() {
         return 0
     fi
     
-    # Check for duperemove
     if ! command -v duperemove &>/dev/null; then
         log "WARNING: duperemove not installed (add to package list for 50-70% space savings)"
         safe_umount "$MOUNT_DIR"
         return 0
     fi
     
-    # Get size before
     local before=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | tail -1 | awk '{print $1}')
     
-    # Run deduplication using native FIDEDUPERANGE ioctl
-    # -d: dedupe (don't just report)
-    # -h: use hash file for faster repeated runs
-    # -r: recursive
     log "Running Btrfs extent deduplication (this may take a few minutes)..."
-    duperemove -dhr \
-        --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
-        "$MOUNT_DIR/@blue" \
-        "$MOUNT_DIR/@green" &>/dev/null
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would run duperemove on blue/green slots"
+    else
+        duperemove -dhr \
+            --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
+            "$MOUNT_DIR/@blue" \
+            "$MOUNT_DIR/@green" &>/dev/null
+    fi
     
-    # Get size after and report savings
     local after=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | tail -1 | awk '{print $1}')
     
     if [[ -n "$before" ]] && [[ -n "$after" ]] && (( before > after )); then
@@ -819,23 +796,18 @@ parse_candidate_fstab_subvolumes() {
         return 1
     fi
     
-    # Extract subvolume names from fstab
     while IFS= read -r line; do
-        # Skip comments and empty lines
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$line" ]] && continue
         
-        # Look for Btrfs lines with subvol=@<name> option
         if [[ "$line" =~ LABEL=shani_root ]] && [[ "$line" =~ subvol=@([a-zA-Z0-9_]+) ]]; then
             local subvol="${BASH_REMATCH[1]}"
-            # Skip blue/green as they're the root subvolumes
             if [[ "$subvol" != "blue" && "$subvol" != "green" ]]; then
                 subvols+=("$subvol")
             fi
         fi
     done < "$fstab_file"
     
-    # Remove duplicates and sort
     local -a unique_subvols=($(printf '%s\n' "${subvols[@]}" | sort -u))
     
     printf '%s\n' "${unique_subvols[@]}"
@@ -847,7 +819,6 @@ verify_and_create_required_subvolumes() {
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     
-    # Read fstab from candidate slot
     local candidate_fstab="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/fstab"
     
     if [[ ! -f "$candidate_fstab" ]]; then
@@ -856,7 +827,6 @@ verify_and_create_required_subvolumes() {
         return 0
     fi
     
-    # Parse required subvolumes from candidate's fstab
     mapfile -t required_subvols < <(parse_candidate_fstab_subvolumes "$candidate_fstab")
     
     if [[ ${#required_subvols[@]} -eq 0 ]]; then
@@ -868,15 +838,12 @@ verify_and_create_required_subvolumes() {
     log "Candidate slot requires ${#required_subvols[@]} subvolume(s): ${required_subvols[*]}"
     
     local -a missing_subvols=()
-    
-    # Check which subvolumes are missing
     for subvol in "${required_subvols[@]}"; do
         if ! btrfs subvolume show "$MOUNT_DIR/@${subvol}" &>/dev/null; then
             missing_subvols+=("$subvol")
         fi
     done
     
-    # If any are missing, create them
     if [[ ${#missing_subvols[@]} -gt 0 ]]; then
         log "Found ${#missing_subvols[@]} missing subvolume(s): ${missing_subvols[*]}"
         log "Creating missing subvolumes to prevent boot failure..."
@@ -884,48 +851,88 @@ verify_and_create_required_subvolumes() {
         for subvol in "${missing_subvols[@]}"; do
             log "Creating @${subvol}..."
             
-            if ! btrfs subvolume create "$MOUNT_DIR/@${subvol}"; then
-                log "ERROR: Failed to create @${subvol}"
-                safe_umount "$MOUNT_DIR"
-                die "Cannot proceed - subvolume creation failed"
-            fi
+            run_cmd btrfs subvolume create "$MOUNT_DIR/@${subvol}"
             
-            # Special handling for swap (disable CoW)
-            if [[ "$subvol" == "swap" ]]; then
-                if chattr +C "$MOUNT_DIR/@${subvol}" 2>/dev/null; then
-                    log "Disabled CoW on @swap subvolume"
-                else
-                    log "WARNING: Failed to disable CoW on @swap"
-                fi
-                
-                # Create swapfile if it doesn't exist
-                local swapfile="$MOUNT_DIR/@${subvol}/swapfile"
-                if [[ ! -f "$swapfile" ]]; then
-                    log "Creating swapfile..."
-                    dd if=/dev/zero of="$swapfile" bs=1M count=4096 status=none 2>/dev/null || \
-                        log "WARNING: Failed to create swapfile"
-                    chmod 600 "$swapfile" 2>/dev/null
-                    mkswap "$swapfile" &>/dev/null || log "WARNING: Failed to format swapfile"
-                fi
-            fi
-            
-            # Create directory structures based on subvolume purpose
             case "$subvol" in
+                swap)
+                    log "Setting up @swap subvolume for hibernation..."
+                    
+                    if [[ "${DRY_RUN}" == "yes" ]]; then
+                        log "[Dry Run] Would disable CoW and create swapfile"
+                    else
+                        if chattr +C "$MOUNT_DIR/@${subvol}" 2>/dev/null; then
+                            log "Disabled CoW on @swap subvolume"
+                        else
+                            log "WARNING: Failed to disable CoW on @swap"
+                        fi
+                        
+                        local swapfile="$MOUNT_DIR/@${subvol}/swapfile"
+                        if [[ ! -f "$swapfile" ]]; then
+                            log "Creating swapfile..."
+                            
+                            local mem_mb
+                            mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+                            
+                            # Check available space on the filesystem
+                            local available_mb
+                            available_mb=$(df -BM "$MOUNT_DIR" | awk 'NR==2 {gsub(/M/,""); print $4}')
+                            
+                            # Need at least mem_mb + 2GB buffer for safety
+                            local required_mb=$((mem_mb + 2048))
+                            
+                            if (( available_mb < required_mb )); then
+                                log "WARNING: Insufficient space for full-size swapfile"
+                                log "Available: ${available_mb}MB, Required: ${required_mb}MB"
+                                
+                                # Try to create smaller swapfile (50% of RAM if space allows)
+                                local fallback_mb=$((mem_mb / 2))
+                                local fallback_required=$((fallback_mb + 1024))
+                                
+                                if (( available_mb >= fallback_required )); then
+                                    log "Creating reduced swapfile: ${fallback_mb}MB (50% of RAM)"
+                                    mem_mb=$fallback_mb
+                                else
+                                    log "ERROR: Not enough space even for reduced swapfile. Skipping."
+                                    continue
+                                fi
+                            fi
+                            
+                            if btrfs filesystem mkswapfile --size "${mem_mb}M" "$swapfile" 2>/dev/null; then
+                                log "Created swapfile: ${mem_mb}M"
+                                chmod 600 "$swapfile"
+                            else
+                                log "WARNING: btrfs mkswapfile unavailable, using fallback"
+                                if dd if=/dev/zero of="$swapfile" bs=1M count="$mem_mb" status=none 2>/dev/null; then
+                                    chmod 600 "$swapfile" 2>/dev/null
+                                    mkswap "$swapfile" &>/dev/null || log "WARNING: Failed to format swapfile"
+                                    log "Created swapfile using dd: ${mem_mb}M"
+                                else
+                                    log "ERROR: Failed to create swapfile"
+                                    rm -f "$swapfile"
+                                fi
+                            fi
+                        fi
+                    fi
+                    ;;
+                    
                 data)
                     log "Creating overlay structure in @data..."
-                    mkdir -p "$MOUNT_DIR/@data/overlay/etc/lower"
-                    mkdir -p "$MOUNT_DIR/@data/overlay/etc/upper"
-                    mkdir -p "$MOUNT_DIR/@data/overlay/etc/work"
-                    mkdir -p "$MOUNT_DIR/@data/overlay/var/lower"
-                    mkdir -p "$MOUNT_DIR/@data/overlay/var/upper"
-                    mkdir -p "$MOUNT_DIR/@data/overlay/var/work"
-                    mkdir -p "$MOUNT_DIR/@data/downloads"
-                    
-                    # Ensure slot markers exist
-                    [[ ! -f "$MOUNT_DIR/@data/current-slot" ]] && \
-                        echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot"
-                    [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]] && \
-                        echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot"
+                    if [[ "${DRY_RUN}" == "yes" ]]; then
+                        log "[Dry Run] Would create @data overlay structure"
+                    else
+                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/lower"
+                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/upper"
+                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/work"
+                        mkdir -p "$MOUNT_DIR/@data/overlay/var/lower"
+                        mkdir -p "$MOUNT_DIR/@data/overlay/var/upper"
+                        mkdir -p "$MOUNT_DIR/@data/overlay/var/work"
+                        mkdir -p "$MOUNT_DIR/@data/downloads"
+                        
+                        [[ ! -f "$MOUNT_DIR/@data/current-slot" ]] && \
+                            echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot"
+                        [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]] && \
+                            echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot"
+                    fi
                     ;;
             esac
         done
@@ -947,12 +954,10 @@ analyze_storage_usage() {
     echo ""
     echo "=== Btrfs Storage Analysis ==="
     
-    # Show filesystem usage
     echo ""
     echo "1. Filesystem Overview:"
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/   /' || echo "   Unable to read filesystem info"
     
-    # Show subvolume sizes
     echo ""
     echo "2. Individual Subvolume Sizes (uncompressed):"
     for subvol in blue green data; do
@@ -969,7 +974,6 @@ analyze_storage_usage() {
         fi
     done
     
-    # Show combined exclusive size (actual space used)
     echo ""
     echo "3. Actual Space Used (after sharing/deduplication):"
     if btrfs subvolume show "$MOUNT_DIR/@blue" &>/dev/null && btrfs subvolume show "$MOUNT_DIR/@green" &>/dev/null; then
@@ -977,7 +981,6 @@ analyze_storage_usage() {
         if [[ -n "$combined" ]]; then
             echo "   Blue + Green combined: $(numfmt --to=iec $combined 2>/dev/null || echo $combined)"
             
-            # Calculate sharing efficiency
             local blue_size=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
             local green_size=$(btrfs filesystem du -s "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
             if [[ -n "$blue_size" ]] && [[ -n "$green_size" ]] && (( blue_size + green_size > 0 )); then
@@ -993,7 +996,6 @@ analyze_storage_usage() {
         echo "   Both slots not present - cannot calculate"
     fi
     
-    # Show compression statistics if available
     if command -v compsize &>/dev/null; then
         echo ""
         echo "4. Compression Statistics:"
@@ -1004,7 +1006,6 @@ analyze_storage_usage() {
         echo "4. Compression Statistics: (install 'compsize' for details)"
     fi
     
-    # Show dedupe database info if exists
     if [[ -f "$MOUNT_DIR/@data/.dedupe.db" ]]; then
         local db_size=$(stat -c%s "$MOUNT_DIR/@data/.dedupe.db" 2>/dev/null || echo 0)
         echo ""
@@ -1023,7 +1024,7 @@ analyze_storage_usage() {
 
 boot_validation_and_candidate_selection() {
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null || echo "")
-    CURRENT_SLOT="${CURRENT_SLOT// /}"  # Trim whitespace
+    CURRENT_SLOT="${CURRENT_SLOT// /}"
     if [[ -z "$CURRENT_SLOT" ]]; then
         CURRENT_SLOT="blue"
     fi
@@ -1051,7 +1052,7 @@ pre_update_checks() {
         die "Not enough disk space: ${free_space_mb} MB available; ${MIN_FREE_SPACE_MB} MB required."
     fi
     log "Disk space is sufficient: ${free_space_mb} MB available."
-    mkdir -p "$DOWNLOAD_DIR" "$ZSYNC_CACHE_DIR"
+    run_cmd mkdir -p "$DOWNLOAD_DIR" "$ZSYNC_CACHE_DIR"
 }
 
 fetch_update_info() {
@@ -1066,19 +1067,13 @@ fetch_update_info() {
     if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
         REMOTE_VERSION="${BASH_REMATCH[1]}"
         REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        
-        # Validate remote version is reasonable (not absurdly large)
-        if (( REMOTE_VERSION > 99999 )); then
-            die "Error: Invalid remote version number: ${REMOTE_VERSION}"
-        fi
-        
         log "Parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
     else
         die "Error: Invalid update format in ${UPDATE_CHANNEL}.txt. Received: '${IMAGE_NAME}'"
     fi
 
     if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-        log "Local system is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Proceeding to verify candidate update slot..."
+        log "Local system is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Proceeding to verify candidate slot..."
         
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
@@ -1095,10 +1090,10 @@ fetch_update_info() {
                     log "Candidate slot is up-to-date (${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Skipping deployment."
                     touch "${STATE_DIR}/skip-deployment"
                 else
-                    log "Mismatch detected in candidate slot: found ${CANDIDATE_VERSION} (${CANDIDATE_PROFILE}) vs expected ${REMOTE_VERSION} (${REMOTE_PROFILE}). Deploying new update."
+                    log "Mismatch in candidate slot: found ${CANDIDATE_VERSION} (${CANDIDATE_PROFILE}) vs expected ${REMOTE_VERSION} (${REMOTE_PROFILE}). Deploying update."
                 fi
             else
-                log "Candidate slot missing version/profile details. Deploying new update."
+                log "Candidate slot missing version/profile details. Deploying update."
             fi
         else
             log "No candidate subvolume '@${CANDIDATE_SLOT}' found. Exiting update process."
@@ -1107,31 +1102,21 @@ fetch_update_info() {
         fi
         safe_umount "$MOUNT_DIR"
     else
-        log "Local system version (${LOCAL_VERSION}, ${LOCAL_PROFILE}) differs from remote update (${REMOTE_VERSION}, ${REMOTE_PROFILE}). Initiating update process."
+        log "Local system version (${LOCAL_VERSION}, ${LOCAL_PROFILE}) differs from remote (${REMOTE_VERSION}, ${REMOTE_PROFILE}). Initiating update."
     fi
 }
 
 download_update() {
     log "Starting download process for ${IMAGE_NAME}"
 
-    if [[ -z "${IMAGE_NAME}" ]]; then
-        log "ERROR: IMAGE_NAME is not set"
-        return 1
-    fi
-    
-    if [[ -z "${DOWNLOAD_DIR}" ]]; then
-        log "ERROR: DOWNLOAD_DIR is not set"
-        return 1
-    fi
-    
-    if [[ -z "${REMOTE_PROFILE}" || -z "${REMOTE_VERSION}" ]]; then
-        log "ERROR: REMOTE_PROFILE or REMOTE_VERSION not set"
+    if [[ -z "${IMAGE_NAME}" || -z "${DOWNLOAD_DIR}" || -z "${REMOTE_PROFILE}" || -z "${REMOTE_VERSION}" ]]; then
+        log "ERROR: Required variables not set"
         return 1
     fi
 
     local missing_cmds=()
-    for cmd in wget sha256sum ; do
-        if ! command -v "$cmd" &> /dev/null; then
+    for cmd in wget sha256sum; do
+        if ! command -v "$cmd" &>/dev/null; then
             missing_cmds+=("$cmd")
         fi
     done
@@ -1141,10 +1126,7 @@ download_update() {
         return 1
     fi
 
-    if ! mkdir -p "${DOWNLOAD_DIR}"; then
-        log "ERROR: Could not create download directory: ${DOWNLOAD_DIR}"
-        return 1
-    fi
+    run_cmd mkdir -p "${DOWNLOAD_DIR}"
     
     if ! cd "${DOWNLOAD_DIR}"; then
         log "ERROR: Could not access download directory: ${DOWNLOAD_DIR}"
@@ -1198,7 +1180,6 @@ download_update() {
     fi
 
     local mirror_url=""
-    # Use race-condition safe mirror file reading
     mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
     if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
         log "Using cached mirror: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
@@ -1247,6 +1228,12 @@ download_update() {
     if ! echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}"; then
         log "ERROR: Failed to write channel file: ${UPDATE_CHANNEL_FILE}"
         return 1
+    fi
+
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would download ${IMAGE_NAME} from mirror"
+        log "[Dry Run] Would verify SHA256 and GPG signature"
+        return 0
     fi
 
     local attempt=0
@@ -1355,7 +1342,6 @@ download_update() {
         return 1
     fi
     
-    # Save current GNUPGHOME state properly
     local old_gnupghome_set=false
     local old_gnupghome_value=""
     if [[ -v GNUPGHOME ]]; then
@@ -1367,7 +1353,6 @@ download_update() {
     chmod 700 "${gpg_temp}"
     
     cleanup_gpg() {
-        # Restore GNUPGHOME state properly
         if [[ "${old_gnupghome_set}" == "true" ]]; then
             export GNUPGHOME="${old_gnupghome_value}"
         else
@@ -1429,54 +1414,72 @@ deploy_btrfs_update() {
     if btrfs subvolume list "$MOUNT_DIR" | grep -q "path @${CANDIDATE_SLOT}\$"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
         log "Creating backup of candidate slot @${CANDIDATE_SLOT} as @${BACKUP_NAME}..."
-        btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || die "Backup snapshot failed"
-        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false || die "Failed to clear read-only property"
-        btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Failed to delete candidate slot"
+        run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}"
+        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
+        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     fi
     
     local temp_subvol="$MOUNT_DIR/temp_update"
     if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "temp_update"; then
         log "Deleting existing temporary subvolume temp_update..."
-        [[ -d "$temp_subvol/shanios_base" ]] && btrfs subvolume delete "$temp_subvol/shanios_base" || log "Failed to delete nested subvolume shanios_base"
-        btrfs subvolume delete "$temp_subvol" || log "Failed to delete temporary subvolume temp_update"
+        if [[ -d "$temp_subvol/shanios_base" ]]; then
+            run_cmd btrfs subvolume delete "$temp_subvol/shanios_base"
+        fi
+        run_cmd btrfs subvolume delete "$temp_subvol"
     fi
     
-    btrfs subvolume create "$temp_subvol" || die "Failed to create temporary subvolume"
+    run_cmd btrfs subvolume create "$temp_subvol"
     log "Receiving update image into temporary subvolume..."
     
-    # Use bash pipeline with proper error handling
-    if ! zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | btrfs receive "$temp_subvol"; then
-        die "Image extraction failed"
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would extract ${IMAGE_NAME} to temporary subvolume"
+    else
+        if ! zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | btrfs receive "$temp_subvol"; then
+            die "Image extraction failed"
+        fi
     fi
     
     log "Creating candidate snapshot from temporary update..."
-    btrfs subvolume snapshot "$temp_subvol/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Snapshot creation failed"
-    btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true || die "Failed to set candidate slot to read-only"
+    run_cmd btrfs subvolume snapshot "$temp_subvol/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
+    
     log "Deleting temporary subvolume..."
-    [[ -d "$temp_subvol/shanios_base" ]] && btrfs subvolume delete "$temp_subvol/shanios_base" || log "Failed to delete nested subvolume shanios_base"
-    btrfs subvolume delete "$temp_subvol" || log "Failed to delete temporary subvolume"
+    if [[ -d "$temp_subvol/shanios_base" ]]; then
+        run_cmd btrfs subvolume delete "$temp_subvol/shanios_base"
+    fi
+    run_cmd btrfs subvolume delete "$temp_subvol"
     safe_umount "$MOUNT_DIR"
-    touch "$DEPLOY_PENDING"
+    
+    if [[ "${DRY_RUN}" == "no" ]]; then
+        touch "$DEPLOY_PENDING"
+    fi
 }
 
 finalize_update() {
     log "Finalizing deployment..."
 
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would finalize deployment and switch to slot ${CANDIDATE_SLOT}"
+        return 0
+    fi
+
     echo "$CURRENT_SLOT" > /data/previous-slot
     echo "$CANDIDATE_SLOT" > /data/current-slot
 
-    # CRITICAL: Verify subvolumes exist BEFORE generating bootloader
-    # This prevents boot failures if fstab was updated with new subvolumes
     verify_and_create_required_subvolumes || die "Failed to verify/create required subvolumes"
 
     log "Generating Secure Boot UKI for new deployment..."
     generate_uki_common "$CANDIDATE_SLOT"
-    [[ -f "$DEPLOY_PENDING" ]] && { rm -f "$DEPLOY_PENDING"; log "Removed deployment pending marker."; }
+    
+    [[ -f "$DEPLOY_PENDING" ]] && { 
+        rm -f "$DEPLOY_PENDING"
+        log "Removed deployment pending marker."
+    }
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     [[ -n "$BACKUP_NAME" ]] && {
-        btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" &>/dev/null
+        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}"
         log "Deleted backup @${BACKUP_NAME}"
     }
     cleanup_old_backups
@@ -1485,7 +1488,6 @@ finalize_update() {
     echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/old.txt"
     cleanup_downloads
 
-    # Run storage optimization after successful deployment
     optimize_storage
 
     log "Deployment finalized. Next boot will use @${CANDIDATE_SLOT} (version: ${REMOTE_VERSION})"
@@ -1561,7 +1563,7 @@ main() {
     self_update "$@"
     inhibit_system "$@"
    
-    dry_run=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
+    DRY_RUN=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
     
     if [[ -f "${STATE_DIR}/channel" ]]; then
         UPDATE_CHANNEL=$(cat "${STATE_DIR}/channel")
@@ -1569,7 +1571,6 @@ main() {
         UPDATE_CHANNEL="stable"
     fi
 
-    # Handle storage info request
     if [[ -f "${STATE_DIR}/storage-info" ]]; then
         log "Showing storage information..."
         analyze_storage_usage
@@ -1579,13 +1580,13 @@ main() {
     if [[ -f "${STATE_DIR}/cleanup" ]]; then
         log "Initiating manual cleanup..."
         mkdir -p "$MOUNT_DIR"
-        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || die "Failed to mount for cleanup"
-        cleanup_old_backups
-        safe_umount "$MOUNT_DIR" || true
+        if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
+            cleanup_old_backups
+            safe_umount "$MOUNT_DIR"
+        fi
         cleanup_downloads
-        # Clean dedupe database on manual cleanup
         if [[ -f "/data/.dedupe.db" ]]; then
-            rm -f "/data/.dedupe.db"
+            run_cmd rm -f "/data/.dedupe.db"
             log "Removed deduplication database"
         fi
         exit 0
@@ -1607,7 +1608,6 @@ main() {
     
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
         log "Skipping download and deployment (system is up-to-date)."
-        # Still run optimization if both slots exist
         mkdir -p "$MOUNT_DIR"
         if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
             if btrfs subvolume show "$MOUNT_DIR/@blue" &>/dev/null && \

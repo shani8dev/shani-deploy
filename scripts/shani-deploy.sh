@@ -45,8 +45,7 @@ readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 
-readonly MIRROR_TEST_TIMEOUT=8
-readonly MIRROR_CACHE_TTL=3600
+readonly MIRROR_CACHE_TTL=86400  # 24 hours
 readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
@@ -67,15 +66,6 @@ declare -g DEPLOYMENT_START_TIME="" SKIP_SELF_UPDATE="no"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 readonly CHROOT_STATIC_DIRS=(data etc var)
-
-readonly -a SF_MIRRORS=(
-    "https://master.dl.sourceforge.net"
-    "https://downloads.sourceforge.net"
-    "https://netix.dl.sourceforge.net"
-    "https://phoenixnap.dl.sourceforge.net"
-    "https://liquidtelecom.dl.sourceforge.net"
-    "https://gigenet.dl.sourceforge.net"
-)
 
 readonly E_SUCCESS=0
 readonly E_GENERAL=1
@@ -191,14 +181,6 @@ validate_url() {
     return 0
 }
 
-is_valid_mirror() {
-    local url="$1"
-    validate_url "$url" || return 1
-    [[ "$url" != *"sourceforge.net/projects/shanios/files"* ]] || return 1
-    [[ "$url" == *"${IMAGE_NAME}"* || "$url" =~ /download$ ]] || return 1
-    return 0
-}
-
 file_nonempty() {
     [[ -f "$1" ]] && (( $(stat -c%s "$1" 2>/dev/null || echo 0) > 0 ))
 }
@@ -260,114 +242,65 @@ get_btrfs_available_mb() {
 }
 
 #####################################
-### Mirror Selection & Discovery  ###
+### Simplified Mirror Logic       ###
 #####################################
 
-test_mirror() {
-    local url="$1"
-    validate_url "$url" || return 1
-    
-    if (( HAS_CURL )); then
-        local code
-        code=$(curl -I --max-time "$MIRROR_TEST_TIMEOUT" -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
-        [[ "$code" =~ ^(200|302)$ ]] && return 0
-    fi
-    
-    (( HAS_WGET )) && wget --spider --timeout="$MIRROR_TEST_TIMEOUT" --tries=1 -q "$url" 2>/dev/null && return 0
-    
-    return 1
-}
-
-discover_mirror_from_redirect() {
-    local base_url="$1"
-    
-    validate_url "$base_url" || return 1
-    
-    log_verbose "Discovering mirror via redirect..."
-    
-    if (( HAS_CURL )); then
-        local effective_url
-        effective_url=$(curl -sL -w '%{url_effective}' -o /dev/null --max-time 10 --max-redirs 5 "$base_url" 2>/dev/null)
-        
-        if [[ -n "$effective_url" ]] && validate_url "$effective_url" && [[ "$effective_url" != "$base_url" ]]; then
-            if [[ "$effective_url" != *"/projects/shanios/files"* ]]; then
-                log_verbose "Discovered: $(echo "$effective_url" | sed -E 's|https://([^/]+).*|\1|')"
-                echo "$effective_url"
-                return 0
-            fi
-        fi
-    fi
-    
-    if (( HAS_WGET )); then
-        local effective_url
-        effective_url=$(wget --max-redirect=5 --spider -S --timeout=10 --tries=1 "$base_url" 2>&1 | \
-            grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
-        
-        if [[ -n "$effective_url" ]] && validate_url "$effective_url" && [[ "$effective_url" != "$base_url" ]]; then
-            if [[ "$effective_url" != *"/projects/shanios/files"* ]]; then
-                log_verbose "Discovered: $(echo "$effective_url" | sed -E 's|https://([^/]+).*|\1|')"
-                echo "$effective_url"
-                return 0
-            fi
-        fi
-    fi
-    
-    return 1
-}
-
-select_mirror() {
+get_mirror_url() {
     local project="$1" filepath="$2" filename="$3"
     
     validate_nonempty "$project" "project name"
     validate_nonempty "$filepath" "file path"
     validate_nonempty "$filename" "filename"
     
-    local cache_file="$DOWNLOAD_DIR/.mirror_cache"
-    if [[ -f "$cache_file" ]]; then
-        local cached_mirror cached_time
-        if read -r cached_mirror cached_time < "$cache_file" 2>/dev/null; then
-            if (( $(date +%s) - cached_time < MIRROR_CACHE_TTL )); then
-                if test_mirror "$cached_mirror"; then
-                    log_verbose "Using cached mirror"
-                    echo "$cached_mirror"
-                    return 0
-                fi
+    local mirror_cache="$DOWNLOAD_DIR/mirror.url"
+    
+    # Check if we have a valid cached mirror URL
+    if [[ -f "$mirror_cache" ]]; then
+        local cached_time
+        cached_time=$(stat -c %Y "$mirror_cache" 2>/dev/null || echo 0)
+        local current_time=$(date +%s)
+        
+        if (( current_time - cached_time < MIRROR_CACHE_TTL )); then
+            local cached_url
+            cached_url=$(< "$mirror_cache")
+            if validate_url "$cached_url"; then
+                log_verbose "Using cached mirror URL"
+                echo "$cached_url"
+                return 0
+            else
+                log_warn "Cached mirror URL is invalid, rediscovering..."
+                rm -f "$mirror_cache"
             fi
+        else
+            log_verbose "Mirror cache expired, rediscovering..."
         fi
-        rm -f "$cache_file"
     fi
     
-    local tested=0 max_tests=3
+    # Discover new mirror URL using SourceForge redirect
+    log "Discovering mirror URL from SourceForge..."
     
-    for mirror_base in "${SF_MIRRORS[@]}"; do
-        ((tested++))
-        (( tested > max_tests )) && break
-        
-        local mirror_url="${mirror_base}/project/${project}/${filepath}/${filename}"
-        
-        log_verbose "Testing mirror: $(echo "$mirror_url" | sed -E 's|https://([^/]+).*|\1|')"
-        
-        if test_mirror "$mirror_url"; then
-            log_success "Selected mirror: $(echo "$mirror_url" | sed -E 's|https://([^/]+).*|\1|')"
-            echo "$mirror_url $(date +%s)" > "$cache_file"
-            echo "$mirror_url"
-            return 0
-        fi
-    done
+    local sf_url="https://downloads.sourceforge.net/project/${project}/${filepath}/${filename}"
+    local discovered_url=""
     
-    log_warn "Static mirrors unresponsive, trying dynamic discovery"
-    local sf_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
-    
-    local discovered
-    if discovered=$(discover_mirror_from_redirect "$sf_url"); then
-        log_success "Dynamic mirror: $(echo "$discovered" | sed -E 's|https://([^/]+).*|\1|')"
-        echo "$discovered $(date +%s)" > "$cache_file"
-        echo "$discovered"
-        return 0
+    if (( HAS_CURL )); then
+        log_verbose "Using curl to discover mirror"
+        discovered_url=$(curl -sL -w '%{url_effective}' -o /dev/null -I "$sf_url" 2>/dev/null)
+    elif (( HAS_WGET )); then
+        log_verbose "Using wget to discover mirror"
+        discovered_url=$(wget --spider -S --max-redirect 0 "$sf_url" 2>&1 | grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r')
     fi
     
-    log_warn "Dynamic discovery failed, using direct URL"
-    echo "$sf_url"
+    if [[ -z "$discovered_url" ]] || ! validate_url "$discovered_url"; then
+        log_warn "Failed to discover mirror via redirect, using direct URL"
+        discovered_url="$sf_url"
+    fi
+    
+    # Save the discovered mirror URL
+    mkdir -p "$DOWNLOAD_DIR"
+    echo "$discovered_url" > "$mirror_cache"
+    log_success "Mirror URL cached: $(echo "$discovered_url" | sed -E 's|https://([^/]+).*|\1|')"
+    
+    echo "$discovered_url"
 }
 
 #####################################
@@ -412,6 +345,7 @@ download_file() {
         return 1
     fi
     
+    # Use the same mirror URL for all downloads
     if (( HAS_ARIA2C )); then
         aria2c --console-log-level=error --timeout=30 --max-tries=3 \
             --max-connection-per-server=8 --split=8 --continue=true \
@@ -1037,7 +971,7 @@ verify_and_create_subvolumes() {
         log_success "All required subvolumes exist"
         safe_umount "$MOUNT_DIR"
         return 0
-    }
+    fi
     
     log "Creating ${#missing[@]} missing subvolume(s): ${missing[*]}"
     
@@ -1264,20 +1198,21 @@ download_update() {
     }
     
     local mirror
-    mirror=$(select_mirror "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME") || \
-        die "Failed to select download mirror"
+    mirror=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME") || \
+        die "Failed to get mirror URL"
     
     log "Downloading from: $(echo "$mirror" | sed -E 's|https://([^/]+).*|\1|')"
     
     download_with_retry "$mirror" "$image" || die "Download failed after all retries"
     
-    local base_url="https://sourceforge.net/projects/shanios/files/${REMOTE_PROFILE}/${REMOTE_VERSION}"
+    # Use the same mirror for verification files
+    local base_url=$(dirname "$mirror")
     local sha="${image}.sha256"
     local asc="${image}.asc"
     
-    log "Downloading verification files..."
-    download_file "${base_url}/${IMAGE_NAME}.sha256/download" "$sha" 1 || die "SHA256 download failed"
-    download_file "${base_url}/${IMAGE_NAME}.asc/download" "$asc" 1 || die "Signature download failed"
+    log "Downloading verification files from same mirror..."
+    download_file "${base_url}/${IMAGE_NAME}.sha256" "$sha" 1 || die "SHA256 download failed"
+    download_file "${base_url}/${IMAGE_NAME}.asc" "$asc" 1 || die "Signature download failed"
     
     verify_sha256 "$image" "$sha" || die "SHA256 verification failed"
     verify_gpg "$image" "$asc" || die "GPG verification failed"

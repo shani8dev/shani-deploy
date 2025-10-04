@@ -358,7 +358,7 @@ download_with_tool() {
     
     case "$tool" in
         aria2c)
-            aria2c --console-log-level=warn --summary-interval=0 \
+            aria2c --console-log-level=warn \
                 --timeout=30 --max-tries=3 --retry-wait=3 \
                 --max-connection-per-server=8 --split=8 --min-split-size=1M \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \

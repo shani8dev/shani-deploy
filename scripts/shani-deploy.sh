@@ -4,6 +4,7 @@
 #
 # Enhanced Blue/Green Btrfs Deployment Script for shanios
 # With native Btrfs deduplication and swapfile hibernation support
+# Optimized with aria2c for accelerated downloads
 #
 # Usage: ./shanios-deploy.sh [OPTIONS]
 #
@@ -165,6 +166,23 @@ check_root() {
 }
 
 check_internet() {
+    # Try aria2c first (faster)
+    if command -v aria2c &>/dev/null; then
+        aria2c --dry-run=true --timeout=2 --max-tries=1 \
+            --console-log-level=error "https://www.google.com" >/dev/null 2>&1 && return 0
+    fi
+    
+    # Try wget
+    if command -v wget &>/dev/null; then
+        wget --spider --timeout=2 --tries=1 --quiet "https://www.google.com" 2>/dev/null && return 0
+    fi
+    
+    # Try curl
+    if command -v curl &>/dev/null; then
+        curl -I --max-time 2 --silent --fail "https://www.google.com" >/dev/null 2>&1 && return 0
+    fi
+    
+    # Fallback to ping
     ping -c1 -W2 google.com &>/dev/null || die "No internet connection"
 }
 
@@ -195,7 +213,26 @@ self_update() {
     local temp_script
     temp_script=$(mktemp)
 
-    if curl -fsSL "$remote_url" -o "$temp_script" 2>/dev/null; then
+    # Try aria2c first for faster download
+    local download_success=0
+    if command -v aria2c &>/dev/null; then
+        if aria2c --console-log-level=error --timeout=10 --max-tries=2 \
+            --dir="$(dirname "$temp_script")" --out="$(basename "$temp_script")" \
+            "$remote_url" 2>/dev/null; then
+            download_success=1
+        fi
+    fi
+    
+    # Fallback to wget/curl (wget has better resume for SourceForge)
+    if (( !download_success )); then
+        if command -v wget &>/dev/null; then
+            wget -qO "$temp_script" "$remote_url" 2>/dev/null && download_success=1
+        elif command -v curl &>/dev/null; then
+            curl -fsSL "$remote_url" -o "$temp_script" 2>/dev/null && download_success=1
+        fi
+    fi
+    
+    if (( download_success )); then
         chmod +x "$temp_script"
         log "Self-update: Running updated script..."
         exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
@@ -441,6 +478,8 @@ get_effective_url() {
     [[ -n "$url" ]] || { log "ERROR: Empty URL"; return 1; }
     validate_url "$url" || { log "ERROR: Invalid URL format: $url"; return 1; }
     
+    # Note: aria2c doesn't provide effective URL after redirects easily,
+    # so we use curl/wget for mirror discovery
     case "$method" in
         curl|auto)
             if command -v curl &>/dev/null; then
@@ -474,6 +513,8 @@ get_effective_url() {
             return 1
             ;;
     esac
+    
+    log "WARNING: Could not determine effective URL"
     return 1
 }
 
@@ -483,12 +524,19 @@ test_mirror_response() {
     [[ -n "$mirror_url" ]] || { log "ERROR: Empty mirror_url"; return 1; }
     validate_url "$mirror_url" || { log "ERROR: Invalid mirror URL: $mirror_url"; return 1; }
     
-    if command -v curl &>/dev/null; then
-        curl -I --max-time "$timeout" --retry 1 --silent --fail "$mirror_url" >/dev/null 2>&1 && return 0
+    # Try aria2c first (faster for HEAD requests)
+    if command -v aria2c &>/dev/null; then
+        aria2c --dry-run=true --timeout="$timeout" --connect-timeout="$timeout" \
+            --max-tries=1 --console-log-level=error "$mirror_url" >/dev/null 2>&1 && return 0
     fi
     
+    # wget has better SourceForge compatibility than curl
     if command -v wget &>/dev/null; then
         wget --spider --timeout="$timeout" --tries=1 --quiet "$mirror_url" 2>/dev/null && return 0
+    fi
+    
+    if command -v curl &>/dev/null; then
+        curl -I --max-time "$timeout" --retry 1 --silent --fail "$mirror_url" >/dev/null 2>&1 && return 0
     fi
     
     return 1
@@ -857,8 +905,35 @@ fetch_update_info() {
     local channel_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
     
     log "Checking for updates from ${channel_url}..."
-    IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || \
-        die "Unable to fetch update info from ${channel_url}"
+    
+    # Try aria2c first for faster download
+    if command -v aria2c &>/dev/null; then
+        local temp_file
+        temp_file=$(mktemp)
+        if aria2c --console-log-level=error --timeout=30 --max-tries=3 \
+            --dir="$(dirname "$temp_file")" --out="$(basename "$temp_file")" \
+            "$channel_url" 2>/dev/null; then
+            IMAGE_NAME=$(tr -d '[:space:]' < "$temp_file")
+            rm -f "$temp_file"
+        else
+            rm -f "$temp_file"
+            log "aria2c failed, falling back to wget/curl"
+        fi
+    fi
+    
+    # Fallback to wget/curl if aria2c failed or not available
+    if [[ -z "${IMAGE_NAME:-}" ]]; then
+        if command -v wget &>/dev/null; then
+            IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || \
+                die "Unable to fetch update info from ${channel_url}"
+        elif command -v curl &>/dev/null; then
+            IMAGE_NAME=$(curl -fsSL "$channel_url" | tr -d '[:space:]') || \
+                die "Unable to fetch update info from ${channel_url}"
+        else
+            die "No download tool available (aria2c, wget, or curl required)"
+        fi
+    fi
+    
     log "Fetched update info: '${IMAGE_NAME}'"
     
     [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]] || \
@@ -912,7 +987,7 @@ download_update() {
     }
 
     local missing_cmds=()
-    for cmd in wget sha256sum; do
+    for cmd in sha256sum; do
         command -v "$cmd" &>/dev/null || missing_cmds+=("$cmd")
     done
     [[ ${#missing_cmds[@]} -eq 0 ]] || { log "ERROR: Missing commands: ${missing_cmds[*]}"; return 1; }
@@ -920,21 +995,12 @@ download_update() {
     run_cmd mkdir -p "${DOWNLOAD_DIR}"
     cd "${DOWNLOAD_DIR}" || { log "ERROR: Cannot access ${DOWNLOAD_DIR}"; return 1; }
 
-    local WGET_OPTS=(
-        --retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60
-        --tries=5 --no-verbose --dns-timeout=30 --connect-timeout=30
-        --prefer-family=IPv4 --continue
-    )
-    [[ -t 2 ]] && WGET_OPTS+=(--show-progress)
-
     local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
-    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
     local MAX_ATTEMPTS=5 RETRY_BASE_DELAY=5 RETRY_MAX_DELAY=60
 
     local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
     local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
     local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
-    local image_file_part="${image_file}.part"
     local sha_file="${image_file}.sha256"
     local asc_file="${image_file}.asc"
 
@@ -949,30 +1015,6 @@ download_update() {
     local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
     validate_url "$base_url" || { log "ERROR: Invalid base URL: $base_url"; return 1; }
 
-    local mirror_url
-    mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
-    if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
-        log "Using cached mirror: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
-    else
-        log "Discovering new mirror..."
-        rm -f "${MIRROR_FILE}"
-        discover_mirrors "$base_url" || { log "ERROR: Mirror discovery failed"; return 1; }
-        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
-        [[ -n "$mirror_url" ]] || { log "ERROR: No mirror URL available"; return 1; }
-    fi
-
-    log "Checking remote file availability..."
-    local expected_size
-    expected_size=$(wget -q --spider -S "$mirror_url" 2>&1 | \
-        awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r' || echo "0")
-    
-    if [[ ! "$expected_size" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
-        log "WARNING: Could not determine remote file size"
-        expected_size=0
-    else
-        log "Expected file size: $((expected_size / 1024 / 1024))MB"
-    fi
-
     echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}" || { log "ERROR: Failed to write channel file"; return 1; }
 
     [[ "${DRY_RUN}" == "yes" ]] && {
@@ -980,70 +1022,276 @@ download_update() {
         return 0
     }
 
-    local attempt=0 current_size download_success=0
+    local download_success=0 USE_ARIA2=0
     
-    while (( attempt < MAX_ATTEMPTS && !download_success )); do
-        ((attempt++))
-        log "Download attempt ${attempt}/${MAX_ATTEMPTS} from: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
+    # Determine which downloader to use
+    if command -v aria2c &>/dev/null; then
+        USE_ARIA2=1
+        log "Using aria2c for accelerated downloads"
+    elif command -v wget &>/dev/null; then
+        log "aria2c not available, using wget"
+    else
+        log "ERROR: Neither aria2c nor wget available"
+        return 1
+    fi
 
-        if [[ -f "${image_file_part}" ]]; then
-            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-            
-            if (( expected_size > 0 && current_size > expected_size )); then
-                log "Partial file too large - deleting"
-                rm -f "${image_file_part}"
-                current_size=0
-            elif (( current_size > 0 )); then
-                log "Resuming: $((current_size / 1024 / 1024))MB / $((expected_size / 1024 / 1024))MB"
-            fi
-        fi
+    # Download with aria2c (preferred)
+    if (( USE_ARIA2 )); then
+        local attempt=0
+        
+        while (( attempt < MAX_ATTEMPTS && !download_success )); do
+            ((attempt++))
+            log "Download attempt ${attempt}/${MAX_ATTEMPTS} using aria2c..."
 
-        if wget "${WGET_OPTS[@]}" -O "${image_file_part}" "$mirror_url"; then
-            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-            
-            if (( expected_size == 0 || current_size == expected_size )); then
-                download_success=1
-                log "Download completed"
-                mv "${image_file_part}" "${image_file}" || { log "ERROR: File rename failed"; return 1; }
-            else
-                log "Download incomplete: $((current_size / 1024 / 1024))MB / $((expected_size / 1024 / 1024))MB"
-            fi
-        else
-            log "Download failed with current mirror"
-            
-            (( attempt % 2 == 0 )) && {
-                log "Discovering new mirror..."
-                rm -f "${MIRROR_FILE}"
-                if discover_mirrors "$base_url"; then
-                    mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
-                    [[ -n "$mirror_url" ]] && log "Switched to: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
+            local ARIA2_OPTS=(
+                --max-connection-per-server=8
+                --split=8
+                --min-split-size=1M
+                --max-tries=5
+                --retry-wait=5
+                --timeout=60
+                --connect-timeout=30
+                --max-file-not-found=3
+                --console-log-level=warn
+                --summary-interval=10
+                --auto-file-renaming=false
+                --allow-overwrite=true
+                --continue=true
+                --conditional-get=true
+                --remote-time=true
+            )
+
+            if aria2c "${ARIA2_OPTS[@]}" \
+                --dir="${DOWNLOAD_DIR}" \
+                --out="${IMAGE_NAME}" \
+                "${base_url}"; then
+                
+                if [[ -f "${image_file}" ]]; then
+                    local file_size
+                    file_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
+                    if (( file_size > 0 )); then
+                        download_success=1
+                        log "Download completed successfully with aria2c"
+                        break
+                    fi
                 fi
+            fi
+
+            (( !download_success && attempt < MAX_ATTEMPTS )) && {
+                local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
+                (( delay > RETRY_MAX_DELAY )) && delay=$RETRY_MAX_DELAY
+                log "aria2c failed, retrying in ${delay}s..."
+                sleep "$delay"
             }
+        done
+
+        # If aria2c failed after all attempts, fall back to wget
+        if (( !download_success )); then
+            log "WARNING: aria2c failed after ${MAX_ATTEMPTS} attempts"
+            if command -v wget &>/dev/null; then
+                log "Falling back to wget..."
+                USE_ARIA2=0
+            else
+                log "ERROR: No fallback downloader available"
+                return 1
+            fi
+        fi
+    fi
+
+    # Download with wget (fallback)
+    if (( !download_success )); then
+        local WGET_OPTS=(
+            --retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60
+            --tries=5 --no-verbose --dns-timeout=30 --connect-timeout=30
+            --prefer-family=IPv4 --continue
+        )
+        [[ -t 2 ]] && WGET_OPTS+=(--show-progress)
+
+        local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
+        local mirror_url
+        
+        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
+        if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
+            log "Using cached mirror: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
+        else
+            log "Discovering new mirror..."
+            rm -f "${MIRROR_FILE}"
+            discover_mirrors "$base_url" || { log "ERROR: Mirror discovery failed"; return 1; }
+            mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
+            [[ -n "$mirror_url" ]] || { log "ERROR: No mirror URL available"; return 1; }
         fi
 
-        (( !download_success && attempt < MAX_ATTEMPTS )) && {
-            local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
-            (( delay > RETRY_MAX_DELAY )) && delay=$RETRY_MAX_DELAY
-            log "Retrying in ${delay}s..."
-            sleep "$delay"
-        }
-    done
+        local attempt=0 expected_size current_size
+        local image_file_part="${image_file}.part"
+        
+        # Try to get file size using aria2c first, then wget, then curl
+        if command -v aria2c &>/dev/null; then
+            expected_size=$(aria2c --dry-run=true --console-log-level=error "$mirror_url" 2>&1 | \
+                grep -i 'length' | awk '{print $NF}' | tr -d '()' || echo "0")
+        fi
+        
+        if [[ ! "$expected_size" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
+            if command -v wget &>/dev/null; then
+                expected_size=$(wget -q --spider -S "$mirror_url" 2>&1 | \
+                    awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r' || echo "0")
+            fi
+        fi
+        
+        if [[ ! "$expected_size" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
+            if command -v curl &>/dev/null; then
+                expected_size=$(curl -sI "$mirror_url" 2>/dev/null | \
+                    grep -i '^content-length:' | awk '{print $2}' | tr -d '\r' || echo "0")
+            fi
+        fi
+        
+        if [[ ! "$expected_size" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
+            log "WARNING: Could not determine remote file size"
+            expected_size=0
+        else
+            log "Expected file size: $((expected_size / 1024 / 1024))MB"
+        fi
+        
+        while (( attempt < MAX_ATTEMPTS && !download_success )); do
+            ((attempt++))
+            log "Download attempt ${attempt}/${MAX_ATTEMPTS} from: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
+
+            if [[ -f "${image_file_part}" ]]; then
+                current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
+                
+                if (( expected_size > 0 && current_size > expected_size )); then
+                    log "Partial file too large - deleting"
+                    rm -f "${image_file_part}"
+                    current_size=0
+                elif (( current_size > 0 )); then
+                    log "Resuming: $((current_size / 1024 / 1024))MB / $((expected_size / 1024 / 1024))MB"
+                fi
+            fi
+
+            if wget "${WGET_OPTS[@]}" -O "${image_file_part}" "$mirror_url"; then
+                current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
+                
+                if (( expected_size == 0 || current_size == expected_size )); then
+                    download_success=1
+                    log "Download completed"
+                    mv "${image_file_part}" "${image_file}" || { log "ERROR: File rename failed"; return 1; }
+                else
+                    log "Download incomplete: $((current_size / 1024 / 1024))MB / $((expected_size / 1024 / 1024))MB"
+                fi
+            else
+                log "Download failed with current mirror"
+                
+                (( attempt % 2 == 0 )) && {
+                    log "Discovering new mirror..."
+                    rm -f "${MIRROR_FILE}"
+                    if discover_mirrors "$base_url"; then
+                        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
+                        [[ -n "$mirror_url" ]] && log "Switched to: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
+                    fi
+                }
+            fi
+
+            (( !download_success && attempt < MAX_ATTEMPTS )) && {
+                local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
+                (( delay > RETRY_MAX_DELAY )) && delay=$RETRY_MAX_DELAY
+                log "Retrying in ${delay}s..."
+                sleep "$delay"
+            }
+        done
+    fi
 
     (( download_success )) || { log "ERROR: Failed after ${MAX_ATTEMPTS} attempts"; return 1; }
 
     [[ -f "${image_file}" ]] || { log "ERROR: File does not exist: ${image_file}"; return 1; }
+    local current_size
     current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
     (( current_size > 0 )) || { log "ERROR: File is empty"; rm -f "${image_file}"; return 1; }
 
     log "Verifying download..."
     
+    # Download verification files
     log "Fetching SHA256 checksum..."
     local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
-    wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}" || { log "ERROR: Failed to fetch SHA256"; return 1; }
+    
+    if command -v aria2c &>/dev/null; then
+        aria2c --console-log-level=error --dir="${DOWNLOAD_DIR}" --out="${IMAGE_NAME}.sha256" "${sha_url}" || {
+            log "aria2c failed for SHA256, trying curl..."
+            if command -v curl &>/dev/null; then
+                curl -fsSL -o "${sha_file}" "${sha_url}" || {
+                    log "curl failed, trying wget..."
+                    command -v wget &>/dev/null && wget --tries=3 --timeout=30 -O "${sha_file}" "${sha_url}" || {
+                        log "ERROR: Failed to fetch SHA256 with all methods"
+                        return 1
+                    }
+                }
+            elif command -v wget &>/dev/null; then
+                wget --tries=3 --timeout=30 -O "${sha_file}" "${sha_url}" || {
+                    log "ERROR: Failed to fetch SHA256 with wget"
+                    return 1
+                }
+            else
+                log "ERROR: No fallback downloader available"
+                return 1
+            fi
+        }
+    elif command -v curl &>/dev/null; then
+        curl -fsSL -o "${sha_file}" "${sha_url}" || {
+            log "curl failed, trying wget..."
+            command -v wget &>/dev/null && wget --tries=3 --timeout=30 -O "${sha_file}" "${sha_url}" || {
+                log "ERROR: Failed to fetch SHA256"
+                return 1
+            }
+        }
+    elif command -v wget &>/dev/null; then
+        wget --tries=3 --timeout=30 -O "${sha_file}" "${sha_url}" || {
+            log "ERROR: Failed to fetch SHA256 with wget"
+            return 1
+        }
+    else
+        log "ERROR: No download tool available"
+        return 1
+    fi
     
     log "Fetching GPG signature..."
     local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
-    wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}" || { log "ERROR: Failed to fetch GPG signature"; return 1; }
+    
+    if command -v aria2c &>/dev/null; then
+        aria2c --console-log-level=error --dir="${DOWNLOAD_DIR}" --out="${IMAGE_NAME}.asc" "${asc_url}" || {
+            log "aria2c failed for GPG signature, trying curl..."
+            if command -v curl &>/dev/null; then
+                curl -fsSL -o "${asc_file}" "${asc_url}" || {
+                    log "curl failed, trying wget..."
+                    command -v wget &>/dev/null && wget --tries=3 --timeout=30 -O "${asc_file}" "${asc_url}" || {
+                        log "ERROR: Failed to fetch GPG signature with all methods"
+                        return 1
+                    }
+                }
+            elif command -v wget &>/dev/null; then
+                wget --tries=3 --timeout=30 -O "${asc_file}" "${asc_url}" || {
+                    log "ERROR: Failed to fetch GPG signature with wget"
+                    return 1
+                }
+            else
+                log "ERROR: No fallback downloader available"
+                return 1
+            fi
+        }
+    elif command -v curl &>/dev/null; then
+        curl -fsSL -o "${asc_file}" "${asc_url}" || {
+            log "curl failed, trying wget..."
+            command -v wget &>/dev/null && wget --tries=3 --timeout=30 -O "${asc_file}" "${asc_url}" || {
+                log "ERROR: Failed to fetch GPG signature"
+                return 1
+            }
+        }
+    elif command -v wget &>/dev/null; then
+        wget --tries=3 --timeout=30 -O "${asc_file}" "${asc_url}" || {
+            log "ERROR: Failed to fetch GPG signature with wget"
+            return 1
+        }
+    else
+        log "ERROR: No download tool available"
+        return 1
+    fi
 
     log "Verifying SHA256 checksum..."
     sha256sum -c "${sha_file}" --status 2>/dev/null || {

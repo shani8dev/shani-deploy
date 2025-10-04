@@ -46,10 +46,12 @@ readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 
 readonly MIRROR_TEST_TIMEOUT=8
+readonly MIRROR_CACHE_TTL=3600
 readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
 readonly STALL_THRESHOLD=3
+readonly MIN_DOWNLOAD_SIZE=104857600
 
 # Tool availability
 declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0
@@ -68,6 +70,7 @@ readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 readonly CHROOT_STATIC_DIRS=(data etc var)
 
 readonly -a SF_MIRRORS=(
+    "https://master.dl.sourceforge.net"
     "https://downloads.sourceforge.net"
     "https://netix.dl.sourceforge.net"
     "https://phoenixnap.dl.sourceforge.net"
@@ -182,7 +185,18 @@ validate_nonempty() {
 }
 
 validate_url() {
-    [[ "$1" =~ ^https?://[a-zA-Z0-9._-]+(/.*)?$ ]]
+    local url="$1"
+    [[ -n "$url" ]] || return 1
+    [[ "$url" =~ ^https?://[a-zA-Z0-9.-]+(/.*)?$ ]]
+}
+
+is_valid_mirror() {
+    local url="$1"
+    validate_url "$url" || return 1
+    # Exclude SourceForge project URLs (we want actual CDN mirrors)
+    [[ "$url" != *"sourceforge.net/projects/shanios/files"* ]] || return 1
+    # URL should contain the image filename or end with /download
+    [[ "$url" == *"${IMAGE_NAME}"* || "$url" =~ /download$ ]]
 }
 
 file_nonempty() {
@@ -246,8 +260,152 @@ get_btrfs_available_mb() {
 }
 
 #####################################
+### Mirror Selection & Discovery  ###
+#####################################
+
+test_mirror() {
+    local url="$1"
+    validate_url "$url" || return 1
+    
+    if (( HAS_CURL )); then
+        local code
+        code=$(curl -I --max-time "$MIRROR_TEST_TIMEOUT" -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+        [[ "$code" =~ ^(200|302)$ ]] && return 0
+    fi
+    
+    (( HAS_WGET )) && wget --spider --timeout="$MIRROR_TEST_TIMEOUT" --tries=1 -q "$url" 2>/dev/null && return 0
+    
+    return 1
+}
+
+discover_mirror_from_redirect() {
+    local base_url="$1"
+    
+    validate_url "$base_url" || return 1
+    
+    log_verbose "Discovering mirror via redirect..."
+    
+    if (( HAS_CURL )); then
+        local effective_url
+        effective_url=$(curl -sL -w '%{url_effective}' -o /dev/null --max-time 10 --max-redirs 5 "$base_url" 2>/dev/null)
+        
+        if [[ -n "$effective_url" ]] && validate_url "$effective_url" && [[ "$effective_url" != "$base_url" ]]; then
+            # Verify discovered mirror is not a SourceForge project URL
+            if [[ "$effective_url" != *"/projects/shanios/files"* ]]; then
+                log_verbose "Discovered: $(echo "$effective_url" | sed -E 's|https://([^/]+).*|\1|')"
+                echo "$effective_url"
+                return 0
+            fi
+        fi
+    fi
+    
+    if (( HAS_WGET )); then
+        local effective_url
+        effective_url=$(wget --max-redirect=5 --spider -S --timeout=10 --tries=1 "$base_url" 2>&1 | \
+            grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+        
+        if [[ -n "$effective_url" ]] && validate_url "$effective_url" && [[ "$effective_url" != "$base_url" ]]; then
+            if [[ "$effective_url" != *"/projects/shanios/files"* ]]; then
+                log_verbose "Discovered: $(echo "$effective_url" | sed -E 's|https://([^/]+).*|\1|')"
+                echo "$effective_url"
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+select_mirror() {
+    local project="$1" filepath="$2" filename="$3"
+    
+    validate_nonempty "$project" "project name"
+    validate_nonempty "$filepath" "file path"
+    validate_nonempty "$filename" "filename"
+    
+    # Check cache first
+    local cache_file="$DOWNLOAD_DIR/.mirror_cache"
+    if [[ -f "$cache_file" ]]; then
+        local cached_mirror cached_time
+        if read -r cached_mirror cached_time < "$cache_file" 2>/dev/null; then
+            if (( $(date +%s) - cached_time < MIRROR_CACHE_TTL )); then
+                if test_mirror "$cached_mirror"; then
+                    log_verbose "Using cached mirror"
+                    echo "$cached_mirror"
+                    return 0
+                fi
+            fi
+        fi
+        rm -f "$cache_file"
+    fi
+    
+    # Test static mirrors first (fast, predictable)
+    local tested=0 max_tests=3
+    
+    for mirror_base in "${SF_MIRRORS[@]}"; do
+        ((tested++))
+        (( tested > max_tests )) && break
+        
+        local mirror_url="${mirror_base}/project/${project}/${filepath}/${filename}"
+        
+        log_verbose "Testing mirror: $(echo "$mirror_url" | sed -E 's|https://([^/]+).*|\1|')"
+        
+        if test_mirror "$mirror_url"; then
+            log_success "Selected mirror: $(echo "$mirror_url" | sed -E 's|https://([^/]+).*|\1|')"
+            echo "$mirror_url $(date +%s)" > "$cache_file"
+            echo "$mirror_url"
+            return 0
+        fi
+    done
+    
+    # Fallback: Use SourceForge's dynamic redirect
+    log_warn "Static mirrors unresponsive, trying dynamic discovery"
+    local sf_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
+    
+    local discovered
+    if discovered=$(discover_mirror_from_redirect "$sf_url"); then
+        log_success "Dynamic mirror: $(echo "$discovered" | sed -E 's|https://([^/]+).*|\1|')"
+        echo "$discovered $(date +%s)" > "$cache_file"
+        echo "$discovered"
+        return 0
+    fi
+    
+    # Final fallback: direct URL (SourceForge will redirect)
+    log_warn "Dynamic discovery failed, using direct URL"
+    echo "$sf_url"
+}
+
+#####################################
 ### Download System               ###
 #####################################
+
+validate_download() {
+    local file="$1" expected_min_size="${2:-$MIN_DOWNLOAD_SIZE}"
+    
+    [[ -f "$file" ]] || { log_error "File does not exist: $file"; return 1; }
+    
+    local size
+    size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    
+    if (( size < expected_min_size )); then
+        log_error "File too small: $(format_bytes $size) < $(format_bytes $expected_min_size)"
+        return 1
+    fi
+    
+    # Check for HTML error pages
+    if file "$file" 2>/dev/null | grep -qi "html\|xml"; then
+        log_error "Downloaded file appears to be HTML/XML (error page)"
+        return 1
+    fi
+    
+    # Verify zstd format
+    if ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
+        log_warn "File may not be zstd compressed (check format)"
+    fi
+    
+    log_verbose "Download validation passed: $(format_bytes $size)"
+    return 0
+}
 
 download_file() {
     local url="$1" output="$2" is_small="${3:-0}"
@@ -297,7 +455,7 @@ download_with_retry() {
             if (( current_size > 0 && current_size == last_size )); then
                 ((stall_count++))
                 if (( stall_count >= STALL_THRESHOLD )); then
-                    log_warn "Download stalled, restarting from scratch"
+                    log_warn "Download stalled $STALL_THRESHOLD times, restarting"
                     rm -f "$output"
                     current_size=0
                     last_size=0
@@ -307,18 +465,12 @@ download_with_retry() {
         fi
         
         if download_file "$url" "$output" 0; then
-            if file_nonempty "$output"; then
-                local new_size
-                new_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-                
-                # Check for reasonable progress or completion
-                if (( new_size > last_size + 1048576 || new_size > 104857600 )); then
-                    log_success "Download complete - $(format_bytes $new_size)"
-                    return 0
-                fi
-                last_size=$new_size
+            if validate_download "$output"; then
+                log_success "Download complete - $(format_bytes $(stat -c%s "$output"))"
+                return 0
             else
-                rm -f "$output"
+                log_warn "Download validation failed, retrying"
+                last_size=$current_size
             fi
         fi
         
@@ -332,70 +484,6 @@ download_with_retry() {
     log_error "Download failed after $max_attempts attempts"
     rm -f "$output"
     return 1
-}
-
-#####################################
-### Mirror Selection              ###
-#####################################
-
-test_mirror() {
-    local url="$1"
-    validate_url "$url" || return 1
-    
-    if (( HAS_CURL )); then
-        local code
-        code=$(curl -I --max-time "$MIRROR_TEST_TIMEOUT" -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
-        [[ "$code" =~ ^(200|302)$ ]] && return 0
-    fi
-    
-    (( HAS_WGET )) && wget --spider --timeout="$MIRROR_TEST_TIMEOUT" --tries=1 -q "$url" 2>/dev/null && return 0
-    
-    return 1
-}
-
-select_best_mirror() {
-    local project="$1" filepath="$2" filename="$3"
-    
-    validate_nonempty "$project" "project name"
-    validate_nonempty "$filepath" "file path"
-    validate_nonempty "$filename" "filename"
-    
-    local cache_file="$DOWNLOAD_DIR/.mirror_cache"
-    if [[ -f "$cache_file" ]]; then
-        local cached_mirror cached_time
-        if read -r cached_mirror cached_time < "$cache_file" 2>/dev/null; then
-            if (( $(date +%s) - cached_time < 3600 )); then
-                if test_mirror "$cached_mirror"; then
-                    log_verbose "Using cached mirror"
-                    echo "$cached_mirror"
-                    return 0
-                fi
-            fi
-        fi
-        rm -f "$cache_file"
-    fi
-    
-    local tested=0 max_tests=3
-    
-    for mirror_base in "${SF_MIRRORS[@]}"; do
-        ((tested++))
-        (( tested > max_tests )) && break
-        
-        local mirror_url="${mirror_base}/project/${project}/${filepath}/${filename}"
-        
-        log_verbose "Testing mirror: $(echo "$mirror_url" | sed -E 's|https://([^/]+).*|\1|')"
-        
-        if test_mirror "$mirror_url"; then
-            log_success "Selected mirror: $(echo "$mirror_url" | sed -E 's|https://([^/]+).*|\1|')"
-            echo "$mirror_url $(date +%s)" > "$cache_file"
-            echo "$mirror_url"
-            return 0
-        fi
-    done
-    
-    log_warn "No mirrors responded, using direct download"
-    local fallback="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
-    echo "$fallback"
 }
 
 #####################################
@@ -441,7 +529,6 @@ verify_gpg() {
         
         [[ $imported -eq 0 ]] && { log_error "Failed to import GPG key"; exit 1; }
         
-        # Verify fingerprint
         local fp
         fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
         if [[ "$fp" != "$GPG_KEY_ID" ]]; then
@@ -595,13 +682,11 @@ cleanup_old_backups() {
         log "Keeping 2 most recent backups for ${slot}, deleting $((${#backups[@]}-2))"
         
         for (( i=2; i<${#backups[@]}; i++ )); do
-            # Safety check: validate backup name format
             if [[ ! "${backups[i]}" =~ ^(blue|green)_backup_[0-9]{12}$ ]]; then
                 log_warn "Skipping invalid backup name: ${backups[i]}"
                 continue
             fi
             
-            # Additional safety: don't delete active or candidate slots
             if [[ "${backups[i]}" == "$CURRENT_SLOT" ]] || [[ "${backups[i]}" == "$CANDIDATE_SLOT" ]]; then
                 log_error "SAFETY: Refusing to delete active slot: ${backups[i]}"
                 continue
@@ -1169,21 +1254,13 @@ download_update() {
     local image="${DOWNLOAD_DIR}/${IMAGE_NAME}"
     local marker="${image}.verified"
     
-    if [[ -f "$marker" ]] && file_nonempty "$image"; then
-        local cached_size
-        cached_size=$(stat -c%s "$image" 2>/dev/null || echo 0)
-        
+    if [[ -f "$marker" ]] && validate_download "$image"; then
         local sha="${image}.sha256"
-        if [[ -f "$sha" ]]; then
-            if sha256sum -c "$sha" --status 2>/dev/null; then
-                log_success "Using cached verified image: $(format_bytes $cached_size)"
-                return 0
-            else
-                log_warn "Cached file failed verification, re-downloading"
-                rm -f "$marker" "$image"
-            fi
+        if [[ -f "$sha" ]] && sha256sum -c "$sha" --status 2>/dev/null; then
+            log_success "Using cached verified image: $(format_bytes $(stat -c%s "$image"))"
+            return 0
         else
-            log_warn "No checksum for cached file, re-downloading"
+            log_warn "Cached file verification failed, re-downloading"
             rm -f "$marker" "$image"
         fi
     fi
@@ -1194,18 +1271,12 @@ download_update() {
     }
     
     local mirror
-    mirror=$(select_best_mirror "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
+    mirror=$(select_mirror "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME") || \
+        die "Failed to select download mirror"
     
-    log "Downloading OS image..."
+    log "Downloading from: $(echo "$mirror" | sed -E 's|https://([^/]+).*|\1|')"
+    
     download_with_retry "$mirror" "$image" || die "Download failed after all retries"
-    
-    local dl_size
-    dl_size=$(stat -c%s "$image" 2>/dev/null || echo 0)
-    if (( dl_size < 104857600 )); then
-        log_error "Downloaded file suspiciously small: $(format_bytes $dl_size)"
-        rm -f "$image"
-        die "Download validation failed - file too small"
-    fi
     
     local base_url="https://sourceforge.net/projects/shanios/files/${REMOTE_PROFILE}/${REMOTE_VERSION}"
     local sha="${image}.sha256"
@@ -1367,7 +1438,6 @@ EOF
 main() {
     local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no"
     
-    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
@@ -1392,7 +1462,6 @@ main() {
     self_update "$@"
     inhibit_system "$@"
     
-    # Handle special modes
     [[ "$STORAGE_INFO" == "yes" ]] && { analyze_storage; exit 0; }
     
     if [[ "$CLEANUP" == "yes" ]]; then
@@ -1406,7 +1475,6 @@ main() {
         exit 0
     fi
     
-    # Boot failure check
     [[ -f /data/boot-ok ]] || {
         log_error "Boot failure detected (missing /data/boot-ok)"
         rollback_system
@@ -1414,7 +1482,6 @@ main() {
     
     [[ "$ROLLBACK" == "yes" ]] && { rollback_system; exit 0; }
     
-    # Main deployment flow
     validate_boot
     check_space
     fetch_update

@@ -45,7 +45,6 @@ readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 
-readonly MIRROR_CACHE_TTL=86400  # 24 hours
 readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
@@ -173,14 +172,6 @@ validate_nonempty() {
     [[ -n "$1" ]] || die "$2 is empty"
 }
 
-validate_url() {
-    local url="$1"
-    [[ -n "$url" ]] || return 1
-    [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || return 1
-    [[ "${#url}" -ge 10 ]] || return 1
-    return 0
-}
-
 file_nonempty() {
     [[ -f "$1" ]] && (( $(stat -c%s "$1" 2>/dev/null || echo 0) > 0 ))
 }
@@ -254,26 +245,13 @@ get_mirror_url() {
     
     local mirror_cache="$DOWNLOAD_DIR/mirror.url"
     
-    # Check if we have a valid cached mirror URL
+    # Check if we have a cached mirror URL
     if [[ -f "$mirror_cache" ]]; then
-        local cached_time
-        cached_time=$(stat -c %Y "$mirror_cache" 2>/dev/null || echo 0)
-        local current_time=$(date +%s)
-        
-        if (( current_time - cached_time < MIRROR_CACHE_TTL )); then
-            local cached_url
-            cached_url=$(< "$mirror_cache")
-            if validate_url "$cached_url"; then
-                log_verbose "Using cached mirror URL"
-                echo "$cached_url"
-                return 0
-            else
-                log_warn "Cached mirror URL is invalid, rediscovering..."
-                rm -f "$mirror_cache"
-            fi
-        else
-            log_verbose "Mirror cache expired, rediscovering..."
-        fi
+        local cached_url
+        cached_url=$(< "$mirror_cache")
+        log_verbose "Using cached mirror URL"
+        echo "$cached_url"
+        return 0
     fi
     
     # Discover new mirror URL using SourceForge redirect
@@ -290,7 +268,7 @@ get_mirror_url() {
         discovered_url=$(wget --spider -S --max-redirect 0 "$sf_url" 2>&1 | grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r')
     fi
     
-    if [[ -z "$discovered_url" ]] || ! validate_url "$discovered_url"; then
+    if [[ -z "$discovered_url" ]]; then
         log_warn "Failed to discover mirror via redirect, using direct URL"
         discovered_url="$sf_url"
     fi
@@ -336,7 +314,6 @@ validate_download() {
 download_file() {
     local url="$1" output="$2" is_small="${3:-0}"
     
-    validate_url "$url" || { log_error "Invalid URL: $url"; return 1; }
     mkdir -p "$(dirname "$output")"
     
     if (( is_small )); then

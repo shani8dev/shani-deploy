@@ -572,18 +572,37 @@ optimize_storage() {
         return 0
     fi
     
+    # Build list of all subvolumes to dedupe (including backups)
+    local -a dedupe_targets=("$MOUNT_DIR/@blue" "$MOUNT_DIR/@green")
+    
+    # Add backup snapshots to deduplication
+    while IFS= read -r backup; do
+        [[ -n "$backup" ]] && dedupe_targets+=("$MOUNT_DIR/@${backup}")
+    done < <(btrfs subvolume list "$MOUNT_DIR" | awk '/_backup_/ {print $NF}')
+    
+    [[ ${#dedupe_targets[@]} -gt 2 ]] && \
+        log "Including ${#dedupe_targets[@]} subvolumes (with backups) in deduplication"
+    
     local before after saved percent
-    before=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | tail -1 | awk '{print $1}')
+    before=$(btrfs filesystem du -s "${dedupe_targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
     
     log "Running Btrfs extent deduplication (may take several minutes)..."
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log "[Dry Run] Would run duperemove on blue/green slots"
+        log "[Dry Run] Would run duperemove on ${#dedupe_targets[@]} subvolumes"
     else
-        duperemove -dhr --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
-            "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" &>/dev/null
+        duperemove -Adhr \
+            --skip-zeroes \
+            --dedupe-options=same \
+            --lookup-extents=yes \
+            -b 128K \
+            --threads=$(nproc) \
+            --io-threads=$(nproc) \
+            --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
+            --hashfile-threads=$(nproc) \
+            "${dedupe_targets[@]}" > /dev/null
     fi
     
-    after=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | tail -1 | awk '{print $1}')
+    after=$(btrfs filesystem du -s "${dedupe_targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
     
     if [[ -n "$before" && -n "$after" ]] && (( before > after )); then
         saved=$((before - after))
@@ -1141,10 +1160,6 @@ finalize_update() {
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    [[ -n "$BACKUP_NAME" ]] && {
-        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}"
-        log "Deleted backup @${BACKUP_NAME}"
-    }
     cleanup_old_backups
     safe_umount "$MOUNT_DIR"
 

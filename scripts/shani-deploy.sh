@@ -247,46 +247,21 @@ cleanup_old_backups() {
         
         log "Found ${backup_count} backup(s) for slot '${slot}': ${backups[*]}"
         
-        # If we have a backup to exclude (newly created), keep it plus 1 more = keep 2 total
-        local keep_count=2
-        if [[ -n "$exclude_backup" ]]; then
-            # Filter out the excluded backup from deletion consideration
-            local -a eligible_for_deletion=()
-            for backup in "${backups[@]}"; do
-                [[ "$backup" != "$exclude_backup" ]] && eligible_for_deletion+=("$backup")
+        # Keep first 2 backups (most recent), delete the rest
+        # If exclude_backup is set, it will naturally be in position 0 (newest)
+        if (( backup_count > 2 )); then
+            log "Keeping 2 most recent backups, deleting $((backup_count-2)) older backup(s)..."
+            for (( i=2; i<backup_count; i++ )); do
+                backup="${backups[i]}"
+                [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]] || {
+                    log "Skipping unexpected backup name: ${backup}"
+                    continue
+                }
+                run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backup}"
+                log "Deleted old backup: @${backup}"
             done
-            
-            # Keep 1 old backup + the new excluded one = 2 total
-            if (( ${#eligible_for_deletion[@]} > 1 )); then
-                log "Keeping newest old backup plus new backup @${exclude_backup}, deleting $((${#eligible_for_deletion[@]}-1)) older backup(s)..."
-                for (( i=1; i<${#eligible_for_deletion[@]}; i++ )); do
-                    backup="${eligible_for_deletion[i]}"
-                    [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]] || {
-                        log "Skipping unexpected backup name: ${backup}"
-                        continue
-                    }
-                    run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backup}"
-                    log "Deleted old backup: @${backup}"
-                done
-            else
-                log "Only ${#eligible_for_deletion[@]} eligible backup(s) exist (excluding new backup); no cleanup needed."
-            fi
         else
-            # Normal cleanup: keep 2 most recent
-            if (( backup_count > 2 )); then
-                log "Keeping 2 most recent backups, deleting $((backup_count-2)) older backup(s)..."
-                for (( i=2; i<backup_count; i++ )); do
-                    backup="${backups[i]}"
-                    [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]] || {
-                        log "Skipping unexpected backup name: ${backup}"
-                        continue
-                    }
-                    run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backup}"
-                    log "Deleted old backup: @${backup}"
-                done
-            else
-                log "Only ${backup_count} backup(s) exist; no cleanup needed."
-            fi
+            log "Only ${backup_count} backup(s) exist; no cleanup needed."
         fi
     done
 }
@@ -1188,7 +1163,7 @@ finalize_update() {
     log "Running post-deployment cleanup and optimization..."
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    cleanup_old_backups "$BACKUP_NAME"
+    cleanup_old_backups
     safe_umount "$MOUNT_DIR"
 
     echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/old.txt"

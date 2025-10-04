@@ -44,7 +44,6 @@ readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
 readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
-readonly LOCKFILE="/var/run/shanios-deploy.lock"
 
 readonly MIRROR_TEST_TIMEOUT=8
 readonly MAX_INHIBIT_DEPTH=2
@@ -90,25 +89,7 @@ readonly E_DEPLOY=5
 STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
 export STATE_DIR
 
-acquire_lock() {
-    if [[ -f "$LOCKFILE" ]]; then
-        local pid
-        pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            die "Another instance running (PID: $pid)"
-        fi
-        log_warn "Removing stale lockfile"
-        rm -f "$LOCKFILE"
-    fi
-    echo $$ > "$LOCKFILE"
-}
-
-release_lock() {
-    [[ -f "$LOCKFILE" ]] && rm -f "$LOCKFILE"
-}
-
 cleanup_state() {
-    release_lock
     [[ -n "${STATE_DIR:-}" && -d "${STATE_DIR}" ]] && rm -rf "${STATE_DIR}"
 }
 trap cleanup_state EXIT
@@ -121,7 +102,7 @@ persist_state() {
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL 2>/dev/null || true
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE DEPLOYMENT_START_TIME 2>/dev/null || true
-        declare -p STATE_DIR LOCKFILE LOG_FILE DEPLOY_PENDING GPG_KEY_ID 2>/dev/null || true
+        declare -p STATE_DIR LOG_FILE DEPLOY_PENDING GPG_KEY_ID 2>/dev/null || true
         declare -p CHROOT_BIND_DIRS CHROOT_STATIC_DIRS HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
@@ -1408,7 +1389,6 @@ main() {
     check_internet
     check_tools
     set_environment
-    acquire_lock
     self_update "$@"
     inhibit_system "$@"
     

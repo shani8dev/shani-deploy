@@ -182,7 +182,7 @@ validate_nonempty() {
 }
 
 validate_url() {
-    [[ "$1" =~ ^https?://[a-zA-Z0-9.-]+(/.*)?$ ]]
+    [[ "$1" =~ ^https?://[a-zA-Z0-9._-]+(/.*)?$ ]]
 }
 
 file_nonempty() {

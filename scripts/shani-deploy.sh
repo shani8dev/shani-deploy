@@ -616,22 +616,12 @@ parse_fstab_subvolumes() {
 
 create_swapfile() {
     local swapfile="$1" mem_mb="$2" available_mb="$3"
-    local required_mb=$((mem_mb + 2048))
     
-    if (( available_mb < required_mb )); then
-        log "WARNING: Insufficient space for full-size swapfile"
-        log "Available: ${available_mb}MB, Required: ${required_mb}MB"
-        
-        local fallback_mb=$((mem_mb / 2))
-        local fallback_required=$((fallback_mb + 1024))
-        
-        if (( available_mb >= fallback_required )); then
-            log "Creating reduced swapfile: ${fallback_mb}MB (50% of RAM)"
-            mem_mb=$fallback_mb
-        else
-            log "ERROR: Not enough space even for reduced swapfile. Skipping."
-            return 1
-        fi
+    if (( available_mb < mem_mb )); then
+        log "WARNING: Insufficient space for hibernation swapfile"
+        log "Available: ${available_mb}MB, Required: ${mem_mb}MB"
+        log "Skipping swapfile creation. System will use zram for swap."
+        return 1
     fi
     
     if btrfs filesystem mkswapfile --size "${mem_mb}M" "$swapfile" 2>/dev/null; then
@@ -710,8 +700,8 @@ verify_and_create_required_subvolumes() {
                 available_mb=$(get_btrfs_available_mb "$MOUNT_DIR")
                 
                 [[ "$available_mb" -eq 0 ]] && {
-                    log "WARNING: Could not determine space, attempting swapfile creation"
-                    available_mb=$((mem_mb * 2 + 2048))
+                    log "WARNING: Could not determine space, skipping swapfile"
+                    continue
                 }
                 
                 create_swapfile "$swapfile" "$mem_mb" "$available_mb"

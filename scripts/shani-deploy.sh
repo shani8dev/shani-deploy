@@ -166,10 +166,6 @@ get_file_size() {
     stat -c%s "$1" 2>/dev/null || echo 0
 }
 
-is_valid_url() {
-    [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
-}
-
 #####################################
 ### Mount Management              ###
 #####################################
@@ -226,6 +222,43 @@ get_btrfs_available_mb() {
 ### Mirror Discovery              ###
 #####################################
 
+get_remote_file_size() {
+    local url="$1"
+    local size=0
+    
+    if (( HAS_WGET )); then
+        size=$(timeout 15 wget -q --spider -S "$url" 2>&1 | \
+            awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r' || echo "0")
+    elif (( HAS_CURL )); then
+        size=$(timeout 15 curl -sI "$url" 2>/dev/null | \
+            awk '/[Cc]ontent-[Ll]ength:/ {print $2}' | tr -d '\r' || echo "0")
+    fi
+    
+    [[ "$size" =~ ^[0-9]+$ ]] && echo "$size" || echo "0"
+}
+
+discover_mirror() {
+    local sf_url="$1"
+    local discovered="" base_url=""
+    
+    # Try curl for discovery
+    if (( HAS_CURL )); then
+        log_verbose "Attempting curl discovery"
+        discovered=$(timeout 10 curl -sL -w '%{url_effective}' -o /dev/null --max-redirs 10 "$sf_url" 2>/dev/null | grep -E '^https?://' || echo "")
+        [[ -n "$discovered" ]] && base_url=$(dirname "$discovered" | grep -E '^https?://' || echo "")
+    fi
+    
+    # Fallback to wget
+    if [[ -z "$base_url" ]] && (( HAS_WGET )); then
+        log_verbose "Attempting wget discovery"
+        discovered=$(timeout 10 wget --spider -S --max-redirect=10 "$sf_url" 2>&1 | \
+            grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r' | grep -E '^https?://' || echo "")
+        [[ -n "$discovered" ]] && base_url=$(dirname "$discovered" | grep -E '^https?://' || echo "")
+    fi
+    
+    echo "$base_url"
+}
+
 get_mirror_url() {
     local project="$1" filepath="$2" filename="$3"
     local mirror_cache="$DOWNLOAD_DIR/mirror.url"
@@ -234,61 +267,36 @@ get_mirror_url() {
     if [[ -f "$mirror_cache" ]]; then
         local cached
         cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | xargs)
-        if [[ -n "$cached" ]] && is_valid_url "$cached"; then
+        if [[ -n "$cached" ]]; then
             log_verbose "Using cached mirror: $(echo "$cached" | sed -E 's|https://([^/]+).*|\1|')"
-            # Return full URL for the specific file
             echo "${cached}/${filename}"
             return 0
         fi
-        log_verbose "Cached mirror invalid"
+        # Only remove if empty or corrupted
+        log_verbose "Cached mirror invalid, removing"
         rm -f "$mirror_cache"
     fi
     
     # Construct SourceForge URL
     local sf_url="https://downloads.sourceforge.net/project/${project}/${filepath}/${filename}"
     
-    if ! is_valid_url "$sf_url"; then
-        log_error "Invalid SourceForge URL constructed"
-        return 1
-    fi
-    
     log "Discovering mirror from SourceForge..."
     
-    local discovered=""
-    
-    # Try curl first
-    if (( HAS_CURL )); then
-        log_verbose "Using curl for discovery"
-        discovered=$(curl -sL -w '%{url_effective}' -o /dev/null -I "$sf_url" 2>/dev/null || echo "")
-    fi
-    
-    # Fallback to wget
-    if [[ -z "$discovered" ]] && (( HAS_WGET )); then
-        log_verbose "Using wget for discovery"
-        discovered=$(wget --spider -S --max-redirect=5 "$sf_url" 2>&1 | \
-            grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r' || echo "")
-    fi
-    
-    # Extract base directory URL and cache it
     local base_url
-    if [[ -n "$discovered" ]] && is_valid_url "$discovered"; then
-        base_url=$(dirname "$discovered")
-        log_success "Discovered: $(echo "$base_url" | sed -E 's|https://([^/]+).*|\1|')"
-    else
-        log_warn "Discovery failed, using SourceForge direct"
-        base_url="https://downloads.sourceforge.net/project/${project}/${filepath}"
-    fi
+    base_url=$(discover_mirror "$sf_url")
     
-    # Validate and cache base URL
-    if is_valid_url "$base_url"; then
+    # Use discovered mirror or fallback
+    if [[ -n "$base_url" ]]; then
+        log_success "Discovered: $(echo "$base_url" | sed -E 's|https://([^/]+).*|\1|')"
         mkdir -p "$DOWNLOAD_DIR"
         echo "$base_url" > "$mirror_cache"
-        # Return full URL for the specific file
         echo "${base_url}/${filename}"
         return 0
     else
-        log_error "Invalid mirror URL"
-        return 1
+        log_warn "Discovery failed, using SourceForge direct"
+        base_url="https://downloads.sourceforge.net/project/${project}/${filepath}"
+        echo "${base_url}/${filename}"
+        return 0
     fi
 }
 
@@ -297,12 +305,18 @@ get_mirror_url() {
 #####################################
 
 validate_download() {
-    local file="$1" min_size="${2:-$MIN_FILE_SIZE}"
+    local file="$1" expected_size="${2:-0}"
     
     [[ -f "$file" ]] || { log_error "File not found: $file"; return 1; }
     
     local size
     size=$(get_file_size "$file")
+    
+    # Use server-provided size if available, otherwise use minimum threshold
+    local min_size="$MIN_FILE_SIZE"
+    if (( expected_size > 0 )); then
+        min_size="$expected_size"
+    fi
     
     if (( size < min_size )); then
         log_error "File too small: $(format_bytes $size) < $(format_bytes $min_size)"
@@ -376,15 +390,19 @@ download_file() {
         local temp_output="${output}.tmp"
         
         if (( HAS_WGET )); then
-            if wget -q --timeout=15 --tries=2 -O "$temp_output" "$url" 2>/dev/null; then
-                mv "$temp_output" "$output" 2>/dev/null && return 0
+            if timeout 20 wget -q --timeout=15 --tries=2 -O "$temp_output" "$url" 2>/dev/null; then
+                if [[ -f "$temp_output" ]] && [[ -s "$temp_output" ]]; then
+                    mv "$temp_output" "$output" 2>/dev/null && return 0
+                fi
             fi
             rm -f "$temp_output"
         fi
         
         if (( HAS_CURL )); then
-            if curl -fsSL --max-time 15 --retry 1 -o "$temp_output" "$url" 2>/dev/null; then
-                mv "$temp_output" "$output" 2>/dev/null && return 0
+            if timeout 20 curl -fsSL --max-time 15 --retry 1 -o "$temp_output" "$url" 2>/dev/null; then
+                if [[ -f "$temp_output" ]] && [[ -s "$temp_output" ]]; then
+                    mv "$temp_output" "$output" 2>/dev/null && return 0
+                fi
             fi
             rm -f "$temp_output"
         fi
@@ -398,10 +416,21 @@ download_file() {
     (( HAS_WGET )) && downloaders+=(wget)
     (( HAS_CURL )) && downloaders+=(curl)
     
+    if [[ ${#downloaders[@]} -eq 0 ]]; then
+        log_error "No download tools available"
+        return 1
+    fi
+    
     for tool in "${downloaders[@]}"; do
         log_verbose "Trying $tool..."
         if download_with_tool "$tool" "$url" "$output"; then
-            return 0
+            # Verify download produced a file
+            if [[ -f "$output" ]] && [[ -s "$output" ]]; then
+                return 0
+            else
+                log_verbose "$tool completed but no output file"
+                rm -f "$output"
+            fi
         fi
         log_verbose "$tool failed"
     done
@@ -1047,10 +1076,14 @@ download_update() {
                 log_success "Using verified cache: $(format_bytes $existing_size)"
                 return 0
             fi
-            log_warn "Cached file verification failed"
+            log_warn "Cached file verification failed, will re-download"
         fi
-        rm -f "$marker" "$image" "$image_part" "$image.aria2"
+        # Only delete when verification fails
+        rm -f "$marker" "$image" "$sha" "$asc"
     fi
+    
+    # Clean up partial downloads from interrupted sessions
+    [[ -f "$image_part.aria2" ]] && rm -f "$image_part.aria2"
     
     [[ "${DRY_RUN}" == "yes" ]] && return 0
     
@@ -1062,44 +1095,44 @@ download_update() {
     # Get mirror URL for main image
     log "Discovering mirror..."
     local mirror_url
-    mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME") || \
+    mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
+    
+    if [[ -z "$mirror_url" ]]; then
+        log_error "Failed to get mirror URL"
         die "Mirror discovery failed"
+    fi
+    
+    log_verbose "Mirror URL: $mirror_url"
     
     # Check remote file size
     log "Checking remote file..."
-    local expected_size=0
-    if (( HAS_WGET )); then
-        expected_size=$(wget -q --spider -S "$mirror_url" 2>&1 | \
-            awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r' || echo "0")
-    elif (( HAS_CURL )); then
-        expected_size=$(curl -sI "$mirror_url" 2>/dev/null | \
-            awk '/[Cc]ontent-[Ll]ength:/ {print $2}' | tr -d '\r' || echo "0")
-    fi
+    local expected_size
+    expected_size=$(get_remote_file_size "$mirror_url")
     
-    if [[ "$expected_size" =~ ^[0-9]+$ ]] && (( expected_size > 0 )); then
+    if (( expected_size > 0 )); then
         log "Expected size: $(format_bytes $expected_size)"
     else
         log_warn "Could not determine remote size"
-        expected_size=0
     fi
     
     # Download main image with retry and resume
     local attempt=0 delay=5
     local download_success=0
+    local mirror_failed=0
     
     while (( attempt < MAX_DOWNLOAD_ATTEMPTS )); do
         ((attempt++))
         
-        log "Attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}"
+        log "Download attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}"
         
         # Check partial download
         local current_size=0
         if [[ -f "$image_part" ]]; then
             current_size=$(get_file_size "$image_part")
             
-            # Validate partial file
+            # Validate partial file - only delete if corrupted
             if (( expected_size > 0 && current_size > expected_size )); then
-                log_warn "Partial file larger than expected, restarting"
+                log_warn "Partial file larger than expected, corrupted"
                 rm -f "$image_part" "$image_part.aria2"
                 current_size=0
             elif (( current_size > 0 )); then
@@ -1109,28 +1142,45 @@ download_update() {
         
         # Attempt download
         if download_file "$mirror_url" "$image_part" 0; then
-            current_size=$(get_file_size "$image_part")
-            
-            # Check if complete
-            if (( expected_size == 0 )) || (( current_size == expected_size )); then
-                if mv "$image_part" "$image" 2>/dev/null; then
-                    download_success=1
-                    log_success "Downloaded: $(format_bytes $current_size)"
-                    break
-                else
-                    log_error "Failed to rename downloaded file"
-                fi
+            # Verify file was created and has content
+            if [[ ! -f "$image_part" ]] || [[ ! -s "$image_part" ]]; then
+                log_warn "Download completed but no file produced"
+                mirror_failed=1
             else
-                log_warn "Incomplete: $(format_bytes $current_size) / $(format_bytes $expected_size)"
+                current_size=$(get_file_size "$image_part")
+                
+                # Check if complete
+                if (( expected_size == 0 )) || (( current_size >= expected_size )); then
+                    if mv "$image_part" "$image" 2>/dev/null; then
+                        download_success=1
+                        log_success "Downloaded: $(format_bytes $current_size)"
+                        break
+                    else
+                        log_error "Failed to rename downloaded file"
+                    fi
+                else
+                    log_warn "Incomplete: $(format_bytes $current_size) / $(format_bytes $expected_size)"
+                fi
             fi
         else
-            log_warn "Download failed"
+            log_warn "Download attempt failed"
+            mirror_failed=1
+        fi
+        
+        # Clear mirror cache and rediscover on repeated failures
+        if (( mirror_failed && attempt % 2 == 0 && attempt < MAX_DOWNLOAD_ATTEMPTS )); then
+            log "Mirror appears broken, rediscovering..."
+            rm -f "$DOWNLOAD_DIR/mirror.url"
             
-            # Rediscover mirror every 2 attempts
-            if (( attempt % 2 == 0 && attempt < MAX_DOWNLOAD_ATTEMPTS )); then
-                log "Attempting mirror rediscovery..."
-                rm -f "$DOWNLOAD_DIR/mirror.url"
-                mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME") || true
+            mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
+            
+            if [[ -z "$mirror_url" ]]; then
+                log_warn "Mirror rediscovery failed, will retry"
+            else
+                log_verbose "New mirror: $mirror_url"
+                # Refresh expected size from new mirror
+                expected_size=$(get_remote_file_size "$mirror_url")
+                mirror_failed=0
             fi
         fi
         
@@ -1143,24 +1193,41 @@ download_update() {
     done
     
     if [[ $download_success -eq 0 ]]; then
+        # Clean up failed download artifacts
         rm -f "$image_part" "$image" "$image.aria2"
         die "Download failed after $MAX_DOWNLOAD_ATTEMPTS attempts"
     fi
     
     # Validate downloaded file
-    if ! validate_download "$image"; then
+    if ! validate_download "$image" "$expected_size"; then
         rm -f "$image"
         die "Downloaded file validation failed"
     fi
     
     # Download verification files (use SourceForge direct URLs)
     log "Downloading verification files..."
-    download_file "$sha_url" "$sha" 1 || die "SHA256 download failed"
-    download_file "$asc_url" "$asc" 1 || die "Signature download failed"
+    if ! download_file "$sha_url" "$sha" 1; then
+        log_error "Failed to download SHA256 checksum"
+        rm -f "$image"
+        die "SHA256 download failed"
+    fi
+    
+    if ! download_file "$asc_url" "$asc" 1; then
+        log_error "Failed to download GPG signature"
+        rm -f "$image" "$sha"
+        die "Signature download failed"
+    fi
     
     # Verify integrity
-    verify_sha256 "$image" "$sha" || { rm -f "$image"; die "SHA256 verification failed"; }
-    verify_gpg "$image" "$asc" || { rm -f "$image"; die "GPG verification failed"; }
+    if ! verify_sha256 "$image" "$sha"; then
+        rm -f "$image" "$sha" "$asc"
+        die "SHA256 verification failed"
+    fi
+    
+    if ! verify_gpg "$image" "$asc"; then
+        rm -f "$image" "$sha" "$asc"
+        die "GPG verification failed"
+    fi
     
     # Mark as verified
     touch "$marker" || log_warn "Failed to create verification marker"

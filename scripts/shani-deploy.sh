@@ -3,7 +3,7 @@
 # shanios-deploy.sh
 #
 # Enhanced Blue/Green Btrfs Deployment Script for shanios
-# With comprehensive error handling and robust mirror discovery
+# Refactored to eliminate redundancies
 #
 # Usage: ./shanios-deploy.sh [OPTIONS]
 #
@@ -11,68 +11,22 @@
 #   -h, --help             Show this help message.
 #   -r, --rollback         Force a full rollback.
 #   -c, --cleanup          Run manual cleanup.
+#   -s, --storage-info     Show storage usage analysis.
 #   -t, --channel <chan>   Specify update channel: latest or stable (default: stable).
 #   -d, --dry-run          Dry run (simulate actions without making changes).
 ################################################################################
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
 #####################################
-### State Restoration (if needed) ###
+### State Restoration             ###
 #####################################
 
-if [ -n "$SHANIOS_DEPLOY_STATE_FILE" ] && [ -f "$SHANIOS_DEPLOY_STATE_FILE" ]; then
-    # Restore all persisted variables (scalars and arrays)
+if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FILE" ]]; then
     source "$SHANIOS_DEPLOY_STATE_FILE"
     rm -f "$SHANIOS_DEPLOY_STATE_FILE"
 fi
-
-#####################################
-### State Persistence Function    ###
-#####################################
-
-# Create a temporary directory for state files
-STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
-export STATE_DIR
-
-# Cleanup trap to remove the state directory on exit
-cleanup() {
-    if [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]]; then
-        rm -rf "${STATE_DIR}"
-    fi
-}
-trap cleanup EXIT
-
-persist_state() {
-    local state_file
-    state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
-    {
-        # Persist scalar variables using printf %q to handle quoting
-        echo "export OS_NAME=$(printf '%q' "$OS_NAME")"
-        echo "export DOWNLOAD_DIR=$(printf '%q' "$DOWNLOAD_DIR")"
-        echo "export ZSYNC_CACHE_DIR=$(printf '%q' "$ZSYNC_CACHE_DIR")"
-        echo "export MOUNT_DIR=$(printf '%q' "$MOUNT_DIR")"
-        echo "export ROOTLABEL=$(printf '%q' "$ROOTLABEL")"
-        echo "export ROOT_DEV=$(printf '%q' "$ROOT_DEV")"
-        echo "export MIN_FREE_SPACE_MB=$(printf '%q' "$MIN_FREE_SPACE_MB")"
-        echo "export GENEFI_SCRIPT=$(printf '%q' "$GENEFI_SCRIPT")"
-        echo "export DEPLOY_PENDING=$(printf '%q' "$DEPLOY_PENDING")"
-        echo "export GPG_KEY_ID=$(printf '%q' "$GPG_KEY_ID")"
-        echo "export LOCAL_VERSION=$(printf '%q' "$LOCAL_VERSION")"
-        echo "export LOCAL_PROFILE=$(printf '%q' "$LOCAL_PROFILE")"
-        echo "export BACKUP_NAME=$(printf '%q' "$BACKUP_NAME")"
-        echo "export CURRENT_SLOT=$(printf '%q' "$CURRENT_SLOT")"
-        echo "export CANDIDATE_SLOT=$(printf '%q' "$CANDIDATE_SLOT")"
-        echo "export REMOTE_VERSION=$(printf '%q' "$REMOTE_VERSION")"
-        echo "export REMOTE_PROFILE=$(printf '%q' "$REMOTE_PROFILE")"
-        echo "export IMAGE_NAME=$(printf '%q' "$IMAGE_NAME")"
-        echo "export STATE_DIR=$(printf '%q' "${STATE_DIR}")"
-        echo "export MARKER_FILE=$(printf '%q' "$MARKER_FILE")"
-        echo "export UPDATE_CHANNEL=$(printf '%q' "$UPDATE_CHANNEL")"
-        # Persist arrays using declare -p
-        declare -p CHROOT_BIND_DIRS
-        declare -p CHROOT_STATIC_DIRS
-    } > "$state_file"
-    export SHANIOS_DEPLOY_STATE_FILE="$state_file"
-}
 
 #####################################
 ### Global Configuration          ###
@@ -89,68 +43,50 @@ readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
 readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 
-# Mirror discovery configuration
 readonly MIRROR_DISCOVERY_TIMEOUT=15
 readonly MIRROR_TEST_TIMEOUT=10
 readonly MAX_MIRROR_DISCOVERIES=8
 readonly MIN_MIRRORS_NEEDED=3
+readonly MAX_INHIBIT_DEPTH=2
 
-# Global state variables
-declare -g LOCAL_VERSION
-declare -g LOCAL_PROFILE
-declare -g BACKUP_NAME=""
-declare -g CURRENT_SLOT=""
-declare -g CANDIDATE_SLOT=""
-declare -g REMOTE_VERSION=""
-declare -g REMOTE_PROFILE=""
-declare -g IMAGE_NAME=""
-declare -g UPDATE_CHANNEL="stable"
-MARKER_FILE=""
+# Tool availability flags (check once at startup)
+declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0
+command -v aria2c &>/dev/null && HAS_ARIA2C=1
+command -v wget &>/dev/null && HAS_WGET=1
+command -v curl &>/dev/null && HAS_CURL=1
 
-# Arrays for chroot bind mounts (persisted via declare -p)
+declare -g LOCAL_VERSION LOCAL_PROFILE
+declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
+declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
+declare -g UPDATE_CHANNEL="stable" DRY_RUN="no"
+declare -g MARKER_FILE=""
+
 CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp /sys/firmware/efi/efivars)
 CHROOT_STATIC_DIRS=(data etc var)
 
 #####################################
-### Preliminary & Environment     ###
+### State Management              ###
 #####################################
 
-check_root() {
-    if [[ $(id -u) -ne 0 ]]; then
-        echo "Error: Must be run as root (use sudo)." >&2
-        exit 1
-    fi
-}
+STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
+export STATE_DIR
 
-check_internet() {
-    if ! ping -c1 -W2 google.com &>/dev/null; then
-        echo "Error: No internet connection. Please check your network." >&2
-        exit 1
-    fi
+cleanup_state() {
+    [[ -n "${STATE_DIR}" && -d "${STATE_DIR}" ]] && rm -rf "${STATE_DIR}"
 }
+trap cleanup_state EXIT
 
-set_environment() {
-    set -Eeuo pipefail
-    IFS=$'\n\t'
-    
-    if [[ ! -f /etc/shani-version ]]; then
-        die "Missing /etc/shani-version file"
-    fi
-    
-    if [[ ! -f /etc/shani-profile ]]; then
-        die "Missing /etc/shani-profile file"
-    fi
-    
-    LOCAL_VERSION=$(< /etc/shani-version)
-    LOCAL_PROFILE=$(< /etc/shani-profile)
-    
-    if [[ -z "$LOCAL_VERSION" ]]; then
-        die "LOCAL_VERSION is empty"
-    fi
-    
-    if [[ -z "$LOCAL_PROFILE" ]]; then
-        die "LOCAL_PROFILE is empty"
-    fi
+persist_state() {
+    local state_file
+    state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
+    {
+        declare -p OS_NAME DOWNLOAD_DIR ZSYNC_CACHE_DIR MOUNT_DIR ROOTLABEL ROOT_DEV 2>/dev/null || true
+        declare -p MIN_FREE_SPACE_MB GENEFI_SCRIPT DEPLOY_PENDING GPG_KEY_ID 2>/dev/null || true
+        declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
+        declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME STATE_DIR MARKER_FILE UPDATE_CHANNEL 2>/dev/null || true
+        declare -p CHROOT_BIND_DIRS CHROOT_STATIC_DIRS 2>/dev/null || true
+    } > "$state_file"
+    export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
 
 #####################################
@@ -167,58 +103,298 @@ die() {
 }
 
 run_cmd() {
-    if [[ "${dry_run:-no}" == "yes" ]]; then
+    if [[ "${DRY_RUN}" == "yes" ]]; then
         log "[Dry Run] $*"
-    else
-        log "Executing: $*"
-        eval "$@" || die "Command failed: $*"
+        return 0
     fi
+    log "Executing: $*"
+    "$@" || die "Command failed: $*"
 }
+
+validate_nonempty() {
+    local value="$1" name="$2"
+    [[ -n "$value" ]] || die "$name is empty"
+}
+
+validate_url() {
+    [[ "$1" =~ ^https?://[a-zA-Z0-9.-]+(/.*)?$ ]]
+}
+
+file_nonempty() {
+    [[ -f "$1" ]] && (( $(stat -c%s "$1" 2>/dev/null || echo 0) > 0 ))
+}
+
+#####################################
+### Mount Management              ###
+#####################################
 
 safe_mount() {
     local src="$1" tgt="$2" opts="$3"
     
-    if [[ -z "$src" || -z "$tgt" ]]; then
-        die "safe_mount: Invalid arguments (src='$src', tgt='$tgt')"
-    fi
+    [[ -n "$src" && -n "$tgt" ]] || die "safe_mount: Invalid arguments (src='$src', tgt='$tgt')"
     
     if ! findmnt -M "$tgt" &>/dev/null; then
-        if ! mount -o "$opts" "$src" "$tgt"; then
-            die "Mount failed: $src -> $tgt (opts: $opts)"
-        fi
-        log "Mounted $tgt with options ($opts)"
+        run_cmd mount -o "$opts" "$src" "$tgt"
+        log "Mounted $tgt"
     fi
 }
 
 safe_umount() {
     local tgt="$1"
     
-    if [[ -z "$tgt" ]]; then
-        log "WARNING: safe_umount called with empty target"
-        return 1
-    fi
+    [[ -n "$tgt" ]] || { log "WARNING: safe_umount called with empty target"; return 1; }
     
     if findmnt -M "$tgt" &>/dev/null; then
-        if umount -R "$tgt"; then
-            log "Unmounted $tgt"
-            return 0
-        else
-            log "WARNING: Failed to unmount $tgt"
-            return 1
-        fi
+        [[ "${DRY_RUN}" == "yes" ]] && { log "[Dry Run] Would unmount $tgt"; return 0; }
+        umount -R "$tgt" && log "Unmounted $tgt" || { log "WARNING: Failed to unmount $tgt"; return 1; }
     fi
     return 0
 }
 
+#####################################
+### Btrfs Helpers                 ###
+#####################################
+
 get_booted_subvol() {
     local rootflags subvol
-    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2-)
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- || echo "")
     subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
     subvol="${subvol#@}"
-    if [[ -z "$subvol" ]]; then
-        subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
-    fi
+    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
     echo "${subvol:-blue}"
+}
+
+btrfs_subvol_exists() {
+    local path="$1"
+    btrfs subvolume show "$path" &>/dev/null
+}
+
+get_btrfs_available_mb() {
+    local mount_point="$1"
+    local available_bytes
+    available_bytes=$(btrfs filesystem usage -b "$mount_point" 2>/dev/null | \
+        awk '/Free \(estimated\):/ {gsub(/[^0-9]/,"",$3); print $3}')
+    
+    if [[ -z "$available_bytes" ]] || [[ "$available_bytes" -eq 0 ]]; then
+        log "WARNING: Could not determine Btrfs available space"
+        echo "0"
+        return 1
+    fi
+    echo "$((available_bytes / 1024 / 1024))"
+}
+
+#####################################
+### Universal Download Function   ###
+#####################################
+
+download_file() {
+    local url="$1" output="$2"
+    
+    validate_url "$url" || return 1
+    mkdir -p "$(dirname "$output")"
+    
+    # Try aria2c (fastest, multi-connection)
+    if (( HAS_ARIA2C )); then
+        aria2c --console-log-level=error --timeout=30 --max-tries=3 \
+            --dir="$(dirname "$output")" --out="$(basename "$output")" \
+            "$url" 2>/dev/null && return 0
+    fi
+    
+    # Try wget (best SourceForge support, resume capability)
+    if (( HAS_WGET )); then
+        wget --timeout=30 --tries=3 --quiet --continue \
+            -O "$output" "$url" 2>/dev/null && return 0
+    fi
+    
+    # Try curl (last resort)
+    if (( HAS_CURL )); then
+        curl -fsSL --max-time 30 --retry 2 \
+            -o "$output" "$url" 2>/dev/null && return 0
+    fi
+    
+    log "ERROR: All download methods failed"
+    return 1
+}
+
+download_with_retry() {
+    local url="$1" output="$2" max_attempts="${3:-5}"
+    local attempt=0 delay=5
+    
+    while (( attempt < max_attempts )); do
+        ((attempt++))
+        log "Download attempt ${attempt}/${max_attempts}..."
+        
+        download_file "$url" "$output" && file_nonempty "$output" && return 0
+        
+        (( attempt < max_attempts )) && {
+            log "Retrying in ${delay}s..."
+            sleep "$delay"
+            delay=$(( delay < 60 ? delay * 2 : 60 ))
+        }
+    done
+    
+    return 1
+}
+
+#####################################
+### Mirror Discovery & Testing    ###
+#####################################
+
+get_effective_url() {
+    local url="$1" result=""
+    
+    validate_url "$url" || return 1
+    
+    # Use curl for redirect following
+    if (( HAS_CURL )); then
+        result=$(curl -sL -w '%{url_effective}' -o /dev/null \
+            --max-time "$MIRROR_DISCOVERY_TIMEOUT" --max-redirs 5 "$url" 2>/dev/null)
+        validate_url "$result" && { echo "$result"; return 0; }
+    fi
+    
+    # Fallback to wget
+    if (( HAS_WGET )); then
+        result=$(wget --max-redirect=5 --spider -S \
+            --timeout="$MIRROR_DISCOVERY_TIMEOUT" "$url" 2>&1 | \
+            grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+        validate_url "$result" && { echo "$result"; return 0; }
+    fi
+    
+    return 1
+}
+
+test_mirror_response() {
+    local mirror_url="$1" timeout="${2:-$MIRROR_TEST_TIMEOUT}"
+    
+    validate_url "$mirror_url" || return 1
+    
+    # Try aria2c dry-run
+    (( HAS_ARIA2C )) && aria2c --dry-run=true --timeout="$timeout" \
+        --connect-timeout="$timeout" --max-tries=1 --console-log-level=error \
+        "$mirror_url" &>/dev/null && return 0
+    
+    # Try wget spider
+    (( HAS_WGET )) && wget --spider --timeout="$timeout" --tries=1 \
+        --quiet "$mirror_url" 2>/dev/null && return 0
+    
+    # Try curl HEAD
+    (( HAS_CURL )) && curl -I --max-time "$timeout" --retry 1 \
+        --silent --fail "$mirror_url" &>/dev/null && return 0
+    
+    return 1
+}
+
+is_valid_mirror() {
+    local url="$1"
+    validate_url "$url" || return 1
+    [[ "$url" != *"sourceforge.net/projects/shanios/files"* ]] || return 1
+    [[ "$url" == *"${IMAGE_NAME}"* || "$url" =~ /download$ ]]
+}
+
+discover_mirrors() {
+    local base_url="$1" MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
+    local -a discovered_mirrors=()
+    local -A seen_domains=()
+    
+    validate_url "$base_url" || return 1
+    
+    log "Discovering mirrors for: $base_url"
+    
+    for ((i=0; i<MAX_MIRROR_DISCOVERIES; i++)); do
+        local mirror_url domain
+        mirror_url=$(get_effective_url "$base_url")
+        
+        if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
+            domain=$(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')
+            [[ -n "$domain" ]] || continue
+            
+            [[ -z "${seen_domains[$domain]:-}" ]] && {
+                seen_domains["$domain"]=1
+                discovered_mirrors+=("$mirror_url")
+                log "Discovered mirror: $domain"
+            }
+        fi
+        
+        [[ ${#discovered_mirrors[@]} -ge MIN_MIRRORS_NEEDED ]] && break
+        sleep 0.5
+    done
+    
+    if [[ ${#discovered_mirrors[@]} -eq 0 ]]; then
+        log "No mirrors discovered, using direct URL"
+        echo "$base_url" > "$MIRROR_FILE"
+        return 0
+    fi
+    
+    log "Testing ${#discovered_mirrors[@]} mirror(s)..."
+    
+    local selected_mirror=""
+    for mirror in "${discovered_mirrors[@]}"; do
+        if test_mirror_response "$mirror"; then
+            selected_mirror="$mirror"
+            log "Selected: $(echo "$mirror" | sed -E 's|https?://([^/]+).*|\1|')"
+            break
+        fi
+    done
+    
+    [[ -z "$selected_mirror" ]] && selected_mirror="${discovered_mirrors[0]}"
+    echo "$selected_mirror" > "$MIRROR_FILE"
+}
+
+#####################################
+### Verification Functions        ###
+#####################################
+
+verify_sha256() {
+    local file="$1" sha_file="$2"
+    log "Verifying SHA256..."
+    sha256sum -c "$sha_file" --status 2>/dev/null
+}
+
+verify_gpg() {
+    local file="$1" sig_file="$2"
+    local gpg_temp
+    
+    log "Verifying GPG signature..."
+    gpg_temp=$(mktemp -d) || return 1
+    
+    (
+        export GNUPGHOME="$gpg_temp"
+        chmod 700 "$gpg_temp"
+        
+        log "Importing GPG key ${GPG_KEY_ID}..."
+        for keyserver in keys.openpgp.org keyserver.ubuntu.com; do
+            gpg --batch --quiet --keyserver "$keyserver" \
+                --recv-keys "$GPG_KEY_ID" 2>/dev/null && break
+        done || exit 1
+        
+        gpg --batch --verify "$sig_file" "$file" 2>/dev/null
+    )
+    local result=$?
+    rm -rf "$gpg_temp"
+    return $result
+}
+
+#####################################
+### Preliminary Checks            ###
+#####################################
+
+check_root() {
+    [[ $(id -u) -eq 0 ]] || die "Must be run as root (use sudo)"
+}
+
+check_internet() {
+    ping -c1 -W2 8.8.8.8 &>/dev/null || die "No internet connection"
+}
+
+set_environment() {
+    [[ -f /etc/shani-version ]] || die "Missing /etc/shani-version file"
+    [[ -f /etc/shani-profile ]] || die "Missing /etc/shani-profile file"
+    
+    LOCAL_VERSION=$(< /etc/shani-version)
+    LOCAL_PROFILE=$(< /etc/shani-profile)
+    
+    validate_nonempty "$LOCAL_VERSION" "LOCAL_VERSION"
+    validate_nonempty "$LOCAL_PROFILE" "LOCAL_PROFILE"
 }
 
 #####################################
@@ -228,23 +404,23 @@ get_booted_subvol() {
 ORIGINAL_ARGS=("$@")
 
 self_update() {
-    if [[ -z "${SELF_UPDATE_DONE:-}" ]]; then
-        export SELF_UPDATE_DONE=1
-        persist_state
+    [[ -n "${SELF_UPDATE_DONE:-}" ]] && return 0
+    
+    export SELF_UPDATE_DONE=1
+    persist_state
 
-        local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
-        local temp_script
-        temp_script=$(mktemp)
+    local remote_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
+    local temp_script
+    temp_script=$(mktemp)
 
-        if curl -fsSL "$remote_url" -o "$temp_script"; then
-            chmod +x "$temp_script"
-            log "Self-update: Running updated script (state preserved via $SHANIOS_DEPLOY_STATE_FILE)..."
-            exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
-        else
-            log "Warning: Unable to fetch remote script; continuing with local version." >&2
-        fi
-        rm -f "$temp_script"
+    if download_file "$remote_url" "$temp_script"; then
+        chmod +x "$temp_script"
+        log "Self-update: Running updated script..."
+        exec /bin/bash "$temp_script" "${ORIGINAL_ARGS[@]}"
     fi
+    
+    log "Warning: Unable to fetch remote script; continuing with local version."
+    rm -f "$temp_script"
 }
 
 #####################################
@@ -252,108 +428,110 @@ self_update() {
 #####################################
 
 inhibit_system() {
-    if [ -z "${SYSTEMD_INHIBITED:-}" ]; then
-        export SYSTEMD_INHIBITED=1
-        log "Inhibiting all system interruptions during update..."
-        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="Updating system" "$0" "$@"
-    fi
+    local inhibit_depth="${SYSTEMD_INHIBIT_DEPTH:-0}"
+    
+    (( inhibit_depth >= MAX_INHIBIT_DEPTH )) && {
+        log "WARNING: Maximum inhibit depth reached, continuing without inhibit"
+        return 0
+    }
+    
+    [[ -z "${SYSTEMD_INHIBITED:-}" ]] || return 0
+    
+    export SYSTEMD_INHIBITED=1
+    export SYSTEMD_INHIBIT_DEPTH=$((inhibit_depth + 1))
+    log "Inhibiting all system interruptions during update..."
+    exec systemd-inhibit \
+        --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+        --who="shanios-deployment" \
+        --why="Updating system" \
+        "$0" "$@"
 }
 
 #####################################
-### Backup & Cleanup Functions    ###
+### Cleanup Functions             ###
 #####################################
 
 cleanup_old_backups() {
+    local slot backup backup_count exclude_backup="${1:-}"
+    
     for slot in blue green; do
         log "Checking for old backups in slot '${slot}'..."
         mapfile -t backups < <(btrfs subvolume list "$MOUNT_DIR" | \
             awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' | sort -r)
         
-        if [ ${#backups[@]} -gt 0 ]; then
-            log "Found backups for slot '${slot}': ${backups[*]}"
-        else
-            log "No backups found for slot '${slot}'."
-            continue
-        fi
-        
         backup_count=${#backups[@]}
-        if (( backup_count > 1 )); then
-            log "Keeping the most recent backup and deleting the older $((backup_count-1)) backup(s) for slot '${slot}'."
-            for (( i=1; i<backup_count; i++ )); do
+        
+        [[ $backup_count -eq 0 ]] && { log "No backups found for slot '${slot}'."; continue; }
+        
+        log "Found ${backup_count} backup(s) for slot '${slot}': ${backups[*]}"
+        
+        if (( backup_count > 2 )); then
+            log "Keeping 2 most recent backups, deleting $((backup_count-2)) older backup(s)..."
+            for (( i=2; i<backup_count; i++ )); do
                 backup="${backups[i]}"
-                if [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]]; then
-                    if btrfs subvolume delete "$MOUNT_DIR/@${backup}"; then
-                        log "Deleted old backup: @${backup}"
-                    else
-                        log "Failed to delete backup: @${backup}"
-                    fi
-                else
-                    log "Skipping deletion for backup with unexpected name format: ${backup}"
-                fi
+                [[ "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]] || {
+                    log "Skipping unexpected backup name: ${backup}"
+                    continue
+                }
+                run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backup}"
+                log "Deleted old backup: @${backup}"
             done
         else
-            log "Only the latest backup exists for slot '${slot}'; no cleanup needed."
+            log "Only ${backup_count} backup(s) exist; no cleanup needed."
         fi
     done
 }
 
 cleanup_downloads() {
     local files latest_file count
-    files=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst*" -mtime +7 -printf "%T@ %p\n" | sort -n)
-    count=$(echo "$files" | grep -c . || echo 0)
-    if (( count > 1 )); then
-        latest_file=$(echo "$files" | tail -n 1 | cut -d' ' -f2-)
-        echo "$files" | while read -r line; do
-            local file
-            file=$(echo "$line" | cut -d' ' -f2-)
-            if [[ "$file" != "$latest_file" ]]; then
-                if rm -f "$file"; then
-                    log "Deleted old download: $file"
-                else
-                    log "Failed to delete old download: $file"
-                fi
-            fi
-        done
-    else
-        log "No old downloads to clean up."
-    fi
+    files=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst*" -mtime +7 -printf "%T@ %p\n" 2>/dev/null | sort -n)
+    count=$(echo "$files" | wc -l)
+    
+    (( count <= 1 )) && { log "No old downloads to clean up."; return 0; }
+    
+    latest_file=$(echo "$files" | tail -n 1 | cut -d' ' -f2-)
+    echo "$files" | while read -r line; do
+        local file
+        file=$(echo "$line" | cut -d' ' -f2-)
+        [[ "$file" != "$latest_file" ]] && {
+            run_cmd rm -f "$file"
+            log "Deleted old download: $file"
+        }
+    done
 }
 
 #####################################
-### Chroot Environment Functions  ###
+### Chroot Environment            ###
 #####################################
 
 prepare_chroot_env() {
     local slot="$1"
-    
-    if [[ -z "$slot" ]]; then
-        die "prepare_chroot_env: slot parameter is empty"
-    fi
+    validate_nonempty "$slot" "slot parameter"
     
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvol=@${slot}"
     
+    mkdir -p "$MOUNT_DIR/boot/efi"
     if mountpoint -q /boot/efi; then
         log "EFI partition already mounted; binding /boot/efi..."
-        mkdir -p "$MOUNT_DIR/boot/efi"
-        run_cmd "mount --bind /boot/efi $MOUNT_DIR/boot/efi"
+        run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi"
     else
         safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults"
     fi
     
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR/$dir"
-        run_cmd "mount --bind /$dir $MOUNT_DIR/$dir"
+        run_cmd mount --bind "/$dir" "$MOUNT_DIR/$dir"
     done
     
     for d in "${CHROOT_BIND_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR$d"
-        run_cmd "mount --bind $d $MOUNT_DIR$d"
+        run_cmd mount --bind "$d" "$MOUNT_DIR$d"
     done
 }
 
 cleanup_chroot_env() {
+    local d dir
     for d in "${CHROOT_BIND_DIRS[@]}"; do
         safe_umount "$MOUNT_DIR$d"
     done
@@ -366,21 +544,19 @@ cleanup_chroot_env() {
 
 generate_uki_common() {
     local slot="$1"
-    
-    if [[ -z "$slot" ]]; then
-        die "generate_uki_common: slot parameter is empty"
-    fi
-    
-    if [[ ! -x "$GENEFI_SCRIPT" ]]; then
-        die "gen-efi script not found or not executable: $GENEFI_SCRIPT"
-    fi
+    validate_nonempty "$slot" "slot parameter"
+    [[ -x "$GENEFI_SCRIPT" ]] || die "gen-efi script not found: $GENEFI_SCRIPT"
     
     prepare_chroot_env "$slot"
-    log "Generating Secure Boot UKI for slot ${slot} using external gen-efi script..."
+    log "Generating Secure Boot UKI for slot ${slot}..."
     
-    if ! chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot"; then
-        cleanup_chroot_env
-        die "UKI generation failed for slot ${slot}"
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would generate UKI for slot ${slot}"
+    else
+        if ! chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot"; then
+            cleanup_chroot_env
+            die "UKI generation failed for slot ${slot}"
+        fi
     fi
     
     cleanup_chroot_env
@@ -388,7 +564,7 @@ generate_uki_common() {
 }
 
 #####################################
-### Rollback & Restore Functions  ###
+### Rollback Functions            ###
 #####################################
 
 restore_candidate() {
@@ -396,13 +572,15 @@ restore_candidate() {
     {
         set +e
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-        if [[ -n "$BACKUP_NAME" ]] && btrfs subvolume show "$MOUNT_DIR/@${BACKUP_NAME}" &>/dev/null; then
+        
+        if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
             log "Restoring candidate slot @${CANDIDATE_SLOT} from backup @${BACKUP_NAME}"
             btrfs property set -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false &>/dev/null || true
             btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" &>/dev/null || true
             btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
             btrfs property set -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
         fi
+        
         [[ -d "$MOUNT_DIR/temp_update" ]] && btrfs subvolume delete "$MOUNT_DIR/temp_update" &>/dev/null
         safe_umount "$MOUNT_DIR"
     } || log "Candidate restore incomplete – manual intervention may be required"
@@ -418,697 +596,440 @@ rollback_system() {
     local failed_slot previous_slot
     if [[ -f "$MOUNT_DIR/@data/current-slot" ]]; then
         failed_slot=$(< "$MOUNT_DIR/@data/current-slot")
+        failed_slot="${failed_slot// /}"
     else
-        die "Current slot marker missing. Cannot rollback."
+        log "WARNING: Current slot marker missing, using booted slot"
+        failed_slot=$(get_booted_subvol)
     fi
     
     if [[ -f "$MOUNT_DIR/@data/previous-slot" ]]; then
         previous_slot=$(< "$MOUNT_DIR/@data/previous-slot")
+        previous_slot="${previous_slot// /}"
     else
         previous_slot=$([[ "$failed_slot" == "blue" ]] && echo "green" || echo "blue")
     fi
     
-    log "Detected failing slot: ${failed_slot}. Rolling back to previous slot: ${previous_slot}."
-    BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" | awk -v slot="${failed_slot}" '$0 ~ slot"_backup" {print $NF}' | sort | tail -n 1)
+    log "Detected failing slot: ${failed_slot}. Rolling back to: ${previous_slot}."
+    BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" | \
+        awk -v slot="${failed_slot}" '$0 ~ slot"_backup" {print $NF}' | sort | tail -n 1)
     
-    if [[ -z "$BACKUP_NAME" ]]; then
-        die "No backup found for slot ${failed_slot}. Rollback aborted."
-    fi
+    [[ -n "$BACKUP_NAME" ]] || die "No backup found for slot ${failed_slot}"
     
     log "Restoring slot ${failed_slot} from backup ${BACKUP_NAME}..."
-    local failed_path backup_path
-    failed_path="$MOUNT_DIR/@${failed_slot}"
-    backup_path="$MOUNT_DIR/@${BACKUP_NAME}"
+    run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro false
+    run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
+    run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
+    run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro true
     
-    btrfs property set -ts "$failed_path" ro false &>/dev/null || true
-    btrfs subvolume delete "$failed_path" || die "Failed to delete slot ${failed_slot}"
-    btrfs subvolume snapshot "$backup_path" "$failed_path" || die "Failed to restore slot ${failed_slot}"
-    btrfs property set -ts "$failed_path" ro true
-    
-    log "Updating active slot marker to previous slot: ${previous_slot}..."
+    log "Updating active slot marker to: ${previous_slot}..."
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
     safe_umount "$MOUNT_DIR"
     
     generate_uki_common "$previous_slot"
     log "Rollback complete. Rebooting system..."
-    reboot
+    [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 
 #####################################
-### URL Validation Functions      ###
+### Storage Optimization          ###
 #####################################
 
-validate_url() {
-    local url="$1"
+optimize_storage() {
+    log "Optimizing storage (deduplicating blue/green slots)..."
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     
-    [[ -n "$url" ]] || return 1
-    [[ "$url" =~ ^https?:// ]] || return 1
-    [[ "$url" =~ ^https?://[a-zA-Z0-9.-]+(/.*)?$ ]] || return 1
-    
-    return 0
-}
-
-is_valid_mirror() {
-    local url="$1"
-    
-    validate_url "$url" || return 1
-    [[ "$url" != *"sourceforge.net/projects/shanios/files"* ]] || return 1
-    [[ "$url" == *"${IMAGE_NAME}"* ]] || [[ "$url" =~ /download$ ]] || return 1
-    
-    return 0
-}
-
-#####################################
-### Effective URL Discovery       ###
-#####################################
-
-get_effective_url() {
-    local url="$1"
-    local method="${2:-auto}"
-    local effective_url=""
-    
-    if [[ -z "$url" ]]; then
-        log "ERROR: Empty URL passed to get_effective_url"
-        return 1
-    fi
-    
-    if ! validate_url "$url"; then
-        log "ERROR: Invalid URL format: $url"
-        return 1
-    fi
-    
-    case "$method" in
-        curl|auto)
-            if command -v curl &>/dev/null; then
-                effective_url=$(curl -sL -w '%{url_effective}' -o /dev/null \
-                    --max-time "$MIRROR_DISCOVERY_TIMEOUT" \
-                    --max-redirs 5 \
-                    --retry 1 \
-                    --retry-delay 2 \
-                    "$url" 2>/dev/null || echo "")
-                
-                [[ -n "$effective_url" ]] && validate_url "$effective_url" && {
-                    echo "$effective_url"
-                    return 0
-                }
-            fi
-            ;;&
-            
-        wget|auto)
-            if command -v wget &>/dev/null; then
-                effective_url=$(wget --max-redirect=5 \
-                    --spider -S \
-                    --timeout="$MIRROR_DISCOVERY_TIMEOUT" \
-                    --tries=1 \
-                    "$url" 2>&1 | \
-                    grep -i '^ *Location: ' | \
-                    tail -1 | \
-                    awk '{print $2}' | \
-                    tr -d '\r' || echo "")
-                
-                [[ -n "$effective_url" ]] && validate_url "$effective_url" && {
-                    echo "$effective_url"
-                    return 0
-                }
-            fi
-            ;;
-            
-        *)
-            log "ERROR: Unknown method '$method' in get_effective_url"
-            return 1
-            ;;
-    esac
-    
-    return 1
-}
-
-#####################################
-### Mirror Testing                ###
-#####################################
-
-test_mirror_response() {
-    local mirror_url="$1"
-    local timeout="${2:-$MIRROR_TEST_TIMEOUT}"
-    
-    if [[ -z "$mirror_url" ]]; then
-        log "ERROR: Empty mirror_url in test_mirror_response"
-        return 1
-    fi
-    
-    if ! validate_url "$mirror_url"; then
-        log "ERROR: Invalid mirror URL: $mirror_url"
-        return 1
-    fi
-    
-    if command -v curl &>/dev/null; then
-        if curl -I \
-            --max-time "$timeout" \
-            --retry 1 \
-            --silent \
-            --fail \
-            "$mirror_url" >/dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    
-    if command -v wget &>/dev/null; then
-        if wget --spider \
-            --timeout="$timeout" \
-            --tries=1 \
-            --quiet \
-            "$mirror_url" 2>/dev/null; then
-            return 0
-        fi
-    fi
-    
-    return 1
-}
-
-#####################################
-### Mirror Discovery              ###
-#####################################
-
-discover_initial_mirror() {
-    local base_url="$1"
-    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
-    
-    if [[ -z "$base_url" ]]; then
-        log "ERROR: base_url is empty in discover_initial_mirror"
-        return 1
-    fi
-    
-    if ! validate_url "$base_url"; then
-        log "ERROR: Invalid base_url format: $base_url"
-        return 1
-    fi
-    
-    log "Performing initial mirror discovery for: $base_url"
-    
-    local mirror_url=""
-    local methods=("curl" "wget")
-    
-    for method in "${methods[@]}"; do
-        log "Trying mirror discovery with $method..."
-        mirror_url=$(get_effective_url "$base_url" "$method")
-        
-        if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
-            if ! echo "$mirror_url" > "$MIRROR_FILE"; then
-                log "ERROR: Failed to write mirror file: $MIRROR_FILE"
-                return 1
-            fi
-            log "Discovered mirror: $mirror_url"
-            return 0
-        fi
-    done
-    
-    log "WARNING: Could not discover mirror, using direct SourceForge URL"
-    if ! echo "$base_url" > "$MIRROR_FILE"; then
-        log "ERROR: Failed to write fallback mirror file"
-        return 1
-    fi
-    return 0
-}
-
-find_fastest_mirror() {
-    local base_url="$1"
-    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
-    
-    if [[ -z "$base_url" ]]; then
-        log "ERROR: base_url is empty in find_fastest_mirror"
-        return 1
-    fi
-    
-    if ! validate_url "$base_url"; then
-        log "ERROR: Invalid base_url: $base_url"
-        return 1
-    fi
-    
-    log "Finding fastest mirror for: $base_url"
-    
-    local -a discovered_mirrors=()
-    local -A seen_domains=()
-    local mirror_url domain
-    local methods=("curl" "wget")
-    local method_idx=0
-    
-    for ((i=0; i<MAX_MIRROR_DISCOVERIES; i++)); do
-        local method="${methods[$method_idx]}"
-        method_idx=$(( (method_idx + 1) % ${#methods[@]} ))
-        
-        mirror_url=$(get_effective_url "$base_url" "$method")
-        
-        if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
-            domain=$(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')
-            
-            if [[ -z "$domain" ]]; then
-                log "WARNING: Could not extract domain from: $mirror_url"
-                continue
-            fi
-            
-            if [[ -z "${seen_domains[$domain]:-}" ]]; then
-                seen_domains["$domain"]=1
-                discovered_mirrors+=("$mirror_url")
-                log "Discovered mirror: $domain"
-            fi
-        fi
-        
-        if [[ ${#discovered_mirrors[@]} -ge MIN_MIRRORS_NEEDED ]]; then
-            break
-        fi
-        
-        sleep 0.5
-    done
-    
-    if [[ ${#discovered_mirrors[@]} -eq 0 ]]; then
-        log "No mirrors discovered, using direct URL"
-        if ! echo "$base_url" > "$MIRROR_FILE"; then
-            log "ERROR: Failed to write mirror file"
-            return 1
-        fi
+    if ! btrfs_subvol_exists "$MOUNT_DIR/@blue" || ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
+        log "Skipping optimization: both slots not present"
+        safe_umount "$MOUNT_DIR"
         return 0
     fi
     
-    log "Testing ${#discovered_mirrors[@]} mirror(s) for responsiveness..."
-    
-    local selected_mirror=""
-    
-    for mirror in "${discovered_mirrors[@]}"; do
-        log "Testing mirror: $(echo "$mirror" | sed -E 's|https?://([^/]+).*|\1|')"
-        
-        if test_mirror_response "$mirror"; then
-            selected_mirror="$mirror"
-            log "Selected responsive mirror: $(echo "$mirror" | sed -E 's|https?://([^/]+).*|\1|')"
-            break
-        else
-            log "Mirror unresponsive: $(echo "$mirror" | sed -E 's|https?://([^/]+).*|\1|')"
-        fi
-    done
-    
-    if [[ -z "$selected_mirror" ]]; then
-        selected_mirror="${discovered_mirrors[0]}"
-        log "WARNING: All mirrors unresponsive, using first discovered: $selected_mirror"
+    if ! command -v duperemove &>/dev/null; then
+        log "WARNING: duperemove not installed (50-70% space savings possible)"
+        safe_umount "$MOUNT_DIR"
+        return 0
     fi
     
-    if ! echo "$selected_mirror" > "$MIRROR_FILE"; then
-        log "ERROR: Failed to write selected mirror to file"
-        return 1
+    local -a dedupe_targets=("$MOUNT_DIR/@blue" "$MOUNT_DIR/@green")
+    
+    while IFS= read -r backup; do
+        [[ -n "$backup" ]] && dedupe_targets+=("$MOUNT_DIR/@${backup}")
+    done < <(btrfs subvolume list "$MOUNT_DIR" | awk '/_backup_/ {print $NF}')
+    
+    [[ ${#dedupe_targets[@]} -gt 2 ]] && \
+        log "Including ${#dedupe_targets[@]} subvolumes (with backups) in deduplication"
+    
+    local before after saved percent
+    before=$(btrfs filesystem du -s "${dedupe_targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+    
+    log "Running Btrfs extent deduplication (may take several minutes)..."
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would run duperemove on ${#dedupe_targets[@]} subvolumes"
+    else
+        duperemove -Adhr \
+            --skip-zeroes \
+            --dedupe-options=same \
+            --lookup-extents=yes \
+            -b 128K \
+            --threads=$(nproc) \
+            --io-threads=$(nproc) \
+            --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
+            --hashfile-threads=$(nproc) \
+            "${dedupe_targets[@]}" > /dev/null
     fi
     
-    return 0
+    after=$(btrfs filesystem du -s "${dedupe_targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+    
+    if [[ -n "$before" && -n "$after" ]] && (( before > after )); then
+        saved=$((before - after))
+        percent=$((saved * 100 / before))
+        log "Storage reclaimed: $(numfmt --to=iec $saved) (${percent}% reduction)"
+    else
+        log "Storage already optimized"
+    fi
+    
+    safe_umount "$MOUNT_DIR"
 }
 
 #####################################
-### Deployment Phase Functions    ###
+### Subvolume Management          ###
+#####################################
+
+parse_fstab_subvolumes() {
+    local fstab_file="$1"
+    [[ -f "$fstab_file" ]] || { log "WARNING: Cannot read fstab"; return 1; }
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]] && continue
+        
+        if [[ "$line" =~ LABEL=shani_root.*subvol=@([a-zA-Z0-9_]+) ]]; then
+            local subvol="${BASH_REMATCH[1]}"
+            [[ "$subvol" != "blue" && "$subvol" != "green" ]] && echo "$subvol"
+        fi
+    done < "$fstab_file" | sort -u
+}
+
+create_swapfile() {
+    local swapfile="$1" mem_mb="$2" available_mb="$3"
+    
+    if (( available_mb < mem_mb )); then
+        log "WARNING: Insufficient space for hibernation swapfile"
+        log "Available: ${available_mb}MB, Required: ${mem_mb}MB"
+        log "Skipping swapfile creation. System will use zram for swap."
+        return 1
+    fi
+    
+    if btrfs filesystem mkswapfile --size "${mem_mb}M" "$swapfile" 2>/dev/null; then
+        log "Created swapfile: ${mem_mb}M"
+        chmod 600 "$swapfile"
+    else
+        log "WARNING: btrfs mkswapfile unavailable, using fallback"
+        if dd if=/dev/zero of="$swapfile" bs=1M count="$mem_mb" status=none 2>/dev/null; then
+            chmod 600 "$swapfile" 2>/dev/null
+            mkswap "$swapfile" &>/dev/null || log "WARNING: Failed to format swapfile"
+            log "Created swapfile using dd: ${mem_mb}M"
+        else
+            log "ERROR: Failed to create swapfile"
+            rm -f "$swapfile"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+verify_and_create_required_subvolumes() {
+    log "Verifying required subvolumes for candidate slot..."
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    
+    local candidate_fstab="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/fstab"
+    [[ -f "$candidate_fstab" ]] || {
+        log "WARNING: fstab not found in candidate slot"
+        safe_umount "$MOUNT_DIR"
+        return 0
+    }
+    
+    mapfile -t required_subvols < <(parse_fstab_subvolumes "$candidate_fstab")
+    
+    [[ ${#required_subvols[@]} -eq 0 ]] && {
+        log "No additional subvolumes required"
+        safe_umount "$MOUNT_DIR"
+        return 0
+    }
+    
+    log "Candidate requires ${#required_subvols[@]} subvolume(s): ${required_subvols[*]}"
+    
+    local -a missing_subvols=()
+    for subvol in "${required_subvols[@]}"; do
+        btrfs_subvol_exists "$MOUNT_DIR/@${subvol}" || missing_subvols+=("$subvol")
+    done
+    
+    [[ ${#missing_subvols[@]} -eq 0 ]] && {
+        log "All required subvolumes exist"
+        safe_umount "$MOUNT_DIR"
+        return 0
+    }
+    
+    log "Creating ${#missing_subvols[@]} missing subvolume(s): ${missing_subvols[*]}"
+    
+    for subvol in "${missing_subvols[@]}"; do
+        log "Creating @${subvol}..."
+        run_cmd btrfs subvolume create "$MOUNT_DIR/@${subvol}"
+        
+        case "$subvol" in
+            swap)
+                log "Setting up @swap for hibernation..."
+                [[ "${DRY_RUN}" == "yes" ]] && {
+                    log "[Dry Run] Would disable CoW and create swapfile"
+                    continue
+                }
+                
+                chattr +C "$MOUNT_DIR/@${subvol}" 2>/dev/null && log "Disabled CoW on @swap" || \
+                    log "WARNING: Failed to disable CoW on @swap"
+                
+                local swapfile="$MOUNT_DIR/@${subvol}/swapfile"
+                [[ -f "$swapfile" ]] && continue
+                
+                local mem_mb available_mb
+                mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+                available_mb=$(get_btrfs_available_mb "$MOUNT_DIR")
+                
+                [[ "$available_mb" -eq 0 ]] && {
+                    log "WARNING: Could not determine space, skipping swapfile"
+                    continue
+                }
+                
+                create_swapfile "$swapfile" "$mem_mb" "$available_mb"
+                ;;
+                
+            data)
+                log "Creating overlay structure in @data..."
+                [[ "${DRY_RUN}" == "yes" ]] && {
+                    log "[Dry Run] Would create @data overlay structure"
+                    continue
+                }
+                
+                mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{lower,upper,work}
+                mkdir -p "$MOUNT_DIR/@data/downloads"
+                
+                [[ ! -f "$MOUNT_DIR/@data/current-slot" ]] && \
+                    echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot"
+                [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]] && \
+                    echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot"
+                ;;
+        esac
+    done
+    
+    log "All missing subvolumes created successfully"
+    safe_umount "$MOUNT_DIR"
+    return 0
+}
+
+analyze_storage_usage() {
+    log "Analyzing storage usage..."
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    
+    echo ""
+    echo "=== Btrfs Storage Analysis ==="
+    echo ""
+    echo "1. Filesystem Overview:"
+    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/   /' || echo "   Unable to read filesystem info"
+    
+    echo ""
+    echo "2. Individual Subvolume Sizes (uncompressed):"
+    for subvol in blue green data; do
+        if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
+            local exclusive total
+            exclusive=$(btrfs filesystem du -s "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $1}')
+            total=$(btrfs filesystem du -s "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ -n "$exclusive" && -n "$total" ]]; then
+                echo "   @${subvol}: Exclusive=$(numfmt --to=iec $exclusive 2>/dev/null || echo $exclusive) Total=$(numfmt --to=iec $total 2>/dev/null || echo $total)"
+            else
+                echo "   @${subvol}: Present"
+            fi
+        else
+            echo "   @${subvol}: Not found"
+        fi
+    done
+    
+    echo ""
+    echo "3. Actual Space Used (after sharing/deduplication):"
+    if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
+        local combined blue_size green_size theoretical saved percent
+        combined=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | tail -1 | awk '{print $1}')
+        if [[ -n "$combined" ]]; then
+            echo "   Blue + Green combined: $(numfmt --to=iec $combined 2>/dev/null || echo $combined)"
+            
+            blue_size=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
+            green_size=$(btrfs filesystem du -s "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ -n "$blue_size" && -n "$green_size" ]] && (( blue_size + green_size > 0 )); then
+                theoretical=$((blue_size + green_size))
+                saved=$((theoretical - combined))
+                percent=$((saved * 100 / theoretical))
+                echo "   Saved via sharing: $(numfmt --to=iec $saved 2>/dev/null || echo $saved) (${percent}%)"
+            fi
+        else
+            echo "   Unable to calculate combined size"
+        fi
+    else
+        echo "   Both slots not present - cannot calculate"
+    fi
+    
+    if command -v compsize &>/dev/null; then
+        echo ""
+        echo "4. Compression Statistics:"
+        compsize "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | sed 's/^/   /' || \
+            echo "   (unable to read compression stats)"
+    else
+        echo ""
+        echo "4. Compression Statistics: (install 'compsize' for details)"
+    fi
+    
+    if [[ -f "$MOUNT_DIR/@data/.dedupe.db" ]]; then
+        local db_size
+        db_size=$(stat -c%s "$MOUNT_DIR/@data/.dedupe.db" 2>/dev/null || echo 0)
+        echo ""
+        echo "5. Deduplication Database: $(numfmt --to=iec $db_size 2>/dev/null || echo $db_size)"
+    fi
+    
+    echo "=============================="
+    echo ""
+    
+    safe_umount "$MOUNT_DIR"
+}
+
+#####################################
+### Deployment Functions          ###
 #####################################
 
 boot_validation_and_candidate_selection() {
-    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null || echo "")
-    CURRENT_SLOT=$(echo "$CURRENT_SLOT" | xargs)
-    if [[ -z "$CURRENT_SLOT" ]]; then
-        CURRENT_SLOT="blue"
-    fi
+    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null || echo "blue")
+    CURRENT_SLOT="${CURRENT_SLOT// /}"
+    [[ -z "$CURRENT_SLOT" ]] && CURRENT_SLOT="blue"
 
     local booted
     booted=$(get_booted_subvol)
-    if [[ "$booted" != "$CURRENT_SLOT" ]]; then
-        die "System booted from @$booted but expected @$CURRENT_SLOT. Reboot into the correct slot first."
-    fi
+    [[ "$booted" == "$CURRENT_SLOT" ]] || \
+        die "System booted from @$booted but expected @$CURRENT_SLOT. Reboot into correct slot first."
 
-    if [[ "$CURRENT_SLOT" == "blue" ]]; then
-        CANDIDATE_SLOT="green"
-    else
-        CANDIDATE_SLOT="blue"
-    fi
-
-    log "System booted from @$CURRENT_SLOT. Preparing deployment to candidate slot @${CANDIDATE_SLOT}."
+    CANDIDATE_SLOT=$([[ "$CURRENT_SLOT" == "blue" ]] && echo "green" || echo "blue")
+    log "System booted from @$CURRENT_SLOT. Deploying to candidate slot @${CANDIDATE_SLOT}."
 }
 
 pre_update_checks() {
     local free_space_mb
     free_space_mb=$(df --output=avail "/data" | tail -n1)
     free_space_mb=$(( free_space_mb / 1024 ))
-    if (( free_space_mb < MIN_FREE_SPACE_MB )); then
-        die "Not enough disk space: ${free_space_mb} MB available; ${MIN_FREE_SPACE_MB} MB required."
-    fi
-    log "Disk space is sufficient: ${free_space_mb} MB available."
-    mkdir -p "$DOWNLOAD_DIR" "$ZSYNC_CACHE_DIR"
+    (( free_space_mb >= MIN_FREE_SPACE_MB )) || \
+        die "Not enough disk space: ${free_space_mb}MB available; ${MIN_FREE_SPACE_MB}MB required"
+    log "Disk space sufficient: ${free_space_mb}MB available."
+    run_cmd mkdir -p "$DOWNLOAD_DIR" "$ZSYNC_CACHE_DIR"
 }
 
 fetch_update_info() {
-    local channel_url
-    channel_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
+    local channel_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
     
-    log "Initiating update check: retrieving update info from ${channel_url}..."
+    log "Checking for updates from ${channel_url}..."
     
-    IMAGE_NAME=$(wget -qO- "$channel_url" | tr -d '[:space:]') || die "Error: Unable to fetch update info from ${channel_url}"
+    local temp_file
+    temp_file=$(mktemp)
+    
+    if download_file "$channel_url" "$temp_file"; then
+        IMAGE_NAME=$(tr -d '[:space:]' < "$temp_file")
+        rm -f "$temp_file"
+    else
+        rm -f "$temp_file"
+        die "Unable to fetch update info from ${channel_url}"
+    fi
+    
     log "Fetched update info: '${IMAGE_NAME}'"
     
-    if [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]]; then
-        REMOTE_VERSION="${BASH_REMATCH[1]}"
-        REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        log "Parsed update info: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
-    else
-        die "Error: Invalid update format in ${UPDATE_CHANNEL}.txt. Received: '${IMAGE_NAME}'"
-    fi
+    [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]] || \
+        die "Invalid update format in ${UPDATE_CHANNEL}.txt: '${IMAGE_NAME}'"
+    
+    REMOTE_VERSION="${BASH_REMATCH[1]}"
+    REMOTE_PROFILE="${BASH_REMATCH[2]}"
+    log "Remote update: version v${REMOTE_VERSION}, profile '${REMOTE_PROFILE}'"
 
     if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-        log "Local system is up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Proceeding to verify candidate update slot..."
+        log "Local system up-to-date (v${REMOTE_VERSION}, ${REMOTE_PROFILE}). Verifying candidate slot..."
         
         mkdir -p "$MOUNT_DIR"
         safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
 
-        if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "@${CANDIDATE_SLOT}"; then
-            CANDIDATE_RELEASE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-version"
-            CANDIDATE_PROFILE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-profile"
+        if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+            local CANDIDATE_RELEASE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-version"
+            local CANDIDATE_PROFILE_FILE="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-profile"
 
             if [[ -f "$CANDIDATE_RELEASE_FILE" && -f "$CANDIDATE_PROFILE_FILE" ]]; then
+                local CANDIDATE_VERSION CANDIDATE_PROFILE
                 CANDIDATE_VERSION=$(cat "$CANDIDATE_RELEASE_FILE")
                 CANDIDATE_PROFILE=$(cat "$CANDIDATE_PROFILE_FILE")
 
                 if [[ "$CANDIDATE_VERSION" == "$REMOTE_VERSION" && "$CANDIDATE_PROFILE" == "$REMOTE_PROFILE" ]]; then
-                    log "Candidate slot is up-to-date (${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Skipping deployment."
+                    log "Candidate slot up-to-date (${CANDIDATE_VERSION}, ${CANDIDATE_PROFILE}). Skipping deployment."
                     touch "${STATE_DIR}/skip-deployment"
                 else
-                    log "Mismatch detected in candidate slot: found ${CANDIDATE_VERSION} (${CANDIDATE_PROFILE}) vs expected ${REMOTE_VERSION} (${REMOTE_PROFILE}). Deploying new update."
+                    log "Candidate mismatch: ${CANDIDATE_VERSION} (${CANDIDATE_PROFILE}) vs ${REMOTE_VERSION} (${REMOTE_PROFILE}). Deploying."
                 fi
             else
-                log "Candidate slot missing version/profile details. Deploying new update."
+                log "Candidate missing version/profile. Deploying update."
             fi
         else
-            log "No candidate subvolume '@${CANDIDATE_SLOT}' found. Exiting update process."
+            log "No candidate subvolume '@${CANDIDATE_SLOT}' found. Exiting."
             safe_umount "$MOUNT_DIR"
             exit 0
         fi
         safe_umount "$MOUNT_DIR"
     else
-        log "Local system version (${LOCAL_VERSION}, ${LOCAL_PROFILE}) differs from remote update (${REMOTE_VERSION}, ${REMOTE_PROFILE}). Initiating update process."
+        log "Local (${LOCAL_VERSION}, ${LOCAL_PROFILE}) differs from remote (${REMOTE_VERSION}, ${REMOTE_PROFILE}). Updating."
     fi
 }
 
 download_update() {
-    log "Starting download process for ${IMAGE_NAME}"
-
-    if [[ -z "${IMAGE_NAME}" ]]; then
-        log "ERROR: IMAGE_NAME is not set"
-        return 1
-    fi
+    log "Downloading ${IMAGE_NAME}..."
     
-    if [[ -z "${DOWNLOAD_DIR}" ]]; then
-        log "ERROR: DOWNLOAD_DIR is not set"
-        return 1
-    fi
+    local image="${DOWNLOAD_DIR}/${IMAGE_NAME}"
+    local marker="${image}.verified"
     
-    if [[ -z "${REMOTE_PROFILE}" || -z "${REMOTE_VERSION}" ]]; then
-        log "ERROR: REMOTE_PROFILE or REMOTE_VERSION not set"
-        return 1
-    fi
-
-    local missing_cmds=()
-    for cmd in wget sha256sum ; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing_cmds+=("$cmd")
-        fi
-    done
-    
-    if [[ ${#missing_cmds[@]} -gt 0 ]]; then
-        log "ERROR: Required commands not found: ${missing_cmds[*]}"
-        return 1
-    fi
-
-    if ! mkdir -p "${DOWNLOAD_DIR}"; then
-        log "ERROR: Could not create download directory: ${DOWNLOAD_DIR}"
-        return 1
-    fi
-    
-    if ! cd "${DOWNLOAD_DIR}"; then
-        log "ERROR: Could not access download directory: ${DOWNLOAD_DIR}"
-        return 1
-    fi
-
-    local WGET_OPTS=(
-        --retry-connrefused
-        --waitretry=30
-        --read-timeout=60
-        --timeout=60
-        --tries=5
-        --no-verbose
-        --dns-timeout=30
-        --connect-timeout=30
-        --prefer-family=IPv4
-        --continue
-    )
-    [[ -t 2 ]] && WGET_OPTS+=(--show-progress)
-
-    local SOURCEFORGE_BASE="https://sourceforge.net/projects/shanios/files"
-    local MIRROR_FILE="${DOWNLOAD_DIR}/mirror.url"
-    local MAX_ATTEMPTS=5
-    local RETRY_BASE_DELAY=5
-    local RETRY_MAX_DELAY=60
-
-    local UPDATE_CHANNEL_FILE="${DOWNLOAD_DIR}/${UPDATE_CHANNEL}.channel"
-    local MARKER_FILE="${DOWNLOAD_DIR}/${IMAGE_NAME}.verified"
-    local image_file="${DOWNLOAD_DIR}/${IMAGE_NAME}"
-    local image_file_part="${image_file}.part"
-    local sha_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.sha256"
-    local asc_file="${DOWNLOAD_DIR}/${IMAGE_NAME}.asc"
-
-    if [[ -f "${MARKER_FILE}" && -f "${image_file}" ]]; then
-        local existing_size
-        existing_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
-        if (( existing_size > 0 )); then
-            log "Found existing verified download: ${IMAGE_NAME} (${existing_size} bytes)"
-            return 0
-        else
-            log "WARNING: Marker exists but file is empty, re-downloading"
-            rm -f "${MARKER_FILE}"
-        fi
-    fi
-
-    local base_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}/download"
-    
-    if ! validate_url "$base_url"; then
-        log "ERROR: Constructed invalid base URL: $base_url"
-        return 1
-    fi
-
-    local mirror_url=""
-    if [[ -f "${MIRROR_FILE}" ]]; then
-        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
-        if [[ -n "$mirror_url" ]] && is_valid_mirror "$mirror_url"; then
-            log "Using cached mirror: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
-        else
-            log "Cached mirror invalid or missing, discovering new mirror..."
-            rm -f "${MIRROR_FILE}"
-            mirror_url=""
-        fi
-    fi
-    
-    if [[ -z "$mirror_url" ]]; then
-        if ! find_fastest_mirror "$base_url"; then
-            log "WARNING: Mirror discovery failed, attempting initial discovery..."
-            if ! discover_initial_mirror "$base_url"; then
-                log "ERROR: All mirror discovery attempts failed"
-                return 1
-            fi
-        fi
-        
-        if [[ ! -f "${MIRROR_FILE}" ]]; then
-            log "ERROR: Mirror file not created after discovery"
-            return 1
-        fi
-        
-        mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
-        
-        if [[ -z "$mirror_url" ]]; then
-            log "ERROR: No mirror URL available after discovery"
-            return 1
-        fi
-    fi
-
-    log "Checking remote file availability..."
-    local expected_size
-    expected_size=$(wget -q --spider -S "$mirror_url" 2>&1 | \
-        awk '/Content-Length:/ {print $2}' | \
-        tail -1 | \
-        tr -d '\r' || echo "0")
-    
-    if [[ ! "$expected_size" =~ ^[0-9]+$ ]] || (( expected_size <= 0 )); then
-        log "WARNING: Could not determine remote file size, proceeding anyway"
-        expected_size=0
-    else
-        log "Expected file size: $((expected_size / 1024 / 1024)) MB"
-    fi
-
-    if ! echo "${IMAGE_NAME}" > "${UPDATE_CHANNEL_FILE}"; then
-        log "ERROR: Failed to write channel file: ${UPDATE_CHANNEL_FILE}"
-        return 1
-    fi
-
-    local attempt=0
-    local current_size=0
-    local download_success=0
-    
-    while (( attempt < MAX_ATTEMPTS )) && [[ $download_success -eq 0 ]]; do
-        attempt=$((attempt + 1))
-        log "Download attempt ${attempt}/${MAX_ATTEMPTS} from: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
-
-        if [[ -f "${image_file_part}" ]]; then
-            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-            
-            if (( expected_size > 0 && current_size > expected_size )); then
-                log "Partial file larger than expected - deleting"
-                rm -f "${image_file_part}"
-                current_size=0
-            elif (( current_size > 0 )); then
-                log "Resuming download: $((current_size / 1024 / 1024)) MB / $((expected_size / 1024 / 1024)) MB"
-            fi
-        fi
-
-        if wget "${WGET_OPTS[@]}" -O "${image_file_part}" "$mirror_url"; then
-            current_size=$(stat -c%s "${image_file_part}" 2>/dev/null || echo 0)
-            
-            if (( expected_size == 0 )) || (( current_size == expected_size )); then
-                download_success=1
-                log "Download completed successfully"
-                if ! mv "${image_file_part}" "${image_file}"; then
-                    log "ERROR: File rename failed"
-                    return 1
-                fi
-            else
-                log "Download incomplete ($((current_size / 1024 / 1024)) MB / $((expected_size / 1024 / 1024)) MB)"
-            fi
-        else
-            log "Download failed with current mirror"
-            
-            if (( attempt % 2 == 0 )); then
-                log "Attempting to discover new mirror..."
-                rm -f "${MIRROR_FILE}"
-                if find_fastest_mirror "$base_url"; then
-                    mirror_url=$(cat "${MIRROR_FILE}" 2>/dev/null | head -1 | xargs || echo "")
-                    if [[ -n "$mirror_url" ]]; then
-                        log "Switched to new mirror: $(echo "$mirror_url" | sed -E 's|https?://([^/]+).*|\1|')"
-                    else
-                        log "ERROR: New mirror URL is empty"
-                    fi
-                fi
-            fi
-        fi
-
-        if [[ $download_success -eq 0 ]] && (( attempt < MAX_ATTEMPTS )); then
-            local delay=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
-            (( delay = delay > RETRY_MAX_DELAY ? RETRY_MAX_DELAY : delay ))
-            log "Retrying in ${delay}s..."
-            sleep "$delay"
-        fi
-    done
-
-    if [[ $download_success -eq 0 ]]; then
-        log "ERROR: Failed to download after ${MAX_ATTEMPTS} attempts"
-        return 1
-    fi
-
-    if [[ ! -f "${image_file}" ]]; then
-        log "ERROR: Downloaded file does not exist: ${image_file}"
-        return 1
-    fi
-    
-    current_size=$(stat -c%s "${image_file}" 2>/dev/null || echo 0)
-    if (( current_size == 0 )); then
-        log "ERROR: Downloaded file is empty"
-        rm -f "${image_file}"
-        return 1
-    fi
-
-    log "Download completed, proceeding with verification..."
-    
-    log "Fetching SHA256 checksum..."
-    local sha_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
-    if ! wget "${WGET_OPTS[@]}" -O "${sha_file}" "${sha_url}"; then
-        log "ERROR: Failed to fetch SHA256 file"
-        return 1
-    fi
-    
-    log "Fetching GPG signature..."
-    local asc_url="${SOURCEFORGE_BASE}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
-    if ! wget "${WGET_OPTS[@]}" -O "${asc_file}" "${asc_url}"; then
-        log "ERROR: Failed to fetch GPG signature file"
-        return 1
-    fi
-
-    log "Verifying SHA256 checksum..."
-    if ! sha256sum -c "${sha_file}" --status 2>/dev/null; then
-        log "ERROR: SHA256 checksum verification failed"
-        rm -f "${image_file}"
-        return 1
-    fi
-    log "SHA256 checksum verified successfully"
-
-    log "Verifying GPG signature..."
-    local gpg_temp
-    if ! gpg_temp=$(mktemp -d); then
-        log "ERROR: Failed to create temporary GPG directory"
-        return 1
-    fi
-    
-    # Save current GNUPGHOME state properly
-    local old_gnupghome_set=false
-    local old_gnupghome_value=""
-    if [[ -n "${GNUPGHOME:-}" ]]; then
-        old_gnupghome_set=true
-        old_gnupghome_value="${GNUPGHOME}"
-    fi
-    
-    export GNUPGHOME="${gpg_temp}"
-    chmod 700 "${gpg_temp}"
-    
-    cleanup_gpg() {
-        # Restore GNUPGHOME state properly
-        if [[ "${old_gnupghome_set}" == "true" ]]; then
-            export GNUPGHOME="${old_gnupghome_value}"
-        else
-            unset GNUPGHOME
-        fi
-        rm -rf "${gpg_temp}"
+    # Use cached if available
+    [[ -f "$marker" ]] && file_nonempty "$image" && {
+        log "Using cached verified image"
+        return 0
     }
-    trap cleanup_gpg RETURN
-
-    log "Importing GPG key ${GPG_KEY_ID}..."
-    local GPG_KEYSERVERS=("hkps://keys.openpgp.org" "keyserver.ubuntu.com")
-    local key_imported=0
     
-    for keyserver in "${GPG_KEYSERVERS[@]}"; do
-        if gpg --batch --quiet --keyserver "${keyserver}" --recv-keys "${GPG_KEY_ID}" 2>/dev/null; then
-            log "Successfully imported key from ${keyserver}"
-            key_imported=1
-            break
-        else
-            log "Failed to import key from ${keyserver}, trying next..."
-        fi
-    done
+    [[ "${DRY_RUN}" == "yes" ]] && { log "[Dry Run] Would download and verify"; return 0; }
     
-    if [[ ${key_imported} -ne 1 ]]; then
-        log "ERROR: Failed to import GPG key from all keyservers"
-        cleanup_gpg
-        return 1
-    fi
-
-    if ! gpg --batch --verify "${asc_file}" "${image_file}" 2>/dev/null; then
-        log "ERROR: GPG signature verification failed"
-        rm -f "${image_file}"
-        cleanup_gpg
-        return 1
-    fi
-    log "GPG signature verified successfully"
-
-    cleanup_gpg
-
-    if ! touch "${MARKER_FILE}"; then
-        log "ERROR: Failed to create verification marker"
-        return 1
-    fi
-
-    log "Download and verification completed successfully"
-    return 0
+    local base_url="https://sourceforge.net/projects/shanios/files/${REMOTE_PROFILE}/${REMOTE_VERSION}"
+    local mirror_file="${DOWNLOAD_DIR}/mirror.url"
+    
+    # Get mirror
+    local mirror
+    mirror=$(cat "$mirror_file" 2>/dev/null | head -1 | xargs) || {
+        discover_mirrors "${base_url}/${IMAGE_NAME}/download"
+        mirror=$(cat "$mirror_file" 2>/dev/null | head -1 | xargs)
+    }
+    
+    validate_nonempty "$mirror" "mirror URL"
+    
+    # Download main file with retry
+    download_with_retry "$mirror" "$image" || die "Download failed after retries"
+    
+    # Download verification files
+    local sha="${image}.sha256"
+    local asc="${image}.asc"
+    
+    download_file "${base_url}/${IMAGE_NAME}.sha256/download" "$sha" || die "Failed to fetch SHA256"
+    download_file "${base_url}/${IMAGE_NAME}.asc/download" "$asc" || die "Failed to fetch signature"
+    
+    # Verify
+    verify_sha256 "$image" "$sha" || die "SHA256 verification failed"
+    verify_gpg "$image" "$asc" || die "GPG verification failed"
+    
+    touch "$marker"
+    log "Download and verification completed"
 }
 
 deploy_btrfs_update() {
@@ -1116,66 +1037,81 @@ deploy_btrfs_update() {
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     
-    if mountpoint -q "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+    mountpoint -q "$MOUNT_DIR/@${CANDIDATE_SLOT}" && {
         safe_umount "$MOUNT_DIR"
-        die "Candidate slot @${CANDIDATE_SLOT} is currently mounted. Aborting deployment."
-    fi
+        die "Candidate slot @${CANDIDATE_SLOT} is mounted. Aborting."
+    }
     
-    if btrfs subvolume list "$MOUNT_DIR" | grep -q "path @${CANDIDATE_SLOT}\$"; then
+    if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
-        log "Creating backup of candidate slot @${CANDIDATE_SLOT} as @${BACKUP_NAME}..."
-        btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || die "Backup snapshot failed"
-        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false || die "Failed to clear read-only property"
-        btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Failed to delete candidate slot"
+        log "Backing up @${CANDIDATE_SLOT} as @${BACKUP_NAME}..."
+        run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}"
+        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
+        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     fi
     
     local temp_subvol="$MOUNT_DIR/temp_update"
-    if btrfs subvolume list "$MOUNT_DIR" | awk '{print $NF}' | grep -qx "temp_update"; then
-        log "Deleting existing temporary subvolume temp_update..."
-        [[ -d "$temp_subvol/shanios_base" ]] && btrfs subvolume delete "$temp_subvol/shanios_base" || log "Failed to delete nested subvolume shanios_base"
-        btrfs subvolume delete "$temp_subvol" || log "Failed to delete temporary subvolume temp_update"
+    if btrfs_subvol_exists "$temp_subvol"; then
+        log "Deleting existing temp_update..."
+        [[ -d "$temp_subvol/shanios_base" ]] && run_cmd btrfs subvolume delete "$temp_subvol/shanios_base"
+        run_cmd btrfs subvolume delete "$temp_subvol"
     fi
     
-    btrfs subvolume create "$temp_subvol" || die "Failed to create temporary subvolume"
-    log "Receiving update image into temporary subvolume..."
-    run_cmd "zstd -d --long=31 -T0 '$DOWNLOAD_DIR/$IMAGE_NAME' -c | btrfs receive '$temp_subvol'" || die "Image extraction failed"
-    log "Creating candidate snapshot from temporary update..."
-    btrfs subvolume snapshot "$temp_subvol/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}" || die "Snapshot creation failed"
-    btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true || die "Failed to set candidate slot to read-only"
-    log "Deleting temporary subvolume..."
-    [[ -d "$temp_subvol/shanios_base" ]] && btrfs subvolume delete "$temp_subvol/shanios_base" || log "Failed to delete nested subvolume shanios_base"
-    btrfs subvolume delete "$temp_subvol" || log "Failed to delete temporary subvolume"
+    run_cmd btrfs subvolume create "$temp_subvol"
+    log "Extracting update image..."
+    
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[Dry Run] Would extract ${IMAGE_NAME}"
+    else
+        zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | btrfs receive "$temp_subvol" || \
+            die "Image extraction failed"
+    fi
+    
+    log "Creating candidate snapshot..."
+    run_cmd btrfs subvolume snapshot "$temp_subvol/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
+    
+    log "Cleaning up temporary subvolume..."
+    [[ -d "$temp_subvol/shanios_base" ]] && run_cmd btrfs subvolume delete "$temp_subvol/shanios_base"
+    run_cmd btrfs subvolume delete "$temp_subvol"
     safe_umount "$MOUNT_DIR"
-    touch "$DEPLOY_PENDING"
+    
+    [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"
 }
 
 finalize_update() {
     log "Finalizing deployment..."
 
+    [[ "${DRY_RUN}" == "yes" ]] && {
+        log "[Dry Run] Would finalize and switch to ${CANDIDATE_SLOT}"
+        return 0
+    }
+
     echo "$CURRENT_SLOT" > /data/previous-slot
     echo "$CANDIDATE_SLOT" > /data/current-slot
 
-    log "Generating Secure Boot UKI for new deployment..."
-    generate_uki_common "$CANDIDATE_SLOT"
-    [[ -f "$DEPLOY_PENDING" ]] && { rm -f "$DEPLOY_PENDING"; log "Removed deployment pending marker."; }
+    verify_and_create_required_subvolumes || die "Failed to verify/create subvolumes"
 
+    log "Generating Secure Boot UKI..."
+    generate_uki_common "$CANDIDATE_SLOT"
+    
+    [[ -f "$DEPLOY_PENDING" ]] && rm -f "$DEPLOY_PENDING"
+
+    log "Running post-deployment cleanup and optimization..."
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    [[ -n "$BACKUP_NAME" ]] && {
-        btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" &>/dev/null
-        log "Deleted backup @${BACKUP_NAME}"
-    }
     cleanup_old_backups
     safe_umount "$MOUNT_DIR"
 
     echo "$IMAGE_NAME" > "$DOWNLOAD_DIR/old.txt"
     cleanup_downloads
+    optimize_storage
 
-    log "Deployment finalized. Next boot will use @${CANDIDATE_SLOT} (version: ${REMOTE_VERSION})"
+    log "Deployment complete. Next boot: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
 }
 
 #####################################
-### Usage & Parameter Parsing     ###
+### Usage & Main                  ###
 #####################################
 
 usage() {
@@ -1183,54 +1119,34 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  -h, --help             Show this help message.
-  -r, --rollback         Force a full rollback.
-  -c, --cleanup          Run manual cleanup.
-  -t, --channel <chan>   Specify update channel: latest or stable (default: stable).
-  -d, --dry-run          Dry run (simulate actions without making changes).
+  -h, --help             Show this help message
+  -r, --rollback         Force full rollback
+  -c, --cleanup          Run manual cleanup
+  -s, --storage-info     Show storage analysis
+  -t, --channel <chan>   Update channel: latest or stable (default: stable)
+  -d, --dry-run          Simulate without making changes
 EOF
 }
 
-args=$(getopt -o hrct:d --long help,rollback,cleanup,channel:,dry-run -n "$0" -- "$@") || { usage; exit 1; }
+# Parse arguments
+args=$(getopt -o hrcst:d --long help,rollback,cleanup,storage-info,channel:,dry-run -n "$0" -- "$@") || {
+    usage
+    exit 1
+}
 eval set -- "$args"
 
 while true; do
     case "$1" in
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        -r|--rollback)
-            touch "${STATE_DIR}/rollback"
-            shift
-            ;;
-        -c|--cleanup)
-            touch "${STATE_DIR}/cleanup"
-            shift
-            ;;
-        -t|--channel)
-            echo "$2" > "${STATE_DIR}/channel"
-            shift 2
-            ;;
-        -d|--dry-run)
-            touch "${STATE_DIR}/dry-run"
-            shift
-            ;;
-        --)
-            shift
-            break
-            ;;
-        *)
-            echo "Invalid option: $1"
-            usage
-            exit 1
-            ;;
+        -h|--help) usage; exit 0 ;;
+        -r|--rollback) touch "${STATE_DIR}/rollback"; shift ;;
+        -c|--cleanup) touch "${STATE_DIR}/cleanup"; shift ;;
+        -s|--storage-info) touch "${STATE_DIR}/storage-info"; shift ;;
+        -t|--channel) echo "$2" > "${STATE_DIR}/channel"; shift 2 ;;
+        -d|--dry-run) touch "${STATE_DIR}/dry-run"; shift ;;
+        --) shift; break ;;
+        *) echo "Invalid option: $1"; usage; exit 1 ;;
     esac
 done
-
-#####################################
-### Main Execution Flow           ###
-#####################################
 
 main() {
     check_root
@@ -1239,50 +1155,50 @@ main() {
     self_update "$@"
     inhibit_system "$@"
    
-    dry_run=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
-    
-    if [[ -f "${STATE_DIR}/channel" ]]; then
-        UPDATE_CHANNEL=$(cat "${STATE_DIR}/channel")
-    else
-        UPDATE_CHANNEL="stable"
-    fi
+    DRY_RUN=$([[ -f "${STATE_DIR}/dry-run" ]] && echo "yes" || echo "no")
+    UPDATE_CHANNEL=$(cat "${STATE_DIR}/channel" 2>/dev/null || echo "stable")
+
+    # Handle special modes
+    [[ -f "${STATE_DIR}/storage-info" ]] && { analyze_storage_usage; exit 0; }
 
     if [[ -f "${STATE_DIR}/cleanup" ]]; then
-        log "Initiating manual cleanup..."
+        log "Running manual cleanup..."
         mkdir -p "$MOUNT_DIR"
-        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || die "Failed to mount for cleanup"
-        cleanup_old_backups
-        safe_umount "$MOUNT_DIR" || true
+        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null && {
+            cleanup_old_backups
+            safe_umount "$MOUNT_DIR"
+        }
         cleanup_downloads
+        [[ -f "/data/.dedupe.db" ]] && run_cmd rm -f "/data/.dedupe.db"
         exit 0
     fi
 
-    if [[ ! -f /data/boot-ok ]]; then
-        log "Boot failure detected: /data/boot-ok missing. Initiating rollback..."
-        rollback_system
-    fi
-    
-    if [[ -f "${STATE_DIR}/rollback" ]]; then
-        rollback_system
-        exit 0
-    fi
+    [[ -f /data/boot-ok ]] || { log "Boot failure detected. Initiating rollback..."; rollback_system; }
+    [[ -f "${STATE_DIR}/rollback" ]] && { rollback_system; exit 0; }
 
     boot_validation_and_candidate_selection
     pre_update_checks
     fetch_update_info
     
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
-        log "Skipping download and deployment (system is up-to-date)."
+        log "System up-to-date. Running optimization check..."
+        mkdir -p "$MOUNT_DIR"
+        if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
+            btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green" && {
+                safe_umount "$MOUNT_DIR"
+                optimize_storage
+            } || safe_umount "$MOUNT_DIR"
+        fi
     else
-        log "System deployment is outdated. Starting download and deployment..."
-        download_update || die "Download update failed."
-        deploy_btrfs_update || die "Deployment of update failed."
+        log "Deployment required. Starting update..."
+        download_update || die "Download failed"
+        deploy_btrfs_update || die "Deployment failed"
     fi
 
-    if [[ -f "${DEPLOY_PENDING}" ]]; then
-        log "Deployment pending marker found. Resuming finalization..."
-        finalize_update || die "Finalization of update failed."
-    fi
+    [[ -f "${DEPLOY_PENDING}" ]] && {
+        log "Resuming finalization..."
+        finalize_update || die "Finalization failed"
+    }
 }
 
 main "$@"

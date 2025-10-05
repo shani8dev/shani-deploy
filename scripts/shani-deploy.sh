@@ -813,9 +813,18 @@ restore_candidate() {
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot marker"
         
-        # Keep previous-slot as-is since we're staying on current slot
-        if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
-            echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
+        # If previous-slot was modified during failed deployment, restore it
+        # Check if it was set to CANDIDATE_SLOT (which would be wrong after rollback)
+        local prev_slot
+        prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
+        
+        if [[ "$prev_slot" == "$CANDIDATE_SLOT" ]] || [[ -z "$prev_slot" ]]; then
+            # previous-slot was modified or missing, restore to current
+            echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
+                log_warn "Failed to restore previous-slot marker"
+            log_verbose "Restored previous-slot: $CURRENT_SLOT"
+        else
+            log_verbose "Preserved previous-slot: $prev_slot"
         fi
     fi
     
@@ -861,12 +870,15 @@ rollback_system() {
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro true
     
+    # Update slot markers - we're rolling back TO previous_slot
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
+    # Keep previous-slot unchanged (it already contains the right value)
     
     safe_umount "$MOUNT_DIR"
     generate_uki "$previous_slot"
     
     log_success "Rollback complete"
+    log "System will boot: @${previous_slot}"
     [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 
@@ -954,7 +966,7 @@ verify_and_create_subvolumes() {
         case "$sub" in
             swap)
                 [[ "${DRY_RUN}" == "yes" ]] && continue
-                chattr +C "$MOUNT_DIR/@${sub}" 2>/dev/null
+                chattr +C "$MOUNT_DIR/@${sub}" 2>/dev/null || true
                 
                 local swapfile="$MOUNT_DIR/@${sub}/swapfile"
                 if [[ ! -f "$swapfile" ]]; then
@@ -969,10 +981,13 @@ verify_and_create_subvolumes() {
                 mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{lower,upper,work}
                 mkdir -p "$MOUNT_DIR/@data/downloads"
                 
-                [[ ! -f "$MOUNT_DIR/@data/current-slot" ]] && \
+                # Initialize slot markers if they don't exist
+                if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
                     echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot"
-                [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]] && \
+                fi
+                if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
                     echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot"
+                fi
                 ;;
         esac
         
@@ -1033,6 +1048,7 @@ analyze_storage() {
 validate_boot() {
     log_section "Boot Validation"
     
+    # Read from persistent storage
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]')
     
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
@@ -1043,6 +1059,7 @@ validate_boot() {
             CURRENT_SLOT="blue"
         fi
         
+        mkdir -p /data
         echo "$CURRENT_SLOT" > /data/current-slot
         log "Corrected: $CURRENT_SLOT"
     fi
@@ -1054,6 +1071,7 @@ validate_boot() {
     
     if [[ "$booted" != "$CURRENT_SLOT" ]]; then
         log_error "BOOT MISMATCH!"
+        log_error "Expected to boot @${CURRENT_SLOT} but running @${booted}"
         die "Marker: @${CURRENT_SLOT}, Booted: @${booted}"
     fi
     
@@ -1363,7 +1381,8 @@ finalize_update() {
     
     [[ "${DRY_RUN}" == "yes" ]] && return 0
     
-    # Update slot markers
+    # Update slot markers BEFORE any operations that might fail
+    mkdir -p /data
     echo "$CURRENT_SLOT" > /data/previous-slot || log_warn "Failed to write previous-slot"
     echo "$CANDIDATE_SLOT" > /data/current-slot || log_warn "Failed to write current-slot"
     
@@ -1377,9 +1396,9 @@ finalize_update() {
     set +e
     
     mkdir -p "$MOUNT_DIR"
-    if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
+    if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
         cleanup_old_backups
-        safe_umount "$MOUNT_DIR"
+        umount -R "$MOUNT_DIR" 2>/dev/null || true
     fi
     cleanup_downloads
     optimize_storage
@@ -1445,12 +1464,18 @@ main() {
     [[ "$STORAGE_INFO" == "yes" ]] && { analyze_storage; exit 0; }
     
     if [[ "$CLEANUP" == "yes" ]]; then
+        # Disable ERR trap for manual cleanup
+        trap - ERR
+        set +e
+        
         mkdir -p "$MOUNT_DIR"
-        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null && {
+        if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             cleanup_old_backups
-            safe_umount "$MOUNT_DIR"
-        }
+            umount -R "$MOUNT_DIR" 2>/dev/null || true
+        fi
         cleanup_downloads
+        
+        set -e
         exit 0
     fi
     
@@ -1463,15 +1488,24 @@ main() {
     fetch_update
     
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
+        # Both slots already up-to-date, just optimize if possible
+        # Disable ERR trap for non-critical optimization
+        trap - ERR
+        set +e
+        
         mkdir -p "$MOUNT_DIR"
-        if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
+        if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
-                safe_umount "$MOUNT_DIR"
+                umount -R "$MOUNT_DIR" 2>/dev/null || true
                 optimize_storage
             else
-                safe_umount "$MOUNT_DIR"
+                umount -R "$MOUNT_DIR" 2>/dev/null || true
             fi
         fi
+        
+        # Re-enable ERR trap
+        trap 'restore_candidate' ERR
+        set -e
     else
         download_update || die "Download failed"
         deploy_update || die "Deployment failed"

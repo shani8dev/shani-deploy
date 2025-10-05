@@ -446,10 +446,22 @@ verify_sha256() {
     local file="$1" sha_file="$2"
     log_verbose "Verifying SHA256"
     
-    if ! sha256sum -c "$sha_file" --status 2>/dev/null; then
+    local expected actual
+    expected=$(awk '{print $1}' "$sha_file" 2>/dev/null | head -1 | tr -d '[:space:]')
+    actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')
+    
+    if [[ -z "$expected" || -z "$actual" ]]; then
+        log_error "SHA256 verification failed: missing checksums"
+        return 1
+    fi
+    
+    log_verbose "Expected: $expected"
+    log_verbose "Actual: $actual"
+    
+    if [[ "$expected" != "$actual" ]]; then
         log_error "SHA256 mismatch"
-        log_error "Expected: $(cat "$sha_file" 2>/dev/null || echo 'unknown')"
-        log_error "Got: $(sha256sum "$file" 2>/dev/null | awk '{print $1}')"
+        log_error "Expected: $expected"
+        log_error "Got: $actual"
         return 1
     fi
     
@@ -462,34 +474,57 @@ verify_gpg() {
     log_verbose "Verifying GPG signature"
     
     local gpg_temp
-    gpg_temp=$(mktemp -d) || return 1
+    gpg_temp=$(mktemp -d) || { log_error "Failed to create GPG temp dir"; return 1; }
     
-    (
-        export GNUPGHOME="$gpg_temp"
-        chmod 700 "$gpg_temp"
-        
-        local imported=0
-        for keyserver in keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu; do
-            if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
-                imported=1
-                log_verbose "Key from: $keyserver"
-                break
-            fi
-        done
-        
-        [[ $imported -eq 0 ]] && { log_error "GPG key import failed"; exit 1; }
-        
-        local fp
-        fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
-        [[ "$fp" != "$GPG_KEY_ID" ]] && { log_error "Fingerprint mismatch"; exit 1; }
-        
-        gpg --batch --verify "$sig" "$file" 2>/dev/null
-    )
+    local old_gnupghome="${GNUPGHOME:-}"
+    export GNUPGHOME="$gpg_temp"
+    chmod 700 "$gpg_temp"
     
-    local result=$?
+    local result=1
+    local keyservers=(keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu)
+    
+    # Import key
+    local imported=0
+    for keyserver in "${keyservers[@]}"; do
+        if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
+            imported=1
+            log_verbose "Key imported from: $keyserver"
+            break
+        fi
+    done
+    
+    if [[ $imported -eq 0 ]]; then
+        log_error "Failed to import GPG key from all keyservers"
+        rm -rf "$gpg_temp"
+        [[ -n "$old_gnupghome" ]] && export GNUPGHOME="$old_gnupghome" || unset GNUPGHOME
+        return 1
+    fi
+    
+    # Verify fingerprint
+    local fp
+    fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+    if [[ "$fp" != "$GPG_KEY_ID" ]]; then
+        log_error "GPG fingerprint mismatch"
+        log_error "Expected: $GPG_KEY_ID"
+        log_error "Got: ${fp:-none}"
+        rm -rf "$gpg_temp"
+        [[ -n "$old_gnupghome" ]] && export GNUPGHOME="$old_gnupghome" || unset GNUPGHOME
+        return 1
+    fi
+    
+    # Verify signature
+    if gpg --batch --verify "$sig" "$file" 2>/dev/null; then
+        log_success "GPG signature verified"
+        result=0
+    else
+        log_error "GPG signature verification failed"
+        result=1
+    fi
+    
+    # Cleanup
     rm -rf "$gpg_temp"
+    [[ -n "$old_gnupghome" ]] && export GNUPGHOME="$old_gnupghome" || unset GNUPGHOME
     
-    [[ $result -eq 0 ]] && log_success "GPG verified" || log_error "GPG failed"
     return $result
 }
 
@@ -1072,11 +1107,8 @@ download_update() {
     if [[ -f "$marker" && -f "$image" ]]; then
         local existing_size=$(get_file_size "$image")
         if (( existing_size > 0 )); then
-            if [[ -f "$sha" ]] && sha256sum -c "$sha" --status 2>/dev/null; then
-                log_success "Using verified cache: $(format_bytes $existing_size)"
-                return 0
-            fi
-            log_warn "Cached file verification failed, will re-download"
+            log_success "Using verified cache: $(format_bytes $existing_size)"
+            return 0
         fi
         # Only delete when verification fails
         rm -f "$marker" "$image" "$sha" "$asc"
@@ -1193,7 +1225,6 @@ download_update() {
     done
     
     if [[ $download_success -eq 0 ]]; then
-        # Clean up failed download artifacts
         rm -f "$image_part" "$image" "$image.aria2"
         die "Download failed after $MAX_DOWNLOAD_ATTEMPTS attempts"
     fi
@@ -1206,30 +1237,17 @@ download_update() {
     
     # Download verification files (use SourceForge direct URLs)
     log "Downloading verification files..."
-    if ! download_file "$sha_url" "$sha" 1; then
-        log_error "Failed to download SHA256 checksum"
-        rm -f "$image"
-        die "SHA256 download failed"
-    fi
+    download_file "$sha_url" "$sha" 1 || { rm -f "$image"; die "SHA256 download failed"; }
+    download_file "$asc_url" "$asc" 1 || { rm -f "$image" "$sha"; die "GPG signature download failed"; }
     
-    if ! download_file "$asc_url" "$asc" 1; then
-        log_error "Failed to download GPG signature"
-        rm -f "$image" "$sha"
-        die "Signature download failed"
-    fi
-    
-    # Verify integrity
-    if ! verify_sha256 "$image" "$sha"; then
+    # Verify integrity - cleanup on any failure
+    if ! verify_sha256 "$image" "$sha" || ! verify_gpg "$image" "$asc"; then
         rm -f "$image" "$sha" "$asc"
-        die "SHA256 verification failed"
+        die "Verification failed"
     fi
     
-    if ! verify_gpg "$image" "$asc"; then
-        rm -f "$image" "$sha" "$asc"
-        die "GPG verification failed"
-    fi
-    
-    # Mark as verified
+    # Clear mirror cache and mark as verified
+    rm -f "$DOWNLOAD_DIR/mirror.url"
     touch "$marker" || log_warn "Failed to create verification marker"
     log_success "Download and verification complete"
 }

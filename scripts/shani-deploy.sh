@@ -614,13 +614,16 @@ inhibit_system() {
 }
 
 #####################################
-### Cleanup Functions             ###
+### Cleanup Functions (FIXED)     ###
 #####################################
 
 cleanup_old_backups() {
     log_verbose "Cleaning backups"
     
-    findmnt -M "$MOUNT_DIR" &>/dev/null || return 1
+    # Disable ERR trap for this function - cleanup is non-critical
+    set +e
+    
+    findmnt -M "$MOUNT_DIR" &>/dev/null || { set -e; return 1; }
     
     for slot in blue green; do
         mapfile -t backups < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
@@ -634,11 +637,16 @@ cleanup_old_backups() {
             [[ "${backups[i]}" =~ ^(blue|green)_backup_[0-9]{12}$ ]] || continue
             [[ "${backups[i]}" != "$CURRENT_SLOT" && "${backups[i]}" != "$CANDIDATE_SLOT" ]] || continue
             
-            if run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backups[i]}"; then
+            if run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backups[i]}" 2>/dev/null; then
                 log_success "Deleted: @${backups[i]}"
+            else
+                log_warn "Failed to delete: @${backups[i]}"
             fi
         done
     done
+    
+    # Re-enable ERR trap
+    set -e
 }
 
 cleanup_downloads() {
@@ -780,12 +788,14 @@ generate_uki() {
 }
 
 #####################################
-### Rollback                      ###
+### Rollback (FIXED)              ###
 #####################################
 
 restore_candidate() {
     log_error "Initiating rollback"
-    trap - ERR
+    
+    # Disable all traps and error handling for recovery
+    trap - ERR EXIT
     set +e
     
     mkdir -p "$MOUNT_DIR" 2>/dev/null
@@ -797,8 +807,19 @@ restore_candidate() {
         btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
         btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
         btrfs property set -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+        
+        # CRITICAL FIX: Restore slot markers to reflect current booted state
+        log "Restoring slot markers..."
+        echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
+            log_warn "Failed to restore current-slot marker"
+        
+        # Keep previous-slot as-is since we're staying on current slot
+        if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
+            echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
+        fi
     fi
     
+    # Cleanup temporary volumes
     [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null
     [[ -d "$MOUNT_DIR/temp_update" ]] && \
@@ -807,7 +828,7 @@ restore_candidate() {
     umount -R "$MOUNT_DIR" 2>/dev/null
     rm -f "$DEPLOY_PENDING" 2>/dev/null
     
-    log_error "System remains on @${CURRENT_SLOT}"
+    log_error "Rollback complete - system remains on @${CURRENT_SLOT}"
     exit 1
 }
 trap 'restore_candidate' ERR
@@ -1351,7 +1372,10 @@ finalize_update() {
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
     
     # Cleanup operations (non-critical, don't fail on errors)
+    # CRITICAL: Temporarily disable ERR trap for cleanup operations
+    trap - ERR
     set +e
+    
     mkdir -p "$MOUNT_DIR"
     if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
         cleanup_old_backups
@@ -1359,19 +1383,13 @@ finalize_update() {
     fi
     cleanup_downloads
     optimize_storage
+    
+    # Re-enable ERR trap
+    trap 'restore_candidate' ERR
     set -e
     
     # Clear pending flag - deployment complete
     rm -f "$DEPLOY_PENDING" || log_warn "Failed to remove deployment pending flag"
-    
-    # Cleanup
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    cleanup_old_backups
-    safe_umount "$MOUNT_DIR"
-    
-    cleanup_downloads
-    optimize_storage
     
     log_success "Complete"
     log "Next boot: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"

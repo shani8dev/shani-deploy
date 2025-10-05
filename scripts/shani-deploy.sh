@@ -938,14 +938,14 @@ optimize_storage() {
     [[ "${DRY_RUN}" == "yes" ]] && { safe_umount "$MOUNT_DIR"; return 0; }
     
     local before after
-    before=$(btrfs filesystem du -s "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+    before=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
     
     duperemove -Adhr --skip-zeroes --dedupe-options=same --lookup-extents=yes \
         -b 128K --threads=$(nproc) --io-threads=$(nproc) \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" --hashfile-threads=$(nproc) \
         "${targets[@]}" >/dev/null 2>&1
     
-    after=$(btrfs filesystem du -s "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+    after=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
     
     if [[ -n "$before" && -n "$after" ]] && (( before > after )); then
         local saved=$((before - after))

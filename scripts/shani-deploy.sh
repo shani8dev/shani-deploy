@@ -23,7 +23,9 @@ IFS=$'\n\t'
 #####################################
 
 if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FILE" ]]; then
+    set +e
     source "$SHANIOS_DEPLOY_STATE_FILE"
+    set -e
     rm -f "$SHANIOS_DEPLOY_STATE_FILE"
 fi
 

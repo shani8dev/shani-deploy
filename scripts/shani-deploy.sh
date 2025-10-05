@@ -95,20 +95,20 @@ persist_state() {
 
 log() {
     local msg="$(date '+%Y-%m-%d %H:%M:%S') [INFO] $*"
-    echo "$msg"
+    echo "$msg" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_verbose() {
     [[ "${VERBOSE}" == "yes" ]] || return 0
     local msg="$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $*"
-    echo "$msg"
+    echo "$msg" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_success() {
     local msg="$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] $*"
-    echo -e "\033[0;32m${msg}\033[0m"
+    echo -e "\033[0;32m${msg}\033[0m" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -138,7 +138,13 @@ log_section() {
         echo "$line"
         echo "  $1"
         echo "$line"
-    } | tee -a "$LOG_FILE" 2>/dev/null || cat
+    } >&2
+    {
+        echo ""
+        echo "$line"
+        echo "  $1"
+        echo "$line"
+    } >> "$LOG_FILE" 2>/dev/null || true
 }
 
 #####################################
@@ -258,23 +264,42 @@ discover_mirror() {
     
     if (( HAS_WGET )); then
         log_verbose "Attempting wget discovery with redirect chain"
+        
+        # Capture only stderr from wget, filter to headers only
         local spider_output
-        spider_output=$(timeout 30 wget --max-redirect=20 --spider -S "$sf_url" 2>&1)
+        spider_output=$(timeout 30 wget --max-redirect=20 --spider -S "$sf_url" 2>&1 >/dev/null | \
+            grep -E '^ +(HTTP|Location):' || echo "")
+        
+        # Debug: show what we captured
+        if [[ "${VERBOSE}" == "yes" ]]; then
+            log_verbose "Spider output:"
+            echo "$spider_output" | head -20 >&2
+        fi
         
         # Extract the final Location header after all redirects
         local final_url
-        final_url=$(echo "$spider_output" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+        final_url=$(echo "$spider_output" | \
+            grep -i '^  Location: ' | \
+            tail -1 | \
+            sed 's/^  Location: //' | \
+            tr -d '\r\n' | \
+            xargs)
         
-        if [[ -n "$final_url" && "$final_url" =~ ^https?:// ]]; then
+        log_verbose "Extracted URL: ${final_url:-none}"
+        
+        # Strict validation: must be a proper HTTP(S) URL
+        if [[ -n "$final_url" ]] && [[ "$final_url" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
             local base_url
             base_url=$(dirname "$final_url")
             log_verbose "Wget discovered: $base_url"
             echo "$base_url"
             return 0
+        else
+            log_verbose "URL validation failed or empty"
         fi
     fi
     
-    # Fallback to curl if wget unavailable
+    # Fallback to curl if wget unavailable or failed
     if (( HAS_CURL )); then
         log_verbose "Attempting curl discovery"
         local discovered
@@ -283,9 +308,15 @@ discover_mirror() {
             --connect-timeout 10 \
             --max-time 25 \
             -o /dev/null \
-            "$sf_url" 2>/dev/null | grep -E '^https?://' || echo "")
+            "$sf_url" 2>/dev/null | \
+            tail -1 | \
+            tr -d '\r\n' | \
+            xargs)
         
-        if [[ -n "$discovered" ]]; then
+        log_verbose "Curl extracted: ${discovered:-none}"
+        
+        # Strict validation
+        if [[ -n "$discovered" ]] && [[ "$discovered" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
             local base_url
             base_url=$(dirname "$discovered")
             log_verbose "Curl discovered: $base_url"
@@ -302,19 +333,34 @@ validate_mirror() {
     
     [[ -z "$mirror_url" ]] && return 1
     
+    log_verbose "Validating mirror: $mirror_url"
+    
     # Quick check to verify mirror responds
     if (( HAS_WGET )); then
-        if timeout 15 wget -q --spider -S --timeout=10 --tries=1 \
-            "$mirror_url" 2>&1 | grep -qi "HTTP/.*200\|Content-Length:"; then
+        local response
+        response=$(timeout 20 wget -q --spider -S --timeout=15 --tries=1 \
+            "$mirror_url" 2>&1 || echo "")
+        
+        log_verbose "Wget validation response: ${response:0:200}"
+        
+        if echo "$response" | grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:"; then
+            log_verbose "Mirror validation: PASS (wget)"
             return 0
         fi
     elif (( HAS_CURL )); then
-        if timeout 15 curl -sI --connect-timeout 5 --max-time 10 \
-            "$mirror_url" 2>/dev/null | grep -qi "200 OK\|Content-Length:"; then
+        local response
+        response=$(timeout 20 curl -sI --connect-timeout 8 --max-time 15 \
+            "$mirror_url" 2>&1 || echo "")
+        
+        log_verbose "Curl validation response: ${response:0:200}"
+        
+        if echo "$response" | grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:"; then
+            log_verbose "Mirror validation: PASS (curl)"
             return 0
         fi
     fi
     
+    log_verbose "Mirror validation: FAIL"
     return 1
 }
 
@@ -325,7 +371,7 @@ get_mirror_url() {
     # Check cached mirror and validate it
     if [[ -f "$mirror_cache" ]]; then
         local cached
-        cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | xargs)
+        cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | tr -d '\r\n' | xargs)
         if [[ -n "$cached" ]]; then
             # Reconstruct full URL from cached base
             local full_url="${cached}/${filename}"
@@ -350,13 +396,30 @@ get_mirror_url() {
     local base_url
     base_url=$(discover_mirror "$sf_url")
     
+    # Clean and validate discovered mirror
+    if [[ -n "$base_url" ]]; then
+        # Sanitize the base_url
+        base_url=$(echo "$base_url" | tr -d '\r\n' | xargs)
+        
+        log_verbose "Discovered base URL: $base_url"
+        
+        # Validate it's a proper URL
+        if [[ ! "$base_url" =~ ^https?://[a-zA-Z0-9] ]]; then
+            log_warn "Discovered base_url has invalid format: ${base_url:0:100}"
+            base_url=""
+        fi
+    else
+        log_verbose "No base URL discovered"
+    fi
+    
     # Validate discovered mirror
     if [[ -n "$base_url" ]]; then
         local full_url="${base_url}/${filename}"
-        log_verbose "Validating discovered mirror..."
+        log_verbose "Testing mirror: $full_url"
         
         if validate_mirror "$full_url"; then
-            log_success "Mirror validated: $(echo "$base_url" | sed -E 's|https://([^/]+).*|\1|')"
+            local mirror_host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|')
+            log_success "Mirror validated: $mirror_host"
             mkdir -p "$DOWNLOAD_DIR"
             echo "$base_url" > "$mirror_cache"
             echo "$full_url"
@@ -417,6 +480,15 @@ validate_download() {
 download_with_tool() {
     local tool="$1" url="$2" output="$3"
     
+    # Sanitize URL - remove any whitespace and validate
+    url=$(echo "$url" | tr -d '\r\n' | xargs)
+    
+    # Validate URL format
+    if [[ ! "$url" =~ ^https?://[a-zA-Z0-9] ]]; then
+        log_error "Invalid URL format: ${url:0:100}"
+        return 1
+    fi
+    
     local wget_opts=(
         --retry-connrefused
         --waitretry=30
@@ -433,13 +505,14 @@ download_with_tool() {
     
     case "$tool" in
         aria2c)
+            # Redirect stderr to prevent log contamination
             aria2c --console-log-level=warn \
                 --timeout=30 --max-tries=3 --retry-wait=3 \
                 --max-connection-per-server=8 --split=8 --min-split-size=1M \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
                 --conditional-get=true --remote-time=true \
                 --dir="$(dirname "$output")" --out="$(basename "$output")" \
-                "$url" 2>&1 | grep -v "^$"
+                "$url" 2>&1 | grep -v "^$" | grep -v "^\[" || true
             ;;
         wget)
             wget "${wget_opts[@]}" -O "$output" "$url" 2>&1 | grep -E "(saved|%)" || true
@@ -1330,9 +1403,19 @@ download_update() {
     local mirror_url
     mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
     
+    # Critical sanitization - remove any contamination
+    mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
+    
     if [[ -z "$mirror_url" ]]; then
         log_error "Failed to get mirror URL"
         die "Mirror discovery failed"
+    fi
+    
+    # Validate URL format before proceeding
+    if [[ ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]]; then
+        log_error "Invalid mirror URL format"
+        log_error "Got: ${mirror_url:0:200}"
+        die "Mirror URL validation failed"
     fi
     
     log_verbose "Mirror URL: $mirror_url"
@@ -1406,8 +1489,9 @@ download_update() {
             rm -f "$DOWNLOAD_DIR/mirror.url"
             
             mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
+            mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
             
-            if [[ -z "$mirror_url" ]]; then
+            if [[ -z "$mirror_url" ]] || [[ ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]]; then
                 log_warn "Mirror rediscovery failed, will retry"
             else
                 log_verbose "New mirror: $mirror_url"

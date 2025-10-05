@@ -227,77 +227,152 @@ get_remote_file_size() {
     local size=0
     
     if (( HAS_WGET )); then
-        size=$(timeout 15 wget -q --spider -S "$url" 2>&1 | \
-            awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r' || echo "0")
+        size=$(timeout 20 wget -q --spider -S \
+            --timeout=15 \
+            --tries=1 \
+            "$url" 2>&1 | \
+            awk '/Content-Length:/ {print $2}' | \
+            tail -1 | \
+            tr -d '\r' || echo "0")
     elif (( HAS_CURL )); then
-        size=$(timeout 15 curl -sI "$url" 2>/dev/null | \
-            awk '/[Cc]ontent-[Ll]ength:/ {print $2}' | tr -d '\r' || echo "0")
+        size=$(timeout 20 curl -sI \
+            --connect-timeout 8 \
+            --max-time 15 \
+            "$url" 2>/dev/null | \
+            grep -i "content-length:" | \
+            tail -1 | \
+            awk '{print $2}' | \
+            tr -d '\r' || echo "0")
     fi
     
-    [[ "$size" =~ ^[0-9]+$ ]] && echo "$size" || echo "0"
+    # Validate size is numeric and positive
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
+        echo "$size"
+    else
+        echo "0"
+    fi
 }
 
 discover_mirror() {
     local sf_url="$1"
-    local discovered="" base_url=""
     
-    # Try curl for discovery
+    if (( HAS_WGET )); then
+        log_verbose "Attempting wget discovery with redirect chain"
+        local spider_output
+        spider_output=$(timeout 30 wget --max-redirect=20 --spider -S "$sf_url" 2>&1)
+        
+        # Extract the final Location header after all redirects
+        local final_url
+        final_url=$(echo "$spider_output" | grep -i '^ *Location: ' | tail -1 | awk '{print $2}' | tr -d '\r')
+        
+        if [[ -n "$final_url" && "$final_url" =~ ^https?:// ]]; then
+            local base_url
+            base_url=$(dirname "$final_url")
+            log_verbose "Wget discovered: $base_url"
+            echo "$base_url"
+            return 0
+        fi
+    fi
+    
+    # Fallback to curl if wget unavailable
     if (( HAS_CURL )); then
         log_verbose "Attempting curl discovery"
-        discovered=$(timeout 10 curl -sL -w '%{url_effective}' -o /dev/null --max-redirs 10 "$sf_url" 2>/dev/null | grep -E '^https?://' || echo "")
-        [[ -n "$discovered" ]] && base_url=$(dirname "$discovered" | grep -E '^https?://' || echo "")
+        local discovered
+        discovered=$(timeout 30 curl -sL -w '%{url_effective}' \
+            --max-redirs 20 \
+            --connect-timeout 10 \
+            --max-time 25 \
+            -o /dev/null \
+            "$sf_url" 2>/dev/null | grep -E '^https?://' || echo "")
+        
+        if [[ -n "$discovered" ]]; then
+            local base_url
+            base_url=$(dirname "$discovered")
+            log_verbose "Curl discovered: $base_url"
+            echo "$base_url"
+            return 0
+        fi
     fi
     
-    # Fallback to wget
-    if [[ -z "$base_url" ]] && (( HAS_WGET )); then
-        log_verbose "Attempting wget discovery"
-        discovered=$(timeout 10 wget --spider -S --max-redirect=10 "$sf_url" 2>&1 | \
-            grep -i 'Location:' | tail -1 | awk '{print $2}' | tr -d '\r' | grep -E '^https?://' || echo "")
-        [[ -n "$discovered" ]] && base_url=$(dirname "$discovered" | grep -E '^https?://' || echo "")
+    echo ""
+}
+
+validate_mirror() {
+    local mirror_url="$1"
+    
+    [[ -z "$mirror_url" ]] && return 1
+    
+    # Quick check to verify mirror responds
+    if (( HAS_WGET )); then
+        if timeout 15 wget -q --spider -S --timeout=10 --tries=1 \
+            "$mirror_url" 2>&1 | grep -qi "HTTP/.*200\|Content-Length:"; then
+            return 0
+        fi
+    elif (( HAS_CURL )); then
+        if timeout 15 curl -sI --connect-timeout 5 --max-time 10 \
+            "$mirror_url" 2>/dev/null | grep -qi "200 OK\|Content-Length:"; then
+            return 0
+        fi
     fi
     
-    echo "$base_url"
+    return 1
 }
 
 get_mirror_url() {
     local project="$1" filepath="$2" filename="$3"
     local mirror_cache="$DOWNLOAD_DIR/mirror.url"
     
-    # Check cached mirror
+    # Check cached mirror and validate it
     if [[ -f "$mirror_cache" ]]; then
         local cached
         cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | xargs)
         if [[ -n "$cached" ]]; then
-            log_verbose "Using cached mirror: $(echo "$cached" | sed -E 's|https://([^/]+).*|\1|')"
-            echo "${cached}/${filename}"
-            return 0
+            # Reconstruct full URL from cached base
+            local full_url="${cached}/${filename}"
+            log_verbose "Testing cached mirror: $(echo "$cached" | sed -E 's|https://([^/]+).*|\1|')"
+            
+            if validate_mirror "$full_url"; then
+                log_verbose "Cached mirror valid"
+                echo "$full_url"
+                return 0
+            else
+                log_verbose "Cached mirror failed validation, removing"
+                rm -f "$mirror_cache"
+            fi
         fi
-        # Only remove if empty or corrupted
-        log_verbose "Cached mirror invalid, removing"
-        rm -f "$mirror_cache"
     fi
     
-    # Construct SourceForge URL
-    local sf_url="https://downloads.sourceforge.net/project/${project}/${filepath}/${filename}"
+    # Construct SourceForge URL with /download endpoint (critical for proper redirects)
+    local sf_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
     
     log "Discovering mirror from SourceForge..."
     
     local base_url
     base_url=$(discover_mirror "$sf_url")
     
-    # Use discovered mirror or fallback
+    # Validate discovered mirror
     if [[ -n "$base_url" ]]; then
-        log_success "Discovered: $(echo "$base_url" | sed -E 's|https://([^/]+).*|\1|')"
-        mkdir -p "$DOWNLOAD_DIR"
-        echo "$base_url" > "$mirror_cache"
-        echo "${base_url}/${filename}"
-        return 0
-    else
-        log_warn "Discovery failed, using SourceForge direct"
-        base_url="https://downloads.sourceforge.net/project/${project}/${filepath}"
-        echo "${base_url}/${filename}"
-        return 0
+        local full_url="${base_url}/${filename}"
+        log_verbose "Validating discovered mirror..."
+        
+        if validate_mirror "$full_url"; then
+            log_success "Mirror validated: $(echo "$base_url" | sed -E 's|https://([^/]+).*|\1|')"
+            mkdir -p "$DOWNLOAD_DIR"
+            echo "$base_url" > "$mirror_cache"
+            echo "$full_url"
+            return 0
+        else
+            log_warn "Discovered mirror failed validation"
+        fi
     fi
+    
+    # Ultimate fallback: use SourceForge direct download URL (slower but reliable)
+    log_warn "Mirror discovery failed, using SourceForge direct"
+    local fallback_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
+    
+    # Don't cache the fallback URL as it will redirect on each use
+    echo "$fallback_url"
+    return 0
 }
 
 #####################################

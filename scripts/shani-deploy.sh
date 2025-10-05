@@ -1364,19 +1364,35 @@ fetch_update() {
     log "Remote: v${REMOTE_VERSION} (${REMOTE_PROFILE})"
     log "Local:  v${LOCAL_VERSION} (${LOCAL_PROFILE})"
     
-    # Only allow upgrades to newer versions
-    if (( REMOTE_VERSION <= LOCAL_VERSION )); then
-        if (( REMOTE_VERSION < LOCAL_VERSION )); then
-            log_warn "Remote version older than local (${REMOTE_VERSION} < ${LOCAL_VERSION})"
-        else
-            log "Already running latest version"
-        fi
+    # Check for newer version
+    if (( REMOTE_VERSION < LOCAL_VERSION )); then
+        log_warn "Remote version older than local (${REMOTE_VERSION} < ${LOCAL_VERSION})"
         log_success "No update needed"
         touch "${STATE_DIR}/skip-deployment"
         return 0
     fi
     
-    log "Update available: v${LOCAL_VERSION} → v${REMOTE_VERSION}"
+    if (( REMOTE_VERSION > LOCAL_VERSION )); then
+        log "Update available: v${LOCAL_VERSION} → v${REMOTE_VERSION}"
+        return 0
+    fi
+    
+    # REMOTE_VERSION == LOCAL_VERSION - only check if candidate is missing
+    log "Current slot already at latest version (v${REMOTE_VERSION})"
+    
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    
+    if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+        log "Candidate slot missing, will create"
+        safe_umount "$MOUNT_DIR"
+        return 0
+    fi
+    
+    safe_umount "$MOUNT_DIR"
+    log_success "System up-to-date"
+    touch "${STATE_DIR}/skip-deployment"
+    return 0
 }
 
 download_update() {

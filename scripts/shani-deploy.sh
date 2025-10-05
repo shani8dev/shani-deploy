@@ -738,11 +738,17 @@ prepare_chroot() {
 cleanup_chroot() {
     log_verbose "Cleaning chroot"
     
+    # Disable error exit for cleanup - we want to unmount as much as possible
+    set +e
+    
     [[ -d "$MOUNT_DIR/sys/firmware/efi/efivars" ]] && safe_umount "$MOUNT_DIR/sys/firmware/efi/efivars"
     for d in "${CHROOT_BIND_DIRS[@]}"; do safe_umount "$MOUNT_DIR$d"; done
     for d in "${CHROOT_STATIC_DIRS[@]}"; do safe_umount "$MOUNT_DIR/$d"; done
     safe_umount "$MOUNT_DIR/boot/efi"
     safe_umount "$MOUNT_DIR"
+    
+    # Re-enable error exit
+    set -e
 }
 
 generate_uki() {
@@ -760,14 +766,17 @@ generate_uki() {
     
     log "Generating UKI for @${slot}..."
     
+    local result=0
     if chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot"; then
         log_success "UKI complete"
+        result=0
     else
-        cleanup_chroot
-        die "UKI failed"
+        log_error "UKI generation failed"
+        result=1
     fi
     
     cleanup_chroot
+    return $result
 }
 
 #####################################
@@ -1333,14 +1342,27 @@ finalize_update() {
     
     [[ "${DRY_RUN}" == "yes" ]] && return 0
     
-    echo "$CURRENT_SLOT" > /data/previous-slot
-    echo "$CANDIDATE_SLOT" > /data/current-slot
+    # Update slot markers
+    echo "$CURRENT_SLOT" > /data/previous-slot || log_warn "Failed to write previous-slot"
+    echo "$CANDIDATE_SLOT" > /data/current-slot || log_warn "Failed to write current-slot"
     
     verify_and_create_subvolumes || die "Subvolume verification failed"
     
-    generate_uki "$CANDIDATE_SLOT"
+    generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
     
-    rm -f "$DEPLOY_PENDING"
+    # Cleanup operations (non-critical, don't fail on errors)
+    set +e
+    mkdir -p "$MOUNT_DIR"
+    if safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" 2>/dev/null; then
+        cleanup_old_backups
+        safe_umount "$MOUNT_DIR"
+    fi
+    cleanup_downloads
+    optimize_storage
+    set -e
+    
+    # Clear pending flag - deployment complete
+    rm -f "$DEPLOY_PENDING" || log_warn "Failed to remove deployment pending flag"
     
     # Cleanup
     mkdir -p "$MOUNT_DIR"

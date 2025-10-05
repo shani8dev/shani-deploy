@@ -506,13 +506,17 @@ download_with_tool() {
     case "$tool" in
         aria2c)
             # Redirect stderr to prevent log contamination
-            aria2c --console-log-level=warn \
+            aria2c --console-log-level=error \
+                --summary-interval=0 \
+                --download-result=hide \
+                --show-console-readout=false \
+                --quiet=false \
                 --timeout=30 --max-tries=3 --retry-wait=3 \
                 --max-connection-per-server=8 --split=8 --min-split-size=1M \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
                 --conditional-get=true --remote-time=true \
                 --dir="$(dirname "$output")" --out="$(basename "$output")" \
-                "$url" 2>&1 | grep -v "^$" | grep -v "^\[" || true
+                "$url" 2>&1 | stdbuf -oL grep -E "^\[#|ERROR" || true
             ;;
         wget)
             wget "${wget_opts[@]}" -O "$output" "$url" 2>&1 | grep -E "(saved|%)" || true

@@ -21,12 +21,28 @@ IFS=$'\n\t'
 #####################################
 ### State Restoration             ###
 #####################################
-
 if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FILE" ]]; then
     set +e
-    source "$SHANIOS_DEPLOY_STATE_FILE"
-    set -e
+    
+    # Read state file content
+    local state_content
+    state_content=$(cat "$SHANIOS_DEPLOY_STATE_FILE" 2>/dev/null)
+    
+    # Remove the file immediately to prevent re-use
     rm -f "$SHANIOS_DEPLOY_STATE_FILE"
+    
+    # Now try to source it if we got content
+    if [[ -n "$state_content" ]]; then
+        # Filter out readonly variable declarations
+        state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS" || true)
+        
+        # Source the filtered content
+        if [[ -n "$state_content" ]]; then
+            eval "$state_content" 2>/dev/null || true
+        fi
+    fi
+    
+    set -e
 fi
 
 #####################################

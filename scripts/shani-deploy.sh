@@ -75,16 +75,17 @@ cleanup_state() {
 }
 trap cleanup_state EXIT
 
+
 persist_state() {
     local state_file
     state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
     {
-        declare -p OS_NAME DOWNLOAD_DIR MOUNT_DIR ROOT_DEV GENEFI_SCRIPT 2>/dev/null || true
+        # Only persist non-readonly variables
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL 2>/dev/null || true
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE DEPLOYMENT_START_TIME 2>/dev/null || true
-        declare -p STATE_DIR LOG_FILE DEPLOY_PENDING GPG_KEY_ID 2>/dev/null || true
-        declare -p CHROOT_BIND_DIRS CHROOT_STATIC_DIRS HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV 2>/dev/null || true
+        declare -p STATE_DIR 2>/dev/null || true
+        declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
@@ -804,7 +805,7 @@ cleanup_old_backups() {
                 local backup="${backups[i]}"
                 
                 # Validate backup name against expected pattern
-                if [[ ! "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]]; then
+                if [[ ! "$backup" =~ ^(blue|green)_backup_[0-9]{10}$ ]]; then
                     log_warn "Skipping deletion for backup with unexpected name format: ${backup}"
                     continue
                 fi

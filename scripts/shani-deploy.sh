@@ -614,7 +614,7 @@ inhibit_system() {
 }
 
 #####################################
-### Cleanup Functions (FIXED)     ###
+### Cleanup Functions             ###
 #####################################
 
 cleanup_old_backups() {
@@ -623,42 +623,120 @@ cleanup_old_backups() {
     # Disable ERR trap for this function - cleanup is non-critical
     set +e
     
-    findmnt -M "$MOUNT_DIR" &>/dev/null || { set -e; return 1; }
+    if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
+        log_verbose "Mount point not available, skipping backup cleanup"
+        set -e
+        return 1
+    fi
     
     for slot in blue green; do
+        log_verbose "Checking for old backups in slot '${slot}'..."
+        
+        # Gather backups for this slot, sorted by timestamp (newest first)
         mapfile -t backups < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
-            awk -v s="${slot}" '$0 ~ s"_backup_" {print $NF}' | sort -r)
+            awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' | sort -r)
         
-        (( ${#backups[@]} <= 2 )) && continue
+        local backup_count=${#backups[@]}
         
-        log "Cleaning ${slot} backups"
+        if (( backup_count == 0 )); then
+            log_verbose "No backups found for slot '${slot}'"
+            continue
+        fi
         
-        for (( i=2; i<${#backups[@]}; i++ )); do
-            [[ "${backups[i]}" =~ ^(blue|green)_backup_[0-9]{12}$ ]] || continue
-            [[ "${backups[i]}" != "$CURRENT_SLOT" && "${backups[i]}" != "$CANDIDATE_SLOT" ]] || continue
+        log_verbose "Found ${backup_count} backup(s) for slot '${slot}'"
+        
+        if (( backup_count > 1 )); then
+            log "Keeping the most recent backup and deleting $((backup_count-1)) older backup(s) for slot '${slot}'"
             
-            if run_cmd btrfs subvolume delete "$MOUNT_DIR/@${backups[i]}" 2>/dev/null; then
-                log_success "Deleted: @${backups[i]}"
-            else
-                log_warn "Failed to delete: @${backups[i]}"
-            fi
-        done
+            # Loop over all but the first (most recent) backup
+            for (( i=1; i<backup_count; i++ )); do
+                local backup="${backups[i]}"
+                
+                # Validate backup name against expected pattern
+                if [[ ! "$backup" =~ ^(blue|green)_backup_[0-9]{12}$ ]]; then
+                    log_warn "Skipping deletion for backup with unexpected name format: ${backup}"
+                    continue
+                fi
+                
+                # Extra safety: don't delete if it matches current backup being created
+                if [[ -n "${BACKUP_NAME:-}" ]] && [[ "$backup" == "$BACKUP_NAME" ]]; then
+                    log_verbose "Skipping current backup: @${backup}"
+                    continue
+                fi
+                
+                # Attempt deletion
+                if [[ "${DRY_RUN}" == "yes" ]]; then
+                    log "[DRY-RUN] Would delete old backup: @${backup}"
+                elif btrfs subvolume delete "$MOUNT_DIR/@${backup}" &>/dev/null; then
+                    log_success "Deleted old backup: @${backup}"
+                else
+                    log_warn "Failed to delete backup: @${backup}"
+                fi
+            done
+        else
+            log_verbose "Only the latest backup exists for slot '${slot}'; no cleanup needed"
+        fi
     done
     
-    # Re-enable ERR trap
+    # Restore error handling
     set -e
+    return 0
 }
 
 cleanup_downloads() {
     log_verbose "Cleaning downloads"
     
-    local count=0
-    while IFS= read -r f; do
-        ((count++))
-        run_cmd rm -f "$f"
-    done < <(find "$DOWNLOAD_DIR" -maxdepth 1 \( -name "shanios-*.zst*" -o -name "*.aria2" -o -name "*.part" -o -name "*.tmp" \) -mtime +7 -type f 2>/dev/null)
+    [[ ! -d "$DOWNLOAD_DIR" ]] && return 0
     
-    (( count > 0 )) && log "Cleaned $count file(s)"
+    # Find the most recent complete shanios image
+    local latest_image
+    latest_image=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" -printf "%T@ %p\n" 2>/dev/null | \
+        sort -rn | head -1 | cut -d' ' -f2-)
+    
+    local count=0 protected=0
+    
+    # Process each old file
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        
+        # Protect the latest complete image and its verification files
+        if [[ -n "$latest_image" ]]; then
+            local basename
+            basename=$(basename "$file")
+            local latest_basename
+            latest_basename=$(basename "$latest_image")
+            
+            if [[ "$basename" == "$latest_basename" ]] || \
+               [[ "$basename" == "${latest_basename}.sha256" ]] || \
+               [[ "$basename" == "${latest_basename}.asc" ]] || \
+               [[ "$basename" == "${latest_basename}.verified" ]]; then
+                log_verbose "Protecting: $basename"
+                ((protected++))
+                continue
+            fi
+        fi
+        
+        # Delete old file
+        if [[ "${DRY_RUN}" == "yes" ]]; then
+            log "[DRY-RUN] Would delete: $(basename "$file")"
+            ((count++))
+        elif rm -f "$file" 2>/dev/null; then
+            log_verbose "Deleted: $(basename "$file")"
+            ((count++))
+        else
+            log_warn "Failed to delete: $(basename "$file")"
+        fi
+    done < <(find "$DOWNLOAD_DIR" -maxdepth 1 -type f \
+        \( -name "shanios-*.zst*" -o -name "*.aria2" -o -name "*.part" -o -name "*.tmp" \) \
+        -mtime +7 2>/dev/null)
+    
+    if (( count > 0 )); then
+        log "Cleaned $count old download(s)"
+    fi
+    
+    if (( protected > 0 )); then
+        log_verbose "Protected $protected current file(s)"
+    fi
 }
 
 optimize_storage() {
@@ -788,7 +866,7 @@ generate_uki() {
 }
 
 #####################################
-### Rollback (FIXED)              ###
+### Rollback                      ###
 #####################################
 
 restore_candidate() {

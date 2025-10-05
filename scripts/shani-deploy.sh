@@ -1364,25 +1364,19 @@ fetch_update() {
     log "Remote: v${REMOTE_VERSION} (${REMOTE_PROFILE})"
     log "Local:  v${LOCAL_VERSION} (${LOCAL_PROFILE})"
     
-    # Check if update needed
-    if [[ "$LOCAL_VERSION" == "$REMOTE_VERSION" && "$LOCAL_PROFILE" == "$REMOTE_PROFILE" ]]; then
-        mkdir -p "$MOUNT_DIR"
-        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-        
-        if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
-            local cand_ver=$(cat "$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-version" 2>/dev/null || echo "")
-            local cand_prof=$(cat "$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/shani-profile" 2>/dev/null || echo "")
-            
-            if [[ "$cand_ver" == "$REMOTE_VERSION" && "$cand_prof" == "$REMOTE_PROFILE" ]]; then
-                log_success "Both slots up-to-date"
-                touch "${STATE_DIR}/skip-deployment"
-            fi
+    # Only allow upgrades to newer versions
+    if (( REMOTE_VERSION <= LOCAL_VERSION )); then
+        if (( REMOTE_VERSION < LOCAL_VERSION )); then
+            log_warn "Remote version older than local (${REMOTE_VERSION} < ${LOCAL_VERSION})"
+        else
+            log "Already running latest version"
         fi
-        
-        safe_umount "$MOUNT_DIR"
-    else
-        log "Update: v${LOCAL_VERSION} → v${REMOTE_VERSION}"
+        log_success "No update needed"
+        touch "${STATE_DIR}/skip-deployment"
+        return 0
     fi
+    
+    log "Update available: v${LOCAL_VERSION} → v${REMOTE_VERSION}"
 }
 
 download_update() {

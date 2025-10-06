@@ -935,13 +935,17 @@ analyze_storage() {
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to retrieve filesystem usage"
 
     echo ""
-    log "Subvolumes:"
+    log "Subvolume Size Analysis:"
     local -a check_subvols=(blue green data swap)
     for subvol in "${check_subvols[@]}"; do
         if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
-            local info
-            info=$(btrfs filesystem du -s "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print}')
-            echo "  @${subvol}: ${info:-Present}"
+            local size
+            size=$(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ "$size" =~ ^[0-9]+$ ]]; then
+                echo "  @${subvol}: $(format_bytes "$size")"
+            else
+                echo "  @${subvol}: size unavailable"
+            fi
         else
             echo "  @${subvol}: Missing"
         fi
@@ -966,26 +970,16 @@ analyze_storage() {
     log "Deduplication Analysis:"
     log_verbose "Analyzing ${#targets[@]} subvolume(s) (${backup_count} backup(s))"
 
-    # Show compsize output if available
-    if command -v compsize &>/dev/null; then
-        for target in "${targets[@]}"; do
-            log "Compsize for $target:"
-            compsize "$target" 2>/dev/null | sed 's/^/  /' || log_warn "compsize failed for $target"
-        done
-    else
-        log_verbose "compsize not installed"
-    fi
-
     # Calculate combined size before optimization
-    local before
-    before=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
-
-    if [[ -z "$before" ]] || [[ ! "$before" =~ ^[0-9]+$ ]]; then
-        log_warn "Failed to determine combined size"
-        echo ""
-        set -e
-        return 0
-    fi
+    before=0
+    for target in "${targets[@]}"; do
+        if [[ -d "$target" ]]; then
+            size=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ "$size" =~ ^[0-9]+$ ]]; then
+                before=$((before + size))
+            fi
+        fi
+    done
 
     echo "  Combined Size: $(format_bytes "$before")"
 
@@ -1005,7 +999,7 @@ analyze_storage() {
 
     # Deduplication optimization
     if ! command -v duperemove &>/dev/null; then
-        log_warn "duperemove not installed — install it to enable deduplication optimization"
+        log_warn "duperemove not installed — skipping deduplication optimization"
         echo ""
         set -e
         return 0
@@ -1022,29 +1016,32 @@ analyze_storage() {
     log "Running deduplication optimization (this may take several minutes)..."
     mkdir -p "$MOUNT_DIR/@data"
 
-    if duperemove -dhr --skip-zeroes \
+    # Run duperemove with **no redirection**
+    duperemove -dhr --skip-zeroes \
         --dedupe-options=same,partial \
         -b 128K \
         --batchsize=256 \
         --io-threads="$(nproc)" \
         --cpu-threads="$(nproc)" \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
-        "${targets[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+        "${targets[@]}"
+
+    if [[ $? -eq 0 ]]; then
         log_success "Deduplication completed successfully"
     else
         log_warn "Deduplication completed with warnings"
     fi
 
     # Post-optimization size calculation
-    local after saved percent
-    after=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
-
-    if [[ -z "$after" ]] || [[ ! "$after" =~ ^[0-9]+$ ]]; then
-        log_error "Failed to determine size after optimization"
-        echo ""
-        set -e
-        return 1
-    fi
+    after=0
+    for target in "${targets[@]}"; do
+        if [[ -d "$target" ]]; then
+            size=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ "$size" =~ ^[0-9]+$ ]]; then
+                after=$((after + size))
+            fi
+        fi
+    done
 
     echo ""
     log "Post-Optimization Results:"

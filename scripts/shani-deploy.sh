@@ -1901,9 +1901,6 @@ main() {
     fi
     
     [[ -f "$DEPLOY_PENDING" ]] && finalize_update
-
-    # Show final storage status
-    analyze_storage
     
     log_success "Done"
 }

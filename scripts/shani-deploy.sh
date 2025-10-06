@@ -907,6 +907,27 @@ cleanup_downloads() {
     fi
 }
 
+format_bytes() {
+    local bytes=${1:-0}
+    local kib=$((1024))
+    local mib=$((kib * 1024))
+    local gib=$((mib * 1024))
+    local tib=$((gib * 1024))
+
+    if (( bytes >= tib )); then
+        printf "%.2f TiB" "$(bc -l <<< "$bytes / $tib")"
+    elif (( bytes >= gib )); then
+        printf "%.2f GiB" "$(bc -l <<< "$bytes / $gib")"
+    elif (( bytes >= mib )); then
+        printf "%.2f MiB" "$(bc -l <<< "$bytes / $mib")"
+    elif (( bytes >= kib )); then
+        printf "%.2f KiB" "$(bc -l <<< "$bytes / $kib")"
+    else
+        printf "%d B" "$bytes"
+    fi
+}
+
+
 analyze_storage() {
     set +e  # Disable strict error checking for analysis
 
@@ -945,14 +966,17 @@ analyze_storage() {
     log "Subvolume Size Analysis:"
     local -a check_subvols=(blue green data swap)
     local -A subvol_sizes_before
+    local -A subvol_exclusive_before
     
     for subvol in "${check_subvols[@]}"; do
         if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
-            local size
-            size=$(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $2}')
+            local size excl
+            # Get both total and exclusive sizes in bytes
+            read -r size excl < <(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $1, $2}')
             if [[ "$size" =~ ^[0-9]+$ ]]; then
                 subvol_sizes_before[$subvol]=$size
-                echo "  @${subvol}: $(format_bytes "$size")"
+                subvol_exclusive_before[$subvol]=${excl:-$size}
+                echo "  @${subvol}: $(format_bytes "$size") (exclusive: $(format_bytes "${excl:-$size}"))"
             else
                 echo "  @${subvol}: size unavailable"
             fi
@@ -976,14 +1000,14 @@ analyze_storage() {
         [[ -n "$backup" ]] && { targets+=("$MOUNT_DIR/@${backup}"); ((backup_count++)); }
     done < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | awk '$NF ~ /_backup_/ {print $NF}')
 
-    # Calculate combined size before deduplication
+    # Calculate combined exclusive size before deduplication (accurate for CoW)
     local before=0
     for target in "${targets[@]}"; do
         if [[ -d "$target" ]]; then
-            local size
-            size=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
-            if [[ "$size" =~ ^[0-9]+$ ]]; then
-                before=$((before + size))
+            local excl
+            excl=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ "$excl" =~ ^[0-9]+$ ]]; then
+                before=$((before + excl))
             fi
         fi
     done
@@ -991,18 +1015,19 @@ analyze_storage() {
     echo ""
     log "Current State:"
     echo "  Target Subvolumes: ${#targets[@]} (${backup_count} backup(s))"
-    echo "  Combined Size: $(format_bytes "$before")"
+    echo "  Combined Exclusive Size: $(format_bytes "$before")"
 
-    # Calculate already-saved space from CoW
-    local blue_size green_size
-    blue_size=$(btrfs filesystem du -sb "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
-    green_size=$(btrfs filesystem du -sb "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
+    # Calculate CoW savings
+    local blue_total blue_excl green_total green_excl
+    read -r blue_total blue_excl < <(btrfs filesystem du -sb "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $1, $2}')
+    read -r green_total green_excl < <(btrfs filesystem du -sb "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $1, $2}')
 
-    if [[ -n "$blue_size" && -n "$green_size" ]] && [[ "$blue_size" =~ ^[0-9]+$ ]] && [[ "$green_size" =~ ^[0-9]+$ ]]; then
-        local total_unshared=$((blue_size + green_size))
-        if (( total_unshared > before && before > 0 )); then
-            local already_saved=$((total_unshared - before))
-            local saved_pct=$((already_saved * 100 / total_unshared))
+    if [[ -n "$blue_total" && -n "$green_total" ]] && [[ "$blue_total" =~ ^[0-9]+$ ]] && [[ "$green_total" =~ ^[0-9]+$ ]]; then
+        local total_referenced=$((blue_total + green_total))
+        local total_exclusive=$((blue_excl + green_excl))
+        if (( total_exclusive < total_referenced && total_referenced > 0 )); then
+            local already_saved=$((total_referenced - total_exclusive))
+            local saved_pct=$((already_saved * 100 / total_referenced))
             echo "  CoW Savings: $(format_bytes "$already_saved") (${saved_pct}%)"
         fi
     fi
@@ -1033,7 +1058,7 @@ analyze_storage() {
     
     mkdir -p "$MOUNT_DIR/@data"
 
-    # Run duperemove with live output
+    # Run duperemove with filtered output
     local dedupe_start=$(date +%s)
     local dedupe_status=0
     
@@ -1044,7 +1069,7 @@ analyze_storage() {
         --io-threads="$(nproc)" \
         --cpu-threads="$(nproc)" \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
-        "${targets[@]}" || dedupe_status=$?
+        "${targets[@]}" 2>&1 | grep -E '(Total files|Total extent|Shared|Deduped|Logical|savings|processed|Scan completed|^$)' || dedupe_status=${PIPESTATUS[0]}
 
     local dedupe_duration=$(($(date +%s) - dedupe_start))
 
@@ -1066,29 +1091,31 @@ analyze_storage() {
     # Recalculate sizes after deduplication
     local after=0
     local -A subvol_sizes_after
+    local -A subvol_exclusive_after
     
     for subvol in "${check_subvols[@]}"; do
         if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
-            local size
-            size=$(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $2}')
+            local size excl
+            read -r size excl < <(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $1, $2}')
             if [[ "$size" =~ ^[0-9]+$ ]]; then
                 subvol_sizes_after[$subvol]=$size
+                subvol_exclusive_after[$subvol]=${excl:-$size}
             fi
         fi
     done
 
     for target in "${targets[@]}"; do
         if [[ -d "$target" ]]; then
-            local size
-            size=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
-            if [[ "$size" =~ ^[0-9]+$ ]]; then
-                after=$((after + size))
+            local excl
+            excl=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ "$excl" =~ ^[0-9]+$ ]]; then
+                after=$((after + excl))
             fi
         fi
     done
 
     log "Updated Sizes:"
-    echo "  Combined Size: $(format_bytes "$after")"
+    echo "  Combined Exclusive Size: $(format_bytes "$after")"
 
     # Calculate savings from deduplication
     if (( after < before )); then
@@ -1107,17 +1134,19 @@ analyze_storage() {
     echo ""
     log "Per-Subvolume Changes:"
     for subvol in "${check_subvols[@]}"; do
-        local before_size="${subvol_sizes_before[$subvol]:-0}"
-        local after_size="${subvol_sizes_after[$subvol]:-0}"
+        local before_excl="${subvol_exclusive_before[$subvol]:-0}"
+        local after_excl="${subvol_exclusive_after[$subvol]:-0}"
         
-        if (( before_size > 0 && after_size > 0 )); then
-            if (( after_size < before_size )); then
-                local diff=$((before_size - after_size))
-                local diff_pct=$((diff * 100 / before_size))
-                echo "  @${subvol}: $(format_bytes "$before_size") → $(format_bytes "$after_size") (-${diff_pct}%)"
+        if (( before_excl > 0 && after_excl > 0 )); then
+            if (( after_excl < before_excl )); then
+                local diff=$((before_excl - after_excl))
+                local diff_pct=$((diff * 100 / before_excl))
+                echo "  @${subvol}: $(format_bytes "$before_excl") → $(format_bytes "$after_excl") (-${diff_pct}%)"
             else
-                echo "  @${subvol}: $(format_bytes "$after_size") (unchanged)"
+                echo "  @${subvol}: $(format_bytes "$after_excl") (unchanged)"
             fi
+        elif (( after_excl > 0 )); then
+            echo "  @${subvol}: $(format_bytes "$after_excl")"
         fi
     done
 

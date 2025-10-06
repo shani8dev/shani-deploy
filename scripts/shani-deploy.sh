@@ -25,7 +25,6 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
     set +e
     
     # Read state file content
-    local state_content
     state_content=$(cat "$SHANIOS_DEPLOY_STATE_FILE" 2>/dev/null)
     
     # Remove the file immediately to prevent re-use
@@ -940,10 +939,15 @@ optimize_storage() {
     local before after
     before=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
     
-    duperemove -Adhr --skip-zeroes --dedupe-options=same --lookup-extents=yes \
+    log "Running deduplication (this may take several minutes)..."
+    if duperemove -Adhr --skip-zeroes --dedupe-options=same --lookup-extents=yes \
         -b 128K --threads=$(nproc) --io-threads=$(nproc) \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" --hashfile-threads=$(nproc) \
-        "${targets[@]}" >/dev/null 2>&1
+        "${targets[@]}" 2>&1 | tee -a "$LOG_FILE" | grep -E "Total files scanned|Comparison time|shared"; then
+        log_success "Deduplication completed"
+    else
+        log_warn "Deduplication completed with warnings"
+    fi
     
     after=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
     
@@ -1781,6 +1785,9 @@ main() {
     fi
     
     [[ -f "$DEPLOY_PENDING" ]] && finalize_update
+
+    # Show final storage status
+    analyze_storage
     
     log_success "Done"
 }

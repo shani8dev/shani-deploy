@@ -930,18 +930,28 @@ analyze_storage() {
     # Ensure cleanup on exit
     trap 'safe_umount "$MOUNT_DIR"' RETURN
 
+    # ========================================
+    # PHASE 1: Pre-Deduplication Analysis
+    # ========================================
+    
     echo ""
+    log "=== Pre-Deduplication State ==="
+    echo ""
+    
     log "Filesystem Usage:"
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to retrieve filesystem usage"
 
     echo ""
     log "Subvolume Size Analysis:"
     local -a check_subvols=(blue green data swap)
+    local -A subvol_sizes_before
+    
     for subvol in "${check_subvols[@]}"; do
         if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
             local size
             size=$(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $2}')
             if [[ "$size" =~ ^[0-9]+$ ]]; then
+                subvol_sizes_before[$subvol]=$size
                 echo "  @${subvol}: $(format_bytes "$size")"
             else
                 echo "  @${subvol}: size unavailable"
@@ -951,9 +961,9 @@ analyze_storage() {
         fi
     done
 
-    # Deduplication analysis requires both @blue and @green
+    # Check if deduplication is possible
     if ! btrfs_subvol_exists "$MOUNT_DIR/@blue" || ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
-        log_verbose "Skipping deduplication analysis (missing subvolumes)"
+        log_verbose "Skipping deduplication (missing subvolumes)"
         echo ""
         set -e
         return 0
@@ -966,14 +976,11 @@ analyze_storage() {
         [[ -n "$backup" ]] && { targets+=("$MOUNT_DIR/@${backup}"); ((backup_count++)); }
     done < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | awk '$NF ~ /_backup_/ {print $NF}')
 
-    echo ""
-    log "Deduplication Analysis:"
-    log_verbose "Analyzing ${#targets[@]} subvolume(s) (${backup_count} backup(s))"
-
-    # Calculate combined size before optimization
-    before=0
+    # Calculate combined size before deduplication
+    local before=0
     for target in "${targets[@]}"; do
         if [[ -d "$target" ]]; then
+            local size
             size=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
             if [[ "$size" =~ ^[0-9]+$ ]]; then
                 before=$((before + size))
@@ -981,9 +988,12 @@ analyze_storage() {
         fi
     done
 
+    echo ""
+    log "Current State:"
+    echo "  Target Subvolumes: ${#targets[@]} (${backup_count} backup(s))"
     echo "  Combined Size: $(format_bytes "$before")"
 
-    # Calculate already-saved space
+    # Calculate already-saved space from CoW
     local blue_size green_size
     blue_size=$(btrfs filesystem du -sb "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
     green_size=$(btrfs filesystem du -sb "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
@@ -993,19 +1003,23 @@ analyze_storage() {
         if (( total_unshared > before && before > 0 )); then
             local already_saved=$((total_unshared - before))
             local saved_pct=$((already_saved * 100 / total_unshared))
-            echo "  Already Saved: $(format_bytes "$already_saved") (${saved_pct}%)"
+            echo "  CoW Savings: $(format_bytes "$already_saved") (${saved_pct}%)"
         fi
     fi
 
-    # Deduplication optimization
+    # ========================================
+    # PHASE 2: Run Deduplication
+    # ========================================
+
     if ! command -v duperemove &>/dev/null; then
-        log_warn "duperemove not installed — skipping deduplication optimization"
+        log_warn "duperemove not installed — install it to enable deduplication optimization"
         echo ""
         set -e
         return 0
     fi
 
     if [[ "${DRY_RUN}" == "yes" ]]; then
+        echo ""
         log "[DRY-RUN] Would run deduplication on ${#targets[@]} subvolume(s)"
         echo ""
         set -e
@@ -1013,10 +1027,16 @@ analyze_storage() {
     fi
 
     echo ""
-    log "Running deduplication optimization (this may take several minutes)..."
+    log "=== Running Deduplication ==="
+    log "This may take several minutes depending on data size..."
+    echo ""
+    
     mkdir -p "$MOUNT_DIR/@data"
 
-    # Run duperemove with **no redirection**
+    # Run duperemove with live output
+    local dedupe_start=$(date +%s)
+    local dedupe_status=0
+    
     duperemove -dhr --skip-zeroes \
         --dedupe-options=same,partial \
         -b 128K \
@@ -1024,18 +1044,42 @@ analyze_storage() {
         --io-threads="$(nproc)" \
         --cpu-threads="$(nproc)" \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
-        "${targets[@]}"
+        "${targets[@]}" || dedupe_status=$?
 
-    if [[ $? -eq 0 ]]; then
-        log_success "Deduplication completed successfully"
+    local dedupe_duration=$(($(date +%s) - dedupe_start))
+
+    echo ""
+    if [[ $dedupe_status -eq 0 ]]; then
+        log_success "Deduplication completed in ${dedupe_duration}s"
     else
-        log_warn "Deduplication completed with warnings"
+        log_warn "Deduplication completed with warnings (exit code: $dedupe_status)"
     fi
 
-    # Post-optimization size calculation
-    after=0
+    # ========================================
+    # PHASE 3: Post-Deduplication Analysis
+    # ========================================
+
+    echo ""
+    log "=== Post-Deduplication Results ==="
+    echo ""
+
+    # Recalculate sizes after deduplication
+    local after=0
+    local -A subvol_sizes_after
+    
+    for subvol in "${check_subvols[@]}"; do
+        if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
+            local size
+            size=$(btrfs filesystem du -sb "$MOUNT_DIR/@${subvol}" 2>/dev/null | awk 'NR==2 {print $2}')
+            if [[ "$size" =~ ^[0-9]+$ ]]; then
+                subvol_sizes_after[$subvol]=$size
+            fi
+        fi
+    done
+
     for target in "${targets[@]}"; do
         if [[ -d "$target" ]]; then
+            local size
             size=$(btrfs filesystem du -sb "$target" 2>/dev/null | awk 'NR==2 {print $2}')
             if [[ "$size" =~ ^[0-9]+$ ]]; then
                 after=$((after + size))
@@ -1043,21 +1087,44 @@ analyze_storage() {
         fi
     done
 
-    echo ""
-    log "Post-Optimization Results:"
+    log "Updated Sizes:"
     echo "  Combined Size: $(format_bytes "$after")"
 
+    # Calculate savings from deduplication
     if (( after < before )); then
-        saved=$((before - after))
+        local saved=$((before - after))
         if (( before > 0 )); then
-            percent=$((saved * 100 / before))
-            echo "  Additional Savings: $(format_bytes "$saved") (${percent}%)"
-            log_success "Deduplication saved $(format_bytes "$saved")"
+            local percent=$((saved * 100 / before))
+            echo "  Space Reclaimed: $(format_bytes "$saved") (${percent}%)"
+            log_success "Deduplication freed $(format_bytes "$saved")"
         fi
     else
-        echo "  Additional Savings: None"
-        log_verbose "No additional space saved from deduplication"
+        echo "  Space Reclaimed: None (all duplicates already optimized)"
+        log_verbose "No additional space freed - data was already optimized"
     fi
+
+    # Show per-subvolume changes
+    echo ""
+    log "Per-Subvolume Changes:"
+    for subvol in "${check_subvols[@]}"; do
+        local before_size="${subvol_sizes_before[$subvol]:-0}"
+        local after_size="${subvol_sizes_after[$subvol]:-0}"
+        
+        if (( before_size > 0 && after_size > 0 )); then
+            if (( after_size < before_size )); then
+                local diff=$((before_size - after_size))
+                local diff_pct=$((diff * 100 / before_size))
+                echo "  @${subvol}: $(format_bytes "$before_size") → $(format_bytes "$after_size") (-${diff_pct}%)"
+            else
+                echo "  @${subvol}: $(format_bytes "$after_size") (unchanged)"
+            fi
+        fi
+    done
+
+    # Final filesystem state
+    echo ""
+    log "Final Filesystem Usage:"
+    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || true
 
     echo ""
     set -e

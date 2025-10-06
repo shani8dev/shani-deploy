@@ -787,65 +787,68 @@ inhibit_system() {
 
 cleanup_old_backups() {
     log_verbose "Cleaning backups"
-    
+
     # Disable ERR trap for this function - cleanup is non-critical
     set +e
-    
+
     if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
         log_verbose "Mount point not available, skipping backup cleanup"
         set -e
         return 1
     fi
-    
+
     for slot in blue green; do
         log_verbose "Checking for old backups in slot '${slot}'..."
-        
+
         # Gather backups for this slot, sorted by timestamp (newest first)
-        mapfile -t backups < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
-            awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' | sort -r)
-        
+        mapfile -t backups < <(
+            btrfs subvolume list "$MOUNT_DIR" 2>/dev/null |
+            awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' |
+            sort -r
+        )
+
         local backup_count=${#backups[@]}
-        
+
         if (( backup_count == 0 )); then
             log_verbose "No backups found for slot '${slot}'"
             continue
         fi
-        
+
         log_verbose "Found ${backup_count} backup(s) for slot '${slot}'"
-        
+
         if (( backup_count > 1 )); then
-            log "Keeping the most recent backup and deleting $((backup_count-1)) older backup(s) for slot '${slot}'"
-            
-            # Loop over all but the first (most recent) backup
+            log "Keeping the most recent backup and deleting $((backup_count-1)) older backup(s) for slot '${slot}')"
+
             for (( i=1; i<backup_count; i++ )); do
                 local backup="${backups[i]}"
-                
-                # Validate backup name against expected pattern
-                if [[ ! "$backup" =~ ^(blue|green)_backup_[0-9]{10}$ ]]; then
+                local clean_backup="${backup#@}"
+
+                # Support both 10-digit and 12-digit timestamps
+                if [[ ! "$clean_backup" =~ ^(blue|green)_backup_[0-9]{10}([0-9]{2})?$ ]]; then
                     log_warn "Skipping deletion for backup with unexpected name format: ${backup}"
                     continue
                 fi
-                
+
                 # Extra safety: don't delete if it matches current backup being created
-                if [[ -n "${BACKUP_NAME:-}" ]] && [[ "$backup" == "$BACKUP_NAME" ]]; then
+                if [[ -n "${BACKUP_NAME:-}" ]] && [[ "$backup" == "@${BACKUP_NAME}" ]]; then
                     log_verbose "Skipping current backup: @${backup}"
                     continue
                 fi
-                
+
                 # Attempt deletion
                 if [[ "${DRY_RUN}" == "yes" ]]; then
-                    log "[DRY-RUN] Would delete old backup: @${backup}"
-                elif btrfs subvolume delete "$MOUNT_DIR/@${backup}" &>/dev/null; then
-                    log_success "Deleted old backup: @${backup}"
+                    log "[DRY-RUN] Would delete old backup: ${backup}"
+                elif btrfs subvolume delete "$MOUNT_DIR/${backup}" &>/dev/null; then
+                    log_success "Deleted old backup: ${backup}"
                 else
-                    log_warn "Failed to delete backup: @${backup}"
+                    log_warn "Failed to delete backup: ${backup}"
                 fi
             done
         else
             log_verbose "Only the latest backup exists for slot '${slot}'; no cleanup needed"
         fi
     done
-    
+
     # Restore error handling
     set -e
     return 0

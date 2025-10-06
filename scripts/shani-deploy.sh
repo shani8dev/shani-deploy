@@ -952,7 +952,7 @@ analyze_storage() {
             echo ""
             log "@${subvol}:"
             if command -v compsize &>/dev/null; then
-                compsize -bx "$path" || log_warn "compsize failed for @${subvol}"
+                compsize -x "$path" || log_warn "compsize failed for @${subvol}"
             else
                 btrfs filesystem du -s "$path" || log_warn "btrfs du failed for @${subvol}"
             fi
@@ -975,7 +975,7 @@ analyze_storage() {
     local -a targets=("$MOUNT_DIR/@blue" "$MOUNT_DIR/@green")
     local backup_count=0
     while IFS= read -r backup; do
-        [[ -n "$backup" ]] && { targets+=("$MOUNT_DIR/@${backup}"); ((backup_count++)); }
+        [[ -n "$backup" ]] && { targets+=("$MOUNT_DIR/${backup}"); ((backup_count++)); }
     done < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | awk '$NF ~ /_backup_/ {print $NF}')
 
     echo ""
@@ -1021,7 +1021,7 @@ analyze_storage() {
             echo ""
             log "@${subvol}:"
             if command -v compsize &>/dev/null; then
-                compsize -bx "$path" || log_warn "compsize failed for @${subvol}"
+                compsize -x "$path" || log_warn "compsize failed for @${subvol}"
             else
                 btrfs filesystem du -s "$path" || log_warn "btrfs du failed for @${subvol}"
             fi
@@ -1036,7 +1036,6 @@ analyze_storage() {
     set -e
     return 0
 }
-
 
 #####################################
 ### Chroot Management             ###

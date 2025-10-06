@@ -938,12 +938,15 @@ optimize_storage() {
     
     local before after
     before=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
-    
+
     log "Running deduplication (this may take several minutes)..."
+    # Use --one-file-system to prevent crossing filesystem boundaries
+    # This avoids fstab parsing issues
     if duperemove -Adhr --skip-zeroes --dedupe-options=same --lookup-extents=yes \
+        --one-file-system \
         -b 128K --threads=$(nproc) --io-threads=$(nproc) \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" --hashfile-threads=$(nproc) \
-        "${targets[@]}" 2>&1 | tee -a "$LOG_FILE" | grep -E "Total files scanned|Comparison time|shared"; then
+        "${targets[@]}" 2>&1 | tee -a "$LOG_FILE"; then
         log_success "Deduplication completed"
     else
         log_warn "Deduplication completed with warnings"
@@ -1277,8 +1280,8 @@ analyze_storage() {
         if [[ -n "$combined" ]]; then
             echo "  Combined: $combined"
             
-            local blue=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
-            local green=$(btrfs filesystem du -s "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
+            local blue=$(btrfs filesystem du -sb "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
+            local green=$(btrfs filesystem du -sb "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
             local excl=$(echo "$combined" | awk '{print $1}')
             
             if [[ -n "$blue" && -n "$green" && -n "$excl" ]] && (( blue + green > 0 )); then

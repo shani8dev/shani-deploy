@@ -1420,50 +1420,6 @@ verify_and_create_subvolumes() {
     safe_umount "$MOUNT_DIR"
 }
 
-analyze_storage() {
-    log_section "Storage Analysis"
-    
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    
-    echo ""
-    echo "Filesystem Usage:"
-    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /'
-    
-    echo ""
-    echo "Subvolumes:"
-    for s in blue green data swap; do
-        if btrfs_subvol_exists "$MOUNT_DIR/@${s}"; then
-            local info=$(btrfs filesystem du -s "$MOUNT_DIR/@${s}" 2>/dev/null | awk 'NR==2')
-            echo "  @${s}: ${info:-Present}"
-        else
-            echo "  @${s}: Missing"
-        fi
-    done
-    
-    if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
-        echo ""
-        echo "Deduplication Analysis:"
-        local combined=$(btrfs filesystem du -s "$MOUNT_DIR/@blue" "$MOUNT_DIR/@green" 2>/dev/null | tail -1)
-        if [[ -n "$combined" ]]; then
-            echo "  Combined: $combined"
-            
-            local blue=$(btrfs filesystem du -sb "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
-            local green=$(btrfs filesystem du -sb "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
-            local excl=$(echo "$combined" | awk '{print $1}')
-            
-            if [[ -n "$blue" && -n "$green" && -n "$excl" ]] && (( blue + green > 0 )); then
-                local saved=$(( blue + green - excl ))
-                local percent=$(( saved * 100 / (blue + green) ))
-                echo "  Potential: $(format_bytes $saved) (${percent}%)"
-            fi
-        fi
-    fi
-    
-    echo ""
-    safe_umount "$MOUNT_DIR"
-}
-
 #####################################
 ### Deployment Logic              ###
 #####################################

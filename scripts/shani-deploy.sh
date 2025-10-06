@@ -908,17 +908,17 @@ cleanup_downloads() {
 }
 
 analyze_storage() {
-    set +e  # Disable strict error checking for storage analysis
-    
+    set +e  # Disable strict error checking for analysis
+
     log_section "Storage Analysis"
-    
+
     # Check for pending deployment
     if [[ -f "$DEPLOY_PENDING" ]]; then
         log_warn "Deployment pending, skipping storage analysis"
         set -e
         return 0
     fi
-    
+
     # Prepare mount point
     mkdir -p "$MOUNT_DIR"
     if ! safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"; then
@@ -926,18 +926,16 @@ analyze_storage() {
         set -e
         return 1
     fi
-    
+
     # Ensure cleanup on exit
     trap 'safe_umount "$MOUNT_DIR"' RETURN
-    
-    # Display filesystem usage
+
     echo ""
-    echo "Filesystem Usage:"
+    log "Filesystem Usage:"
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to retrieve filesystem usage"
-    
-    # Display individual subvolume sizes
+
     echo ""
-    echo "Subvolumes:"
+    log "Subvolumes:"
     local -a check_subvols=(blue green data swap)
     for subvol in "${check_subvols[@]}"; do
         if btrfs_subvol_exists "$MOUNT_DIR/@${subvol}"; then
@@ -948,53 +946,55 @@ analyze_storage() {
             echo "  @${subvol}: Missing"
         fi
     done
-    
-    # Deduplication analysis (only if both slots exist)
+
+    # Deduplication analysis requires both @blue and @green
     if ! btrfs_subvol_exists "$MOUNT_DIR/@blue" || ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
         log_verbose "Skipping deduplication analysis (missing subvolumes)"
         echo ""
         set -e
         return 0
     fi
-    
+
     # Build target list including backups
     local -a targets=("$MOUNT_DIR/@blue" "$MOUNT_DIR/@green")
     local backup_count=0
     while IFS= read -r backup; do
         [[ -n "$backup" ]] && { targets+=("$MOUNT_DIR/@${backup}"); ((backup_count++)); }
-    done < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | awk '/_backup_/ {print $NF}')
-    
+    done < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | awk '$NF ~ /_backup_/ {print $NF}')
+
     echo ""
-    echo "Deduplication Analysis:"
+    log "Deduplication Analysis:"
     log_verbose "Analyzing ${#targets[@]} subvolume(s) (${backup_count} backup(s))"
-    
+
     # Show compsize output if available
     if command -v compsize &>/dev/null; then
-        compsize -a "${targets[@]}" 2>/dev/null | sed 's/^/  /' || log_verbose "compsize analysis failed"
+        for target in "${targets[@]}"; do
+            log "Compsize for $target:"
+            compsize "$target" 2>/dev/null | sed 's/^/  /' || log_warn "compsize failed for $target"
+        done
     else
         log_verbose "compsize not installed"
     fi
-    
-    # Calculate current state
+
+    # Calculate combined size before optimization
     local before
     before=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
-    
+
     if [[ -z "$before" ]] || [[ ! "$before" =~ ^[0-9]+$ ]]; then
         log_warn "Failed to determine combined size"
         echo ""
         set -e
         return 0
     fi
-    
+
     echo "  Combined Size: $(format_bytes "$before")"
-    
+
     # Calculate already-saved space
     local blue_size green_size
     blue_size=$(btrfs filesystem du -sb "$MOUNT_DIR/@blue" 2>/dev/null | awk 'NR==2 {print $2}')
     green_size=$(btrfs filesystem du -sb "$MOUNT_DIR/@green" 2>/dev/null | awk 'NR==2 {print $2}')
-    
-    if [[ -n "$blue_size" && -n "$green_size" ]] && \
-       [[ "$blue_size" =~ ^[0-9]+$ ]] && [[ "$green_size" =~ ^[0-9]+$ ]]; then
+
+    if [[ -n "$blue_size" && -n "$green_size" ]] && [[ "$blue_size" =~ ^[0-9]+$ ]] && [[ "$green_size" =~ ^[0-9]+$ ]]; then
         local total_unshared=$((blue_size + green_size))
         if (( total_unshared > before && before > 0 )); then
             local already_saved=$((total_unshared - before))
@@ -1002,27 +1002,26 @@ analyze_storage() {
             echo "  Already Saved: $(format_bytes "$already_saved") (${saved_pct}%)"
         fi
     fi
-    
-    # Perform optimization if duperemove available and not in dry run
+
+    # Deduplication optimization
     if ! command -v duperemove &>/dev/null; then
         log_warn "duperemove not installed — install it to enable deduplication optimization"
         echo ""
         set -e
         return 0
     fi
-    
+
     if [[ "${DRY_RUN}" == "yes" ]]; then
         log "[DRY-RUN] Would run deduplication on ${#targets[@]} subvolume(s)"
         echo ""
         set -e
         return 0
     fi
-    
-    # Run deduplication
+
     echo ""
     log "Running deduplication optimization (this may take several minutes)..."
     mkdir -p "$MOUNT_DIR/@data"
-    
+
     if duperemove -dhr --skip-zeroes \
         --dedupe-options=same,partial \
         -b 128K \
@@ -1035,22 +1034,22 @@ analyze_storage() {
     else
         log_warn "Deduplication completed with warnings"
     fi
-    
-    # Calculate results
+
+    # Post-optimization size calculation
     local after saved percent
     after=$(btrfs filesystem du -sb "${targets[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
-    
+
     if [[ -z "$after" ]] || [[ ! "$after" =~ ^[0-9]+$ ]]; then
         log_error "Failed to determine size after optimization"
         echo ""
         set -e
         return 1
     fi
-    
+
     echo ""
-    echo "Post-Optimization Results:"
+    log "Post-Optimization Results:"
     echo "  Combined Size: $(format_bytes "$after")"
-    
+
     if (( after < before )); then
         saved=$((before - after))
         if (( before > 0 )); then
@@ -1062,7 +1061,7 @@ analyze_storage() {
         echo "  Additional Savings: None"
         log_verbose "No additional space saved from deduplication"
     fi
-    
+
     echo ""
     set -e
     return 0

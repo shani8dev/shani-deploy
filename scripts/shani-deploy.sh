@@ -1805,6 +1805,7 @@ main() {
         mkdir -p "$MOUNT_DIR"
         if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
+                cleanup_old_backups
                 umount -R "$MOUNT_DIR" 2>/dev/null || true
                 analyze_storage
             else

@@ -18,24 +18,23 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+declare -a ORIGINAL_ARGS=("$@")
+declare DEPLOYMENT_START_TIME=$(date +%s)
+export ORIGINAL_ARGS DEPLOYMENT_START_TIME
+
 #####################################
 ### State Restoration             ###
 #####################################
 if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FILE" ]]; then
     set +e
     
-    # Read state file content
     state_content=$(cat "$SHANIOS_DEPLOY_STATE_FILE" 2>/dev/null)
-    
-    # Remove the file immediately to prevent re-use
     rm -f "$SHANIOS_DEPLOY_STATE_FILE"
     
-    # Now try to source it if we got content
     if [[ -n "$state_content" ]]; then
-        # Filter out readonly variable declarations
-        state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS" || true)
+        # Filter out readonly variables (but keep ORIGINAL_ARGS)
+        state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS\|declare.*CHANNEL_FILE" || true)
         
-        # Source the filtered content
         if [[ -n "$state_content" ]]; then
             eval "$state_content" 2>/dev/null || true
         fi
@@ -58,6 +57,7 @@ readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
 readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
+readonly CHANNEL_FILE="/etc/shani-channel"
 
 readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
@@ -74,8 +74,9 @@ command -v pv &>/dev/null && HAS_PV=1
 declare -g LOCAL_VERSION LOCAL_PROFILE
 declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
-declare -g UPDATE_CHANNEL="stable" DRY_RUN="no" VERBOSE="no"
+declare -g UPDATE_CHANNEL="" UPDATE_CHANNEL_SOURCE="" DRY_RUN="no" VERBOSE="no"
 declare -g DEPLOYMENT_START_TIME="" SKIP_SELF_UPDATE="no"
+declare -g SELF_UPDATE_DONE=""
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 readonly CHROOT_STATIC_DIRS=(data etc var)
@@ -96,12 +97,13 @@ persist_state() {
     local state_file
     state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
     {
-        # Only persist non-readonly variables
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
-        declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL 2>/dev/null || true
-        declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE DEPLOYMENT_START_TIME 2>/dev/null || true
+        declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
+        declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE 2>/dev/null || true
         declare -p STATE_DIR 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV 2>/dev/null || true
+        declare -p SELF_UPDATE_DONE 2>/dev/null || true
+        declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
@@ -187,6 +189,72 @@ format_bytes() {
 
 get_file_size() {
     stat -c%s "$1" 2>/dev/null || echo 0
+}
+
+#####################################
+### Channel Management            ###
+#####################################
+
+read_channel_from_file() {
+    local channel=""
+    
+    if [[ -f "$CHANNEL_FILE" ]]; then
+        # Read and sanitize channel name
+        channel=$(cat "$CHANNEL_FILE" 2>/dev/null | tr -d '[:space:]' | head -1)
+        
+        # Validate channel name (only alphanumeric and underscore allowed)
+        if [[ -n "$channel" ]] && [[ "$channel" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            # Normalize to lowercase
+            channel=$(echo "$channel" | tr '[:upper:]' '[:lower:]')
+            
+            # Validate it's a known channel
+            case "$channel" in
+                stable|latest)
+                    log_verbose "Channel from file: $channel"
+                    echo "$channel"
+                    return 0
+                    ;;
+                *)
+                    log_warn "Invalid channel in $CHANNEL_FILE: $channel"
+                    ;;
+            esac
+        else
+            log_verbose "Empty or invalid channel file format"
+        fi
+    else
+        log_verbose "Channel file not found: $CHANNEL_FILE"
+    fi
+    
+    # Return empty if file doesn't exist or is invalid
+    echo ""
+}
+
+set_update_channel() {
+    local channel_arg="${1:-}"
+    
+    # Priority 1: Command-line argument
+    if [[ -n "$channel_arg" ]]; then
+        UPDATE_CHANNEL="$channel_arg"
+        UPDATE_CHANNEL_SOURCE="command-line"
+        log_verbose "Channel source: command-line (-t $channel_arg)"
+        return 0
+    fi
+    
+    # Priority 2: Channel file
+    local file_channel
+    file_channel=$(read_channel_from_file)
+    
+    if [[ -n "$file_channel" ]]; then
+        UPDATE_CHANNEL="$file_channel"
+        UPDATE_CHANNEL_SOURCE="$CHANNEL_FILE"
+        log_verbose "Channel source: $CHANNEL_FILE"
+        return 0
+    fi
+    
+    # Priority 3: Default
+    UPDATE_CHANNEL="stable"
+    UPDATE_CHANNEL_SOURCE="default"
+    log_verbose "Channel source: default (stable)"
 }
 
 #####################################
@@ -725,20 +793,24 @@ set_environment() {
     validate_nonempty "$LOCAL_PROFILE" "LOCAL_PROFILE"
     
     log "System: v${LOCAL_VERSION} (${LOCAL_PROFILE})"
-    log "Channel: ${UPDATE_CHANNEL}"
+    log "Channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"  # ADD SOURCE HERE
 }
 
 #####################################
 ### Self-Update                   ###
 #####################################
 
-ORIGINAL_ARGS=("$@")
-
 self_update() {
-    [[ -n "${SELF_UPDATE_DONE:-}" || "${SKIP_SELF_UPDATE}" == "yes" || -f "$DEPLOY_PENDING" ]] && return 0
+    # Check all conditions including state-restored SELF_UPDATE_DONE
+    if [[ -n "${SELF_UPDATE_DONE:-}" ]] || \
+       [[ "${SKIP_SELF_UPDATE}" == "yes" ]] || \
+       [[ -f "$DEPLOY_PENDING" ]]; then
+        return 0
+    fi
     
+    # Mark as done BEFORE any operations
     export SELF_UPDATE_DONE=1
-    persist_state
+    persist_state  # Save state immediately
 
     local url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     local temp
@@ -751,7 +823,11 @@ self_update() {
             if ! cmp -s "$0" "$temp"; then
                 chmod +x "$temp"
                 log_success "Updated, re-executing..."
-                exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
+                if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+    					exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
+				else
+    					exec /bin/bash "$temp"
+				fi
             fi
         fi
     fi
@@ -774,11 +850,20 @@ inhibit_system() {
     
     log "Inhibiting power events"
     
-    exec systemd-inhibit \
-        --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-        --who="shanios-deployment" \
-        --why="System update in progress" \
-        "$0" "$@"
+    # Ensure we have the args to pass
+    if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+        exec systemd-inhibit \
+            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" \
+            --why="System update in progress" \
+            "$0" "${ORIGINAL_ARGS[@]}"
+    else
+        exec systemd-inhibit \
+            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" \
+            --why="System update in progress" \
+            "$0"
+    fi
 }
 
 #####################################
@@ -1760,15 +1845,14 @@ main() {
             *) die "Invalid option: $1" ;;
         esac
     done
-    
-    DEPLOYMENT_START_TIME=$(date +%s)
-    
+       
     check_root
     check_internet
     check_tools
+    set_update_channel "${UPDATE_CHANNEL:-}"
     set_environment
-    self_update "$@"
-    inhibit_system "$@"
+    self_update
+    inhibit_system
     
     [[ "$STORAGE_INFO" == "yes" ]] && { analyze_storage; exit 0; }
     

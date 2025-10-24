@@ -74,9 +74,8 @@ command -v pv &>/dev/null && HAS_PV=1
 declare -g LOCAL_VERSION LOCAL_PROFILE
 declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
-declare -g UPDATE_CHANNEL="" UPDATE_CHANNEL_SOURCE="" DRY_RUN="no" VERBOSE="no"
-declare -g DEPLOYMENT_START_TIME="" SKIP_SELF_UPDATE="no"
-declare -g SELF_UPDATE_DONE=""
+declare -g UPDATE_CHANNEL="" UPDATE_CHANNEL_SOURCE="" SELF_UPDATE_DONE=""
+declare -g DRY_RUN="no" VERBOSE="no" SKIP_SELF_UPDATE="no"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 readonly CHROOT_STATIC_DIRS=(data etc var)

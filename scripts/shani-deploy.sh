@@ -1310,6 +1310,13 @@ parse_fstab_subvolumes() {
     }' "$1" | sort -u
 }
 
+parse_fstab_bind_dirs() {
+    [[ -f "$1" ]] || return 1
+    awk '/[[:space:]]bind[,[:space:]]/ && !/^[[:space:]]*#/ {
+        if ($4 ~ /bind/ && $1 ~ /^\/data\//) print $1
+    }' "$1" | sort -u
+}
+
 create_swapfile() {
     local file="$1" size_mb="$2" avail_mb="$3"
     
@@ -1342,8 +1349,8 @@ create_swapfile() {
     return 1
 }
 
-verify_and_create_subvolumes() {
-    log_section "Subvolume Verification"
+verify_and_create_filesystem_structure() {
+    log_section "Filesystem Structure Verification"
     
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
@@ -1354,6 +1361,7 @@ verify_and_create_subvolumes() {
         return 0
     fi
     
+    # Parse subvolumes
     mapfile -t required < <(parse_fstab_subvolumes "$fstab")
     
     if [[ ${#required[@]} -eq 0 ]]; then
@@ -1370,45 +1378,73 @@ verify_and_create_subvolumes() {
     
     if [[ ${#missing[@]} -eq 0 ]]; then
         log_success "All subvolumes exist"
-        safe_umount "$MOUNT_DIR"
-        return 0
+    else
+        log "Creating ${#missing[@]} subvolume(s)"
+        
+        for sub in "${missing[@]}"; do
+            run_cmd btrfs subvolume create "$MOUNT_DIR/@${sub}"
+            
+            case "$sub" in
+                swap)
+                    [[ "${DRY_RUN}" == "yes" ]] && continue
+                    chattr +C "$MOUNT_DIR/@${sub}" 2>/dev/null || true
+                    
+                    local swapfile="$MOUNT_DIR/@${sub}/swapfile"
+                    if [[ ! -f "$swapfile" ]]; then
+                        local mem=$(free -m | awk '/^Mem:/{print $2}')
+                        local avail=$(get_btrfs_available_mb "$MOUNT_DIR")
+                        create_swapfile "$swapfile" "$mem" "$avail" || true
+                    fi
+                    ;;
+                    
+                data)
+                    [[ "${DRY_RUN}" == "yes" ]] && continue
+                    mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work}
+                    mkdir -p "$MOUNT_DIR/@data/downloads"
+                    
+                    if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
+                        echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot"
+                    fi
+                    if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
+                        echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot"
+                    fi
+                    ;;
+            esac
+            
+            log_success "Created: @${sub}"
+        done
     fi
     
-    log "Creating ${#missing[@]} subvolume(s)"
+    # Parse and create bind mount directories
+    mapfile -t bind_dirs < <(parse_fstab_bind_dirs "$fstab")
     
-    for sub in "${missing[@]}"; do
-        run_cmd btrfs subvolume create "$MOUNT_DIR/@${sub}"
+    if [[ ${#bind_dirs[@]} -gt 0 ]]; then
+        log "Checking ${#bind_dirs[@]} bind mount director(ies)"
         
-        case "$sub" in
-            swap)
-                [[ "${DRY_RUN}" == "yes" ]] && continue
-                chattr +C "$MOUNT_DIR/@${sub}" 2>/dev/null || true
-                
-                local swapfile="$MOUNT_DIR/@${sub}/swapfile"
-                if [[ ! -f "$swapfile" ]]; then
-                    local mem=$(free -m | awk '/^Mem:/{print $2}')
-                    local avail=$(get_btrfs_available_mb "$MOUNT_DIR")
-                    create_swapfile "$swapfile" "$mem" "$avail" || true
+        local created=0
+        for dir in "${bind_dirs[@]}"; do
+            local full_path="$MOUNT_DIR/${dir#/}"
+            
+            if [[ -d "$full_path" ]]; then
+                log_verbose "Exists: $dir"
+                continue
+            fi
+            
+            if [[ "${DRY_RUN}" == "yes" ]]; then
+                log "[DRY-RUN] Would create: $dir"
+                ((created++))
+            else
+                if mkdir -p "$full_path" 2>/dev/null; then
+                    log_verbose "Created: $dir"
+                    ((created++))
+                else
+                    log_warn "Failed: $dir"
                 fi
-                ;;
-                
-            data)
-                [[ "${DRY_RUN}" == "yes" ]] && continue
-                mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{lower,upper,work}
-                mkdir -p "$MOUNT_DIR/@data/downloads"
-                
-                # Initialize slot markers if they don't exist
-                if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
-                    echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot"
-                fi
-                if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
-                    echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot"
-                fi
-                ;;
-        esac
+            fi
+        done
         
-        log_success "Created: @${sub}"
-    done
+        (( created > 0 )) && log_success "Created ${created} bind director(ies)"
+    fi
     
     safe_umount "$MOUNT_DIR"
 }
@@ -1779,7 +1815,7 @@ finalize_update() {
     echo "$CURRENT_SLOT" > /data/previous-slot || log_warn "Failed to write previous-slot"
     echo "$CANDIDATE_SLOT" > /data/current-slot || log_warn "Failed to write current-slot"
     
-    verify_and_create_subvolumes || die "Subvolume verification failed"
+    verify_and_create_filesystem_structure || die "Filesystem structure verification failed"
     
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
     

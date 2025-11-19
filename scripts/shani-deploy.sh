@@ -588,29 +588,28 @@ download_with_tool() {
     # Add progress if terminal
     [[ -t 2 ]] && wget_base_opts+=(--show-progress --progress=bar:force)
     
-    # Check if partial file exists and is valid for resume
-    local resume_opts=()
+    # Check if partial file exists and server supports resume
+    local resume_supported=0
     if [[ -f "$output" ]] && [[ -s "$output" ]]; then
         local partial_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
         
         if (( partial_size > 0 )); then
             log_verbose "Found partial download: $(format_bytes $partial_size)"
             
-            # Verify server supports byte-range (quick check)
+            # Quick check if server supports byte-range requests
             if timeout 10 wget --spider -S "$url" 2>&1 | grep -qi "Accept-Ranges.*bytes"; then
-                log_verbose "Server supports resume, continuing..."
-                resume_opts+=(--continue)
+                log_verbose "Server supports resume"
+                resume_supported=1
             else
-                log_verbose "Server doesn't support resume, restarting..."
+                log_verbose "Server doesn't support resume, will restart download"
                 rm -f "$output"
             fi
         fi
     fi
-
     
     case "$tool" in
         aria2c)
-            # Use --truncate-console-readout for single-line progress
+            # aria2c handles resume automatically with --continue=true
             aria2c \
                 --max-connection-per-server=1 --split=1 \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
@@ -622,10 +621,15 @@ download_with_tool() {
                 "$url"
             ;;
         wget)
-             # Execute with or without --continue based on capability check
-    		wget "${wget_base_opts[@]}" "${resume_opts[@]}" -O "$output" "$url"
+            # Only add --continue if server supports it
+            if (( resume_supported )); then
+                wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
+            else
+                wget "${wget_base_opts[@]}" -O "$output" "$url"
+            fi
             ;;
         curl)
+            # curl's --continue-at - handles resume automatically
             curl --fail --location --max-time 300 --retry 3 --retry-delay 3 \
                 --continue-at - --create-dirs --output "$output" \
                 --progress-bar --remote-time "$url"
@@ -668,9 +672,9 @@ download_file() {
     
     # Large files - try downloaders with resume support
     local -a downloaders=()
+    (( HAS_ARIA2C )) && downloaders+=(aria2c)
     (( HAS_WGET )) && downloaders+=(wget)
     (( HAS_CURL )) && downloaders+=(curl)
-    (( HAS_ARIA2C )) && downloaders+=(aria2c)
     
     if [[ ${#downloaders[@]} -eq 0 ]]; then
         log_error "No download tools available"
@@ -679,7 +683,7 @@ download_file() {
     
     for tool in "${downloaders[@]}"; do
         log_verbose "Trying $tool..."
-        if download_with_tool "$tool" "$url" "$output"; then
+        if download_with_tool "$tool" "$output" "$url"; then
             # Verify download produced a file
             if [[ -f "$output" ]] && [[ -s "$output" ]]; then
                 return 0
@@ -1579,7 +1583,6 @@ fetch_update() {
 download_update() {
     log_section "Download Phase"
     
-    # Validate prerequisites
     [[ -n "$IMAGE_NAME" ]] || die "IMAGE_NAME not set"
     [[ -n "$REMOTE_PROFILE" ]] || die "REMOTE_PROFILE not set"
     [[ -n "$REMOTE_VERSION" ]] || die "REMOTE_VERSION not set"
@@ -1593,20 +1596,20 @@ download_update() {
     # Check existing verified download
     if [[ -f "$marker" && -f "$image" ]]; then
         local existing_size=$(get_file_size "$image")
-        if (( existing_size > 0 )); then
+        if (( existing_size >= MIN_FILE_SIZE )); then
             log_success "Using verified cache: $(format_bytes $existing_size)"
             return 0
         fi
-        # Only delete when verification fails
+        log_verbose "Cached file invalid, removing"
         rm -f "$marker" "$image" "$sha" "$asc"
     fi
     
-    # Clean up partial downloads from interrupted sessions
-    [[ -f "$image_part.aria2" ]] && rm -f "$image_part.aria2"
+    # Clean up aria2c control files from interrupted sessions
+    rm -f "$image_part.aria2" "$image.aria2"
     
     [[ "${DRY_RUN}" == "yes" ]] && return 0
     
-    # Construct SourceForge URLs
+    # Construct SourceForge URLs for verification files
     local sf_base="https://sourceforge.net/projects/shanios/files"
     local sha_url="${sf_base}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${sf_base}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
@@ -1615,26 +1618,15 @@ download_update() {
     log "Discovering mirror..."
     local mirror_url
     mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
-    
-    # Critical sanitization - remove any contamination
     mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
     
-    if [[ -z "$mirror_url" ]]; then
-        log_error "Failed to get mirror URL"
-        die "Mirror discovery failed"
-    fi
-    
-    # Validate URL format before proceeding
-    if [[ ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]]; then
-        log_error "Invalid mirror URL format"
-        log_error "Got: ${mirror_url:0:200}"
-        die "Mirror URL validation failed"
-    fi
+    [[ -z "$mirror_url" ]] && die "Mirror discovery failed"
+    [[ ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]] && die "Invalid mirror URL format"
     
     log_verbose "Mirror URL: $mirror_url"
     
     # Check remote file size
-    log "Checking remote file..."
+    log "Checking remote file size..."
     local expected_size
     expected_size=$(get_remote_file_size "$mirror_url")
     
@@ -1644,45 +1636,50 @@ download_update() {
         log_warn "Could not determine remote size"
     fi
     
-    # Download main image with retry and resume
+    # Download main image with retry, resume, and validation
     local attempt=0 delay=5
     local download_success=0
     local mirror_failed=0
     
     while (( attempt < MAX_DOWNLOAD_ATTEMPTS )); do
         ((attempt++))
-        
         log "Download attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}"
         
-        # Check partial download
+        # Validate partial file if it exists
         local current_size=0
-		if [[ -f "$image_part" ]]; then
-		    current_size=$(get_file_size "$image_part")
-		    
-		    if (( current_size > 0 )); then
-		        # Validate size is reasonable
-		        if (( expected_size > 0 )); then
-		            if (( current_size > expected_size )); then
-		                log_warn "Partial file oversized ($(format_bytes $current_size) > $(format_bytes $expected_size)), corrupted"
-		                rm -f "$image_part" "$image_part.aria2"
-		                current_size=0
-		            elif (( current_size == expected_size )); then
-		                log_verbose "Partial file appears complete, will verify"
-		            else
-		                log "Resuming from $(format_bytes $current_size) / $(format_bytes $expected_size)"
-		            fi
-		        else
-		            # Can't validate size, at least check it's not obviously wrong
-		            if (( current_size < MIN_FILE_SIZE )); then
-		                log_warn "Partial file suspiciously small ($(format_bytes $current_size)), restarting"
-		                rm -f "$image_part" "$image_part.aria2"
-		                current_size=0
-		            else
-		                log "Resuming from $(format_bytes $current_size) (size unknown)"
-		            fi
-		        fi
-		    fi
-		fi
+        if [[ -f "$image_part" ]]; then
+            current_size=$(get_file_size "$image_part")
+            
+            if (( current_size > 0 )); then
+                # Size validation against expected size
+                if (( expected_size > 0 )); then
+                    if (( current_size > expected_size )); then
+                        log_warn "Partial file oversized ($(format_bytes $current_size) > $(format_bytes $expected_size)), removing"
+                        rm -f "$image_part" "$image_part.aria2"
+                        current_size=0
+                    elif (( current_size == expected_size )); then
+                        log "Partial file appears complete ($(format_bytes $current_size)), validating..."
+                        # Move to final location for validation
+                        if mv "$image_part" "$image" 2>/dev/null; then
+                            download_success=1
+                            break
+                        fi
+                    else
+                        local percent=$(( current_size * 100 / expected_size ))
+                        log "Resuming from $(format_bytes $current_size) / $(format_bytes $expected_size) (${percent}%)"
+                    fi
+                else
+                    # No expected size available, basic sanity check
+                    if (( current_size < MIN_FILE_SIZE )); then
+                        log_warn "Partial file too small ($(format_bytes $current_size)), removing"
+                        rm -f "$image_part" "$image_part.aria2"
+                        current_size=0
+                    else
+                        log "Resuming from $(format_bytes $current_size) (expected size unknown)"
+                    fi
+                fi
+            fi
+        fi
         
         # Attempt download
         if download_file "$mirror_url" "$image_part" 0; then
@@ -1693,17 +1690,35 @@ download_update() {
             else
                 current_size=$(get_file_size "$image_part")
                 
-                # Check if complete
-                if (( expected_size == 0 )) || (( current_size >= expected_size )); then
-                    if mv "$image_part" "$image" 2>/dev/null; then
-                        download_success=1
-                        log_success "Downloaded: $(format_bytes $current_size)"
-                        break
-                    else
-                        log_error "Failed to rename downloaded file"
+                # Validate downloaded size
+                if (( expected_size > 0 )); then
+                    if (( current_size < expected_size )); then
+                        log_warn "Download incomplete: $(format_bytes $current_size) / $(format_bytes $expected_size)"
+                        # Keep partial file for resume on next attempt
+                        continue
+                    elif (( current_size > expected_size )); then
+                        log_warn "Downloaded file larger than expected, may be corrupted"
+                        rm -f "$image_part"
+                        mirror_failed=1
+                        continue
                     fi
                 else
-                    log_warn "Incomplete: $(format_bytes $current_size) / $(format_bytes $expected_size)"
+                    # No expected size, at least check minimum
+                    if (( current_size < MIN_FILE_SIZE )); then
+                        log_warn "Downloaded file too small ($(format_bytes $current_size))"
+                        rm -f "$image_part"
+                        mirror_failed=1
+                        continue
+                    fi
+                fi
+                
+                # Move to final location
+                if mv "$image_part" "$image" 2>/dev/null; then
+                    download_success=1
+                    log_success "Downloaded: $(format_bytes $current_size)"
+                    break
+                else
+                    log_error "Failed to rename downloaded file"
                 fi
             fi
         else
@@ -1711,7 +1726,7 @@ download_update() {
             mirror_failed=1
         fi
         
-        # Clear mirror cache and rediscover on repeated failures
+        # Rediscover mirror on repeated failures
         if (( mirror_failed && attempt % 2 == 0 && attempt < MAX_DOWNLOAD_ATTEMPTS )); then
             log "Mirror appears broken, rediscovering..."
             rm -f "$DOWNLOAD_DIR/mirror.url"
@@ -1720,16 +1735,15 @@ download_update() {
             mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
             
             if [[ -z "$mirror_url" ]] || [[ ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]]; then
-                log_warn "Mirror rediscovery failed, will retry"
+                log_warn "Mirror rediscovery failed"
             else
                 log_verbose "New mirror: $mirror_url"
-                # Refresh expected size from new mirror
                 expected_size=$(get_remote_file_size "$mirror_url")
                 mirror_failed=0
             fi
         fi
         
-        # Retry delay
+        # Retry delay with exponential backoff
         if (( attempt < MAX_DOWNLOAD_ATTEMPTS )); then
             log "Retrying in ${delay}s..."
             sleep "$delay"
@@ -1737,31 +1751,31 @@ download_update() {
         fi
     done
     
+    # Final validation
     if [[ $download_success -eq 0 ]]; then
-        rm -f "$image_part" "$image" "$image.aria2"
+        rm -f "$image_part" "$image" "$image.aria2" "$image_part.aria2"
         die "Download failed after $MAX_DOWNLOAD_ATTEMPTS attempts"
     fi
     
-    # Validate downloaded file
     if ! validate_download "$image" "$expected_size"; then
         rm -f "$image"
         die "Downloaded file validation failed"
     fi
     
-    # Download verification files (use SourceForge direct URLs)
+    # Download verification files
     log "Downloading verification files..."
     download_file "$sha_url" "$sha" 1 || { rm -f "$image"; die "SHA256 download failed"; }
     download_file "$asc_url" "$asc" 1 || { rm -f "$image" "$sha"; die "GPG signature download failed"; }
     
-    # Verify integrity - cleanup on any failure
+    # Verify integrity
     if ! verify_sha256 "$image" "$sha" || ! verify_gpg "$image" "$asc"; then
         rm -f "$image" "$sha" "$asc"
         die "Verification failed"
     fi
     
-    # Clear mirror cache and mark as verified
-    rm -f "$DOWNLOAD_DIR/mirror.url"
+    # Mark as verified and clear mirror cache
     touch "$marker" || log_warn "Failed to create verification marker"
+    rm -f "$DOWNLOAD_DIR/mirror.url"
     log_success "Download and verification complete"
 }
 

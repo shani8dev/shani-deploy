@@ -32,7 +32,6 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
     rm -f "$SHANIOS_DEPLOY_STATE_FILE"
     
     if [[ -n "$state_content" ]]; then
-        # Filter out readonly variables (but keep ORIGINAL_ARGS)
         state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS\|declare.*CHANNEL_FILE" || true)
         
         if [[ -n "$state_content" ]]; then
@@ -63,14 +62,12 @@ readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
 
-# Tool availability flags
 declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0
 command -v aria2c &>/dev/null && HAS_ARIA2C=1
 command -v wget &>/dev/null && HAS_WGET=1
 command -v curl &>/dev/null && HAS_CURL=1
 command -v pv &>/dev/null && HAS_PV=1
 
-# State variables
 declare -g LOCAL_VERSION LOCAL_PROFILE
 declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
@@ -88,7 +85,10 @@ STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
 export STATE_DIR
 
 cleanup_state() {
-    [[ -n "${STATE_DIR:-}" && -d "${STATE_DIR}" ]] && rm -rf "${STATE_DIR}"
+    local state_dir="${STATE_DIR:-}"
+    if [[ -n "$state_dir" && -d "$state_dir" ]]; then
+        rm -rf "$state_dir" 2>/dev/null || true
+    fi
 }
 trap cleanup_state EXIT
 
@@ -198,15 +198,11 @@ read_channel_from_file() {
     local channel=""
     
     if [[ -f "$CHANNEL_FILE" ]]; then
-        # Read and sanitize channel name
         channel=$(cat "$CHANNEL_FILE" 2>/dev/null | tr -d '[:space:]' | head -1)
         
-        # Validate channel name (only alphanumeric and underscore allowed)
         if [[ -n "$channel" ]] && [[ "$channel" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            # Normalize to lowercase
             channel=$(echo "$channel" | tr '[:upper:]' '[:lower:]')
             
-            # Validate it's a known channel
             case "$channel" in
                 stable|latest)
                     log_verbose "Channel from file: $channel"
@@ -224,14 +220,12 @@ read_channel_from_file() {
         log_verbose "Channel file not found: $CHANNEL_FILE"
     fi
     
-    # Return empty if file doesn't exist or is invalid
     echo ""
 }
 
 set_update_channel() {
     local channel_arg="${1:-}"
     
-    # Priority 1: Command-line argument
     if [[ -n "$channel_arg" ]]; then
         UPDATE_CHANNEL="$channel_arg"
         UPDATE_CHANNEL_SOURCE="command-line"
@@ -239,7 +233,6 @@ set_update_channel() {
         return 0
     fi
     
-    # Priority 2: Channel file
     local file_channel
     file_channel=$(read_channel_from_file)
     
@@ -250,7 +243,6 @@ set_update_channel() {
         return 0
     fi
     
-    # Priority 3: Default
     UPDATE_CHANNEL="stable"
     UPDATE_CHANNEL_SOURCE="default"
     log_verbose "Channel source: default (stable)"
@@ -260,11 +252,17 @@ set_update_channel() {
 ### Mount Management              ###
 #####################################
 
+is_mounted() {
+    local target="$1"
+    [[ -n "$target" ]] || return 1
+    findmnt -M "$target" &>/dev/null
+}
+
 safe_mount() {
     local src="$1" tgt="$2" opts="$3"
     [[ -n "$src" && -n "$tgt" ]] || die "safe_mount: Invalid arguments"
     
-    findmnt -M "$tgt" &>/dev/null && return 0
+    is_mounted "$tgt" && return 0
     
     log_verbose "Mounting: $src -> $tgt (opts: $opts)"
     run_cmd mount -o "$opts" "$src" "$tgt" || die "Failed to mount $tgt"
@@ -274,17 +272,72 @@ safe_umount() {
     local tgt="$1"
     [[ -n "$tgt" ]] || return 1
     
-    findmnt -M "$tgt" &>/dev/null || return 0
+    is_mounted "$tgt" || return 0
     
     if [[ "${DRY_RUN}" == "yes" ]]; then
         log "[DRY-RUN] Would unmount: $tgt"
         return 0
     fi
     
-    umount -R "$tgt" 2>/dev/null || {
-        log_warn "Failed to unmount: $tgt"
+    local attempt=0
+    local max_attempts=3
+    
+    while (( attempt < max_attempts )); do
+        ((attempt++))
+        
+        if umount -R "$tgt" 2>/dev/null; then
+            log_verbose "Unmounted: $tgt (attempt $attempt)"
+            return 0
+        fi
+        
+        if ! is_mounted "$tgt"; then
+            log_verbose "Mount disappeared: $tgt"
+            return 0
+        fi
+        
+        if (( attempt < max_attempts )); then
+            log_verbose "Unmount retry $attempt/$max_attempts: $tgt"
+            sleep 1
+        fi
+    done
+    
+    if umount -l "$tgt" 2>/dev/null; then
+        log_warn "Lazy unmount used: $tgt"
+        return 0
+    fi
+    
+    log_warn "Failed to unmount: $tgt"
+    return 1
+}
+
+force_umount_all() {
+    local base_dir="$1"
+    [[ -n "$base_dir" ]] || return 1
+    
+    log_verbose "Force unmounting all under: $base_dir"
+    
+    local -a mounts
+    mapfile -t mounts < <(
+        findmnt -R -o TARGET -n "$base_dir" 2>/dev/null | sort -r || true
+    )
+    
+    if [[ ${#mounts[@]} -eq 0 ]]; then
+        log_verbose "No mounts found under: $base_dir"
+        return 0
+    fi
+    
+    for mount in "${mounts[@]}"; do
+        [[ -n "$mount" ]] || continue
+        safe_umount "$mount" || log_verbose "Could not unmount: $mount"
+    done
+    
+    if is_mounted "$base_dir"; then
+        log_warn "Base mount still exists after cleanup: $base_dir"
+        umount -fl "$base_dir" 2>/dev/null || true
         return 1
-    }
+    fi
+    
+    return 0
 }
 
 #####################################
@@ -335,7 +388,6 @@ get_remote_file_size() {
             tr -d '\r' || echo "0")
     fi
     
-    # Validate size is numeric and positive
     if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
         echo "$size"
     else
@@ -349,18 +401,15 @@ discover_mirror() {
     if (( HAS_WGET )); then
         log_verbose "Attempting wget discovery with redirect chain"
         
-        # Capture only stderr from wget, filter to headers only
         local spider_output
         spider_output=$(timeout 30 wget --max-redirect=20 --spider -S "$sf_url" 2>&1 >/dev/null | \
             grep -E '^ +(HTTP|Location):' || echo "")
         
-        # Debug: show what we captured
         if [[ "${VERBOSE}" == "yes" ]]; then
             log_verbose "Spider output:"
             echo "$spider_output" | head -20 >&2
         fi
         
-        # Extract the final Location header after all redirects
         local final_url
         final_url=$(echo "$spider_output" | \
             grep -i '^  Location: ' | \
@@ -371,7 +420,6 @@ discover_mirror() {
         
         log_verbose "Extracted URL: ${final_url:-none}"
         
-        # Strict validation: must be a proper HTTP(S) URL
         if [[ -n "$final_url" ]] && [[ "$final_url" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
             local base_url
             base_url=$(dirname "$final_url")
@@ -383,7 +431,6 @@ discover_mirror() {
         fi
     fi
     
-    # Fallback to curl if wget unavailable or failed
     if (( HAS_CURL )); then
         log_verbose "Attempting curl discovery"
         local discovered
@@ -399,7 +446,6 @@ discover_mirror() {
         
         log_verbose "Curl extracted: ${discovered:-none}"
         
-        # Strict validation
         if [[ -n "$discovered" ]] && [[ "$discovered" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
             local base_url
             base_url=$(dirname "$discovered")
@@ -419,7 +465,6 @@ validate_mirror() {
     
     log_verbose "Validating mirror: $mirror_url"
     
-    # Quick check to verify mirror responds
     if (( HAS_WGET )); then
         local response
         response=$(timeout 20 wget -q --spider -S --timeout=15 --tries=1 \
@@ -452,12 +497,10 @@ get_mirror_url() {
     local project="$1" filepath="$2" filename="$3"
     local mirror_cache="$DOWNLOAD_DIR/mirror.url"
     
-    # Check cached mirror and validate it
     if [[ -f "$mirror_cache" ]]; then
         local cached
         cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | tr -d '\r\n' | xargs)
         if [[ -n "$cached" ]]; then
-            # Reconstruct full URL from cached base
             local full_url="${cached}/${filename}"
             log_verbose "Testing cached mirror: $(echo "$cached" | sed -E 's|https://([^/]+).*|\1|')"
             
@@ -472,7 +515,6 @@ get_mirror_url() {
         fi
     fi
     
-    # Construct SourceForge URL with /download endpoint (critical for proper redirects)
     local sf_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
     
     log "Discovering mirror from SourceForge..."
@@ -480,14 +522,11 @@ get_mirror_url() {
     local base_url
     base_url=$(discover_mirror "$sf_url")
     
-    # Clean and validate discovered mirror
     if [[ -n "$base_url" ]]; then
-        # Sanitize the base_url
         base_url=$(echo "$base_url" | tr -d '\r\n' | xargs)
         
         log_verbose "Discovered base URL: $base_url"
         
-        # Validate it's a proper URL
         if [[ ! "$base_url" =~ ^https?://[a-zA-Z0-9] ]]; then
             log_warn "Discovered base_url has invalid format: ${base_url:0:100}"
             base_url=""
@@ -496,7 +535,6 @@ get_mirror_url() {
         log_verbose "No base URL discovered"
     fi
     
-    # Validate discovered mirror
     if [[ -n "$base_url" ]]; then
         local full_url="${base_url}/${filename}"
         log_verbose "Testing mirror: $full_url"
@@ -513,11 +551,9 @@ get_mirror_url() {
         fi
     fi
     
-    # Ultimate fallback: use SourceForge direct download URL (slower but reliable)
     log_warn "Mirror discovery failed, using SourceForge direct"
     local fallback_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
     
-    # Don't cache the fallback URL as it will redirect on each use
     echo "$fallback_url"
     return 0
 }
@@ -534,7 +570,6 @@ validate_download() {
     local size
     size=$(get_file_size "$file")
     
-    # Use server-provided size if available, otherwise use minimum threshold
     local min_size="$MIN_FILE_SIZE"
     if (( expected_size > 0 )); then
         min_size="$expected_size"
@@ -545,13 +580,11 @@ validate_download() {
         return 1
     fi
     
-    # Detect HTML/XML error pages
     if file "$file" 2>/dev/null | grep -qi "html\|xml"; then
         log_error "File appears to be error page (HTML/XML)"
         return 1
     fi
     
-    # Validate zstd files
     if [[ "$file" == *.zst ]] && ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
         log_warn "File extension .zst but wrong content type"
         return 1
@@ -561,14 +594,11 @@ validate_download() {
     return 0
 }
 
-
 download_with_tool() {
     local tool="$1" url="$2" output="$3"
     
-    # Sanitize URL - remove any whitespace and validate
     url=$(echo "$url" | tr -d '\r\n' | xargs)
     
-    # Validate URL format
     if [[ ! "$url" =~ ^https?://[a-zA-Z0-9] ]]; then
         log_error "Invalid URL format: ${url:0:100}"
         return 1
@@ -585,18 +615,15 @@ download_with_tool() {
         --prefer-family=IPv4
     )
     
-    # Add progress if terminal
     [[ -t 2 ]] && wget_base_opts+=(--show-progress --progress=bar:force)
     
-    # Check if partial file exists and server supports resume
     local resume_supported=0
     if [[ -f "$output" ]] && [[ -s "$output" ]]; then
-        local partial_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+        local partial_size=$(get_file_size "$output")
         
         if (( partial_size > 0 )); then
             log_verbose "Found partial download: $(format_bytes $partial_size)"
             
-            # Quick check if server supports byte-range requests
             if timeout 10 wget --spider -S "$url" 2>&1 | grep -qi "Accept-Ranges.*bytes"; then
                 log_verbose "Server supports resume"
                 resume_supported=1
@@ -609,7 +636,6 @@ download_with_tool() {
     
     case "$tool" in
         aria2c)
-            # aria2c handles resume automatically with --continue=true
             aria2c \
                 --max-connection-per-server=1 --split=1 \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
@@ -621,7 +647,6 @@ download_with_tool() {
                 "$url"
             ;;
         wget)
-            # Only add --continue if server supports it
             if (( resume_supported )); then
                 wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
             else
@@ -629,7 +654,6 @@ download_with_tool() {
             fi
             ;;
         curl)
-            # curl's --continue-at - handles resume automatically
             curl --fail --location --max-time 300 --retry 3 --retry-delay 3 \
                 --continue-at - --create-dirs --output "$output" \
                 --progress-bar --remote-time "$url"
@@ -645,7 +669,6 @@ download_file() {
     
     mkdir -p "$(dirname "$output")"
     
-    # Small files - quick download without complex resume logic
     if (( is_small )); then
         local temp_output="${output}.tmp"
         
@@ -670,7 +693,6 @@ download_file() {
         return 1
     fi
     
-    # Large files - try downloaders with resume support
     local -a downloaders=()
     (( HAS_ARIA2C )) && downloaders+=(aria2c)
     (( HAS_WGET )) && downloaders+=(wget)
@@ -683,8 +705,7 @@ download_file() {
     
     for tool in "${downloaders[@]}"; do
         log_verbose "Trying $tool..."
-        if download_with_tool "$tool" "$output" "$url"; then
-            # Verify download produced a file
+        if download_with_tool "$tool" "$url" "$output"; then
             if [[ -f "$output" ]] && [[ -s "$output" ]]; then
                 return 0
             else
@@ -743,7 +764,6 @@ verify_gpg() {
     local result=1
     local keyservers=(keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu)
     
-    # Import key
     local imported=0
     for keyserver in "${keyservers[@]}"; do
         if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
@@ -760,7 +780,6 @@ verify_gpg() {
         return 1
     fi
     
-    # Verify fingerprint
     local fp
     fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
     if [[ "$fp" != "$GPG_KEY_ID" ]]; then
@@ -772,7 +791,6 @@ verify_gpg() {
         return 1
     fi
     
-    # Verify signature
     if gpg --batch --verify "$sig" "$file" 2>/dev/null; then
         log_success "GPG signature verified"
         result=0
@@ -781,7 +799,6 @@ verify_gpg() {
         result=1
     fi
     
-    # Cleanup
     rm -rf "$gpg_temp"
     [[ -n "$old_gnupghome" ]] && export GNUPGHOME="$old_gnupghome" || unset GNUPGHOME
     
@@ -817,7 +834,7 @@ set_environment() {
     validate_nonempty "$LOCAL_PROFILE" "LOCAL_PROFILE"
     
     log "System: v${LOCAL_VERSION} (${LOCAL_PROFILE})"
-    log "Channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"  # ADD SOURCE HERE
+    log "Channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"
 }
 
 #####################################
@@ -825,16 +842,14 @@ set_environment() {
 #####################################
 
 self_update() {
-    # Check all conditions including state-restored SELF_UPDATE_DONE
     if [[ -n "${SELF_UPDATE_DONE:-}" ]] || \
        [[ "${SKIP_SELF_UPDATE}" == "yes" ]] || \
        [[ -f "$DEPLOY_PENDING" ]]; then
         return 0
     fi
     
-    # Mark as done BEFORE any operations
     export SELF_UPDATE_DONE=1
-    persist_state  # Save state immediately
+    persist_state
 
     local url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     local temp
@@ -848,10 +863,10 @@ self_update() {
                 chmod +x "$temp"
                 log_success "Updated, re-executing..."
                 if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
-    					exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
-				else
-    					exec /bin/bash "$temp"
-				fi
+                    exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
+                else
+                    exec /bin/bash "$temp"
+                fi
             fi
         fi
     fi
@@ -874,7 +889,6 @@ inhibit_system() {
     
     log "Inhibiting power events"
     
-    # Ensure we have the args to pass
     if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
         exec systemd-inhibit \
             --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
@@ -897,10 +911,9 @@ inhibit_system() {
 cleanup_old_backups() {
     log_verbose "Cleaning backups"
 
-    # Disable ERR trap and error exit for this function - cleanup is non-critical
     set +e
-	    # Verify mount exists and is valid
-    if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
+    
+    if ! is_mounted "$MOUNT_DIR"; then
         log_verbose "Mount point not available, skipping backup cleanup"
         set -e
         return 0
@@ -909,7 +922,6 @@ cleanup_old_backups() {
     for slot in blue green; do
         log_verbose "Checking for old backups in slot '${slot}'..."
 
-        # Gather backups for this slot, sorted by timestamp (newest first)
         mapfile -t backups < <(
             btrfs subvolume list "$MOUNT_DIR" 2>/dev/null |
             awk -v slot="${slot}" '$0 ~ slot"_backup_" {print $NF}' |
@@ -926,25 +938,22 @@ cleanup_old_backups() {
         log_verbose "Found ${backup_count} backup(s) for slot '${slot}'"
 
         if (( backup_count > 1 )); then
-            log "Keeping the most recent backup and deleting $((backup_count-1)) older backup(s) for slot '${slot}')"
+            log "Keeping the most recent backup and deleting $((backup_count-1)) older backup(s) for slot '${slot}'"
 
             for (( i=1; i<backup_count; i++ )); do
                 local backup="${backups[i]}"
                 local clean_backup="${backup#@}"
 
-                # Support both 10-digit and 12-digit timestamps
-                if [[ ! "$clean_backup" =~ ^(blue|green)_backup_[0-9]{10}([0-9]{2})?$ ]]; then
+                if [[ ! "$clean_backup" =~ ^(blue|green)_backup_[0-9]{10,12}$ ]]; then
                     log_warn "Skipping deletion for backup with unexpected name format: ${backup}"
                     continue
                 fi
 
-                # Extra safety: don't delete if it matches current backup being created
                 if [[ -n "${BACKUP_NAME:-}" ]] && [[ "$backup" == "@${BACKUP_NAME}" ]]; then
                     log_verbose "Skipping current backup: ${backup}"
                     continue
                 fi
 
-                # Attempt deletion
                 if [[ "${DRY_RUN}" == "yes" ]]; then
                     log "[DRY-RUN] Would delete old backup: ${backup}"
                 elif btrfs subvolume delete "$MOUNT_DIR/${backup}" &>/dev/null; then
@@ -958,7 +967,6 @@ cleanup_old_backups() {
         fi
     done
 
-    # Restore error handling
     set -e
     return 0
 }
@@ -968,18 +976,15 @@ cleanup_downloads() {
     
     [[ ! -d "$DOWNLOAD_DIR" ]] && return 0
     
-    # Find the most recent complete shanios image
     local latest_image
     latest_image=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" -printf "%T@ %p\n" 2>/dev/null | \
         sort -rn | head -1 | cut -d' ' -f2-)
     
     local count=0 protected=0
     
-    # Process each old file
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
         
-        # Protect the latest complete image and its verification files
         if [[ -n "$latest_image" ]]; then
             local basename
             basename=$(basename "$file")
@@ -996,7 +1001,6 @@ cleanup_downloads() {
             fi
         fi
         
-        # Delete old file
         if [[ "${DRY_RUN}" == "yes" ]]; then
             log "[DRY-RUN] Would delete: $(basename "$file")"
             ((count++))
@@ -1017,19 +1021,39 @@ cleanup_downloads() {
     if (( protected > 0 )); then
         log_verbose "Protected $protected current file(s)"
     fi
-    # Explicitly return success
+    
+    return 0
+}
+
+# Consolidated mount_for_operation function
+mount_for_operation() {
+    local operation="$1"
+    
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Already mounted for $operation"
+        return 0
+    fi
+    
+    mkdir -p "$MOUNT_DIR" || { log_error "Cannot create mount directory"; return 1; }
+    
+    if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        log_error "Cannot mount for $operation"
+        return 1
+    fi
+    
+    if ! is_mounted "$MOUNT_DIR"; then
+        log_error "Mount verification failed for $operation"
+        return 1
+    fi
+    
+    log_verbose "Mounted for $operation"
     return 0
 }
 
 analyze_storage() {
-    # Disable strict error checking - this is a diagnostic/optimization function
     set +e
     
     log_section "Storage Analysis"
-
-    # ========================================
-    # PRE-CHECKS & SETUP
-    # ========================================
 
     if [[ -f "$DEPLOY_PENDING" ]]; then
         log_warn "Deployment pending, skipping storage analysis"
@@ -1037,33 +1061,14 @@ analyze_storage() {
         return 0
     fi
 
-    if ! mkdir -p "$MOUNT_DIR" 2>/dev/null; then
-        log_warn "Cannot create mount directory for storage analysis"
+    if ! mount_for_operation "storage analysis"; then
         set -e
         return 1
     fi
     
-    if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
-        log_warn "Cannot mount for storage analysis"
-        set -e
-        return 1
-    fi
-    
-    # ADD THIS: Verify mount succeeded
-    if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
-        log_warn "Mount verification failed for storage analysis"
-        set -e
-        return 1
-    fi
-
-    # Ensure cleanup on return/exit from this function
-    trap 'umount -R "$MOUNT_DIR" 2>/dev/null || umount -fl "$MOUNT_DIR" 2>/dev/null || true' RETURN
+    trap 'force_umount_all "$MOUNT_DIR" 2>/dev/null || true' RETURN
 
     local -a check_subvols=(blue green data swap)
-
-    # ========================================
-    # PHASE 1: Pre-Deduplication Analysis
-    # ========================================
 
     echo ""
     log "=== Pre-Deduplication State ==="
@@ -1090,10 +1095,6 @@ analyze_storage() {
             log_verbose "@${subvol}: Missing"
         fi
     done
-
-    # ========================================
-    # PHASE 2: Run Deduplication
-    # ========================================
 
     if ! btrfs subvolume show "$MOUNT_DIR/@blue" &>/dev/null || \
        ! btrfs subvolume show "$MOUNT_DIR/@green" &>/dev/null; then
@@ -1123,7 +1124,6 @@ analyze_storage() {
     local dedupe_start
     dedupe_start=$(date +%s)
 
-    # Run duperemove - capture exit code but don't fail
     local dedupe_status=0
     duperemove -dhr --skip-zeroes \
         --dedupe-options=same,partial \
@@ -1142,10 +1142,6 @@ analyze_storage() {
     else
         log_warn "Deduplication completed with warnings (exit code: $dedupe_status, duration: ${dedupe_duration}s)"
     fi
-
-    # ========================================
-    # PHASE 3: Post-Deduplication Analysis
-    # ========================================
 
     echo ""
     log "=== Post-Deduplication Results ==="
@@ -1170,7 +1166,6 @@ analyze_storage() {
 
     echo ""
     
-    # Re-enable strict error handling before returning
     set -e
     return 0
 }
@@ -1213,16 +1208,10 @@ prepare_chroot() {
 cleanup_chroot() {
     log_verbose "Cleaning chroot"
     
-    # Disable error exit for cleanup - we want to unmount as much as possible
     set +e
     
-    [[ -d "$MOUNT_DIR/sys/firmware/efi/efivars" ]] && safe_umount "$MOUNT_DIR/sys/firmware/efi/efivars"
-    for d in "${CHROOT_BIND_DIRS[@]}"; do safe_umount "$MOUNT_DIR$d"; done
-    for d in "${CHROOT_STATIC_DIRS[@]}"; do safe_umount "$MOUNT_DIR/$d"; done
-    safe_umount "$MOUNT_DIR/boot/efi"
-    safe_umount "$MOUNT_DIR"
+    force_umount_all "$MOUNT_DIR"
     
-    # Re-enable error exit
     set -e
 }
 
@@ -1231,6 +1220,8 @@ generate_uki() {
     
     log_section "UKI Generation"
     [[ -x "$GENEFI_SCRIPT" ]] || die "gen-efi not found"
+    
+    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
     
     prepare_chroot "$slot"
     
@@ -1261,12 +1252,16 @@ generate_uki() {
 restore_candidate() {
     log_error "Initiating rollback"
     
-    # Disable all traps and error handling for recovery
     trap - ERR EXIT
     set +e
     
-    mkdir -p "$MOUNT_DIR" 2>/dev/null
-    mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
+    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
+    
+    if ! mount_for_operation "rollback"; then
+        log_error "Cannot mount for rollback"
+        rm -f "$DEPLOY_PENDING" 2>/dev/null
+        exit 1
+    fi
     
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
         log "Restoring from @${BACKUP_NAME}"
@@ -1275,18 +1270,14 @@ restore_candidate() {
         btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
         btrfs property set -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
         
-        # CRITICAL FIX: Restore slot markers to reflect current booted state
         log "Restoring slot markers..."
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot marker"
         
-        # If previous-slot was modified during failed deployment, restore it
-        # Check if it was set to CANDIDATE_SLOT (which would be wrong after rollback)
         local prev_slot
         prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
         
         if [[ "$prev_slot" == "$CANDIDATE_SLOT" ]] || [[ -z "$prev_slot" ]]; then
-            # previous-slot was modified or missing, restore to current
             echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
                 log_warn "Failed to restore previous-slot marker"
             log_verbose "Restored previous-slot: $CURRENT_SLOT"
@@ -1295,13 +1286,12 @@ restore_candidate() {
         fi
     fi
     
-    # Cleanup temporary volumes
     [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null
     [[ -d "$MOUNT_DIR/temp_update" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
     
-    umount -R "$MOUNT_DIR" 2>/dev/null
+    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
     
     log_error "Rollback complete - system remains on @${CURRENT_SLOT}"
@@ -1312,8 +1302,11 @@ trap 'restore_candidate' ERR
 rollback_system() {
     log_section "System Rollback"
     
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
+    
+    if ! mount_for_operation "rollback"; then
+        die "Cannot mount for rollback"
+    fi
     
     local failed_slot previous_slot
     
@@ -1337,11 +1330,10 @@ rollback_system() {
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro true
     
-    # Update slot markers - we're rolling back TO previous_slot
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
-    # Keep previous-slot unchanged (it already contains the right value)
     
     safe_umount "$MOUNT_DIR"
+    
     generate_uki "$previous_slot"
     
     log_success "Rollback complete"
@@ -1375,21 +1367,18 @@ create_swapfile() {
     
     log "Creating ${size_mb}MB swapfile"
     
-    # Try btrfs native
     if btrfs filesystem mkswapfile --size "${size_mb}M" "$file" 2>/dev/null; then
         chmod 600 "$file"
         log_success "Swapfile created (btrfs)"
         return 0
     fi
     
-    # Try truncate
     if truncate -s "${size_mb}M" "$file" 2>/dev/null && \
        chmod 600 "$file" && chattr +C "$file" 2>/dev/null && mkswap "$file" &>/dev/null; then
         log_success "Swapfile created (truncate)"
         return 0
     fi
     
-    # Try dd
     if dd if=/dev/zero of="$file" bs=1M count="$size_mb" status=none 2>/dev/null && \
        chmod 600 "$file" && mkswap "$file" &>/dev/null; then
         log_success "Swapfile created (dd)"
@@ -1403,8 +1392,11 @@ create_swapfile() {
 verify_and_create_filesystem_structure() {
     log_section "Filesystem Structure Verification"
     
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
+    
+    if ! mount_for_operation "filesystem verification"; then
+        return 0
+    fi
     
     local fstab="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/fstab"
     if [[ ! -f "$fstab" ]]; then
@@ -1412,7 +1404,6 @@ verify_and_create_filesystem_structure() {
         return 0
     fi
     
-    # Parse subvolumes
     mapfile -t required < <(parse_fstab_subvolumes "$fstab")
     
     if [[ ${#required[@]} -eq 0 ]]; then
@@ -1466,7 +1457,6 @@ verify_and_create_filesystem_structure() {
         done
     fi
     
-    # Parse and create bind mount directories
     mapfile -t bind_dirs < <(parse_fstab_bind_dirs "$fstab")
     
     if [[ ${#bind_dirs[@]} -gt 0 ]]; then
@@ -1507,7 +1497,6 @@ verify_and_create_filesystem_structure() {
 validate_boot() {
     log_section "Boot Validation"
     
-    # Read from persistent storage
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]')
     
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
@@ -1588,21 +1577,27 @@ fetch_update() {
         return 0
     fi
     
-    # REMOTE_VERSION == LOCAL_VERSION - only check if candidate is missing
-    log "Current slot already at latest version (v${REMOTE_VERSION})"
+    # REMOTE_VERSION == LOCAL_VERSION - check if candidate slot needs creation
+    log "Current version matches latest (v${REMOTE_VERSION})"
     
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    
-    if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
-        log "Candidate slot missing, will create"
-        safe_umount "$MOUNT_DIR"
+    if ! mount_for_operation "version check"; then
+        log_warn "Cannot check candidate slot, assuming update needed"
         return 0
     fi
     
+    local needs_update=0
+    if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+        log "Candidate slot missing, will create"
+        needs_update=1
+    fi
+    
     safe_umount "$MOUNT_DIR"
-    log_success "System up-to-date"
-    touch "${STATE_DIR}/skip-deployment"
+    
+    if (( needs_update == 0 )); then
+        log_success "System up-to-date"
+        touch "${STATE_DIR}/skip-deployment"
+    fi
+    
     return 0
 }
 
@@ -1808,167 +1803,197 @@ download_update() {
 deploy_update() {
     log_section "Deployment Phase"
     
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
+    # Use mount_for_operation for consistency
+    if ! mount_for_operation "deployment"; then
+        die "Cannot mount for deployment"
+    fi
     
-    mountpoint -q "$MOUNT_DIR/@${CANDIDATE_SLOT}" && {
+    # Check if candidate is mounted (shouldn't be)
+    if is_mounted "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+        log_error "Candidate slot is mounted, cannot proceed"
         safe_umount "$MOUNT_DIR"
-        die "Candidate mounted"
-    }
+        die "Candidate mounted at $MOUNT_DIR/@${CANDIDATE_SLOT}"
+    fi
     
-    # Backup existing candidate
+    # Backup existing candidate if it exists
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
         
-        log "Backup: @${BACKUP_NAME}"
-        run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || {
+        log "Creating backup: @${BACKUP_NAME}"
+        if ! run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}"; then
             safe_umount "$MOUNT_DIR"
-            die "Backup failed"
-        }
+            die "Backup creation failed"
+        fi
         
+        log "Removing old candidate slot"
         run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
-        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+        if ! run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+            safe_umount "$MOUNT_DIR"
+            die "Failed to delete old candidate slot"
+        fi
     fi
     
-    # Clean temp
+    # Clean temporary extraction subvolume
     local temp="$MOUNT_DIR/temp_update"
     if btrfs_subvol_exists "$temp"; then
+        log_verbose "Cleaning existing temp_update subvolume"
         [[ -d "$temp/shanios_base" ]] && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
         btrfs subvolume delete "$temp" 2>/dev/null
     fi
     
-    # Extract
+    # Create extraction subvolume
     log "Creating extraction subvolume..."
-    run_cmd btrfs subvolume create "$temp"
+    if ! run_cmd btrfs subvolume create "$temp"; then
+        safe_umount "$MOUNT_DIR"
+        die "Failed to create temp_update subvolume"
+    fi
     
-    log "Extracting image..."
+    # Extract image
+    log "Extracting image (this may take several minutes)..."
     
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log "[DRY-RUN] Would extract"
+        log "[DRY-RUN] Would extract $IMAGE_NAME to temp_update"
     else
         local start=$(date +%s)
+        local extract_status=0
         
         if (( HAS_PV )); then
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
-                pv -p -t -e -r -b | btrfs receive "$temp" || {
-                btrfs subvolume delete "$temp" 2>/dev/null
-                safe_umount "$MOUNT_DIR"
-                die "Extraction failed"
-            }
+                pv -p -t -e -r -b | btrfs receive "$temp" || extract_status=$?
         else
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
-                btrfs receive "$temp" || {
-                btrfs subvolume delete "$temp" 2>/dev/null
-                safe_umount "$MOUNT_DIR"
-                die "Extraction failed"
-            }
+                btrfs receive "$temp" || extract_status=$?
         fi
         
-        log_success "Extracted in $(($(date +%s) - start))s"
+        if [[ $extract_status -ne 0 ]]; then
+            log_error "Extraction failed with status $extract_status"
+            [[ -d "$temp/shanios_base" ]] && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
+            btrfs subvolume delete "$temp" 2>/dev/null
+            safe_umount "$MOUNT_DIR"
+            die "Image extraction failed"
+        fi
+        
+        local duration=$(($(date +%s) - start))
+        log_success "Extraction completed in ${duration}s"
     fi
     
-    # Create candidate
-    log "Snapshotting..."
-    run_cmd btrfs subvolume snapshot "$temp/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
-    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
+    # Verify extracted subvolume exists
+    if [[ ! -d "$temp/shanios_base" ]]; then
+        log_error "Expected subvolume shanios_base not found after extraction"
+        btrfs subvolume delete "$temp" 2>/dev/null
+        safe_umount "$MOUNT_DIR"
+        die "Extraction produced unexpected structure"
+    fi
     
-    # Cleanup
+    # Create candidate from extracted base
+    log "Creating candidate slot snapshot..."
+    if ! run_cmd btrfs subvolume snapshot "$temp/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+        [[ -d "$temp/shanios_base" ]] && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
+        btrfs subvolume delete "$temp" 2>/dev/null
+        safe_umount "$MOUNT_DIR"
+        die "Failed to create candidate snapshot"
+    fi
+    
+    # Set candidate as read-only
+    if ! run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true; then
+        log_warn "Failed to set candidate as read-only"
+    fi
+    
+    # Cleanup temporary subvolumes
+    log_verbose "Cleaning up temporary subvolumes"
     [[ -d "$temp/shanios_base" ]] && run_cmd btrfs subvolume delete "$temp/shanios_base"
     run_cmd btrfs subvolume delete "$temp"
+    
+    # Unmount cleanly
     safe_umount "$MOUNT_DIR"
     
+    # Mark deployment as pending
     [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"
-    log_success "Deployed"
+    log_success "Deployment phase complete"
 }
 
 finalize_update() {
     log_section "Finalization"
     
-    [[ "${DRY_RUN}" == "yes" ]] && return 0
+    [[ "${DRY_RUN}" == "yes" ]] && {
+        log "[DRY-RUN] Would finalize deployment"
+        return 0
+    }
     
-    # Update slot markers BEFORE any operations that might fail
+    # Update slot markers FIRST (before any operations that might fail)
     mkdir -p /data
-    echo "$CURRENT_SLOT" > /data/previous-slot || log_warn "Failed to write previous-slot"
-    echo "$CANDIDATE_SLOT" > /data/current-slot || log_warn "Failed to write current-slot"
+    if ! echo "$CURRENT_SLOT" > /data/previous-slot 2>/dev/null; then
+        log_warn "Failed to write previous-slot marker"
+    fi
+    if ! echo "$CANDIDATE_SLOT" > /data/current-slot 2>/dev/null; then
+        log_error "CRITICAL: Failed to write current-slot marker"
+        die "Cannot update slot markers"
+    fi
+    log_verbose "Updated slot markers: previous=$CURRENT_SLOT, current=$CANDIDATE_SLOT"
     
-    verify_and_create_filesystem_structure || die "Filesystem structure verification failed"
+    # Verify and create filesystem structure
+    log "Verifying filesystem structure..."
+    if ! verify_and_create_filesystem_structure; then
+        die "Filesystem structure verification failed"
+    fi
     
-    generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
+    # Generate UKI for new candidate slot
+    log "Generating boot configuration..."
+    if ! generate_uki "$CANDIDATE_SLOT"; then
+        die "UKI generation failed"
+    fi
     
-    # CRITICAL: Disable ERR trap and error exit for cleanup operations
-    # These are non-critical optimization steps that should not abort deployment
+    # Post-deployment cleanup (non-critical, use permissive error handling)
+    log "Running post-deployment cleanup..."
+    
+    # Temporarily disable ERR trap and error exit for cleanup
     trap - ERR
     set +e
     
-    log "Running post-deployment cleanup..."
-    
-    # Cleanup operations (best-effort, don't fail deployment)
-    if mkdir -p "$MOUNT_DIR" 2>/dev/null; then
-        if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
-            cleanup_old_backups
-            local cleanup_result=$?
-            if [[ $cleanup_result -ne 0 ]]; then
-                log_verbose "Backup cleanup returned code $cleanup_result (non-critical)"
-            fi
-            
-            # Unmount - only if currently mounted
-            if findmnt -M "$MOUNT_DIR" &>/dev/null; then
-                umount -R "$MOUNT_DIR" 2>/dev/null || umount -fl "$MOUNT_DIR" 2>/dev/null || true
-            fi
-        else
-            log_verbose "Could not mount for cleanup (non-critical)"
-        fi
+    # Cleanup old backups
+    if mount_for_operation "backup cleanup"; then
+        cleanup_old_backups
+        local cleanup_status=$?
+        [[ $cleanup_status -ne 0 ]] && log_verbose "Backup cleanup returned status $cleanup_status (non-critical)"
+        
+        # Ensure unmount
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR"
+    else
+        log_verbose "Could not mount for backup cleanup (skipping)"
     fi
     
+    # Cleanup old downloads
     cleanup_downloads
-    local download_cleanup_result=$?
-    if [[ $download_cleanup_result -ne 0 ]]; then
-        log_verbose "Download cleanup returned code $download_cleanup_result (non-critical)"
-    fi
+    [[ $? -ne 0 ]] && log_verbose "Download cleanup had warnings (non-critical)"
     
+    # Storage analysis and deduplication
     analyze_storage
-    local storage_result=$?
-    if [[ $storage_result -ne 0 ]]; then
-        log_verbose "Storage analysis returned code $storage_result (non-critical)"
-    fi
+    [[ $? -ne 0 ]] && log_verbose "Storage analysis had warnings (non-critical)"
     
-    # Explicitly reset $? to 0 before re-enabling error handling
+    # Reset exit status and re-enable strict error handling
     true
-    
-    # Re-enable strict error handling BEFORE critical operations
     set -e
     trap 'restore_candidate' ERR
     
-    # Clear pending flag - deployment complete (critical operation)
-    rm -f "$DEPLOY_PENDING" || die "Failed to remove deployment pending flag"
+    # Clear deployment pending flag (CRITICAL - must succeed)
+    if ! rm -f "$DEPLOY_PENDING" 2>/dev/null; then
+        log_error "CRITICAL: Failed to remove deployment pending flag"
+        die "Cannot clear deployment flag at $DEPLOY_PENDING"
+    fi
     
-    log_success "Complete"
-    log "Next boot: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
+    log_success "Finalization complete"
+    log "System prepared for next boot into @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
+    log "Current boot remains on @${CURRENT_SLOT} until reboot"
 }
 
 #####################################
-### Main Entry Point              ###
+### Main Entry Point (updated)    ###
 #####################################
-
-usage() {
-    cat <<EOF
-Usage: $0 [OPTIONS]
-
-Options:
-  -h, --help              Show help
-  -r, --rollback          Force rollback
-  -c, --cleanup           Manual cleanup
-  -s, --storage-info      Storage analysis
-  -t, --channel <chan>    Update channel (latest|stable)
-  -d, --dry-run           Simulate
-  -v, --verbose           Verbose output
-  --skip-self-update      Skip auto-update
-EOF
-}
 
 main() {
     local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no"
     
+    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
@@ -1983,7 +2008,8 @@ main() {
             *) die "Invalid option: $1" ;;
         esac
     done
-       
+    
+    # System checks
     check_root
     check_internet
     check_tools
@@ -1992,18 +2018,20 @@ main() {
     self_update
     inhibit_system
     
-    [[ "$STORAGE_INFO" == "yes" ]] && { analyze_storage; exit 0; }
+    # Handle special operations
+    if [[ "$STORAGE_INFO" == "yes" ]]; then
+        analyze_storage
+        exit 0
+    fi
     
     if [[ "$CLEANUP" == "yes" ]]; then
+        # Use permissive error handling for manual cleanup
         trap - ERR
         set +e
         
-        mkdir -p "$MOUNT_DIR"
-        if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        if mount_for_operation "manual cleanup"; then
             cleanup_old_backups
-            # Only unmount if still mounted
-            findmnt -M "$MOUNT_DIR" &>/dev/null && \
-                umount -R "$MOUNT_DIR" 2>/dev/null || true
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR"
         fi
         cleanup_downloads
         
@@ -2011,39 +2039,60 @@ main() {
         exit 0
     fi
     
-    [[ -f /data/boot-ok ]] || rollback_system
+    # Check boot-ok flag
+    if [[ ! -f /data/boot-ok ]]; then
+        log_error "boot-ok flag missing, previous boot may have failed"
+        rollback_system
+        exit 1
+    fi
     
-    [[ "$ROLLBACK" == "yes" ]] && { rollback_system; exit 0; }
+    # Handle manual rollback request
+    if [[ "$ROLLBACK" == "yes" ]]; then
+        rollback_system
+        exit 0
+    fi
     
+    # Normal update flow
     validate_boot
     check_space
     fetch_update
     
+    # Check if deployment can be skipped
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
+        log "No deployment needed, running maintenance tasks"
+        
+        # Use permissive error handling for maintenance
         trap - ERR
         set +e
         
-        mkdir -p "$MOUNT_DIR"
-        if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        if mount_for_operation "maintenance"; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
                 cleanup_old_backups
             fi
-            # Only unmount if still mounted
-            findmnt -M "$MOUNT_DIR" &>/dev/null && \
-                umount -R "$MOUNT_DIR" 2>/dev/null || true
-            analyze_storage
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR"
         fi
         
-        trap 'restore_candidate' ERR
+        analyze_storage
+        
+        # Re-enable error handling
         set -e
-    else
-        download_update || die "Download failed"
-        deploy_update || die "Deployment failed"
+        trap 'restore_candidate' ERR
+        
+        log_success "Maintenance complete"
+        exit 0
     fi
     
-    [[ -f "$DEPLOY_PENDING" ]] && finalize_update
+    # Perform update
+    download_update || die "Download phase failed"
+    deploy_update || die "Deployment phase failed"
     
-    log_success "Done"
+    # Finalize if deployment is pending
+    if [[ -f "$DEPLOY_PENDING" ]]; then
+        finalize_update || die "Finalization failed"
+    fi
+    
+    log_success "Update process complete"
+    log "Reboot to activate new system on @${CANDIDATE_SLOT}"
 }
 
 main "$@"

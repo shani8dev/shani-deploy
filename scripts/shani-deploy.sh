@@ -897,13 +897,13 @@ inhibit_system() {
 cleanup_old_backups() {
     log_verbose "Cleaning backups"
 
-    # Disable ERR trap for this function - cleanup is non-critical
+    # Disable ERR trap and error exit for this function - cleanup is non-critical
     set +e
 
     if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
         log_verbose "Mount point not available, skipping backup cleanup"
         set -e
-        return 1
+        return 0  # Changed from 1 to 0 - not an error
     fi
 
     for slot in blue green; do
@@ -940,7 +940,7 @@ cleanup_old_backups() {
 
                 # Extra safety: don't delete if it matches current backup being created
                 if [[ -n "${BACKUP_NAME:-}" ]] && [[ "$backup" == "@${BACKUP_NAME}" ]]; then
-                    log_verbose "Skipping current backup: @${backup}"
+                    log_verbose "Skipping current backup: ${backup}"
                     continue
                 fi
 
@@ -1020,8 +1020,9 @@ cleanup_downloads() {
 }
 
 analyze_storage() {
-    set +e  # Disable strict error checking temporarily
-
+    # Disable strict error checking - this is a diagnostic/optimization function
+    set +e
+    
     log_section "Storage Analysis"
 
     # ========================================
@@ -1034,14 +1035,20 @@ analyze_storage() {
         return 0
     fi
 
-    mkdir -p "$MOUNT_DIR"
-    if ! safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"; then
-        log_error "Failed to mount $ROOT_DEV at $MOUNT_DIR"
+    if ! mkdir -p "$MOUNT_DIR" 2>/dev/null; then
+        log_warn "Cannot create mount directory for storage analysis"
+        set -e
+        return 1
+    fi
+    
+    if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        log_warn "Cannot mount for storage analysis"
         set -e
         return 1
     fi
 
-    trap 'safe_umount "$MOUNT_DIR"' RETURN
+    # Ensure cleanup on return/exit from this function
+    trap 'umount -R "$MOUNT_DIR" 2>/dev/null || true' RETURN
 
     local -a check_subvols=(blue green data swap)
 
@@ -1054,7 +1061,9 @@ analyze_storage() {
     echo ""
 
     log "Filesystem Usage:"
-    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to retrieve filesystem usage"
+    if ! btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /'; then
+        log_warn "Failed to retrieve filesystem usage"
+    fi
 
     echo ""
     log "Subvolume Compression Analysis:"
@@ -1064,12 +1073,12 @@ analyze_storage() {
             echo ""
             log "@${subvol}:"
             if command -v compsize &>/dev/null; then
-                compsize -x "$path" || log_warn "compsize failed for @${subvol}"
+                compsize -x "$path" 2>/dev/null || log_verbose "compsize unavailable for @${subvol}"
             else
-                btrfs filesystem du -s "$path" || log_warn "btrfs du failed for @${subvol}"
+                btrfs filesystem du -s "$path" 2>/dev/null || log_verbose "btrfs du unavailable for @${subvol}"
             fi
         else
-            log_warn "@${subvol}: Missing"
+            log_verbose "@${subvol}: Missing"
         fi
     done
 
@@ -1077,7 +1086,8 @@ analyze_storage() {
     # PHASE 2: Run Deduplication
     # ========================================
 
-    if ! btrfs_subvol_exists "$MOUNT_DIR/@blue" || ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
+    if ! btrfs subvolume show "$MOUNT_DIR/@blue" &>/dev/null || \
+       ! btrfs subvolume show "$MOUNT_DIR/@green" &>/dev/null; then
         log_verbose "Skipping deduplication (missing required subvolumes)"
         echo ""
         set -e
@@ -1086,8 +1096,12 @@ analyze_storage() {
 
     local -a targets=("$MOUNT_DIR/@blue" "$MOUNT_DIR/@green")
     local backup_count=0
+    
     while IFS= read -r backup; do
-        [[ -n "$backup" ]] && { targets+=("$MOUNT_DIR/${backup}"); ((backup_count++)); }
+        if [[ -n "$backup" ]]; then
+            targets+=("$MOUNT_DIR/${backup}")
+            ((backup_count++))
+        fi
     done < <(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | awk '$NF ~ /_backup_/ {print $NF}')
 
     echo ""
@@ -1095,11 +1109,13 @@ analyze_storage() {
     log "This may take several minutes depending on data size..."
     echo ""
 
-    mkdir -p "$MOUNT_DIR/@data"
+    mkdir -p "$MOUNT_DIR/@data" 2>/dev/null || true
 
     local dedupe_start
     dedupe_start=$(date +%s)
 
+    # Run duperemove - capture exit code but don't fail
+    local dedupe_status=0
     duperemove -dhr --skip-zeroes \
         --dedupe-options=same,partial \
         -b 128K \
@@ -1107,16 +1123,15 @@ analyze_storage() {
         --io-threads="$(nproc)" \
         --cpu-threads="$(nproc)" \
         --hashfile="$MOUNT_DIR/@data/.dedupe.db" \
-        "${targets[@]}"
+        "${targets[@]}" 2>&1 || dedupe_status=$?
 
-    local dedupe_status=$?
     local dedupe_duration=$(( $(date +%s) - dedupe_start ))
 
     echo ""
     if [[ $dedupe_status -eq 0 ]]; then
         log_success "Deduplication completed in ${dedupe_duration}s"
     else
-        log_warn "Deduplication completed with warnings (exit code: $dedupe_status)"
+        log_warn "Deduplication completed with warnings (exit code: $dedupe_status, duration: ${dedupe_duration}s)"
     fi
 
     # ========================================
@@ -1133,9 +1148,9 @@ analyze_storage() {
             echo ""
             log "@${subvol}:"
             if command -v compsize &>/dev/null; then
-                compsize -x "$path" || log_warn "compsize failed for @${subvol}"
+                compsize -x "$path" 2>/dev/null || log_verbose "compsize unavailable for @${subvol}"
             else
-                btrfs filesystem du -s "$path" || log_warn "btrfs du failed for @${subvol}"
+                btrfs filesystem du -s "$path" 2>/dev/null || log_verbose "btrfs du unavailable for @${subvol}"
             fi
         fi
     done
@@ -1145,6 +1160,8 @@ analyze_storage() {
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || true
 
     echo ""
+    
+    # Re-enable strict error handling before returning
     set -e
     return 0
 }
@@ -1869,25 +1886,32 @@ finalize_update() {
     
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
     
-    # Cleanup operations (non-critical, don't fail on errors)
-    # CRITICAL: Temporarily disable ERR trap for cleanup operations
+    # CRITICAL: Disable ERR trap and error exit for cleanup operations
+    # These are non-critical optimization steps that should not abort deployment
     trap - ERR
     set +e
     
-    mkdir -p "$MOUNT_DIR"
-    if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
-        cleanup_old_backups
-        umount -R "$MOUNT_DIR" 2>/dev/null || true
-    fi
-    cleanup_downloads
-    analyze_storage
+    log "Running post-deployment cleanup..."
     
-    # Re-enable ERR trap
+    # Cleanup operations (best-effort, don't fail deployment)
+    if mkdir -p "$MOUNT_DIR" 2>/dev/null; then
+        if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+            cleanup_old_backups || log_verbose "Backup cleanup completed with warnings"
+            umount -R "$MOUNT_DIR" 2>/dev/null || log_warn "Failed to unmount during cleanup"
+        else
+            log_verbose "Could not mount for cleanup (non-critical)"
+        fi
+    fi
+    
+    cleanup_downloads || log_verbose "Download cleanup completed with warnings"
+    analyze_storage || log_verbose "Storage analysis completed with warnings"
+    
+    # Re-enable strict error handling
     trap 'restore_candidate' ERR
     set -e
     
-    # Clear pending flag - deployment complete
-    rm -f "$DEPLOY_PENDING" || log_warn "Failed to remove deployment pending flag"
+    # Clear pending flag - deployment complete (critical operation)
+    rm -f "$DEPLOY_PENDING" || die "Failed to remove deployment pending flag"
     
     log_success "Complete"
     log "Next boot: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"

@@ -1986,6 +1986,23 @@ finalize_update() {
     log "Current boot remains on @${CURRENT_SLOT} until reboot"
 }
 
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  -h, --help              Show help
+  -r, --rollback          Force rollback
+  -c, --cleanup           Manual cleanup
+  -s, --storage-info      Storage analysis
+  -t, --channel <chan>    Update channel (latest|stable)
+  -d, --dry-run           Simulate
+  -v, --verbose           Verbose output
+  --skip-self-update      Skip auto-update
+EOF
+}
+
+
 #####################################
 ### Main Entry Point (updated)    ###
 #####################################

@@ -1896,19 +1896,40 @@ finalize_update() {
     # Cleanup operations (best-effort, don't fail deployment)
     if mkdir -p "$MOUNT_DIR" 2>/dev/null; then
         if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
-            cleanup_old_backups || log_verbose "Backup cleanup completed with warnings"
-            umount -R "$MOUNT_DIR" 2>/dev/null || log_warn "Failed to unmount during cleanup"
+            cleanup_old_backups
+            local cleanup_result=$?
+            if [[ $cleanup_result -ne 0 ]]; then
+                log_verbose "Backup cleanup returned code $cleanup_result (non-critical)"
+            fi
+            
+            # Unmount with explicit error handling
+            if ! umount -R "$MOUNT_DIR" 2>/dev/null; then
+                log_warn "Failed to unmount during cleanup"
+            fi
+            local umount_result=$?  # Capture to clear $?
         else
             log_verbose "Could not mount for cleanup (non-critical)"
         fi
     fi
     
-    cleanup_downloads || log_verbose "Download cleanup completed with warnings"
-    analyze_storage || log_verbose "Storage analysis completed with warnings"
+    cleanup_downloads
+    local download_cleanup_result=$?
+    if [[ $download_cleanup_result -ne 0 ]]; then
+        log_verbose "Download cleanup returned code $download_cleanup_result (non-critical)"
+    fi
     
-    # Re-enable strict error handling
-    trap 'restore_candidate' ERR
+    analyze_storage
+    local storage_result=$?
+    if [[ $storage_result -ne 0 ]]; then
+        log_verbose "Storage analysis returned code $storage_result (non-critical)"
+    fi
+    
+    # Explicitly reset $? to 0 before re-enabling error handling
+    true
+    
+    # Re-enable strict error handling BEFORE critical operations
     set -e
+    trap 'restore_candidate' ERR
     
     # Clear pending flag - deployment complete (critical operation)
     rm -f "$DEPLOY_PENDING" || die "Failed to remove deployment pending flag"

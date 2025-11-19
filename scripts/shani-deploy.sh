@@ -561,6 +561,7 @@ validate_download() {
     return 0
 }
 
+
 download_with_tool() {
     local tool="$1" url="$2" output="$3"
     
@@ -579,32 +580,34 @@ download_with_tool() {
         --read-timeout=60
         --timeout=60
         --tries=3
-        --no-verbose
+        --quiet
         --dns-timeout=30
         --connect-timeout=30
         --prefer-family=IPv4
         --continue
     )
-    [[ -t 2 ]] && wget_opts+=(--show-progress)
+    [[ -t 2 ]] && wget_opts+=(--show-progress --progress=bar:force)
     
     case "$tool" in
         aria2c)
+            # Use --truncate-console-readout for single-line progress
             aria2c \
                 --max-connection-per-server=1 --split=1 \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
                 --conditional-get=true --remote-time=true \
                 --timeout=30 --max-tries=3 --retry-wait=3 \
-                --console-log-level=warn --summary-interval=1 --download-result=hide \
+                --console-log-level=error --summary-interval=0 \
+                --truncate-console-readout=true \
                 --dir="$(dirname "$output")" --out="$(basename "$output")" \
                 "$url"
             ;;
         wget)
-            wget "${wget_opts[@]}" -O "$output" "$url" 2>&1 | grep -E "(saved|%)" || true
+            wget "${wget_opts[@]}" -O "$output" "$url"
             ;;
         curl)
             curl --fail --location --max-time 300 --retry 3 --retry-delay 3 \
                 --continue-at - --create-dirs --output "$output" \
-                --progress-bar --remote-time "$url" 2>&1
+                --progress-bar --remote-time "$url"
             ;;
         *)
             return 1

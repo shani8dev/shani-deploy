@@ -1017,6 +1017,8 @@ cleanup_downloads() {
     if (( protected > 0 )); then
         log_verbose "Protected $protected current file(s)"
     fi
+    # Explicitly return success
+    return 0
 }
 
 analyze_storage() {

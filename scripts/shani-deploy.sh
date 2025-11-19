@@ -574,19 +574,39 @@ download_with_tool() {
         return 1
     fi
     
-    local wget_opts=(
+    local wget_base_opts=(
         --retry-connrefused
         --waitretry=30
         --read-timeout=60
         --timeout=60
         --tries=3
-        --quiet
         --dns-timeout=30
         --connect-timeout=30
         --prefer-family=IPv4
-        --continue
     )
-    [[ -t 2 ]] && wget_opts+=(--show-progress --progress=bar:force)
+    
+    # Add progress if terminal
+    [[ -t 2 ]] && wget_base_opts+=(--show-progress --progress=bar:force)
+    
+    # Check if partial file exists and is valid for resume
+    local resume_opts=()
+    if [[ -f "$output" ]] && [[ -s "$output" ]]; then
+        local partial_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+        
+        if (( partial_size > 0 )); then
+            log_verbose "Found partial download: $(format_bytes $partial_size)"
+            
+            # Verify server supports byte-range (quick check)
+            if timeout 10 wget --spider -S "$url" 2>&1 | grep -qi "Accept-Ranges.*bytes"; then
+                log_verbose "Server supports resume, continuing..."
+                resume_opts+=(--continue)
+            else
+                log_verbose "Server doesn't support resume, restarting..."
+                rm -f "$output"
+            fi
+        fi
+    fi
+
     
     case "$tool" in
         aria2c)
@@ -602,7 +622,8 @@ download_with_tool() {
                 "$url"
             ;;
         wget)
-            wget "${wget_opts[@]}" -O "$output" "$url"
+             # Execute with or without --continue based on capability check
+    		wget "${wget_base_opts[@]}" "${resume_opts[@]}" -O "$output" "$url"
             ;;
         curl)
             curl --fail --location --max-time 300 --retry 3 --retry-delay 3 \
@@ -1635,18 +1656,33 @@ download_update() {
         
         # Check partial download
         local current_size=0
-        if [[ -f "$image_part" ]]; then
-            current_size=$(get_file_size "$image_part")
-            
-            # Validate partial file - only delete if corrupted
-            if (( expected_size > 0 && current_size > expected_size )); then
-                log_warn "Partial file larger than expected, corrupted"
-                rm -f "$image_part" "$image_part.aria2"
-                current_size=0
-            elif (( current_size > 0 )); then
-                log "Resuming from $(format_bytes $current_size)"
-            fi
-        fi
+		if [[ -f "$image_part" ]]; then
+		    current_size=$(get_file_size "$image_part")
+		    
+		    if (( current_size > 0 )); then
+		        # Validate size is reasonable
+		        if (( expected_size > 0 )); then
+		            if (( current_size > expected_size )); then
+		                log_warn "Partial file oversized ($(format_bytes $current_size) > $(format_bytes $expected_size)), corrupted"
+		                rm -f "$image_part" "$image_part.aria2"
+		                current_size=0
+		            elif (( current_size == expected_size )); then
+		                log_verbose "Partial file appears complete, will verify"
+		            else
+		                log "Resuming from $(format_bytes $current_size) / $(format_bytes $expected_size)"
+		            fi
+		        else
+		            # Can't validate size, at least check it's not obviously wrong
+		            if (( current_size < MIN_FILE_SIZE )); then
+		                log_warn "Partial file suspiciously small ($(format_bytes $current_size)), restarting"
+		                rm -f "$image_part" "$image_part.aria2"
+		                current_size=0
+		            else
+		                log "Resuming from $(format_bytes $current_size) (size unknown)"
+		            fi
+		        fi
+		    fi
+		fi
         
         # Attempt download
         if download_file "$mirror_url" "$image_part" 0; then

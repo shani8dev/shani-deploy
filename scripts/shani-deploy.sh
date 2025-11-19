@@ -899,11 +899,11 @@ cleanup_old_backups() {
 
     # Disable ERR trap and error exit for this function - cleanup is non-critical
     set +e
-
+	    # Verify mount exists and is valid
     if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
         log_verbose "Mount point not available, skipping backup cleanup"
         set -e
-        return 0  # Changed from 1 to 0 - not an error
+        return 0
     fi
 
     for slot in blue green; do
@@ -1048,9 +1048,16 @@ analyze_storage() {
         set -e
         return 1
     fi
+    
+    # ADD THIS: Verify mount succeeded
+    if ! findmnt -M "$MOUNT_DIR" &>/dev/null; then
+        log_warn "Mount verification failed for storage analysis"
+        set -e
+        return 1
+    fi
 
     # Ensure cleanup on return/exit from this function
-    trap 'umount -R "$MOUNT_DIR" 2>/dev/null || true' RETURN
+    trap 'umount -R "$MOUNT_DIR" 2>/dev/null || umount -fl "$MOUNT_DIR" 2>/dev/null || true' RETURN
 
     local -a check_subvols=(blue green data swap)
 
@@ -1904,11 +1911,10 @@ finalize_update() {
                 log_verbose "Backup cleanup returned code $cleanup_result (non-critical)"
             fi
             
-            # Unmount with explicit error handling
-            if ! umount -R "$MOUNT_DIR" 2>/dev/null; then
-                log_warn "Failed to unmount during cleanup"
+            # Unmount - only if currently mounted
+            if findmnt -M "$MOUNT_DIR" &>/dev/null; then
+                umount -R "$MOUNT_DIR" 2>/dev/null || umount -fl "$MOUNT_DIR" 2>/dev/null || true
             fi
-            local umount_result=$?  # Capture to clear $?
         else
             log_verbose "Could not mount for cleanup (non-critical)"
         fi
@@ -1989,14 +1995,15 @@ main() {
     [[ "$STORAGE_INFO" == "yes" ]] && { analyze_storage; exit 0; }
     
     if [[ "$CLEANUP" == "yes" ]]; then
-        # Disable ERR trap for manual cleanup
         trap - ERR
         set +e
         
         mkdir -p "$MOUNT_DIR"
         if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             cleanup_old_backups
-            umount -R "$MOUNT_DIR" 2>/dev/null || true
+            # Only unmount if still mounted
+            findmnt -M "$MOUNT_DIR" &>/dev/null && \
+                umount -R "$MOUNT_DIR" 2>/dev/null || true
         fi
         cleanup_downloads
         
@@ -2013,8 +2020,6 @@ main() {
     fetch_update
     
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
-        # Both slots already up-to-date, just optimize if possible
-        # Disable ERR trap for non-critical optimization
         trap - ERR
         set +e
         
@@ -2022,14 +2027,13 @@ main() {
         if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
                 cleanup_old_backups
-                umount -R "$MOUNT_DIR" 2>/dev/null || true
-                analyze_storage
-            else
-                umount -R "$MOUNT_DIR" 2>/dev/null || true
             fi
+            # Only unmount if still mounted
+            findmnt -M "$MOUNT_DIR" &>/dev/null && \
+                umount -R "$MOUNT_DIR" 2>/dev/null || true
+            analyze_storage
         fi
         
-        # Re-enable ERR trap
         trap 'restore_candidate' ERR
         set -e
     else

@@ -318,47 +318,98 @@ get_btrfs_available_mb() {
 #####################################
 
 get_remote_file_size() {
-    local url="$1" size=0
+    local url="$1"
+    local size=0
+    
     if (( HAS_WGET )); then
-        size=$(timeout 20 wget -q --spider -S --timeout=15 --tries=1 "$url" 2>&1 | \
-            awk '/Content-Length:/ {print $2}' | tail -1 | tr -d '\r' || echo "0")
+        size=$(timeout 20 wget -q --spider -S \
+            --timeout=15 \
+            --tries=1 \
+            "$url" 2>&1 | \
+            awk '/Content-Length:/ {print $2}' | \
+            tail -1 | \
+            tr -d '\r' || echo "0")
     elif (( HAS_CURL )); then
-        size=$(timeout 20 curl -sI --connect-timeout 8 --max-time 15 "$url" 2>/dev/null | \
-            grep -i "content-length:" | tail -1 | awk '{print $2}' | tr -d '\r' || echo "0")
+        size=$(timeout 20 curl -sI \
+            --connect-timeout 8 \
+            --max-time 15 \
+            "$url" 2>/dev/null | \
+            grep -i "content-length:" | \
+            tail -1 | \
+            awk '{print $2}' | \
+            tr -d '\r' || echo "0")
     fi
-    [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )) && echo "$size" || echo "0"
+    
+    # Validate size is numeric and positive
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
+        echo "$size"
+    else
+        echo "0"
+    fi
 }
 
 discover_mirror() {
     local sf_url="$1"
     
     if (( HAS_WGET )); then
-        log_verbose "Attempting wget discovery"
+        log_verbose "Attempting wget discovery with redirect chain"
+        
+        # Capture only stderr from wget, filter to headers only
         local spider_output
-        spider_output=$(timeout 30 wget --max-redirect=20 --spider -S "$sf_url" 2>&1 | \
+        spider_output=$(timeout 30 wget --max-redirect=20 --spider -S "$sf_url" 2>&1 >/dev/null | \
             grep -E '^ +(HTTP|Location):' || echo "")
         
-        [[ "${VERBOSE}" == "yes" ]] && echo "$spider_output" | head -20 >&2
+        # Debug: show what we captured
+        if [[ "${VERBOSE}" == "yes" ]]; then
+            log_verbose "Spider output:"
+            echo "$spider_output" | head -20 >&2
+        fi
         
+        # Extract the final Location header after all redirects
         local final_url
-        final_url=$(echo "$spider_output" | grep -i '^  Location: ' | tail -1 | \
-            sed 's/^  Location: //' | tr -d '\r\n' | xargs)
+        final_url=$(echo "$spider_output" | \
+            grep -i '^  Location: ' | \
+            tail -1 | \
+            sed 's/^  Location: //' | \
+            tr -d '\r\n' | \
+            xargs)
         
+        log_verbose "Extracted URL: ${final_url:-none}"
+        
+        # Strict validation: must be a proper HTTP(S) URL
         if [[ -n "$final_url" ]] && [[ "$final_url" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
-            dirname "$final_url"
+            local base_url
+            base_url=$(dirname "$final_url")
+            log_verbose "Wget discovered: $base_url"
+            echo "$base_url"
             return 0
+        else
+            log_verbose "URL validation failed or empty"
         fi
     fi
     
+    # Fallback to curl if wget unavailable or failed
     if (( HAS_CURL )); then
         log_verbose "Attempting curl discovery"
         local discovered
-        discovered=$(timeout 30 curl -sL -w '%{url_effective}' --max-redirs 20 \
-            --connect-timeout 10 --max-time 25 -o /dev/null "$sf_url" 2>/dev/null | \
-            tail -1 | tr -d '\r\n' | xargs)
+        discovered=$(timeout 30 curl -sL -w '%{url_effective}' \
+            --max-redirs 20 \
+            --connect-timeout 10 \
+            --max-time 25 \
+            -o /dev/null \
+            "$sf_url" 2>/dev/null | \
+            tail -1 | \
+            tr -d '\r\n' | \
+            xargs)
         
+        log_verbose "Curl extracted: ${discovered:-none}"
+        
+        # Strict validation
         if [[ -n "$discovered" ]] && [[ "$discovered" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
-            dirname "$discovered"
+            local base_url
+            base_url=$(dirname "$discovered")
+            log_verbose "Curl discovered: $base_url"
+            echo "$base_url"
             return 0
         fi
     fi
@@ -368,18 +419,37 @@ discover_mirror() {
 
 validate_mirror() {
     local mirror_url="$1"
+    
     [[ -z "$mirror_url" ]] && return 1
     
     log_verbose "Validating mirror: $mirror_url"
     
+    # Quick check to verify mirror responds
     if (( HAS_WGET )); then
-        timeout 20 wget -q --spider -S --timeout=15 --tries=1 "$mirror_url" 2>&1 | \
-            grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:" && return 0
+        local response
+        response=$(timeout 20 wget -q --spider -S --timeout=15 --tries=1 \
+            "$mirror_url" 2>&1 || echo "")
+        
+        log_verbose "Wget validation response: ${response:0:200}"
+        
+        if echo "$response" | grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:"; then
+            log_verbose "Mirror validation: PASS (wget)"
+            return 0
+        fi
     elif (( HAS_CURL )); then
-        timeout 20 curl -sI --connect-timeout 8 --max-time 15 "$mirror_url" 2>&1 | \
-            grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:" && return 0
+        local response
+        response=$(timeout 20 curl -sI --connect-timeout 8 --max-time 15 \
+            "$mirror_url" 2>&1 || echo "")
+        
+        log_verbose "Curl validation response: ${response:0:200}"
+        
+        if echo "$response" | grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:"; then
+            log_verbose "Mirror validation: PASS (curl)"
+            return 0
+        fi
     fi
     
+    log_verbose "Mirror validation: FAIL"
     return 1
 }
 
@@ -387,33 +457,55 @@ get_mirror_url() {
     local project="$1" filepath="$2" filename="$3"
     local mirror_cache="$DOWNLOAD_DIR/mirror.url"
     
-    # Try cached mirror first
+    # Check cached mirror and validate it
     if [[ -f "$mirror_cache" ]]; then
         local cached
         cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | tr -d '\r\n' | xargs)
         if [[ -n "$cached" ]]; then
+            # Reconstruct full URL from cached base
             local full_url="${cached}/${filename}"
+            log_verbose "Testing cached mirror: $(echo "$cached" | sed -E 's|https://([^/]+).*|\1|')"
+            
             if validate_mirror "$full_url"; then
+                log_verbose "Cached mirror valid"
                 echo "$full_url"
                 return 0
+            else
+                log_verbose "Cached mirror failed validation, removing"
+                rm -f "$mirror_cache"
             fi
-            rm -f "$mirror_cache"
         fi
     fi
     
+    # Construct SourceForge URL with /download endpoint (critical for proper redirects)
     local sf_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
+    
     log "Discovering mirror from SourceForge..."
     
     local base_url
     base_url=$(discover_mirror "$sf_url")
     
+    # Clean and validate discovered mirror
     if [[ -n "$base_url" ]]; then
+        # Sanitize the base_url
         base_url=$(echo "$base_url" | tr -d '\r\n' | xargs)
-        [[ ! "$base_url" =~ ^https?://[a-zA-Z0-9] ]] && base_url=""
+        
+        log_verbose "Discovered base URL: $base_url"
+        
+        # Validate it's a proper URL
+        if [[ ! "$base_url" =~ ^https?://[a-zA-Z0-9] ]]; then
+            log_warn "Discovered base_url has invalid format: ${base_url:0:100}"
+            base_url=""
+        fi
+    else
+        log_verbose "No base URL discovered"
     fi
     
+    # Validate discovered mirror
     if [[ -n "$base_url" ]]; then
         local full_url="${base_url}/${filename}"
+        log_verbose "Testing mirror: $full_url"
+        
         if validate_mirror "$full_url"; then
             local mirror_host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|')
             log_success "Mirror validated: $mirror_host"
@@ -421,11 +513,18 @@ get_mirror_url() {
             echo "$base_url" > "$mirror_cache"
             echo "$full_url"
             return 0
+        else
+            log_warn "Discovered mirror failed validation"
         fi
     fi
     
-    log_warn "Using SourceForge direct"
-    echo "https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
+    # Ultimate fallback: use SourceForge direct download URL (slower but reliable)
+    log_warn "Mirror discovery failed, using SourceForge direct"
+    local fallback_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
+    
+    # Don't cache the fallback URL as it will redirect on each use
+    echo "$fallback_url"
+    return 0
 }
 
 #####################################
@@ -434,62 +533,108 @@ get_mirror_url() {
 
 validate_download() {
     local file="$1" expected_size="${2:-0}"
+    
     [[ -f "$file" ]] || { log_error "File not found: $file"; return 1; }
     
-    local size=$(get_file_size "$file")
+    local size
+    size=$(get_file_size "$file")
+    
+    # Use server-provided size if available, otherwise use minimum threshold
     local min_size="$MIN_FILE_SIZE"
-    (( expected_size > 0 )) && min_size="$expected_size"
+    if (( expected_size > 0 )); then
+        min_size="$expected_size"
+    fi
     
     if (( size < min_size )); then
         log_error "File too small: $(format_bytes $size) < $(format_bytes $min_size)"
         return 1
     fi
     
-    file "$file" 2>/dev/null | grep -qi "html\|xml" && { log_error "File is HTML/XML error page"; return 1; }
-    [[ "$file" == *.zst ]] && ! file "$file" 2>/dev/null | grep -qi "zstandard" && { log_warn "Wrong content type"; return 1; }
+    # Detect HTML/XML error pages
+    if file "$file" 2>/dev/null | grep -qi "html\|xml"; then
+        log_error "File appears to be error page (HTML/XML)"
+        return 1
+    fi
+    
+    # Validate zstd files
+    if [[ "$file" == *.zst ]] && ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
+        log_warn "File extension .zst but wrong content type"
+        return 1
+    fi
     
     log_verbose "Validation passed: $(format_bytes $size)"
     return 0
 }
 
+
 download_with_tool() {
     local tool="$1" url="$2" output="$3"
+    
+    # Sanitize URL - remove any whitespace and validate
     url=$(echo "$url" | tr -d '\r\n' | xargs)
     
-    [[ ! "$url" =~ ^https?://[a-zA-Z0-9] ]] && { log_error "Invalid URL"; return 1; }
+    # Validate URL format
+    if [[ ! "$url" =~ ^https?://[a-zA-Z0-9] ]]; then
+        log_error "Invalid URL format: ${url:0:100}"
+        return 1
+    fi
     
-    local wget_opts=(--retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60 
-                     --tries=3 --dns-timeout=30 --connect-timeout=30 --prefer-family=IPv4)
-    [[ -t 2 ]] && wget_opts+=(--show-progress --progress=bar:force)
+    local wget_base_opts=(
+        --retry-connrefused
+        --waitretry=30
+        --read-timeout=60
+        --timeout=60
+        --tries=3
+        --dns-timeout=30
+        --connect-timeout=30
+        --prefer-family=IPv4
+    )
     
-    # Resume support check
-    local can_resume=0
+    # Add progress if terminal
+    [[ -t 2 ]] && wget_base_opts+=(--show-progress --progress=bar:force)
+    
+    # Check if partial file exists and server supports resume
+    local resume_supported=0
     if [[ -f "$output" ]] && [[ -s "$output" ]]; then
-        if timeout 10 wget --spider -S "$url" 2>&1 | grep -qi "Accept-Ranges.*bytes"; then
-            can_resume=1
-            log_verbose "Server supports resume"
-        else
-            rm -f "$output"
+        local partial_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+        
+        if (( partial_size > 0 )); then
+            log_verbose "Found partial download: $(format_bytes $partial_size)"
+            
+            # Quick check if server supports byte-range requests
+            if timeout 10 wget --spider -S "$url" 2>&1 | grep -qi "Accept-Ranges.*bytes"; then
+                log_verbose "Server supports resume"
+                resume_supported=1
+            else
+                log_verbose "Server doesn't support resume, will restart download"
+                rm -f "$output"
+            fi
         fi
     fi
     
     case "$tool" in
         aria2c)
-            aria2c --console-log-level=error --summary-interval=0 \
-                --timeout=30 --max-tries=3 --retry-wait=3 --max-connection-per-server=1 \
-                --split=1 --continue=true --allow-overwrite=true \
-                --auto-file-renaming=false --conditional-get=true --remote-time=true \
-				--truncate-console-readout=true \
-                --dir="$(dirname "$output")" --out="$(basename "$output")" "$url"
+            # aria2c handles resume automatically with --continue=true
+            aria2c \
+                --max-connection-per-server=1 --split=1 \
+                --continue=true --allow-overwrite=true --auto-file-renaming=false \
+                --conditional-get=true --remote-time=true \
+                --timeout=30 --max-tries=3 --retry-wait=3 \
+                --console-log-level=error --summary-interval=0 \
+                --truncate-console-readout=true \
+                --dir="$(dirname "$output")" --out="$(basename "$output")" \
+                "$url"
             ;;
         wget)
-            if (( can_resume )); then
-                wget "${wget_opts[@]}" --continue -O "$output" "$url" 2>&1 | grep -E "(saved|%)" || true
+            # Only add --continue if server supports it
+            if (( resume_supported )); then
+                wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
             else
-                wget "${wget_opts[@]}" -O "$output" "$url" 2>&1 | grep -E "(saved|%)" || true
+                wget "${wget_base_opts[@]}" -O "$output" "$url"
             fi
             ;;
         curl)
+            # curl's --continue-at - handles resume automatically
             curl --fail --location --max-time 300 --retry 3 --retry-delay 3 \
                 --continue-at - --create-dirs --output "$output" \
                 --progress-bar --remote-time "$url"
@@ -502,40 +647,57 @@ download_with_tool() {
 
 download_file() {
     local url="$1" output="$2" is_small="${3:-0}"
+    
     mkdir -p "$(dirname "$output")"
     
-    # Small file fast-path
+    # Small files - quick download without complex resume logic
     if (( is_small )); then
         local temp_output="${output}.tmp"
+        
         if (( HAS_WGET )); then
             if timeout 20 wget -q --timeout=15 --tries=2 -O "$temp_output" "$url" 2>/dev/null; then
-                [[ -f "$temp_output" && -s "$temp_output" ]] && mv "$temp_output" "$output" 2>/dev/null && return 0
+                if [[ -f "$temp_output" ]] && [[ -s "$temp_output" ]]; then
+                    mv "$temp_output" "$output" 2>/dev/null && return 0
+                fi
             fi
             rm -f "$temp_output"
         fi
+        
         if (( HAS_CURL )); then
             if timeout 20 curl -fsSL --max-time 15 --retry 1 -o "$temp_output" "$url" 2>/dev/null; then
-                [[ -f "$temp_output" && -s "$temp_output" ]] && mv "$temp_output" "$output" 2>/dev/null && return 0
+                if [[ -f "$temp_output" ]] && [[ -s "$temp_output" ]]; then
+                    mv "$temp_output" "$output" 2>/dev/null && return 0
+                fi
             fi
             rm -f "$temp_output"
         fi
+        
         return 1
     fi
     
-    # Large file with retries
+    # Large files - try downloaders with resume support
     local -a downloaders=()
     (( HAS_ARIA2C )) && downloaders+=(aria2c)
     (( HAS_WGET )) && downloaders+=(wget)
     (( HAS_CURL )) && downloaders+=(curl)
     
-    [[ ${#downloaders[@]} -eq 0 ]] && { log_error "No download tools"; return 1; }
+    if [[ ${#downloaders[@]} -eq 0 ]]; then
+        log_error "No download tools available"
+        return 1
+    fi
     
     for tool in "${downloaders[@]}"; do
         log_verbose "Trying $tool..."
-        if download_with_tool "$tool" "$url" "$output"; then
-            [[ -f "$output" && -s "$output" ]] && return 0
-            rm -f "$output"
+        if download_with_tool "$tool" "$output" "$url"; then
+            # Verify download produced a file
+            if [[ -f "$output" ]] && [[ -s "$output" ]]; then
+                return 0
+            else
+                log_verbose "$tool completed but no output file"
+                rm -f "$output"
+            fi
         fi
+        log_verbose "$tool failed"
     done
     
     return 1

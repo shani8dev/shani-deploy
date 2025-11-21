@@ -268,6 +268,70 @@ is_mounted() {
     findmnt -M "$target" &>/dev/null
 }
 
+get_mount_source() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || { echo ""; return 1; }
+    findmnt -n -o SOURCE "$target" 2>/dev/null | head -1 || echo ""
+}
+
+get_mount_options() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || { echo ""; return 1; }
+    findmnt -n -o OPTIONS "$target" 2>/dev/null | head -1 || echo ""
+}
+
+is_correct_mount() {
+    local target="${1:-}" expected_source="${2:-}" expected_opts="${3:-}"
+    
+    if ! is_mounted "$target"; then
+        return 1
+    fi
+    
+    # If source is specified, check it
+    if [[ -n "$expected_source" ]]; then
+        local current_source
+        current_source=$(get_mount_source "$target")
+        
+        # For device mounts, compare by resolving symlinks
+        if [[ "$expected_source" =~ ^/dev/ ]]; then
+            local exp_real cur_real
+            exp_real=$(readlink -f "$expected_source" 2>/dev/null || echo "$expected_source")
+            cur_real=$(readlink -f "$current_source" 2>/dev/null || echo "$current_source")
+            
+            if [[ "$exp_real" != "$cur_real" ]]; then
+                log_verbose "Mount source mismatch: $cur_real != $exp_real"
+                return 1
+            fi
+        else
+            # For other mounts (bind, etc), direct comparison
+            if [[ "$current_source" != "$expected_source" ]]; then
+                log_verbose "Mount source mismatch: $current_source != $expected_source"
+                return 1
+            fi
+        fi
+    fi
+    
+    # If specific options are required, check them
+    if [[ -n "$expected_opts" ]]; then
+        local current_opts
+        current_opts=$(get_mount_options "$target")
+        
+        # Check if expected options are present (simple substring check)
+        if [[ "$expected_opts" =~ subvol=@ ]]; then
+            local exp_subvol cur_subvol
+            exp_subvol=$(echo "$expected_opts" | grep -o 'subvol=@[^,]*' | head -1)
+            cur_subvol=$(echo "$current_opts" | grep -o 'subvol=@[^,]*' | head -1)
+            
+            if [[ "$exp_subvol" != "$cur_subvol" ]]; then
+                log_verbose "Subvolume mismatch: $cur_subvol != $exp_subvol"
+                return 1
+            fi
+        fi
+    fi
+    
+    return 0
+}
+
 safe_mount() {
     local src="$1" tgt="$2" opts="${3:-defaults}"
     
@@ -275,88 +339,26 @@ safe_mount() {
         die "safe_mount: Invalid arguments"
     fi
     
-    if is_mounted "$tgt"; then
-        log_verbose "Already mounted: $tgt"
+    # Check if already correctly mounted
+    if is_correct_mount "$tgt" "$src" "$opts"; then
+        log_verbose "Already correctly mounted: $tgt"
         return 0
+    fi
+    
+    # If mounted but incorrect, try to unmount first
+    if is_mounted "$tgt"; then
+        log_verbose "Mount exists but incorrect, attempting remount: $tgt"
+        if ! safe_umount "$tgt"; then
+            log_warn "Could not unmount $tgt for remount"
+            return 1
+        fi
     fi
     
     mkdir -p "$tgt" 2>/dev/null || true
     
     log_verbose "Mounting: $src -> $tgt (opts: $opts)"
     if ! run_cmd mount -o "$opts" "$src" "$tgt"; then
-        die "Failed to mount $tgt"
-    fi
-}
-
-safe_umount() {
-    local tgt="${1:-}"
-    [[ -n "$tgt" ]] || return 1
-    
-    if ! is_mounted "$tgt"; then
-        log_verbose "Not mounted: $tgt"
-        return 0
-    fi
-    
-    if [[ "${DRY_RUN}" == "yes" ]]; then
-        log "[DRY-RUN] Would unmount: $tgt"
-        return 0
-    fi
-    
-    local attempt=0
-    local max_attempts=3
-    
-    while (( attempt < max_attempts )); do
-        ((attempt++))
-        
-        if umount -R "$tgt" 2>/dev/null; then
-            log_verbose "Unmounted: $tgt (attempt $attempt)"
-            return 0
-        fi
-        
-        if ! is_mounted "$tgt"; then
-            log_verbose "Mount disappeared: $tgt"
-            return 0
-        fi
-        
-        if (( attempt < max_attempts )); then
-            log_verbose "Unmount retry $attempt/$max_attempts: $tgt"
-            sleep 1
-        fi
-    done
-    
-    if umount -l "$tgt" 2>/dev/null; then
-        log_warn "Lazy unmount used: $tgt"
-        return 0
-    fi
-    
-    log_warn "Failed to unmount: $tgt"
-    return 1
-}
-
-force_umount_all() {
-    local base_dir="${1:-}"
-    [[ -n "$base_dir" ]] || return 1
-    
-    log_verbose "Force unmounting all under: $base_dir"
-    
-    local -a mounts
-    mapfile -t mounts < <(
-        findmnt -R -o TARGET -n "$base_dir" 2>/dev/null | sort -r || true
-    )
-    
-    if [[ ${#mounts[@]} -eq 0 ]]; then
-        log_verbose "No mounts found under: $base_dir"
-        return 0
-    fi
-    
-    for mount in "${mounts[@]}"; do
-        [[ -n "$mount" ]] || continue
-        safe_umount "$mount" || log_verbose "Could not unmount: $mount"
-    done
-    
-    if is_mounted "$base_dir"; then
-        log_warn "Base mount still exists after cleanup: $base_dir"
-        umount -fl "$base_dir" 2>/dev/null || true
+        log_error "Failed to mount $tgt"
         return 1
     fi
     
@@ -365,20 +367,49 @@ force_umount_all() {
 
 mount_for_operation() {
     local operation="${1:-unknown}"
+    local required_subvol="${2:-}"  # Optional: specific subvolume needed
     
+    # Check if already mounted
     if is_mounted "$MOUNT_DIR"; then
-        log_verbose "Already mounted for $operation"
-        return 0
+        log_verbose "Mount point exists for $operation"
+        
+        # If specific subvolume required, verify it
+        if [[ -n "$required_subvol" ]]; then
+            local current_opts
+            current_opts=$(get_mount_options "$MOUNT_DIR")
+            
+            if [[ "$current_opts" =~ subvol=@${required_subvol} ]] || \
+               [[ "$current_opts" =~ subvolid=5 ]]; then
+                log_verbose "Correct mount already exists for $operation"
+                return 0
+            else
+                log_verbose "Mount exists but wrong subvolume, remounting"
+                if ! safe_umount "$MOUNT_DIR"; then
+                    log_error "Cannot remount for $operation"
+                    return 1
+                fi
+            fi
+        else
+            # No specific subvolume required, existing mount is fine
+            log_verbose "Using existing mount for $operation"
+            return 0
+        fi
     fi
     
+    # Need to mount
     if ! mkdir -p "$MOUNT_DIR" 2>/dev/null; then
         log_error "Cannot create mount directory"
         return 1
     fi
     
-    # Try to mount with subvolid=5 (top-level subvolume)
-    if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
-        # Check if mount failed because it's already mounted
+    local mount_opts="subvolid=5"
+    if [[ -n "$required_subvol" ]]; then
+        mount_opts="subvol=@${required_subvol}"
+    fi
+    
+    # Try to mount
+    if ! mount -o "$mount_opts" "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        # Check if mount appeared (race condition)
         if is_mounted "$MOUNT_DIR"; then
             log_verbose "Mount appeared during operation for $operation"
             return 0
@@ -392,7 +423,7 @@ mount_for_operation() {
         return 1
     fi
     
-    log_verbose "Mounted for $operation"
+    log_verbose "Mounted for $operation (opts: $mount_opts)"
     return 0
 }
 
@@ -1281,29 +1312,57 @@ prepare_chroot() {
     log_verbose "Preparing chroot: @${slot}"
     
     mkdir -p "$MOUNT_DIR" 2>/dev/null || true
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvol=@${slot}"
     
-    mkdir -p "$MOUNT_DIR/boot/efi" 2>/dev/null || true
-    if mountpoint -q /boot/efi 2>/dev/null; then
-        run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi"
-    else
-        safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults"
+    # Mount root with specific subvolume
+    if ! is_correct_mount "$MOUNT_DIR" "$ROOT_DEV" "subvol=@${slot}"; then
+        safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvol=@${slot}" || return 1
     fi
     
+    # EFI partition
+    mkdir -p "$MOUNT_DIR/boot/efi" 2>/dev/null || true
+    if ! is_mounted "$MOUNT_DIR/boot/efi"; then
+        if mountpoint -q /boot/efi 2>/dev/null; then
+            run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi" || return 1
+        else
+            safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults" || return 1
+        fi
+    else
+        log_verbose "EFI already mounted in chroot"
+    fi
+    
+    # Static directories (data, etc, var)
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR/$dir" 2>/dev/null || true
-        run_cmd mount --bind "/$dir" "$MOUNT_DIR/$dir"
+        if ! is_correct_mount "$MOUNT_DIR/$dir" "/$dir"; then
+            run_cmd mount --bind "/$dir" "$MOUNT_DIR/$dir" || return 1
+        else
+            log_verbose "/$dir already mounted in chroot"
+        fi
     done
     
+    # Bind mounts (dev, proc, sys, etc)
     for d in "${CHROOT_BIND_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR$d" 2>/dev/null || true
-        run_cmd mount --bind "$d" "$MOUNT_DIR$d"
+        if ! is_correct_mount "$MOUNT_DIR$d" "$d"; then
+            run_cmd mount --bind "$d" "$MOUNT_DIR$d" || return 1
+        else
+            log_verbose "$d already mounted in chroot"
+        fi
     done
     
+    # EFI variables
     if [[ -d /sys/firmware/efi/efivars ]]; then
         mkdir -p "$MOUNT_DIR/sys/firmware/efi/efivars" 2>/dev/null || true
-        run_cmd mount --bind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars"
+        if ! is_mounted "$MOUNT_DIR/sys/firmware/efi/efivars"; then
+            run_cmd mount --bind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars" || \
+                log_verbose "Could not mount efivars (non-critical)"
+        else
+            log_verbose "efivars already mounted in chroot"
+        fi
     fi
+    
+    log_verbose "Chroot preparation complete"
+    return 0
 }
 
 cleanup_chroot() {

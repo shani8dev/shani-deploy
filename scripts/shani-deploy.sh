@@ -460,7 +460,7 @@ download_with_tool() {
     
     local wget_opts=(--retry-connrefused --waitretry=30 --read-timeout=60 --timeout=60 
                      --tries=3 --dns-timeout=30 --connect-timeout=30 --prefer-family=IPv4)
-    [[ -t 2 ]] && wget_opts+=(--show-progress)
+    [[ -t 2 ]] && wget_opts+=(--show-progress --progress=bar:force)
     
     # Resume support check
     local can_resume=0
@@ -475,10 +475,11 @@ download_with_tool() {
     
     case "$tool" in
         aria2c)
-            aria2c --console-log-level=warn --summary-interval=1 --download-result=hide \
-                --timeout=30 --max-tries=3 --retry-wait=3 --max-connection-per-server=8 \
-                --split=8 --min-split-size=1M --continue=true --allow-overwrite=true \
+            aria2c --console-log-level=error --summary-interval=0 \
+                --timeout=30 --max-tries=3 --retry-wait=3 --max-connection-per-server=1 \
+                --split=1 --continue=true --allow-overwrite=true \
                 --auto-file-renaming=false --conditional-get=true --remote-time=true \
+				--truncate-console-readout=true \
                 --dir="$(dirname "$output")" --out="$(basename "$output")" "$url"
             ;;
         wget)

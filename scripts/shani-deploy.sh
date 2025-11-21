@@ -321,15 +321,7 @@ get_remote_file_size() {
     local url="$1"
     local size=0
     
-    if (( HAS_WGET )); then
-        size=$(timeout 20 wget -q --spider -S \
-            --timeout=15 \
-            --tries=1 \
-            "$url" 2>&1 | \
-            awk '/Content-Length:/ {print $2}' | \
-            tail -1 | \
-            tr -d '\r' || echo "0")
-    elif (( HAS_CURL )); then
+    if (( HAS_CURL )); then
         size=$(timeout 20 curl -sI \
             --connect-timeout 8 \
             --max-time 15 \
@@ -337,6 +329,14 @@ get_remote_file_size() {
             grep -i "content-length:" | \
             tail -1 | \
             awk '{print $2}' | \
+            tr -d '\r' || echo "0")
+    elif (( HAS_WGET )); then
+        size=$(timeout 20 wget -q --spider -S \
+            --timeout=15 \
+            --tries=1 \
+            "$url" 2>&1 | \
+            awk '/Content-Length:/ {print $2}' | \
+            tail -1 | \
             tr -d '\r' || echo "0")
     fi
     
@@ -350,7 +350,32 @@ get_remote_file_size() {
 
 discover_mirror() {
     local sf_url="$1"
-    
+       
+    if (( HAS_CURL )); then
+        log_verbose "Attempting curl discovery"
+        local discovered
+        discovered=$(timeout 30 curl -sL -w '%{url_effective}' \
+            --max-redirs 20 \
+            --connect-timeout 10 \
+            --max-time 25 \
+            -o /dev/null \
+            "$sf_url" 2>/dev/null | \
+            tail -1 | \
+            tr -d '\r\n' | \
+            xargs)
+        
+        log_verbose "Curl extracted: ${discovered:-none}"
+        
+        # Strict validation
+        if [[ -n "$discovered" ]] && [[ "$discovered" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
+            local base_url
+            base_url=$(dirname "$discovered")
+            log_verbose "Curl discovered: $base_url"
+            echo "$base_url"
+            return 0
+        fi
+    fi
+	
     if (( HAS_WGET )); then
         log_verbose "Attempting wget discovery with redirect chain"
         
@@ -385,32 +410,6 @@ discover_mirror() {
             return 0
         else
             log_verbose "URL validation failed or empty"
-        fi
-    fi
-    
-    # Fallback to curl if wget unavailable or failed
-    if (( HAS_CURL )); then
-        log_verbose "Attempting curl discovery"
-        local discovered
-        discovered=$(timeout 30 curl -sL -w '%{url_effective}' \
-            --max-redirs 20 \
-            --connect-timeout 10 \
-            --max-time 25 \
-            -o /dev/null \
-            "$sf_url" 2>/dev/null | \
-            tail -1 | \
-            tr -d '\r\n' | \
-            xargs)
-        
-        log_verbose "Curl extracted: ${discovered:-none}"
-        
-        # Strict validation
-        if [[ -n "$discovered" ]] && [[ "$discovered" =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*/.+ ]]; then
-            local base_url
-            base_url=$(dirname "$discovered")
-            log_verbose "Curl discovered: $base_url"
-            echo "$base_url"
-            return 0
         fi
     fi
     

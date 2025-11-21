@@ -376,7 +376,13 @@ mount_for_operation() {
         return 1
     fi
     
+    # Try to mount with subvolid=5 (top-level subvolume)
     if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        # Check if mount failed because it's already mounted
+        if is_mounted "$MOUNT_DIR"; then
+            log_verbose "Mount appeared during operation for $operation"
+            return 0
+        fi
         log_error "Cannot mount for $operation"
         return 1
     fi
@@ -1151,6 +1157,12 @@ analyze_storage() {
         return 0
     fi
 
+    # Ensure mount point is clean
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Cleaning up existing mount before storage analysis"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    fi
+
     if ! mount_for_operation "storage analysis"; then
         log_verbose "Cannot mount for storage analysis, skipping"
         return 0
@@ -1401,7 +1413,11 @@ trap 'restore_candidate' ERR
 rollback_system() {
     log_section "System Rollback"
     
-    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
+    # Ensure mount point is clean
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Cleaning up existing mount before rollback"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    fi
     
     if ! mount_for_operation "rollback"; then
         die "Cannot mount for rollback"
@@ -1441,7 +1457,7 @@ rollback_system() {
     
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
     
-    safe_umount "$MOUNT_DIR"
+    safe_umount "$MOUNT_DIR" || true
     
     generate_uki "$previous_slot"
     
@@ -1514,7 +1530,11 @@ create_swapfile() {
 verify_and_create_filesystem_structure() {
     log_section "Filesystem Structure Verification"
     
-    force_umount_all "$MOUNT_DIR" 2>/dev/null || true
+    # Ensure mount point is clean
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Cleaning up existing mount before filesystem verification"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    fi
     
     if ! mount_for_operation "filesystem verification"; then
         log_warn "Cannot mount for filesystem verification (skipping)"
@@ -1524,7 +1544,7 @@ verify_and_create_filesystem_structure() {
     local fstab="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/fstab"
     if [[ ! -f "$fstab" ]]; then
         log_verbose "No fstab found, skipping filesystem verification"
-        safe_umount "$MOUNT_DIR"
+        safe_umount "$MOUNT_DIR" || true
         return 0
     fi
     
@@ -1532,7 +1552,7 @@ verify_and_create_filesystem_structure() {
     
     if [[ ${#required[@]} -eq 0 ]]; then
         log_verbose "No additional subvolumes required"
-        safe_umount "$MOUNT_DIR"
+        safe_umount "$MOUNT_DIR" || true
         return 0
     fi
     
@@ -1553,7 +1573,7 @@ verify_and_create_filesystem_structure() {
         for sub in "${missing[@]}"; do
             if ! run_cmd btrfs subvolume create "$MOUNT_DIR/@${sub}"; then
                 log_error "Failed to create subvolume @${sub}"
-                safe_umount "$MOUNT_DIR"
+                safe_umount "$MOUNT_DIR" || true
                 return 1
             fi
             
@@ -1628,7 +1648,7 @@ verify_and_create_filesystem_structure() {
         fi
     fi
     
-    safe_umount "$MOUNT_DIR"
+    safe_umount "$MOUNT_DIR" || true
 }
 
 #####################################
@@ -1947,6 +1967,12 @@ download_update() {
 deploy_update() {
     log_section "Deployment Phase"
     
+    # Ensure mount point is clean
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Cleaning up existing mount before deployment"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    fi
+    
     if ! mount_for_operation "deployment"; then
         die "Cannot mount for deployment"
     fi
@@ -2192,13 +2218,21 @@ main() {
         trap - ERR
         set +e
         
+        # Ensure mount point is clean
+        if is_mounted "$MOUNT_DIR"; then
+            log_verbose "Cleaning up existing mount before cleanup"
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        fi
+        
         if mount_for_operation "manual cleanup"; then
             cleanup_old_backups
-            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR"
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        else
+            log_verbose "Could not mount for cleanup, skipping backup cleanup"
         fi
         cleanup_downloads
         
-        set -e
+        log_success "Manual cleanup complete"
         exit 0
     fi
     

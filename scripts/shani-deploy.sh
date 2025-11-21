@@ -698,6 +698,7 @@ download_with_tool() {
             if (( resume_supported )); then
                 wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
             else
+                rm -f "$output"
                 wget "${wget_base_opts[@]}" -O "$output" "$url"
             fi
             ;;
@@ -715,6 +716,16 @@ download_with_tool() {
 download_file() {
     local url="${1:-}" output="${2:-}" is_small="${3:-0}"
     [[ -n "$url" && -n "$output" ]] || return 1
+    
+    # Check available space for large downloads
+    if (( !is_small )); then
+        local output_dir=$(dirname "$output")
+        local avail_mb=$(( $(df --output=avail "$output_dir" 2>/dev/null | tail -1) / 1024 ))
+        if (( avail_mb < MIN_FREE_SPACE_MB )); then
+            log_error "Insufficient space in $output_dir: ${avail_mb}MB < ${MIN_FREE_SPACE_MB}MB"
+            return 1
+        fi
+    fi
     
     mkdir -p "$(dirname "$output")"
     

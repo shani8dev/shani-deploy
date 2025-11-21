@@ -2226,17 +2226,20 @@ main() {
         trap - ERR
         set +e
         
+        local maintenance_failed=0
+        
         if mount_for_operation "maintenance"; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
-                cleanup_old_backups
+                cleanup_old_backups || log_verbose "Backup cleanup had warnings"
             fi
-            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR"
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || maintenance_failed=1
+        else
+            log_verbose "Could not mount for maintenance"
         fi
         
-        analyze_storage
+        analyze_storage || log_verbose "Storage analysis had warnings"
         
         set -e
-        trap 'restore_candidate' ERR
         
         log_success "Maintenance complete"
         exit 0
@@ -2258,6 +2261,7 @@ main() {
     
     log_success "Update process complete"
     log "Reboot to activate new system on @${CANDIDATE_SLOT}"
+    exit 0
 }
 
 main "$@"

@@ -332,6 +332,110 @@ is_correct_mount() {
     return 0
 }
 
+safe_umount() {
+    local tgt="${1:-}"
+    [[ -n "$tgt" ]] || return 1
+    
+    # Check if not mounted - skip gracefully
+    if ! is_mounted "$tgt"; then
+        log_verbose "Not mounted (skipping unmount): $tgt"
+        return 0
+    fi
+    
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[DRY-RUN] Would unmount: $tgt"
+        return 0
+    fi
+    
+    local attempt=0
+    local max_attempts=3
+    
+    while (( attempt < max_attempts )); do
+        ((attempt++))
+        
+        if umount -R "$tgt" 2>/dev/null; then
+            log_verbose "Unmounted: $tgt (attempt $attempt)"
+            return 0
+        fi
+        
+        # Verify it's actually unmounted (might have succeeded despite error)
+        if ! is_mounted "$tgt"; then
+            log_verbose "Mount disappeared: $tgt"
+            return 0
+        fi
+        
+        if (( attempt < max_attempts )); then
+            log_verbose "Unmount retry $attempt/$max_attempts: $tgt"
+            sleep 1
+        fi
+    done
+    
+    # Try lazy unmount as last resort
+    if umount -l "$tgt" 2>/dev/null; then
+        log_warn "Lazy unmount used: $tgt"
+        return 0
+    fi
+    
+    # Final check - maybe it unmounted anyway
+    if ! is_mounted "$tgt"; then
+        log_verbose "Mount eventually cleared: $tgt"
+        return 0
+    fi
+    
+    log_warn "Failed to unmount: $tgt"
+    return 1
+}
+
+force_umount_all() {
+    local base_dir="${1:-}"
+    [[ -n "$base_dir" ]] || return 1
+    
+    log_verbose "Force unmounting all under: $base_dir"
+    
+    # Check if base_dir itself is even mounted
+    if ! is_mounted "$base_dir"; then
+        log_verbose "Base directory not mounted (skipping): $base_dir"
+        return 0
+    fi
+    
+    local -a mounts
+    mapfile -t mounts < <(
+        findmnt -R -o TARGET -n "$base_dir" 2>/dev/null | sort -r || true
+    )
+    
+    if [[ ${#mounts[@]} -eq 0 ]]; then
+        log_verbose "No mounts found under: $base_dir"
+        # Double-check if base is mounted
+        if ! is_mounted "$base_dir"; then
+            return 0
+        fi
+        # Only base is mounted, add it to array
+        mounts=("$base_dir")
+    fi
+    
+    for mount in "${mounts[@]}"; do
+        [[ -n "$mount" ]] || continue
+        safe_umount "$mount" || log_verbose "Could not unmount: $mount"
+    done
+    
+    # Final verification
+    if ! is_mounted "$base_dir"; then
+        log_verbose "All mounts cleared under: $base_dir"
+        return 0
+    fi
+    
+    log_warn "Base mount still exists after cleanup: $base_dir"
+    umount -fl "$base_dir" 2>/dev/null || true
+    
+    # One more check
+    if ! is_mounted "$base_dir"; then
+        log_verbose "Forced unmount successful: $base_dir"
+        return 0
+    fi
+    
+    return 1
+}
+
 safe_mount() {
     local src="$1" tgt="$2" opts="${3:-defaults}"
     
@@ -1369,6 +1473,13 @@ cleanup_chroot() {
     log_verbose "Cleaning chroot"
     
     set +e
+    
+    # Check if there's anything to clean up
+    if ! is_mounted "$MOUNT_DIR"; then
+        log_verbose "Chroot not mounted (skipping cleanup)"
+        set -e
+        return 0
+    fi
     
     force_umount_all "$MOUNT_DIR"
     

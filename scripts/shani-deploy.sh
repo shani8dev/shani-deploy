@@ -353,36 +353,34 @@ safe_umount() {
     while (( attempt < max_attempts )); do
         ((attempt++))
         
-        if umount -R "$tgt" 2>/dev/null; then
-            log_verbose "Unmounted: $tgt (attempt $attempt)"
-            return 0
-        fi
+        # Try to unmount, but don't fail on error immediately
+        umount -R "$tgt" 2>/dev/null
+        local umount_status=$?
         
-        # Verify it's actually unmounted (might have succeeded despite error)
+        # CRITICAL: Check if mount actually disappeared, regardless of exit status
         if ! is_mounted "$tgt"; then
-            log_verbose "Mount disappeared: $tgt"
+            log_verbose "Unmounted: $tgt (attempt $attempt, status: $umount_status)"
             return 0
         fi
         
+        # Mount still exists, log and retry
         if (( attempt < max_attempts )); then
-            log_verbose "Unmount retry $attempt/$max_attempts: $tgt"
+            log_verbose "Unmount retry $attempt/$max_attempts: $tgt (mount persists)"
             sleep 1
         fi
     done
     
     # Try lazy unmount as last resort
-    if umount -l "$tgt" 2>/dev/null; then
-        log_warn "Lazy unmount used: $tgt"
-        return 0
-    fi
+    umount -l "$tgt" 2>/dev/null
+    sleep 0.5  # Give lazy unmount a moment
     
-    # Final check - maybe it unmounted anyway
+    # Final check
     if ! is_mounted "$tgt"; then
-        log_verbose "Mount eventually cleared: $tgt"
+        log_warn "Lazy unmount succeeded: $tgt"
         return 0
     fi
     
-    log_warn "Failed to unmount: $tgt"
+    log_warn "Failed to unmount after all attempts: $tgt"
     return 1
 }
 
@@ -413,26 +411,59 @@ force_umount_all() {
         mounts=("$base_dir")
     fi
     
+    # Try normal unmount for all mounts
     for mount in "${mounts[@]}"; do
         [[ -n "$mount" ]] || continue
         safe_umount "$mount" || log_verbose "Could not unmount: $mount"
     done
     
-    # Final verification
+    # Final verification - don't fail if base is actually unmounted
     if ! is_mounted "$base_dir"; then
         log_verbose "All mounts cleared under: $base_dir"
         return 0
     fi
     
+    # Base still mounted, try force
     log_warn "Base mount still exists after cleanup: $base_dir"
-    umount -fl "$base_dir" 2>/dev/null || true
+    umount -fl "$base_dir" 2>/dev/null
+    sleep 0.5
     
-    # One more check
+    # One more check - succeed if it's actually gone
     if ! is_mounted "$base_dir"; then
         log_verbose "Forced unmount successful: $base_dir"
         return 0
     fi
     
+    log_warn "Mount persists after forced unmount: $base_dir"
+    return 1
+}
+
+safe_mkdir() {
+    local dir="${1:-}"
+    [[ -n "$dir" ]] || return 1
+    
+    # Already exists - success
+    if [[ -d "$dir" ]]; then
+        return 0
+    fi
+    
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[DRY-RUN] Would create directory: $dir"
+        return 0
+    fi
+    
+    # Try to create
+    if mkdir -p "$dir" 2>/dev/null; then
+        return 0
+    fi
+    
+    # Failed - check if it appeared anyway (race condition)
+    if [[ -d "$dir" ]]; then
+        log_verbose "Directory appeared during creation: $dir"
+        return 0
+    fi
+    
+    log_verbose "Failed to create directory: $dir"
     return 1
 }
 
@@ -458,7 +489,11 @@ safe_mount() {
         fi
     fi
     
-    mkdir -p "$tgt" 2>/dev/null || true
+    # Create mount point if needed
+    if ! safe_mkdir "$tgt"; then
+        log_error "Cannot create mount point: $tgt"
+        return 1
+    fi
     
     log_verbose "Mounting: $src -> $tgt (opts: $opts)"
     if ! run_cmd mount -o "$opts" "$src" "$tgt"; then
@@ -471,7 +506,7 @@ safe_mount() {
 
 mount_for_operation() {
     local operation="${1:-unknown}"
-    local required_subvol="${2:-}"  # Optional: specific subvolume needed
+    local required_subvol="${2:-}"
     
     # Check if already mounted
     if is_mounted "$MOUNT_DIR"; then
@@ -494,14 +529,13 @@ mount_for_operation() {
                 fi
             fi
         else
-            # No specific subvolume required, existing mount is fine
             log_verbose "Using existing mount for $operation"
             return 0
         fi
     fi
     
-    # Need to mount
-    if ! mkdir -p "$MOUNT_DIR" 2>/dev/null; then
+    # Need to mount - ensure directory exists
+    if ! safe_mkdir "$MOUNT_DIR"; then
         log_error "Cannot create mount directory"
         return 1
     fi
@@ -522,6 +556,7 @@ mount_for_operation() {
         return 1
     fi
     
+    # Verify mount succeeded
     if ! is_mounted "$MOUNT_DIR"; then
         log_error "Mount verification failed for $operation"
         return 1
@@ -751,7 +786,7 @@ get_mirror_url() {
         if validate_mirror "$full_url"; then
             local mirror_host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|')
             log_success "Mirror validated: $mirror_host"
-            mkdir -p "$DOWNLOAD_DIR" 2>/dev/null || true
+            safe_mkdir "$DOWNLOAD_DIR" 2>/dev/null || true
             echo "$base_url" > "$mirror_cache" 2>/dev/null || true
             echo "$full_url"
             return 0
@@ -895,7 +930,7 @@ download_file() {
         fi
     fi
     
-    mkdir -p "$(dirname "$output")" 2>/dev/null || true
+    safe_mkdir "$(dirname "$output")" 2>/dev/null || true
     
     if (( is_small )); then
         local temp_output="${output}.tmp"
@@ -1355,7 +1390,7 @@ analyze_storage() {
     log "This may take several minutes depending on data size..."
     echo ""
 
-    mkdir -p "$MOUNT_DIR/@data" 2>/dev/null || true
+    safe_mkdir "$MOUNT_DIR/@data" 2>/dev/null || true
 
     local dedupe_start
     dedupe_start=$(date +%s)
@@ -1415,7 +1450,7 @@ prepare_chroot() {
     validate_nonempty "$slot" "slot"
     log_verbose "Preparing chroot: @${slot}"
     
-    mkdir -p "$MOUNT_DIR" 2>/dev/null || true
+    safe_mkdir "$MOUNT_DIR" || die "Cannot create mount directory"
     
     # Mount root with specific subvolume
     if ! is_correct_mount "$MOUNT_DIR" "$ROOT_DEV" "subvol=@${slot}"; then
@@ -1423,7 +1458,7 @@ prepare_chroot() {
     fi
     
     # EFI partition
-    mkdir -p "$MOUNT_DIR/boot/efi" 2>/dev/null || true
+    safe_mkdir "$MOUNT_DIR/boot/efi" || return 1
     if ! is_mounted "$MOUNT_DIR/boot/efi"; then
         if mountpoint -q /boot/efi 2>/dev/null; then
             run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi" || return 1
@@ -1436,7 +1471,11 @@ prepare_chroot() {
     
     # Static directories (data, etc, var)
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
-        mkdir -p "$MOUNT_DIR/$dir" 2>/dev/null || true
+        safe_mkdir "$MOUNT_DIR/$dir" || {
+            log_error "Cannot create directory in chroot: $dir"
+            return 1
+        }
+        
         if ! is_correct_mount "$MOUNT_DIR/$dir" "/$dir"; then
             run_cmd mount --bind "/$dir" "$MOUNT_DIR/$dir" || return 1
         else
@@ -1444,9 +1483,13 @@ prepare_chroot() {
         fi
     done
     
-    # Bind mounts (dev, proc, sys, etc)
+    # Bind mounts (dev, proc, sys, run, tmp)
     for d in "${CHROOT_BIND_DIRS[@]}"; do
-        mkdir -p "$MOUNT_DIR$d" 2>/dev/null || true
+        safe_mkdir "$MOUNT_DIR$d" || {
+            log_error "Cannot create bind mount point: $d"
+            return 1
+        }
+        
         if ! is_correct_mount "$MOUNT_DIR$d" "$d"; then
             run_cmd mount --bind "$d" "$MOUNT_DIR$d" || return 1
         else
@@ -1454,14 +1497,20 @@ prepare_chroot() {
         fi
     done
     
-    # EFI variables
+    # EFI variables (optional, non-critical)
     if [[ -d /sys/firmware/efi/efivars ]]; then
-        mkdir -p "$MOUNT_DIR/sys/firmware/efi/efivars" 2>/dev/null || true
-        if ! is_mounted "$MOUNT_DIR/sys/firmware/efi/efivars"; then
-            run_cmd mount --bind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars" || \
-                log_verbose "Could not mount efivars (non-critical)"
+        if safe_mkdir "$MOUNT_DIR/sys/firmware/efi/efivars"; then
+            if ! is_mounted "$MOUNT_DIR/sys/firmware/efi/efivars"; then
+                if run_cmd mount --bind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars"; then
+                    log_verbose "efivars mounted in chroot"
+                else
+                    log_verbose "Could not mount efivars (non-critical)"
+                fi
+            else
+                log_verbose "efivars already mounted in chroot"
+            fi
         else
-            log_verbose "efivars already mounted in chroot"
+            log_verbose "Could not create efivars directory (non-critical)"
         fi
     fi
     
@@ -1765,9 +1814,9 @@ verify_and_create_filesystem_structure() {
                     
                 data)
                     if [[ "${DRY_RUN}" != "yes" ]]; then
-                        mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work} 2>/dev/null || \
+                        safe_mkdir "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work} 2>/dev/null || \
                             log_warn "Could not create overlay directories (non-critical)"
-                        mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
+                        safe_mkdir "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
                             log_warn "Could not create downloads directory (non-critical)"
                         
                         if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
@@ -1804,7 +1853,7 @@ verify_and_create_filesystem_structure() {
                 log "[DRY-RUN] Would create: $dir"
                 ((created++))
             else
-                if mkdir -p "$full_path" 2>/dev/null; then
+                if safe_mkdir "$full_path" 2>/dev/null; then
                     log_verbose "Created: $dir"
                     ((created++))
                 else
@@ -1838,7 +1887,7 @@ validate_boot() {
             CURRENT_SLOT="blue"
         fi
         
-        mkdir -p /data 2>/dev/null || true
+        safe_mkdir /data 2>/dev/null || true
         echo "$CURRENT_SLOT" > /data/current-slot 2>/dev/null || true
         log "Corrected: $CURRENT_SLOT"
     fi
@@ -1876,7 +1925,7 @@ check_space() {
     fi
     
     log_success "Sufficient"
-    run_cmd mkdir -p "$DOWNLOAD_DIR"
+    safe_mkdir "$DOWNLOAD_DIR" || die "Cannot create download directory"
 }
 
 fetch_update() {
@@ -2267,7 +2316,7 @@ finalize_update() {
     fi
     
     # CRITICAL: Update slot markers first
-    mkdir -p /data 2>/dev/null || true
+    safe_mkdir /data 2>/dev/null || true
     if ! echo "$CURRENT_SLOT" > /data/previous-slot 2>/dev/null; then
         log_error "Failed to write previous-slot marker"
         die "Cannot update slot markers (critical)"

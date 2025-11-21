@@ -1027,12 +1027,10 @@ inhibit_system() {
 cleanup_old_backups() {
     log_verbose "Cleaning backups"
 
-    local original_e_state=$-
     set +e
     
     if ! is_mounted "$MOUNT_DIR"; then
         log_verbose "Mount point not available, skipping backup cleanup"
-        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
 
@@ -1084,7 +1082,6 @@ cleanup_old_backups() {
         fi
     done
 
-    [[ $original_e_state =~ e ]] && set -e || true
     return 0
 }
 
@@ -1145,24 +1142,22 @@ cleanup_downloads() {
 }
 
 analyze_storage() {
-    local original_e_state=$-
     set +e
     
     log_section "Storage Analysis"
 
     if [[ -f "$DEPLOY_PENDING" ]]; then
         log_warn "Deployment pending, skipping storage analysis"
-        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
 
     if ! mount_for_operation "storage analysis"; then
         log_verbose "Cannot mount for storage analysis, skipping"
-        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
     
-    trap 'force_umount_all "$MOUNT_DIR" 2>/dev/null || true' RETURN
+    # Set up cleanup that won't fail
+    trap 'force_umount_all "$MOUNT_DIR" 2>/dev/null; true' RETURN
 
     local -a check_subvols=(blue green data swap)
 
@@ -1195,7 +1190,6 @@ analyze_storage() {
        ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
         log_verbose "Skipping deduplication (missing required subvolumes)"
         echo ""
-        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
 
@@ -1261,7 +1255,7 @@ analyze_storage() {
 
     echo ""
     
-    [[ $original_e_state =~ e ]] && set -e || true
+    # Explicitly return success
     return 0
 }
 
@@ -2228,24 +2222,32 @@ main() {
         
         # Disable ERR trap and error exit for maintenance
         trap - ERR
-        local original_e_state=$-
         set +e
         
+        log_verbose "Starting maintenance mount..."
         if mount_for_operation "maintenance"; then
+            log_verbose "Mount successful, checking subvolumes..."
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
+                log_verbose "Running cleanup_old_backups..."
                 cleanup_old_backups
+                log_verbose "Cleanup complete"
+            else
+                log_verbose "Subvolumes not ready for cleanup"
             fi
+            log_verbose "Unmounting..."
             safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+            log_verbose "Unmount complete"
         else
-            log_verbose "Could not mount for maintenance, skipping"
+            log_verbose "Could not mount for maintenance, skipping cleanup"
         fi
         
+        log_verbose "Starting storage analysis..."
         analyze_storage
-        
-        # Restore error handling state if it was enabled
-        [[ $original_e_state =~ e ]] && set -e || true
+        log_verbose "Storage analysis complete"
         
         log_success "Maintenance complete"
+        
+        # Explicitly exit with success
         exit 0
     fi
     

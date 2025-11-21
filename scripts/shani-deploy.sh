@@ -688,7 +688,7 @@ download_file() {
     
     for tool in "${downloaders[@]}"; do
         log_verbose "Trying $tool..."
-        if download_with_tool "$tool" "$output" "$url"; then
+        if download_with_tool "$tool" "$url" "$output"; then
             # Verify download produced a file
             if [[ -f "$output" ]] && [[ -s "$output" ]]; then
                 return 0

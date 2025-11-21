@@ -1027,11 +1027,12 @@ inhibit_system() {
 cleanup_old_backups() {
     log_verbose "Cleaning backups"
 
+    local original_e_state=$-
     set +e
     
     if ! is_mounted "$MOUNT_DIR"; then
         log_verbose "Mount point not available, skipping backup cleanup"
-        set -e
+        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
 
@@ -1083,7 +1084,7 @@ cleanup_old_backups() {
         fi
     done
 
-    set -e
+    [[ $original_e_state =~ e ]] && set -e || true
     return 0
 }
 
@@ -1144,19 +1145,21 @@ cleanup_downloads() {
 }
 
 analyze_storage() {
+    local original_e_state=$-
     set +e
     
     log_section "Storage Analysis"
 
     if [[ -f "$DEPLOY_PENDING" ]]; then
         log_warn "Deployment pending, skipping storage analysis"
-        set -e
+        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
 
     if ! mount_for_operation "storage analysis"; then
-        set -e
-        return 1
+        log_verbose "Cannot mount for storage analysis, skipping"
+        [[ $original_e_state =~ e ]] && set -e || true
+        return 0
     fi
     
     trap 'force_umount_all "$MOUNT_DIR" 2>/dev/null || true' RETURN
@@ -1192,7 +1195,7 @@ analyze_storage() {
        ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
         log_verbose "Skipping deduplication (missing required subvolumes)"
         echo ""
-        set -e
+        [[ $original_e_state =~ e ]] && set -e || true
         return 0
     fi
 
@@ -1258,7 +1261,7 @@ analyze_storage() {
 
     echo ""
     
-    set -e
+    [[ $original_e_state =~ e ]] && set -e || true
     return 0
 }
 
@@ -2223,23 +2226,24 @@ main() {
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
         log "No deployment needed, running maintenance tasks"
         
+        # Disable ERR trap and error exit for maintenance
         trap - ERR
+        local original_e_state=$-
         set +e
-        
-        local maintenance_failed=0
         
         if mount_for_operation "maintenance"; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
-                cleanup_old_backups || log_verbose "Backup cleanup had warnings"
+                cleanup_old_backups
             fi
-            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || maintenance_failed=1
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
         else
-            log_verbose "Could not mount for maintenance"
+            log_verbose "Could not mount for maintenance, skipping"
         fi
         
-        analyze_storage || log_verbose "Storage analysis had warnings"
+        analyze_storage
         
-        set -e
+        # Restore error handling state if it was enabled
+        [[ $original_e_state =~ e ]] && set -e || true
         
         log_success "Maintenance complete"
         exit 0

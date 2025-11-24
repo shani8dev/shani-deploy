@@ -317,29 +317,78 @@ get_btrfs_available_mb() {
 ### Mirror Discovery              ###
 #####################################
 
+
 get_remote_file_size() {
     local url="$1"
     local size=0
     
     if (( HAS_CURL )); then
-        size=$(timeout 20 curl -sI \
-            --connect-timeout 8 \
-            --max-time 15 \
-            --location \
+        # Use -L to follow redirects, increase max redirects and timeouts
+        size=$(timeout 30 curl -sIL \
+            --connect-timeout 10 \
+            --max-time 25 \
+            --max-redirs 20 \
             "$url" 2>/dev/null | \
             grep -i "^content-length:" | \
             tail -1 | \
             awk '{print $2}' | \
             tr -d '\r\n ' || echo "0")
+        
+        # If we got a small size, it might be a redirect page - try with range request
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 10000 )); then
+            log_verbose "Got small size ($size), retrying with range request..."
+            local range_size
+            range_size=$(timeout 30 curl -sI \
+                --connect-timeout 10 \
+                --max-time 25 \
+                --max-redirs 20 \
+                --location \
+                -r 0-0 \
+                "$url" 2>/dev/null | \
+                grep -i "^content-range:" | \
+                awk -F'/' '{print $2}' | \
+                tr -d '\r\n ' || echo "0")
+            
+            if [[ "$range_size" =~ ^[0-9]+$ ]] && (( range_size > size )); then
+                log_verbose "Range request got better size: $range_size"
+                size="$range_size"
+            fi
+        fi
+        
     elif (( HAS_WGET )); then
-        size=$(timeout 20 wget -q --spider -S \
-            --timeout=15 \
+        # wget follows redirects by default, increase max redirects
+        size=$(timeout 30 wget -q --spider -S \
+            --max-redirect=20 \
+            --timeout=20 \
             --tries=1 \
             "$url" 2>&1 | \
             grep -i "^  Content-Length:" | \
             tail -1 | \
             awk '{print $2}' | \
             tr -d '\r\n ' || echo "0")
+        
+        # Try range request if size seems wrong
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 10000 )); then
+            log_verbose "Got small size ($size), retrying with range request..."
+            local range_output
+            range_output=$(timeout 30 wget -q --spider -S \
+                --max-redirect=20 \
+                --timeout=20 \
+                --tries=1 \
+                --header="Range: bytes=0-0" \
+                "$url" 2>&1 || echo "")
+            
+            local range_size
+            range_size=$(echo "$range_output" | \
+                grep -i "^  Content-Range:" | \
+                awk -F'/' '{print $2}' | \
+                tr -d '\r\n ' || echo "0")
+            
+            if [[ "$range_size" =~ ^[0-9]+$ ]] && (( range_size > size )); then
+                log_verbose "Range request got better size: $range_size"
+                size="$range_size"
+            fi
+        fi
     fi
     
     # Validate size is numeric and positive

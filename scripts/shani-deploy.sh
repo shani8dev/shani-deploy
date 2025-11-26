@@ -638,22 +638,24 @@ download_with_tool() {
     
     case "$tool" in
         aria2c)
-            # Always enable resume - aria2c will handle it gracefully
+            # aria2c with explicit resume support
             aria2c \
                 --max-connection-per-server=1 --split=1 \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
                 --conditional-get=true --remote-time=true \
-                --timeout=30 --max-tries=3 --retry-wait=3 \
+                --timeout=60 --max-tries=5 --retry-wait=5 \
                 --console-log-level=error --summary-interval=0 \
+                --max-resume-failure-tries=10 \
                 --dir="$(dirname "$output")" --out="$(basename "$output")" \
                 "$url"
             ;;
         wget)
-            # Always enable resume - wget will handle it gracefully
+            # wget with explicit resume
             wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
             ;;
         curl)
-            curl --fail --location --max-time 300 --retry 3 --retry-delay 3 \
+            # curl with resume support
+            curl --fail --location --max-time 600 --retry 5 --retry-delay 5 \
                 --continue-at - --output "$output" \
                 --progress-bar --remote-time "$url"
             ;;
@@ -693,10 +695,10 @@ download_file() {
         return 1
     fi
     
-    # Large files - try downloaders in order
+    # Large files - intelligent retry with resume
     local -a downloaders=()
-    (( HAS_WGET )) && downloaders+=(wget)
     (( HAS_ARIA2C )) && downloaders+=(aria2c)
+    (( HAS_WGET )) && downloaders+=(wget)
     (( HAS_CURL )) && downloaders+=(curl)
     
     if [[ ${#downloaders[@]} -eq 0 ]]; then
@@ -704,20 +706,61 @@ download_file() {
         return 1
     fi
     
+    # Try each tool multiple times before giving up
+    local max_tool_attempts=3
+    
     for tool in "${downloaders[@]}"; do
-        log_verbose "Attempting $tool..."
-        if download_with_tool "$tool" "$url" "$output"; then
-            if [[ -f "$output" ]] && [[ -s "$output" ]]; then
-                log_verbose "$tool succeeded"
-                return 0
-            else
-                log_verbose "$tool completed but no valid output"
-                rm -f "$output"
+        local attempt=0
+        
+        while (( attempt < max_tool_attempts )); do
+            ((attempt++))
+            log_verbose "Attempting $tool (try ${attempt}/${max_tool_attempts})..."
+            
+            # Check if we have a partial download
+            if [[ -f "$output" ]]; then
+                local current_size=$(get_file_size "$output")
+                if (( current_size > 0 )); then
+                    log_verbose "Resuming from $(format_bytes $current_size)"
+                fi
             fi
-        fi
-        log_verbose "$tool failed, trying next"
+            
+            if download_with_tool "$tool" "$url" "$output"; then
+                if [[ -f "$output" ]] && [[ -s "$output" ]]; then
+                    log_verbose "$tool succeeded"
+                    # Clean up control files on success
+                    rm -f "${output}.aria2" "${output}.tmp"
+                    return 0
+                else
+                    log_verbose "$tool completed but no valid output"
+                fi
+            fi
+            
+            # Check if we made progress
+            if [[ -f "$output" ]]; then
+                local new_size=$(get_file_size "$output")
+                if (( new_size > 0 )); then
+                    log_verbose "Progress: $(format_bytes $new_size)"
+                    # If we have partial data, retry with same tool
+                    if (( attempt < max_tool_attempts )); then
+                        log_verbose "Retrying with $tool to resume..."
+                        sleep 3
+                        continue
+                    fi
+                fi
+            fi
+            
+            # If no progress and more attempts left, try again
+            if (( attempt < max_tool_attempts )); then
+                log_verbose "$tool attempt ${attempt} failed, retrying..."
+                sleep 5
+            fi
+        done
+        
+        log_verbose "$tool exhausted all attempts, trying next tool"
     done
     
+    # All tools failed
+    log_error "All download tools failed"
     return 1
 }
 
@@ -1443,8 +1486,7 @@ download_update() {
         rm -f "$marker" "$image" "$sha" "$asc" "${image}.aria2"
     fi
     
-    # DON'T remove .aria2 control files - needed for resume
-    # Only clean orphaned temp files
+    # Keep control files for resume - only clean orphaned temp files
     rm -f "${image}.tmp"
     
     [[ "${DRY_RUN}" == "yes" ]] && return 0
@@ -1467,51 +1509,71 @@ download_update() {
     (( expected_size > 0 )) && log "Expected: $(format_bytes $expected_size)"
     
     # Check for existing partial download
+    local resume_from=0
     if [[ -f "$image" ]]; then
         local current_size=$(get_file_size "$image")
         if (( current_size > 0 )); then
             log "Found partial download: $(format_bytes $current_size)"
-            # Only clean if larger than expected (corrupted)
-            if (( expected_size > 0 && current_size > expected_size )); then
-                log_warn "Partial download larger than expected, starting fresh"
-                rm -f "$image" "${image}.aria2"
+            
+            # Validate partial download
+            if (( expected_size > 0 )); then
+                if (( current_size >= expected_size )); then
+                    log "Partial download complete or larger, will verify"
+                elif (( current_size < expected_size )); then
+                    log "Will resume from $(format_bytes $current_size)"
+                    resume_from=$current_size
+                fi
+            else
+                log "Cannot determine expected size, will attempt resume"
+                resume_from=$current_size
             fi
         fi
     fi
     
-    # Download with retries
-    local attempt=0 delay=5 download_success=0 mirror_failed=0
+    # Download with comprehensive retry logic
+    local global_attempt=0
+    local max_global_attempts=5
+    local download_success=0
     local current_mirror="$mirror_url"
     
-    while (( attempt < MAX_DOWNLOAD_ATTEMPTS )); do
-        ((attempt++))
-        log "Download attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}"
+    while (( global_attempt < max_global_attempts )); do
+        ((global_attempt++))
+        log "Download attempt ${global_attempt}/${max_global_attempts}"
         
         if download_file "$mirror_url" "$image" 0; then
             if [[ ! -f "$image" ]] || [[ ! -s "$image" ]]; then
-                log_verbose "Download produced no file"
-                mirror_failed=1
+                log_warn "Download produced no file"
+                sleep 5
                 continue
             fi
             
             local current_size=$(get_file_size "$image")
             log_verbose "Downloaded: $(format_bytes $current_size)"
             
-            if (( expected_size > 0 && current_size < expected_size )); then
-                log_verbose "File incomplete: $(format_bytes $current_size) < $(format_bytes $expected_size)"
-                continue
+            # Check if download is complete
+            if (( expected_size > 0 )); then
+                if (( current_size < expected_size )); then
+                    log_warn "Download incomplete: $(format_bytes $current_size) / $(format_bytes $expected_size)"
+                    log "Will retry to resume..."
+                    sleep 5
+                    continue
+                elif (( current_size > expected_size )); then
+                    log_error "Download too large: $(format_bytes $current_size) > $(format_bytes $expected_size)"
+                    rm -f "$image" "${image}.aria2"
+                    sleep 5
+                    continue
+                fi
             fi
             
             download_success=1
             log_success "Downloaded: $(format_bytes $current_size)"
             break
-        else
-            log_verbose "Download failed"
-            mirror_failed=1
         fi
         
-        # Rediscover mirror every 2 failures
-        if (( mirror_failed && attempt % 2 == 0 && attempt < MAX_DOWNLOAD_ATTEMPTS )); then
+        log_warn "Download attempt ${global_attempt} failed"
+        
+        # Try mirror rediscovery every 2 failures
+        if (( global_attempt % 2 == 0 && global_attempt < max_global_attempts )); then
             log "Rediscovering mirror..."
             rm -f "$DOWNLOAD_DIR/mirror.url"
             
@@ -1520,31 +1582,27 @@ download_update() {
             new_mirror=$(echo "$new_mirror" | tail -1 | tr -d '\r\n' | xargs)
             
             if [[ -n "$new_mirror" && "$new_mirror" =~ ^https?://[a-zA-Z0-9] ]]; then
-                # If mirror changed, start fresh
                 if [[ "$new_mirror" != "$current_mirror" ]]; then
-                    log "Switched to new mirror, starting fresh"
-                    rm -f "$image" "${image}.aria2"
+                    log "Switched to new mirror"
                     current_mirror="$new_mirror"
                 fi
-                
                 mirror_url="$new_mirror"
                 expected_size=$(get_remote_file_size "$mirror_url")
-                mirror_failed=0
             else
-                log_warn "Mirror rediscovery failed"
+                log_warn "Mirror rediscovery failed, using current"
             fi
         fi
         
-        if (( attempt < MAX_DOWNLOAD_ATTEMPTS )); then
+        if (( global_attempt < max_global_attempts )); then
+            local delay=$((5 + global_attempt * 5))
             log "Retrying in ${delay}s..."
             sleep "$delay"
-            delay=$(( delay < 60 ? delay * 2 : 60 ))
         fi
     done
     
     if [[ $download_success -eq 0 ]]; then
         rm -f "$image" "${image}.aria2"
-        die "Download failed after $MAX_DOWNLOAD_ATTEMPTS attempts"
+        die "Download failed after $max_global_attempts attempts"
     fi
     
     validate_download "$image" "$expected_size" || { 
@@ -1567,6 +1625,7 @@ download_update() {
         die "Verification failed"
     }
     
+    # Clean up all control files on successful verification
     rm -f "$DOWNLOAD_DIR/mirror.url" "${image}.aria2"
     touch "$marker"
     log_success "Download and verification complete"

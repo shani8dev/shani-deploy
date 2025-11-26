@@ -695,8 +695,8 @@ download_file() {
     
     # Large files - try downloaders in order
     local -a downloaders=()
-    (( HAS_ARIA2C )) && downloaders+=(aria2c)
     (( HAS_WGET )) && downloaders+=(wget)
+    (( HAS_ARIA2C )) && downloaders+=(aria2c)
     (( HAS_CURL )) && downloaders+=(curl)
     
     if [[ ${#downloaders[@]} -eq 0 ]]; then

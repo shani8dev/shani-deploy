@@ -577,7 +577,7 @@ get_mirror_url() {
 #####################################
 
 validate_download() {
-    local file="$1" expected_size="${2:-0}"
+    local file="$1" expected_size="${2:-0}" is_final="${3:-1}"
     
     [[ -f "$file" ]] || { log_error "File not found: $file"; return 1; }
     
@@ -595,21 +595,29 @@ validate_download() {
         return 1
     fi
     
-    # CRITICAL: Check for sparse/incomplete files
-    # Use 'du' to get actual disk usage vs apparent size
+    # Get actual disk usage
     local disk_usage
     disk_usage=$(du -b "$file" 2>/dev/null | awk '{print $1}')
     
     if (( disk_usage > 0 )); then
         local usage_ratio=$((disk_usage * 100 / size))
+        log_verbose "Disk usage: $(format_bytes $disk_usage) / $(format_bytes $size) (${usage_ratio}%)"
         
-        # If disk usage is less than 50% of file size, it's likely sparse/incomplete
-        if (( usage_ratio < 50 )); then
-            log_error "File appears sparse/incomplete: $(format_bytes $disk_usage) actual vs $(format_bytes $size) apparent"
+        # ONLY check for sparse files if this is a final validation
+        # (i.e., download tool claims to be done)
+        if (( is_final )); then
+            # If expected size matches but actual data is sparse, file is preallocated
+            if (( expected_size > 0 && size == expected_size && usage_ratio < 50 )); then
+                log_error "File appears preallocated but incomplete: $(format_bytes $disk_usage) actual vs $(format_bytes $size) apparent"
+                return 1
+            fi
+        fi
+    else
+        # Zero disk usage = completely preallocated
+        if (( size > 0 )); then
+            log_error "File is completely preallocated (0 bytes written)"
             return 1
         fi
-        
-        log_verbose "Disk usage: $(format_bytes $disk_usage) / $(format_bytes $size) (${usage_ratio}%)"
     fi
     
     # Check for aria2c control files (indicates incomplete download)
@@ -624,20 +632,22 @@ validate_download() {
         return 1
     fi
     
-    # Validate zstd files with actual decompression test
+    # Validate zstd files - ONLY run full integrity check if final validation
     if [[ "$file" == *.zst ]]; then
         if ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
             log_warn "File extension .zst but wrong content type"
             return 1
         fi
         
-        # Test actual decompression of first chunk
-        log_verbose "Testing zstd integrity..."
-        if ! timeout 10 zstd -t "$file" 2>/dev/null; then
-            log_error "zstd integrity test failed"
-            return 1
+        # Only run full integrity test on final validation
+        if (( is_final )); then
+            log_verbose "Testing zstd integrity..."
+            if ! timeout 10 zstd -t "$file" 2>/dev/null; then
+                log_error "zstd integrity test failed"
+                return 1
+            fi
+            log_verbose "zstd integrity: OK"
         fi
-        log_verbose "zstd integrity: OK"
     fi
     
     log_verbose "Validation passed: $(format_bytes $size)"
@@ -749,38 +759,37 @@ download_file() {
             ((attempt++))
             log_verbose "Attempting $tool (try ${attempt}/${max_tool_attempts})..."
             
-            # Check for preallocated/sparse file and remove if found
+            # Check existing file state before download
             if [[ -f "$output" ]]; then
                 local current_size=$(get_file_size "$output")
                 local disk_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
                 
                 if (( current_size > 0 && disk_usage == 0 )); then
-                    log_verbose "Removing preallocated empty file"
+                    # Completely preallocated, no real data
+                    log_verbose "Removing completely preallocated file"
                     rm -f "$output" "${output}.aria2"
                 elif (( current_size > 0 )); then
                     local usage_ratio=$((disk_usage * 100 / current_size))
+                    log_verbose "Found partial: $(format_bytes $disk_usage) actual / $(format_bytes $current_size) apparent (${usage_ratio}%)"
                     
-                    # Remove sparse files (less than 50% written)
-                    if (( usage_ratio < 50 )); then
-                        log_verbose "Removing sparse file (${usage_ratio}% written)"
-                        rm -f "$output" "${output}.aria2"
-                    else
-                        log_verbose "Resuming from $(format_bytes $disk_usage) actual / $(format_bytes $current_size) apparent"
-                    fi
+                    # ANY real data is worth keeping for resume
+                    # Don't delete partial downloads just because they're sparse
                 fi
             fi
             
             if download_with_tool "$tool" "$url" "$output"; then
                 if [[ -f "$output" ]] && [[ -s "$output" ]]; then
-                    # Verify the download is actually complete, not just preallocated
+                    # Check if download tool actually completed or just preallocated
                     local final_size=$(get_file_size "$output")
                     local final_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
                     
                     if (( final_usage > 0 )); then
                         local final_ratio=$((final_usage * 100 / final_size))
                         
+                        # If tool claims done but file is mostly empty, it's preallocated
                         if (( final_ratio < 50 )); then
-                            log_verbose "$tool created sparse file, continuing..."
+                            log_verbose "$tool preallocated file but didn't complete (${final_ratio}%), retrying..."
+                            # Don't delete - it might have written some data
                             sleep 3
                             continue
                         fi
@@ -795,7 +804,7 @@ download_file() {
                 fi
             fi
             
-            # Check if we made actual progress (not just preallocation)
+            # Check if we made actual progress
             if [[ -f "$output" ]]; then
                 local new_size=$(get_file_size "$output")
                 local new_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')

@@ -1393,6 +1393,12 @@ verify_and_create_subvolumes() {
                         mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
                             log_warn "Could not create downloads directory"
                         
+                        # Create varlib and varspool directories for bind mounts
+                        mkdir -p "$MOUNT_DIR/@data/varlib" 2>/dev/null || \
+                            log_warn "Could not create varlib directory"
+                        mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
+                            log_warn "Could not create varspool directory"
+                        
                         if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
                             echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
                                 log_warn "Could not create current-slot marker"
@@ -1444,7 +1450,6 @@ verify_and_create_subvolumes() {
     
     log_success "Filesystem structure verified"
 }
-
 #####################################
 ### Deployment Logic              ###
 #####################################

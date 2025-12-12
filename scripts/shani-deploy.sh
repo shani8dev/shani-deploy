@@ -1399,14 +1399,6 @@ verify_and_create_subvolumes() {
 					    mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
 					        log_warn "Could not create varspool directory"
 					    
-					    # Create snap directory structure for bind mounts
-					    mkdir -p "$MOUNT_DIR/@data/snap/"{data,root} 2>/dev/null || \
-					        log_warn "Could not create snap directories"
-					    
-					    # Set proper permissions for snap root directory
-					    chmod 700 "$MOUNT_DIR/@data/snap/root" 2>/dev/null || \
-					        log_warn "Could not set permissions on snap root directory"
-					    
 					    if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
 					        echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
 					            log_warn "Could not create current-slot marker"

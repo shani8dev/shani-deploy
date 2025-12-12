@@ -1387,27 +1387,35 @@ verify_and_create_subvolumes() {
                         ;;
                         
                     data)
-                        [[ "${DRY_RUN}" == "yes" ]] && continue
-                        mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work} 2>/dev/null || \
-                            log_warn "Could not create overlay directories"
-                        mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
-                            log_warn "Could not create downloads directory"
-                        
-                        # Create varlib and varspool directories for bind mounts
-                        mkdir -p "$MOUNT_DIR/@data/varlib" 2>/dev/null || \
-                            log_warn "Could not create varlib directory"
-                        mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
-                            log_warn "Could not create varspool directory"
-                        
-                        if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
-                            echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
-                                log_warn "Could not create current-slot marker"
-                        fi
-                        if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
-                            echo "${CANDIDATE_SLOT:-green}" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
-                                log_warn "Could not create previous-slot marker"
-                        fi
-                        ;;
+					    [[ "${DRY_RUN}" == "yes" ]] && continue
+					    mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work} 2>/dev/null || \
+					        log_warn "Could not create overlay directories"
+					    mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
+					        log_warn "Could not create downloads directory"
+					    
+					    # Create varlib and varspool directories for bind mounts
+					    mkdir -p "$MOUNT_DIR/@data/varlib" 2>/dev/null || \
+					        log_warn "Could not create varlib directory"
+					    mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
+					        log_warn "Could not create varspool directory"
+					    
+					    # Create snap directory structure for bind mounts
+					    mkdir -p "$MOUNT_DIR/@data/snap/"{data,root} 2>/dev/null || \
+					        log_warn "Could not create snap directories"
+					    
+					    # Set proper permissions for snap root directory
+					    chmod 700 "$MOUNT_DIR/@data/snap/root" 2>/dev/null || \
+					        log_warn "Could not set permissions on snap root directory"
+					    
+					    if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
+					        echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
+					            log_warn "Could not create current-slot marker"
+					    fi
+					    if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
+					        echo "${CANDIDATE_SLOT:-green}" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
+					            log_warn "Could not create previous-slot marker"
+					    fi
+					    ;;
                 esac
                 
                 log_success "Created: @${sub}"

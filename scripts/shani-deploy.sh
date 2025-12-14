@@ -638,16 +638,6 @@ validate_download() {
             log_warn "File extension .zst but wrong content type"
             return 1
         fi
-        
-        # Only run full integrity test on final validation
-        if (( is_final )); then
-            log_verbose "Testing zstd integrity..."
-            if ! timeout 10 zstd -t "$file" 2>/dev/null; then
-                log_error "zstd integrity test failed"
-                return 1
-            fi
-            log_verbose "zstd integrity: OK"
-        fi
     fi
     
     log_verbose "Validation passed: $(format_bytes $size)"

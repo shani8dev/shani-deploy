@@ -1,6 +1,7 @@
 [Unit]
 Description=Mark Boot Success for Shani OS
 After=multi-user.target data.mount
+ConditionPathExists=/data/boot_in_progress
 
 [Service]
 Type=oneshot
@@ -9,4 +10,3 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-

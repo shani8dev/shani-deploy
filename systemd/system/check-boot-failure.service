@@ -1,6 +1,7 @@
 [Unit]
 Description=Check Boot Success and Mark Boot Failure if Needed for Shani OS
-After=mark-boot-success.service data.mount
+After=data.mount
+ConditionPathExists=/data/boot_in_progress
 
 [Service]
 Type=oneshot
@@ -8,4 +9,5 @@ ExecStart=/usr/local/bin/check-boot-failure
 
 [Install]
 WantedBy=multi-user.target
+
 

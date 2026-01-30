@@ -6,7 +6,7 @@ IFS=$'\n\t'
 
 # Constants
 readonly SCRIPT_VERSION="2.4"
-readonly DEFER_DELAY=300
+readonly DEFER_DELAY=86400  # 24 hours (1 day)
 readonly UPDATE_CHANNEL="stable"
 readonly BASE_URL="https://sourceforge.net/projects/shanios/files"
 readonly LOCAL_VERSION_FILE="/etc/shani-version"

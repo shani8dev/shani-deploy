@@ -3,20 +3,18 @@
 #
 # Usage: ./gen-efi.sh configure <target_slot>
 #
-# This script creates (or reuses) a kernel command-line file and uses dracut
-# to generate a new UKI image, signing it for Secure Boot.
-# The command line includes "rootflags=subvol=@<target_slot>".
-#
-# It then updates the boot menu configuration for both slots:
-# the active slot (from /data/current-slot) is labeled " (Active)"
-# while the other is labeled " (Candidate)". The active boot entry is set as default.
+# ENHANCED: 
+# - Validates target slot against booted slot
+# - Auto-mounts/unmounts ESP
+# - Safe for direct calls (only for current slot)
+# - Safe for chroot calls (from shani-deploy)
 #
 # Must be run as root.
 
 set -Eeuo pipefail
 
 # Check for required dependencies.
-REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup")
+REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs")
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Required command '$cmd' not found. Please install it." >&2
@@ -51,16 +49,97 @@ MOK_KEY="/etc/secureboot/keys/MOK.key"
 MOK_CRT="/etc/secureboot/keys/MOK.crt"
 ROOTLABEL="shani_root"
 
-mkdir -p "$EFI_DIR" "$BOOT_ENTRIES"
+# Track if we mounted ESP
+ESP_WAS_UNMOUNTED=0
 
 log() {
     echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI] $*"
 }
 
+log_warn() {
+    echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][WARN] $*"
+}
+
 error_exit() {
     log "ERROR: $*"
+    # Unmount ESP if we mounted it
+    [[ $ESP_WAS_UNMOUNTED -eq 1 ]] && umount "$ESP" 2>/dev/null || true
     exit 1
 }
+
+# Detect if we're in chroot
+in_chroot() {
+    # Check if root is not the real root (in chroot or container)
+    if [[ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root/.)" ]] 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Get currently booted slot
+get_booted_slot() {
+    # From kernel cmdline
+    local slot=$(grep -o 'rootflags=[^ ]*' /proc/cmdline 2>/dev/null | sed 's/.*subvol=@//;s/,.*//' || echo "")
+    
+    # Fallback to btrfs
+    [[ -z "$slot" ]] && slot=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    
+    echo "${slot:-blue}"
+}
+
+# Validate target slot
+validate_target_slot() {
+    local target="$1"
+    
+    # If in chroot, trust shani-deploy
+    if in_chroot; then
+        log "Running in chroot, proceeding..."
+        return 0
+    fi
+    
+    # Get booted slot
+    local booted=$(get_booted_slot)
+    log "Booted slot: @${booted}"
+    log "Target slot: @${target}"
+    
+    # Check if target matches booted
+    if [[ "$target" != "$booted" ]]; then
+        echo "" >&2
+        log "ERROR: Cannot generate UKI for inactive slot from live system!"
+        log "ERROR: You are booted in: @${booted}"
+        log "ERROR: You are trying to generate for: @${target}"
+        echo "" >&2
+        log "ERROR: This would use @${booted}'s kernel for @${target}'s boot entry!"
+        echo "" >&2
+        log "ERROR: Solutions:"
+        log "ERROR:   1. Run: gen-efi configure ${booted}  (generate for current slot)"
+        log "ERROR:   2. Use: shani-deploy  (it chroots correctly)"
+        echo "" >&2
+        return 1
+    fi
+    
+    log "Target matches booted slot, safe to proceed ✓"
+    return 0
+}
+
+# Ensure ESP is mounted
+ensure_esp_mounted() {
+    if ! mountpoint -q "$ESP" 2>/dev/null; then
+        log "ESP not mounted, mounting temporarily..."
+        mount "$ESP" || error_exit "Failed to mount ESP"
+        ESP_WAS_UNMOUNTED=1
+    fi
+}
+
+# Unmount ESP if we mounted it
+cleanup_esp() {
+    if [[ $ESP_WAS_UNMOUNTED -eq 1 ]]; then
+        log "Unmounting ESP..."
+        umount "$ESP" 2>/dev/null || log "WARNING: Could not unmount ESP"
+    fi
+}
+
+mkdir -p "$EFI_DIR" "$BOOT_ENTRIES"
 
 sign_efi_binary() {
     local file="$1"
@@ -158,6 +237,13 @@ EOF
 # generate_uki generates the UKI image and then updates the boot entries for both slots.
 generate_uki() {
     local slot="$1"
+    
+    # VALIDATE target slot
+    validate_target_slot "$slot" || error_exit "Slot validation failed"
+    
+    # Ensure ESP is mounted before we start
+    ensure_esp_mounted
+    
     local kernel_ver
     kernel_ver=$(get_kernel_version)
     local uki_path="$EFI_DIR/${OS_NAME}-${slot}.efi"
@@ -183,6 +269,9 @@ generate_uki() {
         active="$slot"
     fi
     bootctl set-default "${OS_NAME}-${active}.conf" || error_exit "bootctl set-default failed"
+    
+    # Unmount ESP if we mounted it
+    cleanup_esp
 }
 
 case "${1:-}" in
@@ -195,4 +284,3 @@ case "${1:-}" in
         exit 1
         ;;
 esac
-

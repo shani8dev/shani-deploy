@@ -68,9 +68,10 @@ declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
 declare -g UPDATE_CHANNEL="" UPDATE_CHANNEL_SOURCE="" DRY_RUN="no" VERBOSE="no"
 declare -g DEPLOYMENT_START_TIME="" SKIP_SELF_UPDATE="no" SELF_UPDATE_DONE=""
+declare -g FORCE_UPDATE="no"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
-readonly CHROOT_STATIC_DIRS=(data etc var)
+readonly CHROOT_STATIC_DIRS=(data etc var swap)
 
 #####################################
 ### State Management              ###
@@ -92,6 +93,7 @@ persist_state() {
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE STATE_DIR 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
+        declare -p FORCE_UPDATE 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
@@ -954,11 +956,14 @@ inhibit_system() {
     export SYSTEMD_INHIBIT_DEPTH=$((depth + 1))
     log "Inhibiting power events"
     
+    local script_path
+    script_path=$(readlink -f "$0")
+
     [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]] && \
         exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="System update in progress" "$0" "${ORIGINAL_ARGS[@]}" || \
+            --who="shanios-deployment" --why="System update in progress" "$script_path" "${ORIGINAL_ARGS[@]}" || \
         exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="System update in progress" "$0"
+            --who="shanios-deployment" --why="System update in progress" "$script_path"
 }
 
 #####################################
@@ -1212,7 +1217,15 @@ restore_candidate() {
     log_error "Initiating rollback"
     trap - ERR EXIT
     set +e
-    
+
+    if [[ -z "${CANDIDATE_SLOT:-}" ]]; then
+        log_warn "CANDIDATE_SLOT unknown, skipping subvolume restore"
+        umount -R "$MOUNT_DIR" 2>/dev/null
+        rm -f "$DEPLOY_PENDING" 2>/dev/null
+        log_error "Rollback incomplete - manual intervention required"
+        exit 1
+    fi
+
     mkdir -p "$MOUNT_DIR" 2>/dev/null
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
     
@@ -1237,9 +1250,15 @@ restore_candidate() {
     [[ -d "$MOUNT_DIR/temp_update" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
     
-    umount -R "$MOUNT_DIR" 2>/dev/null
+	umount -R "$MOUNT_DIR" 2>/dev/null
     rm -f "$DEPLOY_PENDING" 2>/dev/null
-    
+
+    # Reset bootloader default to current slot in case gen-efi already ran
+    if mountpoint -q /boot/efi 2>/dev/null; then
+        bootctl set-default "${OS_NAME}-${CURRENT_SLOT}.conf" 2>/dev/null || \
+            log_warn "Could not reset bootctl default - manual check needed"
+    fi
+
     log_error "Rollback complete - system remains on @${CURRENT_SLOT}"
     exit 1
 }
@@ -1247,34 +1266,50 @@ trap 'restore_candidate' ERR
 
 rollback_system() {
     log_section "System Rollback"
-    
+
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    
+
     local failed_slot=$(cat "$MOUNT_DIR/@data/current-slot" 2>/dev/null | tr -d '[:space:]')
     [[ -z "$failed_slot" ]] && failed_slot=$(get_booted_subvol)
-    
+    [[ ! "$failed_slot" =~ ^(blue|green)$ ]] && die "Cannot determine failed slot"
+
     local previous_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
     [[ -z "$previous_slot" ]] && previous_slot=$([[ "$failed_slot" == "blue" ]] && echo "green" || echo "blue")
-    
+    [[ ! "$previous_slot" =~ ^(blue|green)$ ]] && die "Cannot determine previous slot"
+
+    CURRENT_SLOT="$failed_slot"
+    CANDIDATE_SLOT="$previous_slot"
+
     log "Rollback: ${failed_slot} → ${previous_slot}"
-    
-    BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
+
+	BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
         awk -v s="${failed_slot}" '$0 ~ s"_backup" {print $NF}' | sort | tail -1)
-    [[ -z "$BACKUP_NAME" ]] && die "No backup found"
-    
+
+    if [[ -z "$BACKUP_NAME" ]]; then
+        log_warn "No backup found, attempting UKI regeneration for @${previous_slot} as last resort"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        generate_uki "$previous_slot" && {
+            log_success "UKI regenerated, rebooting"
+            [[ "${DRY_RUN}" == "yes" ]] || reboot
+        } || die "No backup and UKI regeneration failed - manual intervention required"
+        return
+    fi
+
+    BACKUP_NAME="${BACKUP_NAME#@}"
+
     log "Using: @${BACKUP_NAME}"
-    
-    run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro false
+
     run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro true
-    
+
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
-    safe_umount "$MOUNT_DIR"
-    
+    echo "$failed_slot"   > "$MOUNT_DIR/@data/previous-slot"
+    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
+
     generate_uki "$previous_slot"
-    
+
     log_success "Rollback complete"
     log "System will boot: @${previous_slot}"
     [[ "${DRY_RUN}" == "yes" ]] || reboot
@@ -1504,12 +1539,15 @@ fetch_update() {
     
     log "Remote: v${REMOTE_VERSION} (${REMOTE_PROFILE})"
     log "Local:  v${LOCAL_VERSION} (${LOCAL_PROFILE})"
-    
-    if (( REMOTE_VERSION < LOCAL_VERSION )); then
+
+	if (( REMOTE_VERSION < LOCAL_VERSION )); then
         log_warn "Remote older (${REMOTE_VERSION} < ${LOCAL_VERSION})"
-        log_success "No update needed"
-        touch "${STATE_DIR}/skip-deployment"
-        return 0
+        if [[ "${FORCE_UPDATE:-no}" != "yes" ]]; then
+            log_success "No update needed"
+            touch "${STATE_DIR}/skip-deployment"
+            return 0
+        fi
+        log "Force update requested, downgrading to v${REMOTE_VERSION}"
     fi
     
     (( REMOTE_VERSION > LOCAL_VERSION )) && { log "Update available"; return 0; }
@@ -1525,6 +1563,10 @@ fetch_update() {
     fi
     
     safe_umount "$MOUNT_DIR"
+    if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
+        log "Force update requested, redeploying v${REMOTE_VERSION}"
+        return 0
+    fi
     log_success "System up-to-date"
     touch "${STATE_DIR}/skip-deployment"
     return 0
@@ -1704,7 +1746,7 @@ deploy_update() {
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || true' RETURN
     
-    if findmnt -S "$ROOT_DEV" -o TARGET | grep -q "@${CANDIDATE_SLOT}"; then
+	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -q "subvol=/@${CANDIDATE_SLOT}[^a-zA-Z]"; then
         die "Candidate subvolume is currently mounted"
     fi
     
@@ -1762,14 +1804,14 @@ deploy_update() {
 finalize_update() {
     log_section "Finalization"
     [[ "${DRY_RUN}" == "yes" ]] && return 0
-    
+
+    verify_and_create_subvolumes || die "Subvolume verification failed"
+    generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
+
     mkdir -p /data
     echo "$CURRENT_SLOT" > /data/previous-slot || die "Failed to write previous-slot"
     echo "$CANDIDATE_SLOT" > /data/current-slot || die "Failed to write current-slot"
-    
-    verify_and_create_subvolumes || die "Subvolume verification failed"
-    generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
-    
+
     rm -f "$DEPLOY_PENDING" || log_warn "Failed to remove deployment pending flag"
     log_success "Deployment complete"
     
@@ -1815,6 +1857,7 @@ Options:
   -c, --cleanup           Manual cleanup
   -s, --storage-info      Storage analysis
   -t, --channel <chan>    Update channel (latest|stable)
+  -f, --force             Deploy even if version matches
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
   --skip-self-update      Skip auto-update
@@ -1831,6 +1874,7 @@ main() {
             -c|--cleanup) CLEANUP="yes"; shift ;;
             -s|--storage-info) STORAGE_INFO="yes"; shift ;;
             -t|--channel) UPDATE_CHANNEL="$2"; shift 2 ;;
+            -f|--force) FORCE_UPDATE="yes"; shift ;;
             -d|--dry-run) DRY_RUN="yes"; shift ;;
             -v|--verbose) VERBOSE="yes"; shift ;;
             --skip-self-update) SKIP_SELF_UPDATE="yes"; shift ;;
@@ -1840,28 +1884,23 @@ main() {
     done
        
     check_root
-    check_internet
     check_tools
     set_update_channel "${UPDATE_CHANNEL:-}"
     set_environment
-    self_update
-    inhibit_system
-    
-    if [[ "$STORAGE_INFO" == "yes" ]]; then
-        analyze_storage
-        exit 0
-    fi
-    
+
+    # Rollback and cleanup don't need internet - run before check_internet
+    [[ -f /data/boot-ok ]] || rollback_system
+    [[ "$ROLLBACK" == "yes" ]] && { rollback_system; exit 0; }
+
     if [[ "$CLEANUP" == "yes" ]]; then
         trap - ERR
         set +e
-        
-        # Ensure clean mount state
+
         if is_mounted "$MOUNT_DIR"; then
             log_verbose "Cleaning up existing mount before cleanup"
             safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
         fi
-        
+
         mkdir -p "$MOUNT_DIR"
         if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             cleanup_old_backups
@@ -1870,14 +1909,20 @@ main() {
             log_verbose "Could not mount for cleanup"
         fi
         cleanup_downloads
-        
+
         log_success "Manual cleanup complete"
         exit 0
     fi
-    
-    [[ -f /data/boot-ok ]] || rollback_system
-    [[ "$ROLLBACK" == "yes" ]] && { rollback_system; exit 0; }
-    
+
+    if [[ "$STORAGE_INFO" == "yes" ]]; then
+        analyze_storage
+        exit 0
+    fi
+
+	check_internet
+    self_update
+    persist_state
+    inhibit_system
     validate_boot
     check_space
     fetch_update

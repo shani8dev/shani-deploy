@@ -1275,18 +1275,18 @@ rollback_system() {
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
 
-    local failed_slot=$(cat "$MOUNT_DIR/@data/current-slot" 2>/dev/null | tr -d '[:space:]')
-    [[ -z "$failed_slot" ]] && failed_slot=$(get_booted_subvol)
-    [[ ! "$failed_slot" =~ ^(blue|green)$ ]] && die "Cannot determine failed slot"
+    # The failed slot is always the NON-booted slot
+    # (the one that was supposed to be next but failed)
+    local booted
+    booted=$(get_booted_subvol)
+    [[ ! "$booted" =~ ^(blue|green)$ ]] && die "Cannot determine booted slot"
 
-    local previous_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
-    [[ -z "$previous_slot" ]] && previous_slot=$([[ "$failed_slot" == "blue" ]] && echo "green" || echo "blue")
-    [[ ! "$previous_slot" =~ ^(blue|green)$ ]] && die "Cannot determine previous slot"
+    local failed_slot=$([[ "$booted" == "blue" ]] && echo "green" || echo "blue")
 
-    CURRENT_SLOT="$failed_slot"
-    CANDIDATE_SLOT="$previous_slot"
+    CURRENT_SLOT="$booted"
+    CANDIDATE_SLOT="$failed_slot"
 
-    log "Rollback: @${failed_slot} → @${previous_slot}"
+    log "Booted: @${booted} | Restoring: @${failed_slot}"
 
     BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
         awk -v s="${failed_slot}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
@@ -1295,34 +1295,30 @@ rollback_system() {
     if [[ -z "$BACKUP_NAME" ]]; then
         log_warn "No backup found for @${failed_slot}"
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
-        log_warn "Attempting UKI regeneration for @${previous_slot} as last resort"
-        generate_uki "$previous_slot" && {
+        log_warn "Attempting UKI regeneration for @${booted} as last resort"
+        generate_uki "$booted" && {
             log_success "UKI regenerated, rebooting"
             [[ "${DRY_RUN}" == "yes" ]] || reboot
         } || die "No backup and UKI regeneration failed - manual intervention required"
         return
     fi
 
-    log "Using: @${BACKUP_NAME}"
-
-    local booted
-    booted=$(get_booted_subvol)
-    [[ "$failed_slot" == "$booted" ]] && die "Cannot restore @${failed_slot} - it is the currently booted slot"
+    log "Restoring @${failed_slot} from @${BACKUP_NAME}"
 
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
     run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro true
 
-    echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
-    echo "$failed_slot"   > "$MOUNT_DIR/@data/previous-slot"
+    echo "$booted"       > "$MOUNT_DIR/@data/current-slot"
+    echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
 
     safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
 
-    generate_uki "$previous_slot"
+    generate_uki "$booted"
 
     log_success "Rollback complete"
-    log "System will boot: @${previous_slot}"
+    log "System will boot: @${booted}"
     [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 

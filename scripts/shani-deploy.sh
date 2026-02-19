@@ -1050,31 +1050,26 @@ cleanup_downloads() {
 }
 
 analyze_storage() {
-    set +e
     log_section "Storage Analysis"
 
-    [[ -f "$DEPLOY_PENDING" ]] && { log_warn "Deployment pending, skipping"; set -e; return 0; }
-
-    # Ensure clean mount state
     if is_mounted "$MOUNT_DIR"; then
         log_verbose "Cleaning up existing mount before storage analysis"
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
     fi
 
     mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Mount failed"; set -e; return 1; }
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Mount failed"; return 1; }
     trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
 
     local -a check_subvols=(blue green data swap)
 
     echo ""
-    log "=== Pre-Deduplication State ==="
+    log "=== Filesystem Usage ==="
     echo ""
-    log "Filesystem Usage:"
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to get usage"
 
     echo ""
-    log "Subvolume Compression Analysis:"
+    log "=== Subvolume Compression Analysis ==="
     for subvol in "${check_subvols[@]}"; do
         local path="$MOUNT_DIR/@${subvol}"
         [[ -d "$path" ]] || continue
@@ -1087,9 +1082,31 @@ analyze_storage() {
         fi
     done
 
+    echo ""
+    log "=== Subvolume List ==="
+    btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to list subvolumes"
+
+    echo ""
+    return 0
+}
+
+optimize_storage() {
+    set +e
+    log_section "Storage Optimization (Deduplication)"
+
+    [[ -f "$DEPLOY_PENDING" ]] && { log_warn "Deployment pending, skipping"; set -e; return 0; }
+
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Cleaning up existing mount before optimization"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    fi
+
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Mount failed"; set -e; return 1; }
+    trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
+
     btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green" || {
-        log_verbose "Skipping deduplication (missing subvolumes)"
-        echo ""
+        log_warn "Skipping deduplication (missing blue/green subvolumes)"
         set -e
         return 0
     }
@@ -1101,6 +1118,7 @@ analyze_storage() {
 
     echo ""
     log "=== Running Deduplication ==="
+    log "Targets: ${targets[*]}"
     log "This may take several minutes..."
     echo ""
 
@@ -1120,8 +1138,7 @@ analyze_storage() {
 
     echo ""
     log "=== Post-Deduplication Results ==="
-    echo ""
-
+    local -a check_subvols=(blue green data swap)
     for subvol in "${check_subvols[@]}"; do
         local path="$MOUNT_DIR/@${subvol}"
         [[ -d "$path" ]] || continue
@@ -1136,9 +1153,9 @@ analyze_storage() {
 
     echo ""
     log "Final Filesystem Usage:"
-    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || true
+    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to get usage"
+
     echo ""
-    
     set -e
     return 0
 }
@@ -1214,9 +1231,17 @@ generate_uki() {
 #####################################
 
 restore_candidate() {
-    log_error "Initiating rollback"
     trap - ERR EXIT
     set +e
+
+    # Guard: if /dev is gone we're in a broken chroot or degraded environment.
+    # btrfs and mount will fail — bail immediately to prevent further damage.
+    if [[ ! -c /dev/null ]]; then
+        echo "[FATAL] restore_candidate: environment degraded (/dev unavailable), aborting" >&2
+        exit 1
+    fi
+
+    log_error "Initiating rollback"
 
     if [[ -z "${CANDIDATE_SLOT:-}" ]]; then
         log_warn "CANDIDATE_SLOT unknown, skipping subvolume restore"
@@ -1227,14 +1252,28 @@ restore_candidate() {
     fi
 
     mkdir -p "$MOUNT_DIR" 2>/dev/null
+    umount -R "$MOUNT_DIR" 2>/dev/null || true
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
 
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
         log "Restoring from @${BACKUP_NAME}"
-        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
-        btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
-        btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
-        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+
+        local rc_booted
+        rc_booted=$(get_booted_subvol)
+
+        if [[ "$CANDIDATE_SLOT" == "$rc_booted" ]]; then
+            log_warn "Refusing to touch @${CANDIDATE_SLOT} — it is the currently booted slot"
+            log_warn "Skipping subvolume restore, booted system is intact"
+        else
+            if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
+                btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
+            else
+                log_warn "@${CANDIDATE_SLOT} does not exist, restoring directly from backup"
+            fi
+            btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
+            btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+        fi
 
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot"
@@ -1275,18 +1314,18 @@ rollback_system() {
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
 
-    local failed_slot=$(cat "$MOUNT_DIR/@data/current-slot" 2>/dev/null | tr -d '[:space:]')
-    [[ -z "$failed_slot" ]] && failed_slot=$(get_booted_subvol)
-    [[ ! "$failed_slot" =~ ^(blue|green)$ ]] && die "Cannot determine failed slot"
+    # The failed slot is always the NON-booted slot
+    # (the one that was supposed to be next but failed)
+    local booted
+    booted=$(get_booted_subvol)
+    [[ ! "$booted" =~ ^(blue|green)$ ]] && die "Cannot determine booted slot"
 
-    local previous_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
-    [[ -z "$previous_slot" ]] && previous_slot=$([[ "$failed_slot" == "blue" ]] && echo "green" || echo "blue")
-    [[ ! "$previous_slot" =~ ^(blue|green)$ ]] && die "Cannot determine previous slot"
+    local failed_slot=$([[ "$booted" == "blue" ]] && echo "green" || echo "blue")
 
-    CURRENT_SLOT="$failed_slot"
-    CANDIDATE_SLOT="$previous_slot"
+    CURRENT_SLOT="$booted"
+    CANDIDATE_SLOT="$failed_slot"
 
-    log "Rollback: @${failed_slot} → @${previous_slot}"
+    log "Booted: @${booted} | Restoring: @${failed_slot}"
 
     BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
         awk -v s="${failed_slot}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
@@ -1295,34 +1334,43 @@ rollback_system() {
     if [[ -z "$BACKUP_NAME" ]]; then
         log_warn "No backup found for @${failed_slot}"
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
-        log_warn "Attempting UKI regeneration for @${previous_slot} as last resort"
-        generate_uki "$previous_slot" && {
+        log_warn "Attempting UKI regeneration for @${booted} as last resort"
+        generate_uki "$booted" && {
             log_success "UKI regenerated, rebooting"
             [[ "${DRY_RUN}" == "yes" ]] || reboot
         } || die "No backup and UKI regeneration failed - manual intervention required"
         return
     fi
 
-    log "Using: @${BACKUP_NAME}"
+    log "Restoring @${failed_slot} from @${BACKUP_NAME}"
 
-    local booted
-    booted=$(get_booted_subvol)
-    [[ "$failed_slot" == "$booted" ]] && die "Cannot restore @${failed_slot} - it is the currently booted slot"
+    # SAFETY: re-read booted slot immediately before any destructive operation.
+    # Must never touch the booted slot regardless of what variables say.
+    local pre_delete_booted
+    pre_delete_booted=$(get_booted_subvol)
+    if [[ "$failed_slot" == "$pre_delete_booted" ]]; then
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        die "SAFETY ABORT: @${failed_slot} is the currently booted slot — refusing to touch it"
+    fi
 
-    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
-    run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
+    if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
+        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
+        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
+    else
+        log_warn "@${failed_slot} does not exist — restoring directly from backup without delete"
+    fi
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro true
 
-    echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
-    echo "$failed_slot"   > "$MOUNT_DIR/@data/previous-slot"
+    echo "$booted"       > "$MOUNT_DIR/@data/current-slot"
+    echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
 
     safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
 
-    generate_uki "$previous_slot"
+    generate_uki "$booted"
 
     log_success "Rollback complete"
-    log "System will boot: @${previous_slot}"
+    log "System will boot: @${booted}"
     [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 
@@ -1768,7 +1816,15 @@ deploy_update() {
 	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -q "subvol=/@${CANDIDATE_SLOT}[^a-zA-Z]"; then
         die "Candidate subvolume is currently mounted"
     fi
-    
+
+    # SAFETY: confirm candidate is not the booted slot before any destructive operation.
+    local deploy_booted
+    deploy_booted=$(get_booted_subvol)
+    if [[ "$CANDIDATE_SLOT" == "$deploy_booted" ]]; then
+        safe_umount "$MOUNT_DIR"
+        die "SAFETY ABORT: @${CANDIDATE_SLOT} is the currently booted slot — refusing to touch it"
+    fi
+
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
         log "Backup: @${BACKUP_NAME}"
@@ -1847,7 +1903,7 @@ finalize_update() {
         cleanup_old_backups || log_verbose "Backup cleanup warnings"
         
         # Storage analysis handles its own mount
-        analyze_storage || log_verbose "Storage analysis warnings"
+        optimize_storage || log_verbose "Storage optimization warnings"
 		safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
     else
         log_verbose "Could not mount for maintenance"
@@ -1874,9 +1930,10 @@ Options:
   -h, --help              Show help
   -r, --rollback          Force rollback
   -c, --cleanup           Manual cleanup
-  -s, --storage-info      Storage analysis
+  -s, --storage-info      Storage analysis (read-only)
+  -o, --optimize          Run deduplication
   -t, --channel <chan>    Update channel (latest|stable)
-  -f, --force             Deploy even if version matches
+  -f, --force             Deploy even if version matches or boot mismatch
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
   --skip-self-update      Skip auto-update
@@ -1892,6 +1949,7 @@ main() {
             -r|--rollback) ROLLBACK="yes"; shift ;;
             -c|--cleanup) CLEANUP="yes"; shift ;;
             -s|--storage-info) STORAGE_INFO="yes"; shift ;;
+            -o|--optimize) STORAGE_OPTIMIZE="yes"; shift ;;
             -t|--channel) UPDATE_CHANNEL="$2"; shift 2 ;;
             -f|--force) FORCE_UPDATE="yes"; shift ;;
             -d|--dry-run) DRY_RUN="yes"; shift ;;
@@ -1944,6 +2002,11 @@ main() {
         analyze_storage
         exit 0
     fi
+	
+	if [[ "$STORAGE_OPTIMIZE" == "yes" ]]; then
+    optimize_storage
+    exit 0
+    fi
 
 	check_internet
     self_update
@@ -1970,9 +2033,7 @@ main() {
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
                 cleanup_old_backups || log_verbose "Backup cleanup warnings"
                 cleanup_downloads || log_verbose "download cleanup warnings"
-
-                # Run storage analysis with clean mount
-                analyze_storage || log_verbose "Storage analysis warnings"
+				optimize_storage || log_verbose "Storage optimization warnings"
 
                 safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
             else

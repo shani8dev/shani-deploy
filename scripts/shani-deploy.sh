@@ -1050,31 +1050,26 @@ cleanup_downloads() {
 }
 
 analyze_storage() {
-    set +e
     log_section "Storage Analysis"
 
-    [[ -f "$DEPLOY_PENDING" ]] && { log_warn "Deployment pending, skipping"; set -e; return 0; }
-
-    # Ensure clean mount state
     if is_mounted "$MOUNT_DIR"; then
         log_verbose "Cleaning up existing mount before storage analysis"
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
     fi
 
     mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Mount failed"; set -e; return 1; }
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Mount failed"; return 1; }
     trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
 
     local -a check_subvols=(blue green data swap)
 
     echo ""
-    log "=== Pre-Deduplication State ==="
+    log "=== Filesystem Usage ==="
     echo ""
-    log "Filesystem Usage:"
     btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to get usage"
 
     echo ""
-    log "Subvolume Compression Analysis:"
+    log "=== Subvolume Compression Analysis ==="
     for subvol in "${check_subvols[@]}"; do
         local path="$MOUNT_DIR/@${subvol}"
         [[ -d "$path" ]] || continue
@@ -1087,9 +1082,31 @@ analyze_storage() {
         fi
     done
 
+    echo ""
+    log "=== Subvolume List ==="
+    btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to list subvolumes"
+
+    echo ""
+    return 0
+}
+
+optimize_storage() {
+    set +e
+    log_section "Storage Optimization (Deduplication)"
+
+    [[ -f "$DEPLOY_PENDING" ]] && { log_warn "Deployment pending, skipping"; set -e; return 0; }
+
+    if is_mounted "$MOUNT_DIR"; then
+        log_verbose "Cleaning up existing mount before optimization"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    fi
+
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Mount failed"; set -e; return 1; }
+    trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
+
     btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green" || {
-        log_verbose "Skipping deduplication (missing subvolumes)"
-        echo ""
+        log_warn "Skipping deduplication (missing blue/green subvolumes)"
         set -e
         return 0
     }
@@ -1101,6 +1118,7 @@ analyze_storage() {
 
     echo ""
     log "=== Running Deduplication ==="
+    log "Targets: ${targets[*]}"
     log "This may take several minutes..."
     echo ""
 
@@ -1118,27 +1136,6 @@ analyze_storage() {
     [[ $dedupe_status -eq 0 ]] && log_success "Deduplication completed in ${dedupe_duration}s" || \
         log_warn "Deduplication completed with warnings (exit: $dedupe_status)"
 
-    echo ""
-    log "=== Post-Deduplication Results ==="
-    echo ""
-
-    for subvol in "${check_subvols[@]}"; do
-        local path="$MOUNT_DIR/@${subvol}"
-        [[ -d "$path" ]] || continue
-        echo ""
-        log "@${subvol}:"
-        if command -v compsize &>/dev/null; then
-            compsize -x "$path" || log_warn "compsize failed"
-        else
-            btrfs filesystem du -s "$path" || log_warn "btrfs du failed"
-        fi
-    done
-
-    echo ""
-    log "Final Filesystem Usage:"
-    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || true
-    echo ""
-    
     set -e
     return 0
 }
@@ -1886,7 +1883,7 @@ finalize_update() {
         cleanup_old_backups || log_verbose "Backup cleanup warnings"
         
         # Storage analysis handles its own mount
-        analyze_storage || log_verbose "Storage analysis warnings"
+        optimize_storage || log_verbose "Storage optimization warnings"
 		safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
     else
         log_verbose "Could not mount for maintenance"
@@ -1913,9 +1910,10 @@ Options:
   -h, --help              Show help
   -r, --rollback          Force rollback
   -c, --cleanup           Manual cleanup
-  -s, --storage-info      Storage analysis
+  -s, --storage-info      Storage analysis (read-only)
+  -o, --optimize          Run deduplication
   -t, --channel <chan>    Update channel (latest|stable)
-  -f, --force             Deploy even if version matches
+  -f, --force             Deploy even if version matches or boot mismatch
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
   --skip-self-update      Skip auto-update
@@ -1931,6 +1929,7 @@ main() {
             -r|--rollback) ROLLBACK="yes"; shift ;;
             -c|--cleanup) CLEANUP="yes"; shift ;;
             -s|--storage-info) STORAGE_INFO="yes"; shift ;;
+            -o|--optimize) STORAGE_OPTIMIZE="yes"; shift ;;
             -t|--channel) UPDATE_CHANNEL="$2"; shift 2 ;;
             -f|--force) FORCE_UPDATE="yes"; shift ;;
             -d|--dry-run) DRY_RUN="yes"; shift ;;
@@ -1983,6 +1982,11 @@ main() {
         analyze_storage
         exit 0
     fi
+	
+	if [[ "$STORAGE_OPTIMIZE" == "yes" ]]; then
+    optimize_storage
+    exit 0
+    fi
 
 	check_internet
     self_update
@@ -2009,9 +2013,7 @@ main() {
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
                 cleanup_old_backups || log_verbose "Backup cleanup warnings"
                 cleanup_downloads || log_verbose "download cleanup warnings"
-
-                # Run storage analysis with clean mount
-                analyze_storage || log_verbose "Storage analysis warnings"
+				optimize_storage || log_verbose "Storage optimization warnings"
 
                 safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
             else

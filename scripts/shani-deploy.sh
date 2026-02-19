@@ -1489,28 +1489,36 @@ verify_and_create_subvolumes() {
 #####################################
 ### Deployment Logic              ###
 #####################################
-
 validate_boot() {
     log_section "Boot Validation"
     
+    local booted
+    booted=$(get_booted_subvol)
+
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]')
     
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
         log_warn "Invalid marker, detecting..."
-        CURRENT_SLOT=$(get_booted_subvol)
+        CURRENT_SLOT="$booted"
         [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]] && CURRENT_SLOT="blue"
         mkdir -p /data
         echo "$CURRENT_SLOT" > /data/current-slot
         log "Corrected: $CURRENT_SLOT"
     fi
     
-    local booted=$(get_booted_subvol)
     log "Marker: @${CURRENT_SLOT}"
     log "Booted: @${booted}"
     
     if [[ "$booted" != "$CURRENT_SLOT" ]]; then
-        log_error "BOOT MISMATCH!"
-        die "Expected @${CURRENT_SLOT}, running @${booted}"
+        if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
+            log_warn "Boot mismatch detected but --force active, using booted slot @${booted} as current"
+            CURRENT_SLOT="$booted"
+            mkdir -p /data
+            echo "$CURRENT_SLOT" > /data/current-slot
+        else
+            log_error "BOOT MISMATCH!"
+            die "Expected @${CURRENT_SLOT}, running @${booted}"
+        fi
     fi
     
     log_success "Validated"

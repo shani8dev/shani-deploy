@@ -678,7 +678,8 @@ download_with_tool() {
             aria2c \
                 --max-connection-per-server=1 --split=1 \
                 --continue=true --allow-overwrite=true --auto-file-renaming=false \
-                --conditional-get=true --remote-time=true \
+                --conditional-get=false --remote-time=true \
+				--file-allocation=none \
                 --timeout=60 --max-tries=5 --retry-wait=5 \
                 --console-log-level=error --summary-interval=0 \
                 --max-resume-failure-tries=10 \

@@ -177,7 +177,7 @@ generate_cmdline() {
             error_exit "Failed to retrieve LUKS UUID from underlying device $underlying"
         fi
         rootdev="/dev/mapper/${ROOTLABEL}"
-        encryption_params=" rd.luks.uuid=${luks_uuid} rd.luks.name=${luks_uuid}=${ROOTLABEL} rd.luks.options=discard"
+        encryption_params=" rd.luks.uuid=${luks_uuid} rd.luks.name=${luks_uuid}=${ROOTLABEL} rd.luks.options=${luks_uuid}=tpm2-device=auto"
         resume_uuid="${luks_uuid}"
     else
         rootdev="UUID=${fs_uuid}"

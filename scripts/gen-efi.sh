@@ -69,11 +69,10 @@ error_exit() {
 
 # Detect if we're in chroot
 in_chroot() {
-    # Check if root is not the real root (in chroot or container)
-    if [[ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root/.)" ]] 2>/dev/null; then
-        return 0
-    fi
-    return 1
+    local root_id proc_id
+    root_id=$(stat -c %d:%i / 2>/dev/null) || return 1
+    proc_id=$(stat -c %d:%i /proc/1/root/. 2>/dev/null) || return 0
+    [[ "$root_id" != "$proc_id" ]]
 }
 
 # Get currently booted slot
@@ -139,8 +138,6 @@ cleanup_esp() {
     fi
 }
 
-mkdir -p "$EFI_DIR" "$BOOT_ENTRIES"
-
 sign_efi_binary() {
     local file="$1"
     sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$file" "$file" || error_exit "sbsign failed for $file"
@@ -158,70 +155,66 @@ get_kernel_version() {
 
 generate_cmdline() {
     local slot="$1"
-    if [ -f "$CMDLINE_FILE" ]; then
-        log "Reusing existing kernel cmdline from $CMDLINE_FILE"
-    else
-        local fs_uuid
-        fs_uuid=$(blkid -s UUID -o value /dev/disk/by-label/"${ROOTLABEL}" 2>/dev/null || true)
-        if [[ -z "$fs_uuid" ]]; then
-            error_exit "Failed to retrieve filesystem UUID for label ${ROOTLABEL}"
-        fi
-
-        local rootdev encryption_params resume_uuid
-
-        if [ -e "/dev/mapper/${ROOTLABEL}" ]; then
-            local underlying
-            underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" | sed -n 's/^ *device: //p')
-            local luks_uuid
-            luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
-            if [[ -z "$luks_uuid" ]]; then
-                error_exit "Failed to retrieve LUKS UUID from underlying device $underlying"
-            fi
-            rootdev="/dev/mapper/${ROOTLABEL}"
-            encryption_params=" rd.luks.uuid=${luks_uuid} rd.luks.name=${luks_uuid}=${ROOTLABEL} rd.luks.options=discard"
-            resume_uuid="${luks_uuid}"
-        else
-            rootdev="UUID=${fs_uuid}"
-            encryption_params=""
-            resume_uuid="${fs_uuid}"
-        fi
-
-        local cmdline="quiet splash systemd.volatile=state ro lsm=landlock,lockdown,yama,integrity,apparmor,bpf rootfstype=btrfs rootflags=subvol=@${slot},ro,noatime,compress=zstd,space_cache=v2,autodefrag${encryption_params} root=${rootdev}"
-
-		# Append keyboard mapping parameter from /etc/vconsole.conf if available
-		if [[ -f /etc/vconsole.conf ]]; then
-			local keymap
-			keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf | cut -d= -f2)
-			if [[ -n "$keymap" ]]; then
-				cmdline+=" rd.vconsole.keymap=$keymap"
-			fi
-		fi
-
-        if [ -f /swap/swapfile ]; then
-            local swap_offset
-            swap_offset=$(btrfs inspect-internal map-swapfile -r /swap/swapfile | awk '{print $NF}' 2>/dev/null || true)
-            if [[ -n "$swap_offset" ]]; then
-                cmdline+=" resume=UUID=${resume_uuid} resume_offset=${swap_offset}"
-            else
-                log "WARNING: Swap file exists but failed to determine swap offset."
-            fi
-        fi
-
-        echo "$cmdline" > "$CMDLINE_FILE"
-        chmod 0644 "$CMDLINE_FILE"
-        log "Kernel cmdline generated for ${slot} (saved in ${CMDLINE_FILE})"
+    if [[ -f "$CMDLINE_FILE" ]]; then
+        log "Removing stale cmdline, regenerating..."
+        rm -f "$CMDLINE_FILE"
     fi
+
+    local fs_uuid
+    fs_uuid=$(blkid -s UUID -o value /dev/disk/by-label/"${ROOTLABEL}" 2>/dev/null || true)
+    if [[ -z "$fs_uuid" ]]; then
+        error_exit "Failed to retrieve filesystem UUID for label ${ROOTLABEL}"
+    fi
+
+    local rootdev encryption_params resume_uuid
+
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        local underlying
+        underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" | sed -n 's/^ *device: //p')
+        local luks_uuid
+        luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
+        if [[ -z "$luks_uuid" ]]; then
+            error_exit "Failed to retrieve LUKS UUID from underlying device $underlying"
+        fi
+        rootdev="/dev/mapper/${ROOTLABEL}"
+        encryption_params=" rd.luks.uuid=${luks_uuid} rd.luks.name=${luks_uuid}=${ROOTLABEL} rd.luks.options=discard"
+        resume_uuid="${luks_uuid}"
+    else
+        rootdev="UUID=${fs_uuid}"
+        encryption_params=""
+        resume_uuid="${fs_uuid}"
+    fi
+
+    local cmdline="quiet splash systemd.volatile=state ro lsm=landlock,lockdown,yama,integrity,apparmor,bpf rootfstype=btrfs rootflags=subvol=@${slot},ro,noatime,compress=zstd,space_cache=v2,autodefrag${encryption_params} root=${rootdev}"
+
+    if [[ -f /etc/vconsole.conf ]]; then
+        local keymap
+        keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf | cut -d= -f2)
+        if [[ -n "$keymap" ]]; then
+            cmdline+=" rd.vconsole.keymap=$keymap"
+        fi
+    fi
+
+    if [[ -f /swap/swapfile ]]; then
+        local swap_offset
+        swap_offset=$(btrfs inspect-internal map-swapfile -r /swap/swapfile | awk '{print $NF}' 2>/dev/null || true)
+        if [[ -n "$swap_offset" ]]; then
+            cmdline+=" resume=UUID=${resume_uuid} resume_offset=${swap_offset}"
+        else
+            log "WARNING: Swap file exists but failed to determine swap offset."
+        fi
+    fi
+
+    echo "$cmdline" > "$CMDLINE_FILE"
+    chmod 0644 "$CMDLINE_FILE"
+    log "Kernel cmdline generated for ${slot} (saved in ${CMDLINE_FILE})"
 }
 
 # update_slot_conf updates the boot entry configuration for a given slot.
 update_slot_conf() {
-    local slot="$1"
-    local active_slot=""
-    if [ -f /data/current-slot ]; then
-        active_slot=$(cat /data/current-slot)
-    fi
+    local slot="$1" target_slot="$2"
     local suffix=""
-    if [[ "$slot" == "$active_slot" ]]; then
+    if [[ "$slot" == "$target_slot" ]]; then
         suffix=" (Active)"
     else
         suffix=" (Candidate)"
@@ -243,7 +236,8 @@ generate_uki() {
     
     # Ensure ESP is mounted before we start
     ensure_esp_mounted
-    
+    mkdir -p "$EFI_DIR" "$BOOT_ENTRIES"
+
     local kernel_ver
     kernel_ver=$(get_kernel_version)
     local uki_path="$EFI_DIR/${OS_NAME}-${slot}.efi"
@@ -257,18 +251,11 @@ generate_uki() {
     sign_efi_binary "$uki_path"
 
     # Update both slots' boot entries.
-    update_slot_conf "$slot"
+    update_slot_conf "$slot" "$slot"
     local other_slot=$([[ "$slot" == "blue" ]] && echo "green" || echo "blue")
-    update_slot_conf "$other_slot"
+    update_slot_conf "$other_slot" "$slot"
 
-    # Set the active slot (from /data/current-slot, if available) as default.
-    local active
-    if [ -f /data/current-slot ]; then
-        active=$(cat /data/current-slot)
-    else
-        active="$slot"
-    fi
-    bootctl set-default "${OS_NAME}-${active}.conf" || error_exit "bootctl set-default failed"
+	bootctl set-default "${OS_NAME}-${slot}.conf" || error_exit "bootctl set-default failed"
     
     # Unmount ESP if we mounted it
     cleanup_esp

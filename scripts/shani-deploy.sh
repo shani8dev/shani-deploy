@@ -1214,9 +1214,17 @@ generate_uki() {
 #####################################
 
 restore_candidate() {
-    log_error "Initiating rollback"
     trap - ERR EXIT
     set +e
+
+    # Guard: if /dev is gone we're in a broken chroot or degraded environment.
+    # btrfs and mount will fail — bail immediately to prevent further damage.
+    if [[ ! -c /dev/null ]]; then
+        echo "[FATAL] restore_candidate: environment degraded (/dev unavailable), aborting" >&2
+        exit 1
+    fi
+
+    log_error "Initiating rollback"
 
     if [[ -z "${CANDIDATE_SLOT:-}" ]]; then
         log_warn "CANDIDATE_SLOT unknown, skipping subvolume restore"
@@ -1227,14 +1235,28 @@ restore_candidate() {
     fi
 
     mkdir -p "$MOUNT_DIR" 2>/dev/null
+    umount -R "$MOUNT_DIR" 2>/dev/null || true
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
 
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
         log "Restoring from @${BACKUP_NAME}"
-        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
-        btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
-        btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
-        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+
+        local rc_booted
+        rc_booted=$(get_booted_subvol)
+
+        if [[ "$CANDIDATE_SLOT" == "$rc_booted" ]]; then
+            log_warn "Refusing to touch @${CANDIDATE_SLOT} — it is the currently booted slot"
+            log_warn "Skipping subvolume restore, booted system is intact"
+        else
+            if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
+                btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
+            else
+                log_warn "@${CANDIDATE_SLOT} does not exist, restoring directly from backup"
+            fi
+            btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
+            btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+        fi
 
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot"
@@ -1305,8 +1327,21 @@ rollback_system() {
 
     log "Restoring @${failed_slot} from @${BACKUP_NAME}"
 
-    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
-    run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
+    # SAFETY: re-read booted slot immediately before any destructive operation.
+    # Must never touch the booted slot regardless of what variables say.
+    local pre_delete_booted
+    pre_delete_booted=$(get_booted_subvol)
+    if [[ "$failed_slot" == "$pre_delete_booted" ]]; then
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        die "SAFETY ABORT: @${failed_slot} is the currently booted slot — refusing to touch it"
+    fi
+
+    if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
+        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
+        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
+    else
+        log_warn "@${failed_slot} does not exist — restoring directly from backup without delete"
+    fi
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro true
 
@@ -1764,7 +1799,15 @@ deploy_update() {
 	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -q "subvol=/@${CANDIDATE_SLOT}[^a-zA-Z]"; then
         die "Candidate subvolume is currently mounted"
     fi
-    
+
+    # SAFETY: confirm candidate is not the booted slot before any destructive operation.
+    local deploy_booted
+    deploy_booted=$(get_booted_subvol)
+    if [[ "$CANDIDATE_SLOT" == "$deploy_booted" ]]; then
+        safe_umount "$MOUNT_DIR"
+        die "SAFETY ABORT: @${CANDIDATE_SLOT} is the currently booted slot — refusing to touch it"
+    fi
+
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
         log "Backup: @${BACKUP_NAME}"

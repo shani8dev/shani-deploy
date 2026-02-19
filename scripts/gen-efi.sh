@@ -62,8 +62,11 @@ log_warn() {
 
 error_exit() {
     log "ERROR: $*"
-    # Unmount ESP if we mounted it
-    [[ $ESP_WAS_UNMOUNTED -eq 1 ]] && umount "$ESP" 2>/dev/null || true
+    # Only unmount ESP if we were the ones who mounted it
+    if [[ ${ESP_WAS_UNMOUNTED:-0} -eq 1 ]]; then
+        umount "$ESP" 2>/dev/null || true
+        ESP_WAS_UNMOUNTED=0
+    fi
     exit 1
 }
 

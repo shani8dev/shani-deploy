@@ -1228,32 +1228,31 @@ restore_candidate() {
 
     mkdir -p "$MOUNT_DIR" 2>/dev/null
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
-    
+
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
         log "Restoring from @${BACKUP_NAME}"
-        btrfs property set -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
+        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
         btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
         btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
-        btrfs property set -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
-        
+        btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot"
-        
+
         local prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
         if [[ "$prev_slot" == "$CANDIDATE_SLOT" ]] || [[ -z "$prev_slot" ]]; then
             echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
         fi
     fi
-    
+
     [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null
     [[ -d "$MOUNT_DIR/temp_update" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
-    
-	umount -R "$MOUNT_DIR" 2>/dev/null
+
+    umount -R "$MOUNT_DIR" 2>/dev/null
     rm -f "$DEPLOY_PENDING" 2>/dev/null
 
-    # Reset bootloader default to current slot in case gen-efi already ran
     if ! mountpoint -q /boot/efi 2>/dev/null; then
         mount LABEL=shani_boot /boot/efi 2>/dev/null || true
     fi
@@ -1287,14 +1286,16 @@ rollback_system() {
     CURRENT_SLOT="$failed_slot"
     CANDIDATE_SLOT="$previous_slot"
 
-    log "Rollback: ${failed_slot} → ${previous_slot}"
+    log "Rollback: @${failed_slot} → @${previous_slot}"
 
-	BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
-        awk -v s="${failed_slot}" '$0 ~ s"_backup" {print $NF}' | sort | tail -1)
+    BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
+        awk -v s="${failed_slot}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
+    BACKUP_NAME="${BACKUP_NAME#@}"
 
     if [[ -z "$BACKUP_NAME" ]]; then
-        log_warn "No backup found, attempting UKI regeneration for @${previous_slot} as last resort"
+        log_warn "No backup found for @${failed_slot}"
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        log_warn "Attempting UKI regeneration for @${previous_slot} as last resort"
         generate_uki "$previous_slot" && {
             log_success "UKI regenerated, rebooting"
             [[ "${DRY_RUN}" == "yes" ]] || reboot
@@ -1304,12 +1305,18 @@ rollback_system() {
 
     log "Using: @${BACKUP_NAME}"
 
+    local booted
+    booted=$(get_booted_subvol)
+    [[ "$failed_slot" == "$booted" ]] && die "Cannot restore @${failed_slot} - it is the currently booted slot"
+
+    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
     run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
-    run_cmd btrfs property set -ts "$MOUNT_DIR/@${failed_slot}" ro true
+    run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro true
 
     echo "$previous_slot" > "$MOUNT_DIR/@data/current-slot"
     echo "$failed_slot"   > "$MOUNT_DIR/@data/previous-slot"
+
     safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
 
     generate_uki "$previous_slot"

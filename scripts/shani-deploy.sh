@@ -1136,6 +1136,26 @@ optimize_storage() {
     [[ $dedupe_status -eq 0 ]] && log_success "Deduplication completed in ${dedupe_duration}s" || \
         log_warn "Deduplication completed with warnings (exit: $dedupe_status)"
 
+    echo ""
+    log "=== Post-Deduplication Results ==="
+    local -a check_subvols=(blue green data swap)
+    for subvol in "${check_subvols[@]}"; do
+        local path="$MOUNT_DIR/@${subvol}"
+        [[ -d "$path" ]] || continue
+        echo ""
+        log "@${subvol}:"
+        if command -v compsize &>/dev/null; then
+            compsize -x "$path" || log_warn "compsize failed"
+        else
+            btrfs filesystem du -s "$path" || log_warn "btrfs du failed"
+        fi
+    done
+
+    echo ""
+    log "Final Filesystem Usage:"
+    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to get usage"
+
+    echo ""
     set -e
     return 0
 }

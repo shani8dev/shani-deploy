@@ -64,6 +64,7 @@ command -v curl &>/dev/null && HAS_CURL=1
 command -v pv &>/dev/null && HAS_PV=1
 
 declare -g LOCAL_VERSION LOCAL_PROFILE
+declare -g CHROOT_ESP_BIND=0
 declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
 declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
 declare -g UPDATE_CHANNEL="" UPDATE_CHANNEL_SOURCE="" DRY_RUN="no" VERBOSE="no"
@@ -601,7 +602,7 @@ validate_download() {
     local disk_usage
     disk_usage=$(du -b "$file" 2>/dev/null | awk '{print $1}')
     
-    if (( disk_usage > 0 )); then
+    if (( disk_usage > 0 && size > 0 )); then
         local usage_ratio=$((disk_usage * 100 / size))
         log_verbose "Disk usage: $(format_bytes $disk_usage) / $(format_bytes $size) (${usage_ratio}%)"
         
@@ -1175,8 +1176,12 @@ prepare_chroot() {
     mkdir -p "$MOUNT_DIR/boot/efi"
     if mountpoint -q /boot/efi; then
         run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi"
+        # Record that we did a bind-mount (not a fresh label mount) so cleanup
+        # knows it should NOT try to unmount the host's /boot/efi itself.
+        CHROOT_ESP_BIND=1
     else
         safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults"
+        CHROOT_ESP_BIND=0
     fi
     
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
@@ -1198,13 +1203,19 @@ prepare_chroot() {
 cleanup_chroot() {
     log_verbose "Cleaning chroot"
     set +e
-    
+
     [[ -d "$MOUNT_DIR/sys/firmware/efi/efivars" ]] && safe_umount "$MOUNT_DIR/sys/firmware/efi/efivars"
-    for d in "${CHROOT_BIND_DIRS[@]}"; do safe_umount "$MOUNT_DIR$d"; done
-    for d in "${CHROOT_STATIC_DIRS[@]}"; do safe_umount "$MOUNT_DIR/$d"; done
+    # Unmount bind dirs in reverse order to handle nested mounts correctly
+    local -a bind_reversed=()
+    for d in "${CHROOT_BIND_DIRS[@]}"; do bind_reversed=("$d" "${bind_reversed[@]}"); done
+    for d in "${bind_reversed[@]}"; do safe_umount "$MOUNT_DIR$d"; done
+    # Unmount static dirs in reverse order
+    local -a static_reversed=()
+    for d in "${CHROOT_STATIC_DIRS[@]}"; do static_reversed=("$d" "${static_reversed[@]}"); done
+    for d in "${static_reversed[@]}"; do safe_umount "$MOUNT_DIR/$d"; done
     safe_umount "$MOUNT_DIR/boot/efi"
     safe_umount "$MOUNT_DIR"
-    
+
     set -e
 }
 
@@ -1278,11 +1289,13 @@ restore_candidate() {
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot"
 
-        local prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$prev_slot" == "$CANDIDATE_SLOT" ]] || [[ -z "$prev_slot" ]]; then
-            echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
+        # Restore previous-slot to the failed candidate so on next boot the system
+        # knows what was attempted. Only overwrite if it's blank or already wrong.
+        local prev_slot
+        prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
+        if [[ -z "$prev_slot" ]]; then
+            echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
         fi
-    fi
 
     [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null
@@ -1310,6 +1323,10 @@ trap 'restore_candidate' ERR
 
 rollback_system() {
     log_section "System Rollback"
+    # Disable the restore_candidate ERR trap while we're already doing a rollback.
+    # Without this, any error inside rollback_system would re-trigger restore_candidate
+    # causing infinite recursion.
+    trap - ERR
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
@@ -1371,6 +1388,7 @@ rollback_system() {
 
     log_success "Rollback complete"
     log "System will boot: @${booted}"
+    trap 'restore_candidate' ERR
     [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 
@@ -1964,9 +1982,12 @@ main() {
     check_tools
     set_update_channel "${UPDATE_CHANNEL:-}"
     set_environment
+    # validate_boot must run first so CURRENT_SLOT/CANDIDATE_SLOT are set before
+    # rollback_system is called — otherwise restore_candidate's guard hits an empty slot.
+    validate_boot
 
     # Rollback and cleanup don't need internet - run before check_internet
-	if [[ ! -f /data/boot-ok ]]; then
+    if [[ ! -f /data/boot-ok ]]; then
         if [[ -f /data/previous-slot ]]; then
             log_warn "/data/boot-ok missing — possible failed boot, initiating rollback"
             rollback_system
@@ -2012,7 +2033,7 @@ main() {
     self_update
     persist_state
     inhibit_system
-    validate_boot
+    # validate_boot already called above; slots are already set
     check_space
     fetch_update
     

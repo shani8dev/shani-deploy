@@ -1254,9 +1254,15 @@ restore_candidate() {
     rm -f "$DEPLOY_PENDING" 2>/dev/null
 
     # Reset bootloader default to current slot in case gen-efi already ran
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        mount LABEL=shani_boot /boot/efi 2>/dev/null || true
+    fi
     if mountpoint -q /boot/efi 2>/dev/null; then
         bootctl set-default "${OS_NAME}-${CURRENT_SLOT}.conf" 2>/dev/null || \
             log_warn "Could not reset bootctl default - manual check needed"
+        umount /boot/efi 2>/dev/null || true
+    else
+        log_warn "Could not mount ESP to reset bootctl default - manual check needed"
     fi
 
     log_error "Rollback complete - system remains on @${CURRENT_SLOT}"
@@ -1295,8 +1301,6 @@ rollback_system() {
         } || die "No backup and UKI regeneration failed - manual intervention required"
         return
     fi
-
-    BACKUP_NAME="${BACKUP_NAME#@}"
 
     log "Using: @${BACKUP_NAME}"
 
@@ -1889,7 +1893,14 @@ main() {
     set_environment
 
     # Rollback and cleanup don't need internet - run before check_internet
-    [[ -f /data/boot-ok ]] || rollback_system
+	if [[ ! -f /data/boot-ok ]]; then
+        if [[ -f /data/previous-slot ]]; then
+            log_warn "/data/boot-ok missing — possible failed boot, initiating rollback"
+            rollback_system
+        else
+            log "First boot detected (no previous-slot marker), skipping rollback"
+        fi
+    fi
     [[ "$ROLLBACK" == "yes" ]] && { rollback_system; exit 0; }
 
     if [[ "$CLEANUP" == "yes" ]]; then

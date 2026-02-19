@@ -1280,7 +1280,7 @@ restore_candidate() {
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
                 btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
             else
-                log_warn "@${CANDIDATE_SLOT} does not exist, restoring directly from backup"
+                log_warn "@${CANDIDATE_SLOT} does not exist, restoring directly from backup without delete"
             fi
             btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
             btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
@@ -1289,13 +1289,12 @@ restore_candidate() {
         echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
             log_warn "Failed to restore current-slot"
 
-        # Restore previous-slot to the failed candidate so on next boot the system
-        # knows what was attempted. Only overwrite if it's blank or already wrong.
         local prev_slot
         prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
         if [[ -z "$prev_slot" ]]; then
             echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
         fi
+    fi  # <-- THIS WAS MISSING
 
     [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null

@@ -1305,7 +1305,30 @@ restore_candidate() {
         if [[ -z "$prev_slot" ]]; then
             echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
         fi
-    fi  # <-- THIS WAS MISSING
+    else
+        log_error "No backup available for @${CANDIDATE_SLOT} — snapshotting @${CURRENT_SLOT} as fallback"
+        local nb_booted
+        nb_booted=$(get_booted_subvol)
+        if [[ -n "${CURRENT_SLOT:-}" && "$CANDIDATE_SLOT" != "$nb_booted" ]] && \
+           btrfs_subvol_exists "$MOUNT_DIR/@${CURRENT_SLOT}"; then
+            btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
+            btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null || true
+            btrfs subvolume snapshot "$MOUNT_DIR/@${CURRENT_SLOT}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null && \
+                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null && \
+                log "Snapshotted @${CURRENT_SLOT} → @${CANDIDATE_SLOT}" || \
+                log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
+
+            # Unmount before chroot for UKI generation
+            umount -R "$MOUNT_DIR" 2>/dev/null || true
+            # Generate shanios-${CANDIDATE_SLOT}.efi using the candidate slot's
+            # chroot — which now contains current slot's kernel since it's a snapshot
+            generate_uki "$CANDIDATE_SLOT" && \
+                log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent" || \
+                log_warn "UKI generation failed for @${CANDIDATE_SLOT} — manual check of ESP needed"
+        else
+            log_warn "Cannot snapshot — @${CURRENT_SLOT} unavailable or @${CANDIDATE_SLOT} is booted slot"
+        fi
+    fi
 
     [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null

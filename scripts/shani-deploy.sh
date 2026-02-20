@@ -1801,7 +1801,8 @@ download_update() {
     
     # Get expected size
     log "Checking remote size..."
-    local active_url=$(( use_r2 )) && echo "$r2_image_url" || echo "$mirror_url"
+	local active_url
+    (( use_r2 )) && active_url="$r2_image_url" || active_url="$mirror_url"
     local expected_size=$(get_remote_file_size "$active_url")
     (( expected_size > 0 )) && log "Expected: $(format_bytes $expected_size)"
     
@@ -1837,7 +1838,8 @@ download_update() {
         ((global_attempt++))
         log "Download attempt ${global_attempt}/${max_global_attempts}"
         
-    local dl_url=$(( use_r2 )) && echo "$r2_image_url" || echo "$mirror_url"
+    local dl_url
+    (( use_r2 )) && dl_url="$r2_image_url" || dl_url="$mirror_url"
         if download_file "$dl_url" "$image" 0; then
             if [[ ! -f "$image" ]] || [[ ! -s "$image" ]]; then
                 log_warn "Download produced no file"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Bless Current Boot - Shani OS Boot Counting
+DefaultDependencies=no
+After=sysinit.target data.mount
+Before=basic.target
+Wants=data.mount
+ConditionPathExists=/data/boot_in_progress
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'bootctl set-good 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

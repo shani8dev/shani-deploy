@@ -2,11 +2,12 @@
 Description=Mark Boot In Progress for Shani OS
 DefaultDependencies=no
 After=data.mount
+Wants=data.mount
 Before=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'rm -f /data/boot-ok /data/boot_failure && touch /data/boot_in_progress'
+ExecStart=/bin/sh -c 'rm -f /data/boot-ok /data/boot_failure /data/boot_hard_failure && touch /data/boot_in_progress'
 RemainAfterExit=yes
 
 [Install]

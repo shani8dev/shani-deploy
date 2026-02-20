@@ -338,7 +338,7 @@ get_remote_file_size() {
             tr -d '\r\n ' || echo "0")
         
         # If we got a small size, it might be a redirect page - try with range request
-        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 10000 )); then
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 1048576 )); then
             log_verbose "Got small size ($size), retrying with range request..."
             local range_size
             range_size=$(timeout 30 curl -sI \
@@ -371,7 +371,7 @@ get_remote_file_size() {
             tr -d '\r\n ' || echo "0")
         
         # Try range request if size seems wrong
-        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 10000 )); then
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 1048576 )); then
             log_verbose "Got small size ($size), retrying with range request..."
             local range_output
             range_output=$(timeout 30 wget -q --spider -S \

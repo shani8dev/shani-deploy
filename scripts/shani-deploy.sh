@@ -1970,9 +1970,9 @@ finalize_update() {
     if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
         cleanup_old_backups || log_verbose "Backup cleanup warnings"
         
-        # Storage analysis handles its own mount
-        optimize_storage || log_verbose "Storage optimization warnings"
 		safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+		# optimize_storage handles its own mount/umount internally
+        optimize_storage || log_verbose "Storage optimization warnings"
     else
         log_verbose "Could not mount for maintenance"
     fi
@@ -2009,7 +2009,7 @@ EOF
 }
 
 main() {
-    local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no"
+    local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no" STORAGE_OPTIMIZE="no"
     
     while [[ $# -gt 0 ]]; do
         case "$1" in

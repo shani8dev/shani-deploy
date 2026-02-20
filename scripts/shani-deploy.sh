@@ -1587,13 +1587,13 @@ validate_boot() {
     
     if [[ "$booted" != "$CURRENT_SLOT" ]]; then
         if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
-            log_warn "Boot mismatch detected but --force active, using booted slot @${booted} as current"
+            log_warn "Boot mismatch: booted=@${booted} marker=@${CURRENT_SLOT} — correcting"
             CURRENT_SLOT="$booted"
             mkdir -p /data
             echo "$CURRENT_SLOT" > /data/current-slot
         else
-            log_error "BOOT MISMATCH!"
-            die "Expected @${CURRENT_SLOT}, running @${booted}"
+            log_error "BOOT MISMATCH! Expected @${CURRENT_SLOT}, running @${booted}"
+            die "Boot slot mismatch — use --force to override"
         fi
     fi
     
@@ -1992,19 +1992,6 @@ main() {
     check_tools
     set_update_channel "${UPDATE_CHANNEL:-}"
     set_environment
-    # validate_boot must run first so CURRENT_SLOT/CANDIDATE_SLOT are set before
-    # rollback_system is called — otherwise restore_candidate's guard hits an empty slot.
-    validate_boot
-
-    # Rollback and cleanup don't need internet - run before check_internet
-    if [[ ! -f /data/boot-ok ]]; then
-        if [[ -f /data/previous-slot ]]; then
-            log_warn "/data/boot-ok missing — possible failed boot, initiating rollback"
-            rollback_system
-        else
-            log "First boot detected (no previous-slot marker), skipping rollback"
-        fi
-    fi
     [[ "$ROLLBACK" == "yes" ]] && { rollback_system; exit 0; }
 
     if [[ "$CLEANUP" == "yes" ]]; then
@@ -2043,7 +2030,7 @@ main() {
     self_update
     persist_state
     inhibit_system
-    # validate_boot already called above; slots are already set
+	validate_boot
     check_space
     fetch_update
     

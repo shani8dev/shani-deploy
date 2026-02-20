@@ -1267,6 +1267,16 @@ restore_candidate() {
     umount -R "$MOUNT_DIR" 2>/dev/null || true
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
 
+    # If BACKUP_NAME not set, search disk for most recent backup
+    if [[ -z "${BACKUP_NAME:-}" ]]; then
+        local found
+        found=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
+            awk -v s="${CANDIDATE_SLOT}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
+        BACKUP_NAME="${found#@}"
+        [[ -n "$BACKUP_NAME" ]] && log "Found backup on disk: @${BACKUP_NAME}" || \
+            log_warn "No backup found on disk for @${CANDIDATE_SLOT}"
+    fi
+
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
         log "Restoring from @${BACKUP_NAME}"
 

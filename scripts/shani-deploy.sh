@@ -1381,14 +1381,27 @@ rollback_system() {
         awk -v s="${failed_slot}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
     BACKUP_NAME="${BACKUP_NAME#@}"
 
-    if [[ -z "$BACKUP_NAME" ]]; then
-        log_warn "No backup found for @${failed_slot}"
+	if [[ -z "$BACKUP_NAME" ]]; then
+        log_warn "No backup found for @${failed_slot} — snapshotting @${booted} as fallback"
+
+        if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
+            btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false 2>/dev/null
+            btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}" 2>/dev/null || true
+        fi
+
+        run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${booted}" "$MOUNT_DIR/@${failed_slot}"
+        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro true
+
+        echo "$booted"       > "$MOUNT_DIR/@data/current-slot"
+        echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
+
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
-        log_warn "Attempting UKI regeneration for @${booted} as last resort"
-        generate_uki "$booted" && {
-            log_success "UKI regenerated, rebooting"
+
+        # Generate UKI from within failed_slot chroot (snapshot of booted, so kernel is identical)
+        generate_uki "$failed_slot" && {
+            log_success "Fallback UKI generated for @${failed_slot}, rebooting"
             [[ "${DRY_RUN}" == "yes" ]] || reboot
-        } || die "No backup and UKI regeneration failed - manual intervention required"
+        } || die "Snapshot and UKI generation failed - manual intervention required"
         return
     fi
 
@@ -1415,9 +1428,13 @@ rollback_system() {
     echo "$booted"       > "$MOUNT_DIR/@data/current-slot"
     echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
 
-    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
+	safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
 
-    generate_uki "$booted"
+    # Generate UKI from within the restored failed_slot chroot.
+    # The booted slot's UKI already works — only the restored slot needs a new entry.
+    generate_uki "$failed_slot"
+
+    log_success "Rollback complete"
 
     log_success "Rollback complete"
     log "System will boot: @${booted}"

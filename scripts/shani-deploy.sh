@@ -52,6 +52,7 @@ readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 readonly CHANNEL_FILE="/etc/shani-channel"
+readonly R2_BASE_URL="https://downloads.shani.dev"  # Replace with your R2 public bucket URL
 
 readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
@@ -400,6 +401,37 @@ get_remote_file_size() {
     else
         echo "0"
     fi
+}
+
+download_from_r2() {
+    local filepath="$1" output="$2" is_small="${3:-0}"
+    
+    [[ -z "${R2_BASE_URL:-}" ]] && return 1
+    
+    local url="${R2_BASE_URL}/${filepath}"
+    log_verbose "Trying R2: $url"
+    
+    if (( is_small )); then
+        local temp_output="${output}.tmp"
+        if (( HAS_WGET )); then
+            timeout 20 wget -q --timeout=15 --tries=2 -O "$temp_output" "$url" 2>/dev/null && \
+                [[ -f "$temp_output" && -s "$temp_output" ]] && \
+                mv "$temp_output" "$output" && return 0
+            rm -f "$temp_output"
+        fi
+        if (( HAS_CURL )); then
+            timeout 20 curl -fsSL --max-time 15 --retry 1 -o "$temp_output" "$url" 2>/dev/null && \
+                [[ -f "$temp_output" && -s "$temp_output" ]] && \
+                mv "$temp_output" "$output" && return 0
+            rm -f "$temp_output"
+        fi
+        return 1
+    fi
+    
+    download_with_tool "${HAS_ARIA2C:+aria2c}" "$url" "$output" 2>/dev/null || \
+    download_with_tool "${HAS_WGET:+wget}" "$url" "$output" 2>/dev/null || \
+    download_with_tool "${HAS_CURL:+curl}" "$url" "$output" 2>/dev/null || \
+    return 1
 }
 
 discover_mirror() {
@@ -1658,11 +1690,13 @@ check_space() {
 fetch_update() {
     log_section "Update Check"
     
-    local url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
+    local sf_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
+    local r2_path="${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
     local temp=$(mktemp)
     
     log "Checking ${UPDATE_CHANNEL}..."
-    download_file "$url" "$temp" 1 || { rm -f "$temp"; die "Manifest fetch failed"; }
+    download_from_r2 "$r2_path" "$temp" 1 || \
+        download_file "$sf_url" "$temp" 1 || { rm -f "$temp"; die "Manifest fetch failed"; }
     
     IMAGE_NAME=$(tr -d '[:space:]' < "$temp")
     rm -f "$temp"
@@ -1739,16 +1773,36 @@ download_update() {
     local sha_url="${sf_base}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${sf_base}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
     
-    # Mirror discovery
-    log "Discovering mirror..."
-    local mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
-    mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
+    # Try R2 first, fall back to SourceForge mirror
+    local r2_image_path="${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}"
+    local r2_image_url="${R2_BASE_URL}/${r2_image_path}"
+    local use_r2=0
     
-    [[ -z "$mirror_url" || ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]] && die "Mirror discovery failed"
+    if [[ -n "${R2_BASE_URL:-}" ]]; then
+        log "Checking R2 availability..."
+        local r2_size
+        r2_size=$(get_remote_file_size "$r2_image_url")
+        if (( r2_size > MIN_FILE_SIZE )); then
+            log_success "R2 available ($(format_bytes $r2_size)), using R2"
+            use_r2=1
+        else
+            log_verbose "R2 unavailable or too small, falling back to SourceForge"
+        fi
+    fi
+    
+    # Mirror discovery (SourceForge fallback)
+    local mirror_url=""
+    if (( use_r2 == 0 )); then
+        log "Discovering SourceForge mirror..."
+        mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
+        mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
+        [[ -z "$mirror_url" || ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]] && die "Mirror discovery failed"
+    fi
     
     # Get expected size
     log "Checking remote size..."
-    local expected_size=$(get_remote_file_size "$mirror_url")
+    local active_url=$(( use_r2 )) && echo "$r2_image_url" || echo "$mirror_url"
+    local expected_size=$(get_remote_file_size "$active_url")
     (( expected_size > 0 )) && log "Expected: $(format_bytes $expected_size)"
     
     # Check for existing partial download
@@ -1783,7 +1837,8 @@ download_update() {
         ((global_attempt++))
         log "Download attempt ${global_attempt}/${max_global_attempts}"
         
-        if download_file "$mirror_url" "$image" 0; then
+    local dl_url=$(( use_r2 )) && echo "$r2_image_url" || echo "$mirror_url"
+        if download_file "$dl_url" "$image" 0; then
             if [[ ! -f "$image" ]] || [[ ! -s "$image" ]]; then
                 log_warn "Download produced no file"
                 sleep 5
@@ -1817,6 +1872,15 @@ download_update() {
         
         # Try mirror rediscovery every 2 failures
         if (( global_attempt % 2 == 0 && global_attempt < max_global_attempts )); then
+            # If R2 was failing, fall back to SourceForge
+            if (( use_r2 )); then
+                log "R2 failing, switching to SourceForge mirror..."
+                use_r2=0
+                rm -f "$DOWNLOAD_DIR/mirror.url"
+                mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
+                mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
+                continue
+            fi
             log "Rediscovering mirror..."
             rm -f "$DOWNLOAD_DIR/mirror.url"
             
@@ -1854,14 +1918,16 @@ download_update() {
     }
     
     log "Downloading verification files..."
-    download_file "$sha_url" "$sha" 1 || { 
-        rm -f "$image" "${image}.aria2"
-        die "SHA256 download failed"
-    }
-    download_file "$asc_url" "$asc" 1 || { 
-        rm -f "$image" "$sha" "${image}.aria2"
-        die "GPG signature download failed"
-    }
+    download_from_r2 "${r2_image_path}.sha256" "$sha" 1 || \
+        download_file "$sha_url" "$sha" 1 || { 
+            rm -f "$image" "${image}.aria2"
+            die "SHA256 download failed"
+        }
+    download_from_r2 "${r2_image_path}.asc" "$asc" 1 || \
+        download_file "$asc_url" "$asc" 1 || { 
+            rm -f "$image" "$sha" "${image}.aria2"
+            die "GPG signature download failed"
+        }
     
     verify_sha256 "$image" "$sha" && verify_gpg "$image" "$asc" || { 
         rm -f "$image" "$sha" "$asc" "${image}.aria2"

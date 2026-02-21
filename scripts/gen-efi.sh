@@ -149,7 +149,8 @@ sign_efi_binary() {
 
 get_kernel_version() {
     local kernel_ver
-    kernel_ver=$(ls -1 /usr/lib/modules/ 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+    kernel_ver=$(ls -1 /usr/lib/modules/ 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || true)
+    kernel_ver=$(echo "$kernel_ver" | sort -V | tail -n 1)
     if [[ -z "$kernel_ver" ]]; then
         error_exit "No valid kernel version found in /usr/lib/modules/"
     fi
@@ -159,8 +160,8 @@ get_kernel_version() {
 generate_cmdline() {
     local slot="$1"
     if [[ -f "$CMDLINE_FILE" ]]; then
-        log "Removing stale cmdline, regenerating..."
-        rm -f "$CMDLINE_FILE"
+        log "Using existing cmdline for ${slot}"
+        return 0
     fi
 
     local fs_uuid
@@ -173,7 +174,7 @@ generate_cmdline() {
 
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
         local underlying
-        underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" | sed -n 's/^ *device: //p')
+        underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' || true)
         local luks_uuid
         luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
         if [[ -z "$luks_uuid" ]]; then
@@ -192,7 +193,7 @@ generate_cmdline() {
 
     if [[ -f /etc/vconsole.conf ]]; then
         local keymap
-        keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf | cut -d= -f2)
+        keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null | cut -d= -f2 || true)
         if [[ -n "$keymap" ]]; then
             cmdline+=" rd.vconsole.keymap=$keymap"
         fi
@@ -252,13 +253,6 @@ generate_uki() {
     fi
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
-
-    # Update both slots' boot entries.
-    update_slot_conf "$slot" "$slot"
-    local other_slot=$([[ "$slot" == "blue" ]] && echo "green" || echo "blue")
-    update_slot_conf "$other_slot" "$slot"
-
-	bootctl set-default "${OS_NAME}-${slot}.conf" || error_exit "bootctl set-default failed"
     
     # Unmount ESP if we mounted it
     cleanup_esp

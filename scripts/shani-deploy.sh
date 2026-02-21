@@ -52,7 +52,8 @@ readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 readonly CHANNEL_FILE="/etc/shani-channel"
-readonly R2_BASE_URL="https://downloads.shani.dev"  # Replace with your R2 public bucket URL
+readonly ESP="/boot/efi"
+readonly R2_BASE_URL="https://downloads.shani.dev"
 
 readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
@@ -1270,6 +1271,44 @@ generate_uki() {
     return $result
 }
 
+finalize_boot_entries() {
+    local active_slot="$1"
+    local candidate_slot="$2"
+    local esp_mounted=0
+
+    if ! mountpoint -q "$ESP" 2>/dev/null; then
+        log "ESP not mounted, mounting temporarily..."
+        if mount LABEL=shani_boot "$ESP" 2>/dev/null; then
+            esp_mounted=1
+        else
+            log_warn "Could not mount ESP — boot entries not updated"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$ESP/loader/entries"
+
+    local active_conf="$ESP/loader/entries/${OS_NAME}-${active_slot}.conf"
+    local candidate_conf="$ESP/loader/entries/${OS_NAME}-${candidate_slot}.conf"
+
+    cat > "$active_conf" <<EOF
+title   ${OS_NAME}-${active_slot} (Active)
+efi     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
+EOF
+
+    cat > "$candidate_conf" <<EOF
+title   ${OS_NAME}-${candidate_slot} (Candidate)
+efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
+EOF
+
+    bootctl set-default "${OS_NAME}-${active_slot}.conf" || \
+        log_warn "bootctl set-default failed"
+
+    if [[ $esp_mounted -eq 1 ]]; then
+        umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"
+    fi
+}
+
 #####################################
 ### Rollback                      ###
 #####################################
@@ -1352,10 +1391,10 @@ restore_candidate() {
 
             # Unmount before chroot for UKI generation
             umount -R "$MOUNT_DIR" 2>/dev/null || true
-            # Generate shanios-${CANDIDATE_SLOT}.efi using the candidate slot's
-            # chroot — which now contains current slot's kernel since it's a snapshot
-            generate_uki "$CANDIDATE_SLOT" && \
-                log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent" || \
+            generate_uki "$CANDIDATE_SLOT" && {
+                finalize_boot_entries "$CURRENT_SLOT" "$CANDIDATE_SLOT"
+                log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
+            } || \
                 log_warn "UKI generation failed for @${CANDIDATE_SLOT} — manual check of ESP needed"
         else
             log_warn "Cannot snapshot — @${CURRENT_SLOT} unavailable or @${CANDIDATE_SLOT} is booted slot"
@@ -1370,16 +1409,8 @@ restore_candidate() {
     umount -R "$MOUNT_DIR" 2>/dev/null
     rm -f "$DEPLOY_PENDING" 2>/dev/null
 
-    if ! mountpoint -q /boot/efi 2>/dev/null; then
-        mount LABEL=shani_boot /boot/efi 2>/dev/null || true
-    fi
-    if mountpoint -q /boot/efi 2>/dev/null; then
-        bootctl set-default "${OS_NAME}-${CURRENT_SLOT}.conf" 2>/dev/null || \
-            log_warn "Could not reset bootctl default - manual check needed"
-        umount /boot/efi 2>/dev/null || true
-    else
-        log_warn "Could not mount ESP to reset bootctl default - manual check needed"
-    fi
+    finalize_boot_entries "$CURRENT_SLOT" "$CANDIDATE_SLOT" 2>/dev/null || \
+        log_warn "Could not reset boot entries - manual check needed"
 
     log_error "Rollback complete - system remains on @${CURRENT_SLOT}"
     exit 1
@@ -1431,6 +1462,7 @@ rollback_system() {
 
         # Generate UKI from within failed_slot chroot (snapshot of booted, so kernel is identical)
         generate_uki "$failed_slot" && {
+            finalize_boot_entries "$booted" "$failed_slot"
             log_success "Fallback UKI generated for @${failed_slot}, rebooting"
             [[ "${DRY_RUN}" == "yes" ]] || reboot
         } || die "Snapshot and UKI generation failed - manual intervention required"
@@ -1465,8 +1497,7 @@ rollback_system() {
     # Generate UKI from within the restored failed_slot chroot.
     # The booted slot's UKI already works — only the restored slot needs a new entry.
     generate_uki "$failed_slot"
-
-    log_success "Rollback complete"
+    finalize_boot_entries "$booted" "$failed_slot"
 
     log_success "Rollback complete"
     log "System will boot: @${booted}"
@@ -2018,6 +2049,7 @@ finalize_update() {
 
     verify_and_create_subvolumes || die "Subvolume verification failed"
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
+    finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT"
 
     mkdir -p /data
     echo "$CURRENT_SLOT" > /data/previous-slot || die "Failed to write previous-slot"

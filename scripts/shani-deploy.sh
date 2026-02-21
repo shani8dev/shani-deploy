@@ -1224,12 +1224,12 @@ prepare_chroot() {
     
     for d in "${CHROOT_BIND_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR$d"
-        run_cmd mount --bind "$d" "$MOUNT_DIR$d"
+        run_cmd mount --rbind "$d" "$MOUNT_DIR$d"
     done
     
     if [[ -d /sys/firmware/efi/efivars ]]; then
         mkdir -p "$MOUNT_DIR/sys/firmware/efi/efivars"
-        run_cmd mount --bind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars"
+        run_cmd mount --rbind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars"
     fi
 }
 

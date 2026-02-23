@@ -254,7 +254,8 @@ safe_umount() {
         return 0
     fi
     
-    umount -R "$tgt" 2>/dev/null || {
+    umount -R "$tgt" 2>/dev/null || \
+    umount -R -l "$tgt" 2>/dev/null || {
         log_warn "Failed to unmount: $tgt"
         return 1
     }
@@ -1209,12 +1210,18 @@ optimize_storage() {
     log "This may take several minutes..."
     echo ""
 
-    mkdir -p "$MOUNT_DIR/@data"
+    if ! btrfs_subvol_exists "$MOUNT_DIR/@data"; then
+        log_warn "@data subvolume missing — skipping hashfile, deduplication will proceed without cache"
+    fi
     local dedupe_start=$(date +%s)
+
+    local dedupe_hashfile_opts=()
+    btrfs_subvol_exists "$MOUNT_DIR/@data" && \
+        dedupe_hashfile_opts=(--hashfile="$MOUNT_DIR/@data/.dedupe.db")
 
     duperemove -dhr --skip-zeroes --dedupe-options=same,partial -b 128K --batchsize=256 \
         --io-threads="$(nproc)" --cpu-threads="$(nproc)" \
-        --hashfile="$MOUNT_DIR/@data/.dedupe.db" "${targets[@]}"
+        "${dedupe_hashfile_opts[@]}" "${targets[@]}"
 
     local dedupe_status=$?
     local dedupe_duration=$(( $(date +%s) - dedupe_start ))
@@ -1294,7 +1301,7 @@ cleanup_chroot() {
     # Unmount bind dirs in reverse order to handle nested mounts correctly
     local -a bind_reversed=()
     for d in "${CHROOT_BIND_DIRS[@]}"; do bind_reversed=("$d" "${bind_reversed[@]}"); done
-    for d in "${bind_reversed[@]}"; do safe_umount "$MOUNT_DIR$d"; done
+    for d in "${bind_reversed[@]}"; do safe_umount "$MOUNT_DIR$d" || umount -R -l "$MOUNT_DIR$d" 2>/dev/null || true; done
     # Unmount static dirs in reverse order
     local -a static_reversed=()
     for d in "${CHROOT_STATIC_DIRS[@]}"; do static_reversed=("$d" "${static_reversed[@]}"); done
@@ -1303,6 +1310,7 @@ cleanup_chroot() {
     safe_umount "$MOUNT_DIR"
 
     set -e
+    return 0
 }
 
 generate_uki() {
@@ -1381,15 +1389,16 @@ restore_candidate() {
 
     if [[ -z "${CANDIDATE_SLOT:-}" ]]; then
         log_warn "CANDIDATE_SLOT unknown, skipping subvolume restore"
-        umount -R "$MOUNT_DIR" 2>/dev/null
+        umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
         rm -f "$DEPLOY_PENDING" 2>/dev/null
         log_error "Rollback incomplete - manual intervention required"
         exit 1
     fi
 
     mkdir -p "$MOUNT_DIR" 2>/dev/null
-    umount -R "$MOUNT_DIR" 2>/dev/null || true
-    mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || true
+    umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+    mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || \
+        log_warn "Failed to mount subvolid=5 — slot file writes may fail"
 
     # If BACKUP_NAME not set, search disk for most recent backup
     if [[ -z "${BACKUP_NAME:-}" ]]; then
@@ -1448,7 +1457,7 @@ restore_candidate() {
                 log_warn "Failed to write previous-slot"
 
             # Unmount before chroot for UKI generation
-            umount -R "$MOUNT_DIR" 2>/dev/null || true
+            umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
             generate_uki "$CANDIDATE_SLOT" && {
                 log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
             } || {
@@ -1466,7 +1475,7 @@ restore_candidate() {
     btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
 
-    umount -R "$MOUNT_DIR" 2>/dev/null
+    umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
 
     finalize_boot_entries "${CURRENT_SLOT:-$(get_booted_subvol)}" "$CANDIDATE_SLOT" 2>/dev/null || \
@@ -1573,7 +1582,7 @@ rollback_system() {
     echo "$booted"      > "$MOUNT_DIR/@data/current-slot"
     echo "$failed_slot" > "$MOUNT_DIR/@data/previous-slot"
 
-    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
+    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || umount -R -l "$MOUNT_DIR" 2>/dev/null || die "Cannot unmount before UKI generation"
 
     # Generate UKI for restored slot — booted slot UKI is already valid.
     generate_uki "$failed_slot" || {
@@ -1640,7 +1649,7 @@ verify_and_create_subvolumes() {
     
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || true' RETURN
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
     
     local fstab="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/fstab"
     if [[ ! -f "$fstab" ]]; then
@@ -2078,7 +2087,7 @@ deploy_update() {
     
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || true' RETURN
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
     
 	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -qE "subvol=/@${CANDIDATE_SLOT}([^a-zA-Z]|$)"; then
         die "Candidate subvolume is currently mounted"

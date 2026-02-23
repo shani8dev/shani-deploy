@@ -61,12 +61,11 @@ readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
 
-declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0 HAS_ZSYNC=0
+declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0
 command -v aria2c &>/dev/null && HAS_ARIA2C=1
 command -v wget &>/dev/null && HAS_WGET=1
 command -v curl &>/dev/null && HAS_CURL=1
 command -v pv &>/dev/null && HAS_PV=1
-command -v zsync &>/dev/null && HAS_ZSYNC=1
 
 declare -g LOCAL_VERSION LOCAL_PROFILE
 declare -g CHROOT_ESP_BIND=0
@@ -98,7 +97,7 @@ persist_state() {
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE STATE_DIR 2>/dev/null || true
-        declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV HAS_ZSYNC SELF_UPDATE_DONE 2>/dev/null || true
+        declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME 2>/dev/null || true
     } > "$state_file"
@@ -783,49 +782,6 @@ download_with_tool() {
             return 1
             ;;
     esac
-}
-
-download_with_zsync() {
-    local zsync_url="$1" output="$2"
-    local output_dir output_base
-    output_dir=$(dirname "$output")
-    output_base=$(basename "$output")
-    mkdir -p "$output_dir"
-
-    # Per man page:
-    # - zsync writes to CWD, so we cd into output_dir
-    # - -o overrides filename only (not path), use basename
-    # - same-named file and .part in CWD are auto-detected — no -i needed for them
-    # - -i is only for differently-named seeds (older versions)
-    # - -q suppresses interactive progress bar
-    local zsync_opts=(-o "$output_base" -q)
-
-    # Provide older same-profile .zst files as -i seeds (different name = must use -i)
-    local seed seed_count=0
-    while IFS= read -r seed; do
-        [[ "$(basename "$seed")" == "$output_base" ]] && continue
-        zsync_opts+=(-i "$seed")
-        log_verbose "zsync seed: $(basename "$seed")"
-        (( seed_count++ ))
-    done < <(find "$output_dir" -maxdepth 1 -type f \
-        -name "${OS_NAME}-*${REMOTE_PROFILE:+-${REMOTE_PROFILE}}*.zst" \
-        2>/dev/null | sort -t- -k2 -rn)
-
-    if (( seed_count == 0 )); then
-        log_verbose "zsync: $zsync_url — no older seeds, zsync will auto-detect same-named file/.part or do full download"
-    else
-        log_verbose "zsync: $zsync_url — $seed_count older seed(s)"
-    fi
-
-    # cd into output_dir: zsync auto-finds same-named file and .part here
-    local rc=0
-    ( cd "$output_dir" && zsync "${zsync_opts[@]}" "$zsync_url" )
-    rc=$?
-
-    # Clean up .zs-old backup zsync creates from the pre-existing same-named file
-    rm -f "${output}.zs-old"
-
-    return $rc
 }
 
 download_file() {
@@ -1995,27 +1951,7 @@ download_update() {
         fi
     fi
     
-    # Try zsync first — only available from R2, uses old image as block cache
     local download_success=0
-    if (( HAS_ZSYNC && use_r2 )); then
-        local zsync_url="${R2_BASE_URL}/${r2_image_path}.zsync"
-        log "Attempting zsync incremental download..."
-        if download_with_zsync "$zsync_url" "$image"; then
-            if validate_download "$image" "$expected_size"; then
-                rm -f "${image}.aria2"
-                download_success=1
-                log_success "zsync complete: $(format_bytes $(get_file_size "$image"))"
-            else
-                log_warn "zsync output failed validation, falling back to full download"
-                rm -f "$image"
-            fi
-        else
-            log_warn "zsync failed, falling back to full download"
-            rm -f "$image"
-        fi
-    fi
-
-    # Full download retry loop — skipped entirely if zsync succeeded
     local global_attempt=0
     local max_global_attempts=5
     local current_mirror="$mirror_url"

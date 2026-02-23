@@ -787,25 +787,44 @@ download_with_tool() {
 
 download_with_zsync() {
     local zsync_url="$1" output="$2"
-    # zsync uses any existing file at $output as a local cache source.
-    # It writes the result directly to $output.
-    # -o sets output path, -i sets seed file (existing partial/old image).
-    local zsync_opts=(-o "$output")
-    # If a previous image exists anywhere in DOWNLOAD_DIR, offer it as seed
-    local seed
-    seed=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "${OS_NAME}-*.zst" \
-        ! -name "$(basename "$output")" 2>/dev/null | sort -t- -k3 -rn | head -1)
-    [[ -n "$seed" ]] && zsync_opts+=(-i "$seed")
-    # Also seed from partial/current output if exists
-    [[ -f "$output" ]] && zsync_opts+=(-i "$output")
+    local output_dir output_base
+    output_dir=$(dirname "$output")
+    output_base=$(basename "$output")
+    mkdir -p "$output_dir"
 
-    log_verbose "zsync: $zsync_url (seed: ${seed:-none})"
-    zsync "${zsync_opts[@]}" "$zsync_url" 2>&1 | while IFS= read -r line; do
-        log_verbose "zsync: $line"
-    done
-    # zsync exits 0 on success
-    local rc
-    rc=${PIPESTATUS[0]}
+    # Per man page:
+    # - zsync writes to CWD, so we cd into output_dir
+    # - -o overrides filename only (not path), use basename
+    # - same-named file and .part in CWD are auto-detected — no -i needed for them
+    # - -i is only for differently-named seeds (older versions)
+    # - -q suppresses interactive progress bar
+    local zsync_opts=(-o "$output_base" -q)
+
+    # Provide older same-profile .zst files as -i seeds (different name = must use -i)
+    local seed seed_count=0
+    while IFS= read -r seed; do
+        [[ "$(basename "$seed")" == "$output_base" ]] && continue
+        zsync_opts+=(-i "$seed")
+        log_verbose "zsync seed: $(basename "$seed")"
+        (( seed_count++ ))
+    done < <(find "$output_dir" -maxdepth 1 -type f \
+        -name "${OS_NAME}-*${REMOTE_PROFILE:+-${REMOTE_PROFILE}}*.zst" \
+        2>/dev/null | sort -t- -k2 -rn)
+
+    if (( seed_count == 0 )); then
+        log_verbose "zsync: $zsync_url — no older seeds, zsync will auto-detect same-named file/.part or do full download"
+    else
+        log_verbose "zsync: $zsync_url — $seed_count older seed(s)"
+    fi
+
+    # cd into output_dir: zsync auto-finds same-named file and .part here
+    local rc=0
+    ( cd "$output_dir" && zsync "${zsync_opts[@]}" "$zsync_url" )
+    rc=$?
+
+    # Clean up .zs-old backup zsync creates from the pre-existing same-named file
+    rm -f "${output}.zs-old"
+
     return $rc
 }
 

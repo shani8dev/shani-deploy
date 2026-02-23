@@ -61,11 +61,12 @@ readonly MAX_INHIBIT_DEPTH=2
 readonly MAX_DOWNLOAD_ATTEMPTS=5
 readonly EXTRACTION_TIMEOUT=1800
 
-declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0
+declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0 HAS_ZSYNC=0
 command -v aria2c &>/dev/null && HAS_ARIA2C=1
 command -v wget &>/dev/null && HAS_WGET=1
 command -v curl &>/dev/null && HAS_CURL=1
 command -v pv &>/dev/null && HAS_PV=1
+command -v zsync &>/dev/null && HAS_ZSYNC=1
 
 declare -g LOCAL_VERSION LOCAL_PROFILE
 declare -g CHROOT_ESP_BIND=0
@@ -97,7 +98,7 @@ persist_state() {
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE STATE_DIR 2>/dev/null || true
-        declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
+        declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV HAS_ZSYNC SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME 2>/dev/null || true
     } > "$state_file"
@@ -293,7 +294,10 @@ safe_mount() {
     local src="$1" tgt="$2" opts="$3"
     [[ -n "$src" && -n "$tgt" ]] || die "safe_mount: Invalid arguments"
     
-    is_mounted "$tgt" && return 0
+    if is_mounted "$tgt"; then
+        log_verbose "Already mounted: $tgt — unmounting before remount"
+        safe_umount "$tgt" || force_umount_all "$tgt" || { log_warn "Could not unmount $tgt before remount"; return 1; }
+    fi
     
     log_verbose "Mounting: $src -> $tgt (opts: $opts)"
     run_cmd mount -o "$opts" "$src" "$tgt" || die "Failed to mount $tgt"
@@ -342,7 +346,7 @@ get_remote_file_size() {
             tr -d '\r\n ' || echo "0")
         
         # If we got a small size, it might be a redirect page - try with range request
-        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 1048576 )); then
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size == 0 || (size > 0 && size < 1048576) )); then
             log_verbose "Got small size ($size), retrying with range request..."
             local range_size
             range_size=$(timeout 30 curl -sI \
@@ -375,7 +379,7 @@ get_remote_file_size() {
             tr -d '\r\n ' || echo "0")
         
         # Try range request if size seems wrong
-        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < 1048576 )); then
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size == 0 || (size > 0 && size < 1048576) )); then
             log_verbose "Got small size ($size), retrying with range request..."
             local range_output
             range_output=$(timeout 30 wget -q --spider -S \
@@ -644,8 +648,9 @@ validate_download() {
         # ONLY check for sparse files if this is a final validation
         # (i.e., download tool claims to be done)
         if (( is_final )); then
-            # If expected size matches but actual data is sparse, file is preallocated
-            if (( expected_size > 0 && size == expected_size && usage_ratio < 50 )); then
+            # Only flag as preallocated if disk usage is extremely low (< 5%)
+            # — btrfs transparent compression can legitimately yield 40-60% ratios
+            if (( expected_size > 0 && size == expected_size && usage_ratio < 5 )); then
                 log_error "File appears preallocated but incomplete: $(format_bytes $disk_usage) actual vs $(format_bytes $size) apparent"
                 return 1
             fi
@@ -672,7 +677,7 @@ validate_download() {
     
     # Validate zstd files - ONLY run full integrity check if final validation
     if [[ "$file" == *.zst ]]; then
-        if ! file "$file" 2>/dev/null | grep -qi "zstandard"; then
+        if ! file "$file" 2>/dev/null | grep -qiE "zstandard|zst compressed"; then
             log_warn "File extension .zst but wrong content type"
             return 1
         fi
@@ -704,32 +709,75 @@ download_with_tool() {
         --connect-timeout=30
         --prefer-family=IPv4
     )
-    
     [[ -t 2 ]] && wget_base_opts+=(--show-progress --progress=bar:force)
-    
+
+    local curl_base_opts=(
+        --fail
+        --location
+        --max-time 600
+        --retry 5
+        --retry-delay 5
+        --retry-connrefused
+        --connect-timeout 30
+        --progress-bar
+        --remote-time
+    )
+    [[ ! -t 2 ]] && curl_base_opts+=(--silent)
+
+    local aria2c_base_opts=(
+        --allow-overwrite=true
+        --auto-file-renaming=false
+        --conditional-get=false
+        --remote-time=true
+        --file-allocation=none
+        --timeout=60
+        --max-tries=5
+        --retry-wait=5
+        --console-log-level=error
+        --summary-interval=0
+        --max-resume-failure-tries=10
+        --connect-timeout=30
+    )
+
     case "$tool" in
         aria2c)
-            # aria2c with explicit resume support
-            aria2c \
-                --max-connection-per-server=1 --split=1 \
-                --continue=true --allow-overwrite=true --auto-file-renaming=false \
-                --conditional-get=false --remote-time=true \
-				--file-allocation=none \
-                --timeout=60 --max-tries=5 --retry-wait=5 \
-                --console-log-level=error --summary-interval=0 \
-                --max-resume-failure-tries=10 \
-                --dir="$(dirname "$output")" --out="$(basename "$output")" \
-                "$url"
+            if [[ "$url" == *"downloads.shani.dev"* ]]; then
+                # R2: resume supported, use multiple connections
+                local _connections=4
+                aria2c "${aria2c_base_opts[@]}" \
+                    --continue=true \
+                    --max-connection-per-server="${_connections}" \
+                    --split="${_connections}" \
+                    --dir="$(dirname "$output")" \
+                    --out="$(basename "$output")" \
+                    "$url"
+            else
+                # SourceForge: no resume, no multi-connection, start fresh
+                rm -f "$output" "${output}.aria2"
+                aria2c "${aria2c_base_opts[@]}" \
+                    --continue=false \
+                    --max-connection-per-server=1 \
+                    --split=1 \
+                    --dir="$(dirname "$output")" \
+                    --out="$(basename "$output")" \
+                    "$url"
+            fi
             ;;
         wget)
-            # wget with explicit resume
-            wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
+            if [[ "$url" == *"downloads.shani.dev"* ]]; then
+                wget "${wget_base_opts[@]}" --continue -O "$output" "$url"
+            else
+                rm -f "$output"
+                wget "${wget_base_opts[@]}" -O "$output" "$url"
+            fi
             ;;
         curl)
-            # curl with resume support
-            curl --fail --location --max-time 600 --retry 5 --retry-delay 5 \
-                --continue-at - --output "$output" \
-                --progress-bar --remote-time "$url"
+            if [[ "$url" == *"downloads.shani.dev"* ]]; then
+                curl "${curl_base_opts[@]}" --continue-at - --output "$output" "$url"
+            else
+                rm -f "$output"
+                curl "${curl_base_opts[@]}" --output "$output" "$url"
+            fi
             ;;
         *)
             return 1
@@ -737,8 +785,32 @@ download_with_tool() {
     esac
 }
 
+download_with_zsync() {
+    local zsync_url="$1" output="$2"
+    # zsync uses any existing file at $output as a local cache source.
+    # It writes the result directly to $output.
+    # -o sets output path, -i sets seed file (existing partial/old image).
+    local zsync_opts=(-o "$output")
+    # If a previous image exists anywhere in DOWNLOAD_DIR, offer it as seed
+    local seed
+    seed=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "${OS_NAME}-*.zst" \
+        ! -name "$(basename "$output")" 2>/dev/null | sort -t- -k3 -rn | head -1)
+    [[ -n "$seed" ]] && zsync_opts+=(-i "$seed")
+    # Also seed from partial/current output if exists
+    [[ -f "$output" ]] && zsync_opts+=(-i "$output")
+
+    log_verbose "zsync: $zsync_url (seed: ${seed:-none})"
+    zsync "${zsync_opts[@]}" "$zsync_url" 2>&1 | while IFS= read -r line; do
+        log_verbose "zsync: $line"
+    done
+    # zsync exits 0 on success
+    local rc
+    rc=${PIPESTATUS[0]}
+    return $rc
+}
+
 download_file() {
-    local url="$1" output="$2" is_small="${3:-0}"
+    local url="$1" output="$2" is_small="${3:-0}" expected_size="${4:-0}"
     
     mkdir -p "$(dirname "$output")"
     
@@ -816,7 +888,7 @@ download_file() {
                         local final_ratio=$((final_usage * 100 / final_size))
                         
                         # If tool claims done but file is mostly empty, it's preallocated
-                        if (( final_ratio < 50 )); then
+                        if (( expected_size > 0 && final_ratio < 5 )); then
                             log_verbose "$tool preallocated file but didn't complete (${final_ratio}%), retrying..."
                             # Don't delete - it might have written some data
                             sleep 3
@@ -900,13 +972,16 @@ verify_gpg() {
     local result=1
     local keyservers=(keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu)
     
+    local key_imported=0
     for keyserver in "${keyservers[@]}"; do
         if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
             log_verbose "Key imported from: $keyserver"
+            key_imported=1
             break
         fi
     done
-    
+    (( key_imported )) || log_warn "Could not import GPG key from any keyserver"
+
     local fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
     if [[ "$fp" == "$GPG_KEY_ID" ]] && gpg --batch --verify "$sig" "$file" 2>/dev/null; then
         log_success "GPG signature verified"
@@ -1261,15 +1336,15 @@ generate_uki() {
     [[ -x "$GENEFI_SCRIPT" ]] || die "gen-efi not found"
     
     prepare_chroot "$slot"
-    
-    [[ "${DRY_RUN}" == "yes" ]] && { cleanup_chroot; return 0; }
-    
+    trap 'cleanup_chroot' RETURN
+
+    [[ "${DRY_RUN}" == "yes" ]] && return 0
+
     log "Generating UKI for @${slot}..."
     local result=0
     chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot" && \
         log_success "UKI complete" || { log_error "UKI generation failed"; result=1; }
-    
-    cleanup_chroot
+
     return $result
 }
 
@@ -1316,6 +1391,7 @@ EOF
 #####################################
 
 restore_candidate() {
+    trap - ERR
     trap - ERR EXIT
     set +e
 
@@ -1370,51 +1446,59 @@ restore_candidate() {
             btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
         fi
 
-        echo "$CURRENT_SLOT" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
-            log_warn "Failed to restore current-slot"
-
-        local prev_slot
-        prev_slot=$(cat "$MOUNT_DIR/@data/previous-slot" 2>/dev/null | tr -d '[:space:]')
-        if [[ -z "$prev_slot" ]]; then
-            echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null
-        fi
+        local _rc_slot="${CURRENT_SLOT:-$(get_booted_subvol)}"
+        echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
+            log_warn "Failed to write current-slot"
+        echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
+            log_warn "Failed to write previous-slot"
     else
         log_error "No backup available for @${CANDIDATE_SLOT} — snapshotting @${CURRENT_SLOT} as fallback"
         local nb_booted
         nb_booted=$(get_booted_subvol)
         if [[ -n "${CURRENT_SLOT:-}" && "$CANDIDATE_SLOT" != "$nb_booted" ]] && \
            btrfs_subvol_exists "$MOUNT_DIR/@${CURRENT_SLOT}"; then
-            btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
-            btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null || true
+            if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
+                btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null || true
+            fi
             btrfs subvolume snapshot "$MOUNT_DIR/@${CURRENT_SLOT}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null && \
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null && \
                 log "Snapshotted @${CURRENT_SLOT} → @${CANDIDATE_SLOT}" || \
                 log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
 
+            local _rc_slot="${CURRENT_SLOT:-$(get_booted_subvol)}"
+            echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
+                log_warn "Failed to write current-slot"
+            echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
+                log_warn "Failed to write previous-slot"
+
             # Unmount before chroot for UKI generation
             umount -R "$MOUNT_DIR" 2>/dev/null || true
             generate_uki "$CANDIDATE_SLOT" && {
-                finalize_boot_entries "$CURRENT_SLOT" "$CANDIDATE_SLOT"
                 log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
-            } || \
-                log_warn "UKI generation failed for @${CANDIDATE_SLOT} — manual check of ESP needed"
+            } || {
+                log_warn "UKI generation failed — copying @${CURRENT_SLOT} UKI as fallback"
+                cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CURRENT_SLOT}.efi" \
+                   "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CANDIDATE_SLOT}.efi" 2>/dev/null || true
+            }
         else
-            log_warn "Cannot snapshot — @${CURRENT_SLOT} unavailable or @${CANDIDATE_SLOT} is booted slot"
+            log_warn "Cannot restore @${CANDIDATE_SLOT} — system remains on @${CURRENT_SLOT:-booted slot}"
         fi
     fi
 
-    [[ -d "$MOUNT_DIR/temp_update/shanios_base" ]] && \
+    btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null
-    [[ -d "$MOUNT_DIR/temp_update" ]] && \
+    btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
 
     umount -R "$MOUNT_DIR" 2>/dev/null
     rm -f "$DEPLOY_PENDING" 2>/dev/null
 
-    finalize_boot_entries "$CURRENT_SLOT" "$CANDIDATE_SLOT" 2>/dev/null || \
-        log_warn "Could not reset boot entries - manual check needed"
+    finalize_boot_entries "${CURRENT_SLOT:-$(get_booted_subvol)}" "$CANDIDATE_SLOT" 2>/dev/null || \
+        log_warn "Could not update boot entries"
 
-    log_error "Rollback complete - system remains on @${CURRENT_SLOT}"
+    log_error "Rollback complete - system remains on @${CURRENT_SLOT:-$(get_booted_subvol)}"
+    log_error "Please reboot to ensure clean state"
     exit 1
 }
 trap 'restore_candidate' ERR
@@ -1450,6 +1534,12 @@ rollback_system() {
         log_warn "No backup found for @${failed_slot} — snapshotting @${booted} as fallback"
 
         if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
+            local _nb_pre_delete
+            _nb_pre_delete=$(get_booted_subvol)
+            if [[ "$failed_slot" == "$_nb_pre_delete" ]]; then
+                safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+                die "SAFETY ABORT: @${failed_slot} is the currently booted slot — refusing to touch it"
+            fi
             btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false 2>/dev/null
             btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}" 2>/dev/null || true
         fi
@@ -1460,14 +1550,22 @@ rollback_system() {
         echo "$booted"       > "$MOUNT_DIR/@data/current-slot"
         echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
 
+        btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
+            btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
+        btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
+            btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
 
         # Generate UKI from within failed_slot chroot (snapshot of booted, so kernel is identical)
-        generate_uki "$failed_slot" && {
-            finalize_boot_entries "$booted" "$failed_slot"
-            log_success "Fallback UKI generated for @${failed_slot}, rebooting"
-            [[ "${DRY_RUN}" == "yes" ]] || reboot
-        } || die "Snapshot and UKI generation failed - manual intervention required"
+        generate_uki "$failed_slot" || {
+            log_warn "UKI generation failed — copying @${booted} UKI as fallback"
+            cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
+               "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null || true
+        }
+        finalize_boot_entries "$booted" "$failed_slot"
+        log_success "Fallback slot ready"
+        log "Please reboot to boot into @${booted}"
         return
     fi
 
@@ -1491,20 +1589,28 @@ rollback_system() {
     run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${failed_slot}"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro true
 
-    echo "$booted"       > "$MOUNT_DIR/@data/current-slot"
-    echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
+    btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
+        btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
+    btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
+        btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
 
-	safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
+    # Write slot markers before unmount.
+    echo "$booted"      > "$MOUNT_DIR/@data/current-slot"
+    echo "$failed_slot" > "$MOUNT_DIR/@data/previous-slot"
 
-    # Generate UKI from within the restored failed_slot chroot.
-    # The booted slot's UKI already works — only the restored slot needs a new entry.
-    generate_uki "$failed_slot"
+    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || die "Cannot unmount before UKI generation"
+
+    # Generate UKI for restored slot — booted slot UKI is already valid.
+    generate_uki "$failed_slot" || {
+        log_warn "UKI generation failed — copying @${booted} UKI as fallback"
+        cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
+           "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null || true
+    }
     finalize_boot_entries "$booted" "$failed_slot"
 
     log_success "Rollback complete"
-    log "System will boot: @${booted}"
+    log "Please reboot to boot into @${booted}"
     trap 'restore_candidate' ERR
-    [[ "${DRY_RUN}" == "yes" ]] || reboot
 }
 
 #####################################
@@ -1697,8 +1803,19 @@ validate_boot() {
             mkdir -p /data
             echo "$CURRENT_SLOT" > /data/current-slot
         else
-            log_error "BOOT MISMATCH! Expected @${CURRENT_SLOT}, running @${booted}"
-            die "Boot slot mismatch — use --force to override"
+            if [[ ! -f "$DEPLOY_PENDING" ]]; then
+                log_warn "SLOT MISMATCH: marker says @${CURRENT_SLOT} but running @${booted}"
+                log_warn "Possible causes:"
+                log_warn "  1. Update was deployed but system not yet rebooted — please reboot"
+                log_warn "  2. Last update was unbootable and bootloader fell back — run --rollback"
+                log_warn "  3. System was booted manually into wrong slot — reboot into @${CURRENT_SLOT} or run --rollback"
+                log_warn "To force update from currently running @${booted} regardless: run --force"
+                exit 0
+            else
+                log_error "SLOT MISMATCH: marker says @${CURRENT_SLOT} but running @${booted}"
+                log_error "DEPLOY_PENDING flag exists — previous deploy may be incomplete"
+                die "Run --rollback to restore, or --force to override and update from @${booted}"
+            fi
         fi
     fi
     
@@ -1757,14 +1874,13 @@ fetch_update() {
     log "Versions match (v${REMOTE_VERSION})"
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
+
     if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
-        log "Candidate missing, will create"
-        safe_umount "$MOUNT_DIR"
+        log "Candidate @${CANDIDATE_SLOT} missing — will deploy from remote to recreate"
         return 0
     fi
-    
-    safe_umount "$MOUNT_DIR"
+
     if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
         log "Force update requested, redeploying v${REMOTE_VERSION}"
         return 0
@@ -1834,46 +1950,73 @@ download_update() {
     
     # Get expected size
     log "Checking remote size..."
-	local active_url
-    (( use_r2 )) && active_url="$r2_image_url" || active_url="$mirror_url"
-    local expected_size=$(get_remote_file_size "$active_url")
+    local active_url expected_size
+    if (( use_r2 )); then
+        active_url="$r2_image_url"
+    else
+        active_url="$mirror_url"
+    fi
+    expected_size=$(get_remote_file_size "$active_url")
     (( expected_size > 0 )) && log "Expected: $(format_bytes $expected_size)"
     
     # Check for existing partial download
-    local resume_from=0
     if [[ -f "$image" ]]; then
         local current_size=$(get_file_size "$image")
         if (( current_size > 0 )); then
             log "Found partial download: $(format_bytes $current_size)"
-            
-            # Validate partial download
             if (( expected_size > 0 )); then
                 if (( current_size >= expected_size )); then
                     log "Partial download complete or larger, will verify"
                 elif (( current_size < expected_size )); then
                     log "Will resume from $(format_bytes $current_size)"
-                    resume_from=$current_size
                 fi
             else
                 log "Cannot determine expected size, will attempt resume"
-                resume_from=$current_size
             fi
         fi
     fi
     
-    # Download with comprehensive retry logic
+    # Try zsync first — only available from R2, uses old image as block cache
+    local download_success=0
+    if (( HAS_ZSYNC && use_r2 )); then
+        local zsync_url="${R2_BASE_URL}/${r2_image_path}.zsync"
+        log "Attempting zsync incremental download..."
+        if download_with_zsync "$zsync_url" "$image"; then
+            if validate_download "$image" "$expected_size"; then
+                rm -f "${image}.aria2"
+                download_success=1
+                log_success "zsync complete: $(format_bytes $(get_file_size "$image"))"
+            else
+                log_warn "zsync output failed validation, falling back to full download"
+                rm -f "$image"
+            fi
+        else
+            log_warn "zsync failed, falling back to full download"
+            rm -f "$image"
+        fi
+    fi
+
+    # Full download retry loop — skipped entirely if zsync succeeded
     local global_attempt=0
     local max_global_attempts=5
-    local download_success=0
     local current_mirror="$mirror_url"
-    
-    while (( global_attempt < max_global_attempts )); do
+
+    while (( download_success == 0 && global_attempt < max_global_attempts )); do
         ((global_attempt++))
         log "Download attempt ${global_attempt}/${max_global_attempts}"
-        
-    local dl_url
-    (( use_r2 )) && dl_url="$r2_image_url" || dl_url="$mirror_url"
-        if download_file "$dl_url" "$image" 0; then
+
+        local dl_url
+        (( use_r2 )) && dl_url="$r2_image_url" || dl_url="$mirror_url"
+
+        # SourceForge doesn't reliably support resume — clear partial before each attempt
+        if [[ "$dl_url" != *"downloads.shani.dev"* ]]; then
+            [[ -f "$image" ]] && {
+                log_verbose "Clearing partial SF download (no resume support)"
+                rm -f "$image" "${image}.aria2"
+            }
+        fi
+
+        if download_file "$dl_url" "$image" 0 "$expected_size"; then
             if [[ ! -f "$image" ]] || [[ ! -s "$image" ]]; then
                 log_warn "Download produced no file"
                 sleep 5
@@ -1982,7 +2125,7 @@ deploy_update() {
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || true' RETURN
     
-	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -q "subvol=/@${CANDIDATE_SLOT}[^a-zA-Z]"; then
+	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -qE "subvol=/@${CANDIDATE_SLOT}([^a-zA-Z]|$)"; then
         die "Candidate subvolume is currently mounted"
     fi
 
@@ -1994,31 +2137,31 @@ deploy_update() {
         die "SAFETY ABORT: @${CANDIDATE_SLOT} is the currently booted slot — refusing to touch it"
     fi
 
+    # Backup only — do NOT delete candidate yet. Deletion happens after extraction
+    # succeeds so power failure during extraction leaves @CANDIDATE_SLOT intact.
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
         log "Backup: @${BACKUP_NAME}"
         run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || \
             { safe_umount "$MOUNT_DIR"; die "Backup failed"; }
-        
-        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
-        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     fi
-    
+
     local temp="$MOUNT_DIR/temp_update"
     if btrfs_subvol_exists "$temp"; then
-        [[ -d "$temp/shanios_base" ]] && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
+        btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
         btrfs subvolume delete "$temp" 2>/dev/null
     fi
-    
+
     log "Creating extraction subvolume..."
     run_cmd btrfs subvolume create "$temp"
-    
+
     log "Extracting image..."
     [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would extract"; } || {
         local start=$(date +%s)
         if (( HAS_PV )); then
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 pv -p -t -e -r -b | btrfs receive "$temp" || {
+                btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
                 btrfs subvolume delete "$temp" 2>/dev/null
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed"
@@ -2026,6 +2169,7 @@ deploy_update() {
         else
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 btrfs receive "$temp" || {
+                btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
                 btrfs subvolume delete "$temp" 2>/dev/null
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed"
@@ -2033,12 +2177,18 @@ deploy_update() {
         fi
         log_success "Extracted in $(($(date +%s) - start))s"
     }
-    
+
+    # Extraction succeeded — now safe to replace candidate.
+    if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+        run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
+        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+    fi
+
     log "Snapshotting..."
     run_cmd btrfs subvolume snapshot "$temp/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
-    
-    [[ -d "$temp/shanios_base" ]] && run_cmd btrfs subvolume delete "$temp/shanios_base"
+
+    btrfs_subvol_exists "$temp/shanios_base" && run_cmd btrfs subvolume delete "$temp/shanios_base"
     run_cmd btrfs subvolume delete "$temp"
     
     [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"

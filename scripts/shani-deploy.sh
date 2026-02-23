@@ -9,7 +9,9 @@
 #   -r, --rollback          Force system rollback
 #   -c, --cleanup           Manual cleanup (backups, downloads)
 #   -s, --storage-info      Display storage analysis
+#   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
 #   -t, --channel <chan>    Update channel: latest|stable (default: stable)
+#   -f, --force             Deploy even if version matches or boot mismatch
 #   -d, --dry-run           Simulate without changes
 #   -v, --verbose           Detailed output
 #   --skip-self-update      Skip script auto-update
@@ -2069,15 +2071,15 @@ finalize_update() {
     mkdir -p "$MOUNT_DIR"
     if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
         cleanup_old_backups || log_verbose "Backup cleanup warnings"
-        
-		safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
-		# optimize_storage handles its own mount/umount internally
-        optimize_storage || log_verbose "Storage optimization warnings"
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
     else
         log_verbose "Could not mount for maintenance"
     fi
     
     cleanup_downloads || log_verbose "Download cleanup warnings"
+    
+    # Storage info shown after deployment so user can see current state
+    analyze_storage || log_verbose "Storage analysis warnings"
     
     set -e
     trap 'restore_candidate' ERR
@@ -2099,7 +2101,7 @@ Options:
   -r, --rollback          Force rollback
   -c, --cleanup           Manual cleanup
   -s, --storage-info      Storage analysis (read-only)
-  -o, --optimize          Run deduplication
+  -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
   -t, --channel <chan>    Update channel (latest|stable)
   -f, --force             Deploy even if version matches or boot mismatch
   -d, --dry-run           Simulate
@@ -2151,6 +2153,7 @@ main() {
             log_verbose "Could not mount for cleanup"
         fi
         cleanup_downloads
+        analyze_storage || log_verbose "Storage analysis warnings"
 
         log_success "Manual cleanup complete"
         exit 0
@@ -2161,9 +2164,9 @@ main() {
         exit 0
     fi
 	
-	if [[ "$STORAGE_OPTIMIZE" == "yes" ]]; then
-    optimize_storage
-    exit 0
+    if [[ "$STORAGE_OPTIMIZE" == "yes" ]]; then
+        optimize_storage
+        exit 0
     fi
 
 	check_internet
@@ -2190,16 +2193,14 @@ main() {
         if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
             if btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green"; then
                 cleanup_old_backups || log_verbose "Backup cleanup warnings"
-                cleanup_downloads || log_verbose "download cleanup warnings"
-				optimize_storage || log_verbose "Storage optimization warnings"
-
-                safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
-            else
-                safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
             fi
+            safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
         else
             log_verbose "Could not mount for maintenance"
         fi
+
+        cleanup_downloads || log_verbose "Download cleanup warnings"
+        analyze_storage || log_verbose "Storage analysis warnings"
         
         log_success "Maintenance complete"
         exit 0

@@ -1361,8 +1361,16 @@ title   ${OS_NAME}-${candidate_slot} (Candidate)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
 EOF
 
-    bootctl set-default "${OS_NAME}-${active_slot}.conf" || \
-        log_warn "bootctl set-default failed"
+    local loader_conf="$ESP/loader/loader.conf"
+    if [[ -f "$loader_conf" ]]; then
+        grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
+        echo "default ${OS_NAME}-${active_slot}.conf" >> "${loader_conf}.tmp"
+        mv "${loader_conf}.tmp" "$loader_conf"
+    else
+        printf 'default %s\ntimeout 5\nconsole-mode max\neditor 0\n' \
+            "${OS_NAME}-${active_slot}.conf" > "$loader_conf"
+    fi
+    log_verbose "loader.conf default set to ${OS_NAME}-${active_slot}.conf"
 
     if [[ $esp_mounted -eq 1 ]]; then
         umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"

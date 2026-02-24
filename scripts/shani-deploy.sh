@@ -6,7 +6,7 @@
 #
 # Options:
 #   -h, --help              Show help
-#   -r, --rollback          Force system rollback
+#   -r, --rollback          Roll back the non-booted slot. IMPORTANT: run this from the slot you want to KEEP.
 #   -c, --cleanup           Manual cleanup (backups, downloads)
 #   -s, --storage-info      Display storage analysis
 #   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
@@ -918,27 +918,27 @@ download_file() {
 
 verify_sha256() {
     local file="$1" sha_file="$2"
-    log_verbose "Verifying SHA256"
+    log_verbose "Verifying SHA256 checksum..."
     
     local expected=$(awk '{print $1}' "$sha_file" 2>/dev/null | head -1 | tr -d '[:space:]')
     local actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')
     
-    [[ -z "$expected" || -z "$actual" ]] && { log_error "Missing checksums"; return 1; }
+    [[ -z "$expected" || -z "$actual" ]] && { log_error "Could not read checksums for verification"; return 1; }
     
     if [[ "$expected" != "$actual" ]]; then
-        log_error "SHA256 mismatch"
+        log_error "SHA256 checksum mismatch — download may be corrupt"
         log_error "Expected: $expected"
-        log_error "Got: $actual"
+        log_error "Got:      $actual"
         return 1
     fi
     
-    log_success "SHA256 verified"
+    log_success "SHA256 checksum verified"
     return 0
 }
 
 verify_gpg() {
     local file="$1" sig="$2"
-    log_verbose "Verifying GPG signature"
+    log_verbose "Verifying GPG signature..."
     
     local gpg_temp=$(mktemp -d)
     local old_gnupghome="${GNUPGHOME:-}"
@@ -951,19 +951,19 @@ verify_gpg() {
     local key_imported=0
     for keyserver in "${keyservers[@]}"; do
         if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
-            log_verbose "Key imported from: $keyserver"
+            log_verbose "GPG key imported from: $keyserver"
             key_imported=1
             break
         fi
     done
-    (( key_imported )) || log_warn "Could not import GPG key from any keyserver"
+    (( key_imported )) || log_warn "Could not import GPG signing key from any keyserver — signature verification may fail"
 
     local fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
     if [[ "$fp" == "$GPG_KEY_ID" ]] && gpg --batch --verify "$sig" "$file" 2>/dev/null; then
         log_success "GPG signature verified"
         result=0
     else
-        log_error "GPG verification failed"
+        log_error "GPG signature verification failed — image may be tampered with"
     fi
     
     rm -rf "$gpg_temp"
@@ -980,18 +980,21 @@ check_root() {
 }
 
 check_internet() {
-    log_verbose "Checking connectivity"
-    ping -c1 -W2 8.8.8.8 &>/dev/null || die "No internet"
+    log "Checking internet connectivity..."
+    ping -c1 -W2 8.8.8.8 &>/dev/null || die "No internet connection — check your network and try again"
+    log_verbose "Internet connectivity OK"
 }
 
 check_tools() {
-    log_verbose "Checking tools"
-    (( HAS_ARIA2C || HAS_WGET || HAS_CURL )) || die "No download tools available"
+    log_verbose "Checking required tools"
+    (( HAS_ARIA2C || HAS_WGET || HAS_CURL )) || \
+        die "No download tool found — install aria2c, wget, or curl and try again"
+    log_verbose "Download tools available: ${HAS_ARIA2C:+aria2c }${HAS_WGET:+wget }${HAS_CURL:+curl}"
 }
 
 set_environment() {
     [[ -f /etc/shani-version && -f /etc/shani-profile ]] || \
-        die "Missing: /etc/shani-version or /etc/shani-profile"
+        die "Missing system identity files (/etc/shani-version or /etc/shani-profile) — system may be corrupted"
     
     LOCAL_VERSION=$(< /etc/shani-version)
     LOCAL_PROFILE=$(< /etc/shani-profile)
@@ -999,8 +1002,8 @@ set_environment() {
     validate_nonempty "$LOCAL_VERSION" "LOCAL_VERSION"
     validate_nonempty "$LOCAL_PROFILE" "LOCAL_PROFILE"
     
-    log "System: v${LOCAL_VERSION} (${LOCAL_PROFILE})"
-    log "Channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"
+    log "Running system: v${LOCAL_VERSION} profile=${LOCAL_PROFILE}"
+    log "Update channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"
 }
 
 #####################################
@@ -1016,16 +1019,22 @@ self_update() {
     local url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     local temp=$(mktemp)
 
-    log_verbose "Checking for updates..."
+    log "Checking for script updates..."
     
     if download_file "$url" "$temp" 1; then
         if grep -q "#!/bin/bash" "$temp" && grep -q "shanios-deploy" "$temp"; then
             if ! cmp -s "$0" "$temp"; then
                 chmod +x "$temp"
-                log_success "Updated, re-executing..."
+                log_success "Script updated — re-executing with new version..."
                 [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]] && exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}" || exec /bin/bash "$temp"
+            else
+                log_verbose "Script is already up to date"
             fi
+        else
+            log_verbose "Downloaded script failed sanity check, keeping current version"
         fi
+    else
+        log_verbose "Could not check for script update, continuing with current version"
     fi
     
     rm -f "$temp"
@@ -1042,7 +1051,7 @@ inhibit_system() {
     
     export SYSTEMD_INHIBITED=1
     export SYSTEMD_INHIBIT_DEPTH=$((depth + 1))
-    log "Inhibiting power events"
+    log "Inhibiting system power events (sleep/shutdown/hibernate) during deployment..."
     
     local script_path
     script_path=$(readlink -f "$0")
@@ -1316,17 +1325,17 @@ cleanup_chroot() {
 generate_uki() {
     local slot="$1"
     log_section "UKI Generation"
-    [[ -x "$GENEFI_SCRIPT" ]] || die "gen-efi not found"
+    [[ -x "$GENEFI_SCRIPT" ]] || die "gen-efi script not found at ${GENEFI_SCRIPT} — cannot generate boot image"
     
     prepare_chroot "$slot"
     trap 'cleanup_chroot' RETURN
 
     [[ "${DRY_RUN}" == "yes" ]] && return 0
 
-    log "Generating UKI for @${slot}..."
+    log "Generating unified kernel image (UKI) for @${slot}..."
     local result=0
     chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot" && \
-        log_success "UKI complete" || { log_error "UKI generation failed"; result=1; }
+        log_success "UKI generated successfully for @${slot}" || { log_error "UKI generation failed for @${slot}"; result=1; }
 
     return $result
 }
@@ -1371,6 +1380,7 @@ EOF
             "${OS_NAME}-${active_slot}.conf" > "$loader_conf"
     fi
     log_verbose "loader.conf default set to ${OS_NAME}-${active_slot}.conf"
+    log "Boot default set to: @${active_slot} (${OS_NAME}-${active_slot}.conf)"
 
     if [[ $esp_mounted -eq 1 ]]; then
         umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"
@@ -1487,10 +1497,10 @@ restore_candidate() {
     rm -f "$DEPLOY_PENDING" 2>/dev/null
 
     finalize_boot_entries "${CURRENT_SLOT:-$(get_booted_subvol)}" "$CANDIDATE_SLOT" 2>/dev/null || \
-        log_warn "Could not update boot entries"
+        log_warn "Could not update boot entries — you may need to set the default boot slot manually"
 
-    log_error "Rollback complete - system remains on @${CURRENT_SLOT:-$(get_booted_subvol)}"
-    log_error "Please reboot to ensure clean state"
+    log_error "Emergency rollback complete — system remains on @${CURRENT_SLOT:-$(get_booted_subvol)}"
+    log_error "Please reboot to ensure a clean system state"
     exit 1
 }
 trap 'restore_candidate' ERR
@@ -1516,14 +1526,25 @@ rollback_system() {
     CURRENT_SLOT="$booted"
     CANDIDATE_SLOT="$failed_slot"
 
-    log "Booted: @${booted} | Restoring: @${failed_slot}"
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_warn "  ROLLBACK DIRECTION"
+    log_warn "  You are currently booted into: @${booted}"
+    log_warn "  @${booted} will remain the DEFAULT boot slot"
+    log_warn "  @${failed_slot} will be restored from its backup"
+    log_warn ""
+    log_warn "  If this is NOT what you want, press Ctrl+C now"
+    log_warn "  and reboot into @${failed_slot} before running rollback."
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    sleep 5
+
+    log "Booted slot (keeping): @${booted} | Slot being restored: @${failed_slot}"
 
     BACKUP_NAME=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
         awk -v s="${failed_slot}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
     BACKUP_NAME="${BACKUP_NAME#@}"
 
 	if [[ -z "$BACKUP_NAME" ]]; then
-        log_warn "No backup found for @${failed_slot} — snapshotting @${booted} as fallback"
+        log_warn "No backup snapshot found for @${failed_slot} — will create a fresh snapshot from @${booted} as fallback"
 
         if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
             local _nb_pre_delete
@@ -1557,7 +1578,11 @@ rollback_system() {
         }
         finalize_boot_entries "$booted" "$failed_slot"
         log_success "Fallback slot ready"
-        log "Please reboot to boot into @${booted}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "  Default boot slot: @${booted}"
+        log "  Restored slot:     @${failed_slot} (snapshot of @${booted})"
+        log "  Please reboot — the system will boot into @${booted}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         return
     fi
 
@@ -1601,7 +1626,11 @@ rollback_system() {
     finalize_boot_entries "$booted" "$failed_slot"
 
     log_success "Rollback complete"
-    log "Please reboot to boot into @${booted}"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "  Default boot slot: @${booted}"
+    log "  Restored slot:     @${failed_slot} (ready for next deploy)"
+    log "  Please reboot — the system will boot into @${booted}"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     trap 'restore_candidate' ERR
 }
 
@@ -1777,55 +1806,55 @@ validate_boot() {
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]')
     
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
-        log_warn "Invalid marker, detecting..."
+        log_warn "Slot marker is invalid or missing — detecting from live boot..."
         CURRENT_SLOT="$booted"
         [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]] && CURRENT_SLOT="blue"
         mkdir -p /data
         echo "$CURRENT_SLOT" > /data/current-slot
-        log "Corrected: $CURRENT_SLOT"
+        log "Slot marker corrected to: @${CURRENT_SLOT}"
     fi
     
-    log "Marker: @${CURRENT_SLOT}"
-    log "Booted: @${booted}"
+    log "Slot marker says: @${CURRENT_SLOT}"
+    log "Actually booted:  @${booted}"
     
     if [[ "$booted" != "$CURRENT_SLOT" ]]; then
         if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
-            log_warn "Boot mismatch: booted=@${booted} marker=@${CURRENT_SLOT} — correcting"
+            log_warn "Slot mismatch detected (marker=@${CURRENT_SLOT}, booted=@${booted}) — correcting marker due to --force"
             CURRENT_SLOT="$booted"
             mkdir -p /data
             echo "$CURRENT_SLOT" > /data/current-slot
         else
             if [[ ! -f "$DEPLOY_PENDING" ]]; then
-                log_warn "SLOT MISMATCH: marker says @${CURRENT_SLOT} but running @${booted}"
+                log_warn "SLOT MISMATCH: marker says @${CURRENT_SLOT} but you are running @${booted}"
                 log_warn "Possible causes:"
-                log_warn "  1. Update was deployed but system not yet rebooted — please reboot"
-                log_warn "  2. Last update was unbootable and bootloader fell back — run --rollback"
-                log_warn "  3. System was booted manually into wrong slot — reboot into @${CURRENT_SLOT} or run --rollback"
+                log_warn "  1. Update was deployed but system not yet rebooted — please reboot to apply"
+                log_warn "  2. Last update failed to boot and bootloader fell back — run --rollback to fix"
+                log_warn "  3. System was manually booted into wrong slot — reboot into @${CURRENT_SLOT} or run --rollback"
                 log_warn "To force update from currently running @${booted} regardless: run --force"
                 exit 0
             else
                 log_error "SLOT MISMATCH: marker says @${CURRENT_SLOT} but running @${booted}"
-                log_error "DEPLOY_PENDING flag exists — previous deploy may be incomplete"
-                die "Run --rollback to restore, or --force to override and update from @${booted}"
+                log_error "A deployment_pending flag also exists — the previous deploy may be incomplete or interrupted"
+                die "Run --rollback to restore a clean state, or --force to override and update from @${booted}"
             fi
         fi
     fi
     
-    log_success "Validated"
+    log_success "Boot slot validated: @${booted}"
     CANDIDATE_SLOT=$([[ "$CURRENT_SLOT" == "blue" ]] && echo "green" || echo "blue")
-    log "Active: @${CURRENT_SLOT} | Candidate: @${CANDIDATE_SLOT}"
+    log "Active slot: @${CURRENT_SLOT} | Update target (candidate): @${CANDIDATE_SLOT}"
 }
 
 check_space() {
-    log_section "Space Check"
+    log_section "Disk Space Check"
     
     local free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 ))
-    log "Available: ${free_mb}MB | Required: ${MIN_FREE_SPACE_MB}MB"
+    log "Available space: ${free_mb}MB | Required: ${MIN_FREE_SPACE_MB}MB"
     
     (( free_mb >= MIN_FREE_SPACE_MB )) || \
-        die "Insufficient: ${free_mb}MB < ${MIN_FREE_SPACE_MB}MB"
+        die "Not enough disk space: ${free_mb}MB available, ${MIN_FREE_SPACE_MB}MB required. Free up space and try again."
     
-    log_success "Sufficient"
+    log_success "Sufficient disk space available"
     run_cmd mkdir -p "$DOWNLOAD_DIR"
 }
 
@@ -1836,48 +1865,48 @@ fetch_update() {
     local r2_path="${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
     local temp=$(mktemp)
     
-    log "Checking ${UPDATE_CHANNEL}..."
+    log "Fetching latest version info from ${UPDATE_CHANNEL} channel..."
     download_from_r2 "$r2_path" "$temp" 1 || \
-        download_file "$sf_url" "$temp" 1 || { rm -f "$temp"; die "Manifest fetch failed"; }
+        download_file "$sf_url" "$temp" 1 || { rm -f "$temp"; die "Failed to fetch version manifest — check your internet connection"; }
     
     IMAGE_NAME=$(tr -d '[:space:]' < "$temp")
     rm -f "$temp"
     
-    [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]] || die "Invalid manifest"
+    [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]] || die "Version manifest has unexpected format: ${IMAGE_NAME}"
     
     REMOTE_VERSION="${BASH_REMATCH[1]}"
     REMOTE_PROFILE="${BASH_REMATCH[2]}"
     
-    log "Remote: v${REMOTE_VERSION} (${REMOTE_PROFILE})"
-    log "Local:  v${LOCAL_VERSION} (${LOCAL_PROFILE})"
+    log "Remote version: v${REMOTE_VERSION} (${REMOTE_PROFILE})"
+    log "Local  version: v${LOCAL_VERSION} (${LOCAL_PROFILE})"
 
 	if (( REMOTE_VERSION < LOCAL_VERSION )); then
-        log_warn "Remote older (${REMOTE_VERSION} < ${LOCAL_VERSION})"
+        log_warn "Remote version (v${REMOTE_VERSION}) is older than local (v${LOCAL_VERSION})"
         if [[ "${FORCE_UPDATE:-no}" != "yes" ]]; then
-            log_success "No update needed"
+            log_success "System is newer than remote — no update needed"
             touch "${STATE_DIR}/skip-deployment"
             return 0
         fi
-        log "Force update requested, downgrading to v${REMOTE_VERSION}"
+        log_warn "Proceeding with downgrade to v${REMOTE_VERSION} due to --force"
     fi
     
-    (( REMOTE_VERSION > LOCAL_VERSION )) && { log "Update available"; return 0; }
+    (( REMOTE_VERSION > LOCAL_VERSION )) && { log_success "Update available: v${LOCAL_VERSION} → v${REMOTE_VERSION}"; return 0; }
     
-    log "Versions match (v${REMOTE_VERSION})"
+    log "Local and remote versions match (v${REMOTE_VERSION})"
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
 
     if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
-        log "Candidate @${CANDIDATE_SLOT} missing — will deploy from remote to recreate"
+        log_warn "Candidate slot @${CANDIDATE_SLOT} is missing — will redeploy from remote to recreate it"
         return 0
     fi
 
     if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
-        log "Force update requested, redeploying v${REMOTE_VERSION}"
+        log "Redeploying v${REMOTE_VERSION} due to --force"
         return 0
     fi
-    log_success "System up-to-date"
+    log_success "System is up to date (v${LOCAL_VERSION})"
     touch "${STATE_DIR}/skip-deployment"
     return 0
 }
@@ -1920,24 +1949,24 @@ download_update() {
     local use_r2=0
     
     if [[ -n "${R2_BASE_URL:-}" ]]; then
-        log "Checking R2 availability..."
+        log "Checking primary download server (R2)..."
         local r2_size
         r2_size=$(get_remote_file_size "$r2_image_url")
         if (( r2_size > MIN_FILE_SIZE )); then
-            log_success "R2 available ($(format_bytes $r2_size)), using R2"
+            log_success "Primary server available — image size: $(format_bytes $r2_size)"
             use_r2=1
         else
-            log_verbose "R2 unavailable or too small, falling back to SourceForge"
+            log_verbose "Primary server unavailable or returned unexpected size, falling back to SourceForge mirror"
         fi
     fi
     
     # Mirror discovery (SourceForge fallback)
     local mirror_url=""
     if (( use_r2 == 0 )); then
-        log "Discovering SourceForge mirror..."
+        log "Discovering SourceForge mirror for download..."
         mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
         mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
-        [[ -z "$mirror_url" || ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]] && die "Mirror discovery failed"
+        [[ -z "$mirror_url" || ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]] && die "Could not find a valid download mirror — check your internet connection and try again"
     fi
     
     # Get expected size
@@ -2024,14 +2053,14 @@ download_update() {
         if (( global_attempt % 2 == 0 && global_attempt < max_global_attempts )); then
             # If R2 was failing, fall back to SourceForge
             if (( use_r2 )); then
-                log "R2 failing, switching to SourceForge mirror..."
+                log_warn "Primary server failing after ${global_attempt} attempts — switching to SourceForge mirror..."
                 use_r2=0
                 rm -f "$DOWNLOAD_DIR/mirror.url"
                 mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
                 mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
                 continue
             fi
-            log "Rediscovering mirror..."
+            log "Rediscovering download mirror (attempt ${global_attempt})..."
             rm -f "$DOWNLOAD_DIR/mirror.url"
             
             local new_mirror
@@ -2059,7 +2088,7 @@ download_update() {
     
     if [[ $download_success -eq 0 ]]; then
         rm -f "$image" "${image}.aria2"
-        die "Download failed after $max_global_attempts attempts"
+        die "Download failed after $max_global_attempts attempts — check your internet connection or try again later"
     fi
     
     validate_download "$image" "$expected_size" || { 
@@ -2067,21 +2096,22 @@ download_update() {
         die "Validation failed"
     }
     
-    log "Downloading verification files..."
+    log "Downloading verification files (SHA256 + GPG signature)..."
     download_from_r2 "${r2_image_path}.sha256" "$sha" 1 || \
         download_file "$sha_url" "$sha" 1 || { 
             rm -f "$image" "${image}.aria2"
-            die "SHA256 download failed"
+            die "Failed to download SHA256 checksum file"
         }
     download_from_r2 "${r2_image_path}.asc" "$asc" 1 || \
         download_file "$asc_url" "$asc" 1 || { 
             rm -f "$image" "$sha" "${image}.aria2"
-            die "GPG signature download failed"
+            die "Failed to download GPG signature file"
         }
     
+    log "Verifying image integrity..."
     verify_sha256 "$image" "$sha" && verify_gpg "$image" "$asc" || { 
         rm -f "$image" "$sha" "$asc" "${image}.aria2"
-        die "Verification failed"
+        die "Image verification failed — the download may be corrupt or tampered with"
     }
     
     # Clean up all control files on successful verification
@@ -2098,7 +2128,7 @@ deploy_update() {
     trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
     
 	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -qE "subvol=/@${CANDIDATE_SLOT}([^a-zA-Z]|$)"; then
-        die "Candidate subvolume is currently mounted"
+        die "Candidate slot @${CANDIDATE_SLOT} is currently mounted — cannot deploy to an active mount"
     fi
 
     # SAFETY: confirm candidate is not the booted slot before any destructive operation.
@@ -2106,16 +2136,16 @@ deploy_update() {
     deploy_booted=$(get_booted_subvol)
     if [[ "$CANDIDATE_SLOT" == "$deploy_booted" ]]; then
         safe_umount "$MOUNT_DIR"
-        die "SAFETY ABORT: @${CANDIDATE_SLOT} is the currently booted slot — refusing to touch it"
+        die "SAFETY ABORT: @${CANDIDATE_SLOT} is the currently booted slot — refusing to overwrite a running system"
     fi
 
     # Backup only — do NOT delete candidate yet. Deletion happens after extraction
     # succeeds so power failure during extraction leaves @CANDIDATE_SLOT intact.
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
-        log "Backup: @${BACKUP_NAME}"
+        log "Creating safety backup of @${CANDIDATE_SLOT} → @${BACKUP_NAME}"
         run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || \
-            { safe_umount "$MOUNT_DIR"; die "Backup failed"; }
+            { safe_umount "$MOUNT_DIR"; die "Backup snapshot failed — aborting to protect your system"; }
     fi
 
     local temp="$MOUNT_DIR/temp_update"
@@ -2124,10 +2154,10 @@ deploy_update() {
         btrfs subvolume delete "$temp" 2>/dev/null
     fi
 
-    log "Creating extraction subvolume..."
+    log "Creating extraction workspace..."
     run_cmd btrfs subvolume create "$temp"
 
-    log "Extracting image..."
+    log "Extracting system image into @${CANDIDATE_SLOT} (this may take a few minutes)..."
     [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would extract"; } || {
         local start=$(date +%s)
         if (( HAS_PV )); then
@@ -2156,7 +2186,7 @@ deploy_update() {
         run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     fi
 
-    log "Snapshotting..."
+    log "Finalizing @${CANDIDATE_SLOT} snapshot..."
     run_cmd btrfs subvolume snapshot "$temp/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
 
@@ -2207,7 +2237,12 @@ finalize_update() {
     trap 'restore_candidate' ERR
     
     log_success "Complete"
-    log "Next boot: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "  Deployment successful!"
+    log "  Next boot will load: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
+    log "  Current slot:        @${CURRENT_SLOT} (still running)"
+    log "  Please reboot to switch to the updated slot"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 #####################################
@@ -2220,7 +2255,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   -h, --help              Show help
-  -r, --rollback          Force rollback
+  -r, --rollback          Roll back the non-booted slot. IMPORTANT: run from the slot you want to KEEP.
   -c, --cleanup           Manual cleanup
   -s, --storage-info      Storage analysis (read-only)
   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)

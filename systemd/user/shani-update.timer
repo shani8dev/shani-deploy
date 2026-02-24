@@ -2,12 +2,9 @@
 Description=Run Shani OS Update Check every 2 hours
 
 [Timer]
-# Start 5 minutes after boot.
 OnBootSec=5min
-# Run every 2 hours after the last activation.
 OnUnitActiveSec=2h
 Unit=shani-update.service
 
 [Install]
 WantedBy=timers.target
-

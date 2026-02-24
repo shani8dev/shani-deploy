@@ -608,6 +608,7 @@ get_mirror_url() {
     # Ultimate fallback: use SourceForge direct download URL (slower but reliable)
     log_warn "Mirror discovery failed, using SourceForge direct"
     local fallback_url="https://sourceforge.net/projects/${project}/files/${filepath}/${filename}/download"
+    log_verbose "Fallback URL: ${fallback_url}"
     
     # Don't cache the fallback URL as it will redirect on each use
     echo "$fallback_url"
@@ -671,7 +672,7 @@ validate_download() {
     
     # Detect HTML/XML error pages
     if file "$file" 2>/dev/null | grep -qi "html\|xml"; then
-        log_error "File appears to be error page (HTML/XML)"
+        log_error "Downloaded file appears to be an HTML/XML error page, not a valid image — the server may have returned an error"
         return 1
     fi
     
@@ -976,7 +977,7 @@ verify_gpg() {
 #####################################
 
 check_root() {
-    [[ $(id -u) -eq 0 ]] || die "Must run as root"
+    [[ $(id -u) -eq 0 ]] || die "Must run as root — re-run with sudo or as root user"
 }
 
 check_internet() {
@@ -1191,7 +1192,7 @@ optimize_storage() {
     set +e
     log_section "Storage Optimization (Deduplication)"
 
-    [[ -f "$DEPLOY_PENDING" ]] && { log_warn "Deployment pending, skipping"; set -e; return 0; }
+    [[ -f "$DEPLOY_PENDING" ]] && { log_warn "A deployment is currently pending — cannot optimize storage now. Complete or rollback the deployment first, then re-run --optimize"; set -e; return 0; }
 
     if is_mounted "$MOUNT_DIR"; then
         log_verbose "Cleaning up existing mount before optimization"
@@ -1207,6 +1208,8 @@ optimize_storage() {
         set -e
         return 0
     }
+
+    command -v duperemove &>/dev/null || { log_error "duperemove not installed — install it to use --optimize"; set -e; return 1; }
 
     local -a targets=("$MOUNT_DIR/@blue" "$MOUNT_DIR/@green")
     while IFS= read -r backup; do
@@ -1403,13 +1406,13 @@ restore_candidate() {
         exit 1
     fi
 
-    log_error "Initiating rollback"
+    log_error "An error occurred during deployment — initiating emergency rollback to restore a clean state"
 
     if [[ -z "${CANDIDATE_SLOT:-}" ]]; then
         log_warn "CANDIDATE_SLOT unknown, skipping subvolume restore"
         umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
         rm -f "$DEPLOY_PENDING" 2>/dev/null
-        log_error "Rollback incomplete - manual intervention required"
+        log_error "Rollback incomplete — CANDIDATE_SLOT unknown. Manual intervention required: check btrfs subvolumes and boot entries manually"
         exit 1
     fi
 
@@ -1648,7 +1651,7 @@ parse_fstab_subvolumes() {
 
 create_swapfile() {
     local file="$1" size_mb="$2" avail_mb="$3"
-    (( avail_mb < size_mb )) && { log_warn "Insufficient space"; return 1; }
+    (( avail_mb < size_mb )) && { log_warn "Insufficient space for swapfile: need ${size_mb}MB, have ${avail_mb}MB"; return 1; }
     
     log "Creating ${size_mb}MB swapfile"
     
@@ -1670,6 +1673,7 @@ create_swapfile() {
         return 0
     fi
     
+    log_error "All swapfile creation methods failed for: $file"
     rm -f "$file"
     return 1
 }
@@ -1808,7 +1812,10 @@ validate_boot() {
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
         log_warn "Slot marker is invalid or missing — detecting from live boot..."
         CURRENT_SLOT="$booted"
-        [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]] && CURRENT_SLOT="blue"
+        if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
+            log_warn "Could not detect booted slot from kernel cmdline — defaulting to @blue"
+            CURRENT_SLOT="blue"
+        fi
         mkdir -p /data
         echo "$CURRENT_SLOT" > /data/current-slot
         log "Slot marker corrected to: @${CURRENT_SLOT}"
@@ -1852,7 +1859,7 @@ check_space() {
     log "Available space: ${free_mb}MB | Required: ${MIN_FREE_SPACE_MB}MB"
     
     (( free_mb >= MIN_FREE_SPACE_MB )) || \
-        die "Not enough disk space: ${free_mb}MB available, ${MIN_FREE_SPACE_MB}MB required. Free up space and try again."
+        die "Not enough disk space: ${free_mb}MB available, ${MIN_FREE_SPACE_MB}MB required. Run --cleanup to remove old downloads and backups, then try again."
     
     log_success "Sufficient disk space available"
     run_cmd mkdir -p "$DOWNLOAD_DIR"
@@ -1967,6 +1974,7 @@ download_update() {
         mirror_url=$(get_mirror_url "shanios" "${REMOTE_PROFILE}/${REMOTE_VERSION}" "$IMAGE_NAME")
         mirror_url=$(echo "$mirror_url" | tail -1 | tr -d '\r\n' | xargs)
         [[ -z "$mirror_url" || ! "$mirror_url" =~ ^https?://[a-zA-Z0-9] ]] && die "Could not find a valid download mirror — check your internet connection and try again"
+        log "Using mirror: ${mirror_url}"
     fi
     
     # Get expected size
@@ -2008,6 +2016,7 @@ download_update() {
 
         local dl_url
         (( use_r2 )) && dl_url="$r2_image_url" || dl_url="$mirror_url"
+        log_verbose "Downloading from: ${dl_url}"
 
         # SourceForge doesn't reliably support resume — clear partial before each attempt
         if [[ "$dl_url" != *"downloads.shani.dev"* ]]; then
@@ -2069,7 +2078,7 @@ download_update() {
             
             if [[ -n "$new_mirror" && "$new_mirror" =~ ^https?://[a-zA-Z0-9] ]]; then
                 if [[ "$new_mirror" != "$current_mirror" ]]; then
-                    log "Switched to new mirror"
+                    log "Switched to new mirror: ${new_mirror}"
                     current_mirror="$new_mirror"
                 fi
                 mirror_url="$new_mirror"
@@ -2166,7 +2175,7 @@ deploy_update() {
                 btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
                 btrfs subvolume delete "$temp" 2>/dev/null
                 safe_umount "$MOUNT_DIR"
-                die "Extraction failed"
+                die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
             }
         else
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
@@ -2174,7 +2183,7 @@ deploy_update() {
                 btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
                 btrfs subvolume delete "$temp" 2>/dev/null
                 safe_umount "$MOUNT_DIR"
-                die "Extraction failed"
+                die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
             }
         fi
         log_success "Extracted in $(($(date +%s) - start))s"
@@ -2210,7 +2219,6 @@ finalize_update() {
     echo "$CANDIDATE_SLOT" > /data/current-slot || die "Failed to write current-slot"
 
     rm -f "$DEPLOY_PENDING" || log_warn "Failed to remove deployment pending flag"
-    log_success "Deployment complete"
     
     trap - ERR
     set +e
@@ -2236,12 +2244,12 @@ finalize_update() {
     set -e
     trap 'restore_candidate' ERR
     
-    log_success "Complete"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log "  Deployment successful!"
     log "  Next boot will load: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
     log "  Current slot:        @${CURRENT_SLOT} (still running)"
     log "  Please reboot to switch to the updated slot"
+    log "  Tip: run with --optimize to reclaim disk space via deduplication"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -2360,14 +2368,13 @@ main() {
         analyze_storage || log_verbose "Storage analysis warnings"
         
         log_success "Maintenance complete"
+        log "Tip: run with --optimize to reclaim disk space via deduplication"
         exit 0
     fi
     
     download_update || die "Download failed"
     deploy_update || die "Deployment failed"
-    [[ -f "$DEPLOY_PENDING" ]] && finalize_update
-    
-    log_success "Done"
+    [[ -f "$DEPLOY_PENDING" ]] && finalize_update || log_warn "Deployment pipeline completed but no pending flag was found — state may be inconsistent"
 }
 
 main "$@"

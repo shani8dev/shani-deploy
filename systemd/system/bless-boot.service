@@ -1,15 +1,18 @@
 [Unit]
 Description=Bless Current Boot - Shani OS Boot Counting
-DefaultDependencies=no
-After=sysinit.target data.mount
-Before=basic.target
+After=multi-user.target data.mount mark-boot-success.service
 Wants=data.mount
-ConditionPathExists=/data/boot_in_progress
+# Only bless the boot after mark-boot-success has confirmed the system reached
+# multi-user.target and written /data/boot-ok. This ensures the systemd-boot
+# boot counter (+3-0 tries) is only satisfied when the system is truly healthy,
+# not at sysinit time when nothing useful has started yet.
+ConditionPathExists=/data/boot-ok
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'bootctl set-good 2>/dev/null || true'
+ExecStart=bootctl set-good
+SuccessExitStatus=0 1
 RemainAfterExit=yes
 
 [Install]
-WantedBy=basic.target
+WantedBy=multi-user.target

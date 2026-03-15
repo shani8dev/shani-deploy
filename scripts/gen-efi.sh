@@ -3,7 +3,7 @@
 #
 # Usage: ./gen-efi.sh configure <target_slot>
 #
-# ENHANCED: 
+# ENHANCED:
 # - Validates target slot against booted slot
 # - Auto-mounts/unmounts ESP
 # - Safe for direct calls (only for current slot)
@@ -54,7 +54,6 @@ fi
 OS_NAME="shanios"
 ESP="/boot/efi"
 EFI_DIR="$ESP/EFI/${OS_NAME}"
-BOOT_ENTRIES="$ESP/loader/entries"
 CMDLINE_FILE="/etc/kernel/install_cmdline_${TARGET_SLOT}"
 MOK_KEY="/etc/secureboot/keys/MOK.key"
 MOK_CRT="/etc/secureboot/keys/MOK.crt"
@@ -105,18 +104,18 @@ get_booted_slot() {
 # Validate target slot
 validate_target_slot() {
     local target="$1"
-    
+
     # If in chroot, trust shani-deploy
     if in_chroot; then
         log "Running in chroot, proceeding..."
         return 0
     fi
-    
+
     # Get booted slot
     local booted=$(get_booted_slot)
     log "Booted slot: @${booted}"
     log "Target slot: @${target}"
-    
+
     # Check if target matches booted
     if [[ "$target" != "$booted" ]]; then
         echo "" >&2
@@ -132,7 +131,7 @@ validate_target_slot() {
         echo "" >&2
         return 1
     fi
-    
+
     log "Target matches booted slot, safe to proceed ✓"
     return 0
 }
@@ -231,31 +230,7 @@ generate_cmdline() {
     log "Kernel cmdline generated for ${slot} (saved in ${CMDLINE_FILE})"
 }
 
-# update_slot_conf updates the boot entry configuration for a given slot.
-# When called standalone (not from shani-deploy chroot), both entries are
-# written without boot-count tries — the booted slot is already proven good
-# and the other slot is whatever is currently on disk (also good or irrelevant).
-# shani-deploy's finalize_boot_entries handles tries for new deployments.
-update_slot_conf() {
-    local slot="$1" target_slot="$2"
-    local suffix=""
-    if [[ "$slot" == "$target_slot" ]]; then
-        suffix=" (Active)"
-    else
-        suffix=" (Candidate)"
-    fi
-    # Remove any stale tries-suffixed files for this slot before writing the
-    # clean entry — prevents accumulation of +N-M.conf leftovers on the ESP.
-    rm -f "$BOOT_ENTRIES/${OS_NAME}-${slot}"+*.conf 2>/dev/null || true
-    local conf_file="$BOOT_ENTRIES/${OS_NAME}-${slot}.conf"
-    cat > "$conf_file" <<EOF
-title   ${OS_NAME}-${slot}${suffix}
-efi     /EFI/${OS_NAME}/${OS_NAME}-${slot}.efi
-EOF
-    log "Updated boot entry: $conf_file"
-}
-
-# generate_uki generates the UKI image and then updates the boot entries for both slots.
+# generate_uki generates the UKI image for the given slot.
 generate_uki() {
     local slot="$1"
 
@@ -267,7 +242,7 @@ generate_uki() {
 
     # Ensure ESP is mounted before we start
     ensure_esp_mounted
-    mkdir -p "$EFI_DIR" "$BOOT_ENTRIES"
+    mkdir -p "$EFI_DIR"
 
     local kernel_ver
     kernel_ver=$(get_kernel_version)
@@ -282,16 +257,7 @@ generate_uki() {
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
 
-    # Update boot entry only when called standalone — when called via shani-deploy
-    # (in chroot), finalize_boot_entries handles entries with full slot context
-    if ! in_chroot; then
-        local other_slot
-        [[ "$slot" == "blue" ]] && other_slot="green" || other_slot="blue"
-        update_slot_conf "$slot" "$slot"
-        [[ -f "$EFI_DIR/${OS_NAME}-${other_slot}.efi" ]] && update_slot_conf "$other_slot" "$slot"
-    fi
-    # cleanup_esp is called automatically via EXIT trap set above
-}
+
 
 case "${1:-}" in
     configure)

@@ -78,11 +78,17 @@ command -v pv &>/dev/null && HAS_PV=1
 
 declare -g LOCAL_VERSION LOCAL_PROFILE
 declare -g CHROOT_ESP_BIND=0
-declare -g BACKUP_NAME="" CURRENT_SLOT="" CANDIDATE_SLOT=""
-declare -g REMOTE_VERSION="" REMOTE_PROFILE="" IMAGE_NAME=""
-declare -g UPDATE_CHANNEL="" UPDATE_CHANNEL_SOURCE="" DRY_RUN="no" VERBOSE="no"
-declare -g DEPLOYMENT_START_TIME="" SKIP_SELF_UPDATE="no" SELF_UPDATE_DONE=""
-declare -g FORCE_UPDATE="no"
+declare -g BACKUP_NAME="${BACKUP_NAME:-}" CURRENT_SLOT="${CURRENT_SLOT:-}" CANDIDATE_SLOT="${CANDIDATE_SLOT:-}"
+declare -g REMOTE_VERSION="${REMOTE_VERSION:-}" REMOTE_PROFILE="${REMOTE_PROFILE:-}" IMAGE_NAME="${IMAGE_NAME:-}"
+declare -g UPDATE_CHANNEL="${UPDATE_CHANNEL:-}" UPDATE_CHANNEL_SOURCE="${UPDATE_CHANNEL_SOURCE:-}"
+# These must not overwrite values restored from state — the re-exec'd process
+# needs to inherit DRY_RUN/VERBOSE/etc. exactly as the parent had them.
+declare -g DRY_RUN="${DRY_RUN:-no}"
+declare -g VERBOSE="${VERBOSE:-no}"
+declare -g SKIP_SELF_UPDATE="${SKIP_SELF_UPDATE:-no}"
+declare -g SELF_UPDATE_DONE="${SELF_UPDATE_DONE:-}"
+declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
+declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-}"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 # CHROOT_STATIC_DIRS are bind-mounted from the live system into the candidate
@@ -1105,7 +1111,7 @@ self_update() {
 
     log "Checking for script updates..."
 
-    local self_update_url="${R2_BASE_URL}/shani-deploy.sh"
+    local self_update_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
     if download_file "$self_update_url" "$temp" 1; then
         if grep -q "#!/bin/bash" "$temp" && grep -q "shanios-deploy" "$temp"; then
             if ! cmp -s "$script_path" "$temp"; then
@@ -1894,43 +1900,7 @@ verify_and_create_subvolumes() {
                         mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
                             log_warn "Could not create downloads directory"
 
-                        # Create varlib and varspool top-level dirs and all
-                        # individual subdirs that fstab bind-mounts from @data.
-                        # Without these the bind mounts silently fail (nofail)
-                        # on first boot and service state is not persisted.
-                        mkdir -p "$MOUNT_DIR/@data/varlib" 2>/dev/null || \
-                            log_warn "Could not create varlib directory"
-                        mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
-                            log_warn "Could not create varspool directory"
-
-                        local _varlib_dirs=(
-                            AccountsService NetworkManager appimage bluetooth boltd caddy
-                            cloudflared colord cups dbus fail2ban firewalld fontconfig fprint
-                            fwupd gdm geoclue nfs pipewire polkit-1 rclone restic rtkit samba
-                            sane sddm sshd sudo systemd tailscale tpm2-tss upower
-                        )
-                        for _d in "${_varlib_dirs[@]}"; do
-                            mkdir -p "$MOUNT_DIR/@data/varlib/$_d" 2>/dev/null || true
-                        done
-
-                        local _varspool_dirs=(anacron at cron cups postfix samba)
-                        for _d in "${_varspool_dirs[@]}"; do
-                            mkdir -p "$MOUNT_DIR/@data/varspool/$_d" 2>/dev/null || true
-                        done
-
-                        # OverlayFS upper/work dirs — must exist before first boot
-                        # or the /etc overlay mount fails leaving /etc read-only.
-                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/upper" 2>/dev/null || true
-                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/work"  2>/dev/null || true
-                        mkdir -p "$MOUNT_DIR/@data/overlay/var/upper" 2>/dev/null || true
-                        mkdir -p "$MOUNT_DIR/@data/overlay/var/work"  2>/dev/null || true
-
                         if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
-                            # :-blue / :-green are intentional first-boot defaults:
-                            # this branch only runs when @data is being created for
-                            # the first time (fresh install). CURRENT_SLOT/CANDIDATE_SLOT
-                            # are set by validate_boot on normal deploys; the defaults
-                            # cover the install-time path where they may not be set yet.
                             echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
                                 log_warn "Could not create current-slot marker"
                         fi

@@ -28,15 +28,21 @@ export ORIGINAL_ARGS DEPLOYMENT_START_TIME
 ### State Restoration             ###
 #####################################
 if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FILE" ]]; then
-    set +e
-    state_content=$(cat "$SHANIOS_DEPLOY_STATE_FILE" 2>/dev/null)
-    rm -f "$SHANIOS_DEPLOY_STATE_FILE"
-    
-    if [[ -n "$state_content" ]]; then
-        state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS\|declare.*CHANNEL_FILE" || true)
-        [[ -n "$state_content" ]] && eval "$state_content" 2>/dev/null || true
+    # Only trust state files we created ourselves under /run
+    if [[ "$SHANIOS_DEPLOY_STATE_FILE" =~ ^/run/shanios_deploy_state\.[A-Za-z0-9]+$ ]]; then
+        set +e
+        state_content=$(cat "$SHANIOS_DEPLOY_STATE_FILE" 2>/dev/null)
+        rm -f "$SHANIOS_DEPLOY_STATE_FILE"
+
+        if [[ -n "$state_content" ]]; then
+            state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS\|declare.*CHANNEL_FILE\|declare.*STATE_DIR" || true)
+            [[ -n "$state_content" ]] && eval "$state_content" 2>/dev/null || true
+        fi
+        set -e
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARNING] Ignoring untrusted state file path: $SHANIOS_DEPLOY_STATE_FILE" >&2
+        unset SHANIOS_DEPLOY_STATE_FILE
     fi
-    set -e
 fi
 
 #####################################
@@ -51,6 +57,9 @@ readonly MIN_FREE_SPACE_MB=10240
 readonly MIN_FILE_SIZE=10485760
 readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
 readonly DEPLOY_PENDING="/data/deployment_pending"
+# /run is tmpfs — cleared automatically on every reboot, so no manual cleanup needed.
+# Written world-readable so shani-update (running as a normal user) can read it.
+readonly REBOOT_NEEDED_FILE="/run/shanios/reboot-needed"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 readonly CHANNEL_FILE="/etc/shani-channel"
@@ -76,14 +85,26 @@ declare -g DEPLOYMENT_START_TIME="" SKIP_SELF_UPDATE="no" SELF_UPDATE_DONE=""
 declare -g FORCE_UPDATE="no"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
+# CHROOT_STATIC_DIRS are bind-mounted from the live system into the candidate
+# slot chroot so gen-efi can access:
+#   data  — downloads dir and slot markers live here
+#   etc   — /etc/secureboot/keys (MOK signing keys), /etc/vconsole.conf (keymap),
+#            and /etc/kernel/install_cmdline_* (generated from live disk state)
+#   var   — dracut cache and module state
+#   swap  — swap subvolume so gen-efi can compute the resume_offset for the
+#            swapfile that already exists on disk (correct: swap is shared state)
+# Consequence: gen-efi inside the chroot sees the live /etc, not the new slot's
+# /etc. This is intentional for keys and keymap (shared), but means if the new
+# slot ships a different fstab or vconsole.conf those changes don't affect the
+# UKI cmdline until the next deploy after rebooting into the new slot.
 readonly CHROOT_STATIC_DIRS=(data etc var swap)
 
 #####################################
 ### State Management              ###
 #####################################
 
-STATE_DIR=$(mktemp -d /tmp/shanios-deploy-state.XXXXXX)
-export STATE_DIR
+# STATE_DIR is created after check_root() ensures we are root
+STATE_DIR=""
 
 cleanup_state() {
     [[ -n "${STATE_DIR:-}" && -d "${STATE_DIR}" ]] && rm -rf "${STATE_DIR}"
@@ -92,11 +113,12 @@ trap cleanup_state EXIT
 
 persist_state() {
     local state_file
-    state_file=$(mktemp /tmp/shanios_deploy_state.XXXX)
+    state_file=$(mktemp /run/shanios_deploy_state.XXXX)
+    chmod 600 "$state_file"
     {
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
-        declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE STATE_DIR 2>/dev/null || true
+        declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME 2>/dev/null || true
@@ -312,12 +334,13 @@ safe_mount() {
 #####################################
 
 get_booted_subvol() {
-    local subvol
-    subvol=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | sed 's/.*subvol=@//;s/,.*//' || echo "")
+    local rootflags subvol
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
+    subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
+    subvol="${subvol#@}"
     [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
     if [[ -z "$subvol" ]]; then
-        log_warn "Could not detect booted subvolume from cmdline or btrfs default — falling back to 'blue'" >&2 2>/dev/null || true
-        subvol="blue"
+        die "Cannot detect booted subvolume — /proc/cmdline has no subvol= and btrfs get-default returned nothing. Check that the system booted from a ShaniOS slot."
     fi
     echo "$subvol"
 }
@@ -842,7 +865,7 @@ download_file() {
         local attempt=0
         
         while (( attempt < max_tool_attempts )); do
-            ((attempt++))
+            attempt=$((attempt + 1))
             log_verbose "Attempting $tool (try ${attempt}/${max_tool_attempts})..."
             
             # Check existing file state before download
@@ -948,33 +971,49 @@ verify_sha256() {
 verify_gpg() {
     local file="$1" sig="$2"
     log_verbose "Verifying GPG signature..."
-    
-    local gpg_temp=$(mktemp -d)
+
+    local gpg_temp
+    gpg_temp=$(mktemp -d /run/shanios-gpg.XXXXXX)
     local old_gnupghome="${GNUPGHOME:-}"
     export GNUPGHOME="$gpg_temp"
     chmod 700 "$gpg_temp"
-    
-    local result=1
-    local keyservers=(keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu)
-    
-    local key_imported=0
-    for keyserver in "${keyservers[@]}"; do
-        if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
-            log_verbose "GPG key imported from: $keyserver"
-            key_imported=1
-            break
-        fi
-    done
-    (( key_imported )) || log_warn "Could not import GPG signing key from any keyserver — signature verification may fail"
 
-    local fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+    local result=1
+    local key_imported=0
+
+    # Prefer the bundled key — fast, offline, no keyserver dependency.
+    local bundled_key="/etc/shani-keys/signing.asc"
+    if [[ -f "$bundled_key" ]]; then
+        if gpg --batch --quiet --import "$bundled_key" 2>/dev/null; then
+            log_verbose "GPG key imported from bundled key: ${bundled_key}"
+            key_imported=1
+        else
+            log_warn "Bundled key import failed — falling back to keyservers"
+        fi
+    fi
+
+    # Keyserver fallback — only if bundled key is missing or failed to import.
+    if (( ! key_imported )); then
+        local keyservers=(keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu)
+        for keyserver in "${keyservers[@]}"; do
+            if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then
+                log_verbose "GPG key imported from keyserver: $keyserver"
+                key_imported=1
+                break
+            fi
+        done
+        (( key_imported )) || log_warn "Could not import GPG signing key — signature verification may fail"
+    fi
+
+    local fp
+    fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
     if [[ "$fp" == "$GPG_KEY_ID" ]] && gpg --batch --verify "$sig" "$file" 2>/dev/null; then
         log_success "GPG signature verified"
         result=0
     else
         log_error "GPG signature verification failed — image may be tampered with"
     fi
-    
+
     rm -rf "$gpg_temp"
     [[ -n "$old_gnupghome" ]] && export GNUPGHOME="$old_gnupghome" || unset GNUPGHOME
     return $result
@@ -985,13 +1024,39 @@ verify_gpg() {
 #####################################
 
 check_root() {
-    [[ $(id -u) -eq 0 ]] || die "Must run as root — re-run with sudo or as root user"
+    if [[ $(id -u) -ne 0 ]]; then
+        local self
+        self=$(readlink -f "$0")
+        if command -v pkexec &>/dev/null; then
+            exec pkexec "$self" "${ORIGINAL_ARGS[@]}"
+        elif command -v sudo &>/dev/null; then
+            exec sudo "$self" "${ORIGINAL_ARGS[@]}"
+        else
+            die "Must run as root — re-run with sudo or as root user"
+        fi
+    fi
+    # Now confirmed root — safe to create state dir under /run
+    STATE_DIR=$(mktemp -d /run/shanios-deploy-state.XXXXXX)
+    export STATE_DIR
 }
 
 check_internet() {
     log "Checking internet connectivity..."
-    ping -c1 -W2 8.8.8.8 &>/dev/null || die "No internet connection — check your network and try again"
-    log_verbose "Internet connectivity OK"
+    # Try ICMP first (fastest), then fall back to HTTP HEAD for environments
+    # where ICMP is blocked (corporate firewalls, VPNs, containers).
+    if ping -c1 -W2 8.8.8.8 &>/dev/null; then
+        log_verbose "Internet connectivity OK (ping)"
+        return 0
+    fi
+    if (( HAS_CURL )) && timeout 10 curl -fsSL --max-time 8 --head https://downloads.shani.dev &>/dev/null; then
+        log_verbose "Internet connectivity OK (curl)"
+        return 0
+    fi
+    if (( HAS_WGET )) && timeout 10 wget -q --spider --timeout=8 https://downloads.shani.dev &>/dev/null; then
+        log_verbose "Internet connectivity OK (wget)"
+        return 0
+    fi
+    die "No internet connection — check your network and try again"
 }
 
 check_tools() {
@@ -1033,16 +1098,21 @@ self_update() {
     export SELF_UPDATE_DONE=1
     persist_state
 
-    local url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
-    local temp=$(mktemp)
+    local script_path
+    script_path=$(readlink -f "$0")
+    local temp
+    temp=$(mktemp /run/shanios-selfupdate.XXXXXX)
 
     log "Checking for script updates..."
-    
-    if download_file "$url" "$temp" 1; then
+
+    local self_update_url="${R2_BASE_URL}/shani-deploy.sh"
+    if download_file "$self_update_url" "$temp" 1; then
         if grep -q "#!/bin/bash" "$temp" && grep -q "shanios-deploy" "$temp"; then
-            if ! cmp -s "$0" "$temp"; then
+            if ! cmp -s "$script_path" "$temp"; then
                 chmod +x "$temp"
                 log_success "Script updated — re-executing with new version..."
+                # Clean up STATE_DIR before exec — EXIT trap won't fire after exec
+                cleanup_state
                 [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]] && exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}" || exec /bin/bash "$temp"
             else
                 log_verbose "Script is already up to date"
@@ -1053,7 +1123,7 @@ self_update() {
     else
         log_verbose "Could not check for script update, continuing with current version"
     fi
-    
+
     rm -f "$temp"
 }
 
@@ -1065,19 +1135,32 @@ inhibit_system() {
     local depth="${SYSTEMD_INHIBIT_DEPTH:-0}"
     (( depth >= MAX_INHIBIT_DEPTH )) && return 0
     [[ -n "${SYSTEMD_INHIBITED:-}" ]] && return 0
-    
+
     export SYSTEMD_INHIBITED=1
     export SYSTEMD_INHIBIT_DEPTH=$((depth + 1))
     log "Inhibiting system power events (sleep/shutdown/hibernate) during deployment..."
-    
+
     local script_path
     script_path=$(readlink -f "$0")
 
+    # Clean up STATE_DIR before exec — EXIT trap won't fire after exec
+    cleanup_state
+
+    # Explicitly pass SHANIOS_DEPLOY_STATE_FILE via env so it survives the
+    # systemd-inhibit exec regardless of whether it preserves the environment
+    local state_env=()
+    [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && \
+        state_env=(env "SHANIOS_DEPLOY_STATE_FILE=$SHANIOS_DEPLOY_STATE_FILE")
+
     [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]] && \
-        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="System update in progress" "$script_path" "${ORIGINAL_ARGS[@]}" || \
-        exec systemd-inhibit --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="System update in progress" "$script_path"
+        exec "${state_env[@]}" systemd-inhibit \
+            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" --why="System update in progress" \
+            "$script_path" "${ORIGINAL_ARGS[@]}" || \
+        exec "${state_env[@]}" systemd-inhibit \
+            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
+            --who="shanios-deployment" --why="System update in progress" \
+            "$script_path"
 }
 
 #####################################
@@ -1110,8 +1193,9 @@ cleanup_old_backups() {
                 local backup="${backups[i]}"
                 local clean_backup="${backup#@}"
                 
-                # Validate backup name format (10-12 digit timestamp)
-                [[ ! "$clean_backup" =~ ^(blue|green)_backup_[0-9]{10,12}$ ]] && {
+                # Validate backup name format: slot_backup_TIMESTAMP
+                # Timestamp is 10-14 digits covering YYYYMMDDHHmm (12) and YYYYMMDDHHmmSS (14).
+                [[ ! "$clean_backup" =~ ^(blue|green)_backup_[0-9]{10,14}$ ]] && {
                     log_warn "Skipping invalid backup name: ${backup}"
                     continue
                 }
@@ -1130,40 +1214,45 @@ cleanup_old_backups() {
 }
 
 cleanup_downloads() {
-    log_verbose "Scanning for old download files to clean up (files older than 7 days)..."
+    log_verbose "Scanning for old download files to clean up..."
     [[ ! -d "$DOWNLOAD_DIR" ]] && return 0
-    
-    local latest_image=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" \
+
+    # Identify the current image set — protect these regardless of age.
+    local latest_image
+    latest_image=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" \
         -printf "%T@ %p\n" 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-    
+
     local count=0 protected=0
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
-        
+
         if [[ -n "$latest_image" ]]; then
-            local basename=$(basename "$file")
-            local latest_basename=$(basename "$latest_image")
-            
-            if [[ "$basename" == "$latest_basename" ]] || \
-               [[ "$basename" == "${latest_basename}.sha256" ]] || \
-               [[ "$basename" == "${latest_basename}.asc" ]] || \
-               [[ "$basename" == "${latest_basename}.verified" ]]; then
-                ((protected++))
+            local file_base
+            file_base=$(basename "$file")
+            local latest_base
+            latest_base=$(basename "$latest_image")
+
+            # Protect the current image and all its sidecar files.
+            if [[ "$file_base" == "$latest_base" ]] || \
+               [[ "$file_base" == "${latest_base}.sha256" ]] || \
+               [[ "$file_base" == "${latest_base}.asc" ]] || \
+               [[ "$file_base" == "${latest_base}.verified" ]]; then
+                protected=$((protected + 1))
                 continue
             fi
         fi
-        
+
         if [[ "${DRY_RUN}" == "yes" ]]; then
             log "[DRY-RUN] Would delete: $(basename "$file")"
-            ((count++))
+            count=$((count + 1))
         elif rm -f "$file" 2>/dev/null; then
             log_verbose "Deleted: $(basename "$file")"
-            ((count++))
+            count=$((count + 1))
         fi
     done < <(find "$DOWNLOAD_DIR" -maxdepth 1 -type f \
         \( -name "shanios-*.zst*" -o -name "*.aria2" -o -name "*.part" -o -name "*.tmp" \) \
-        -mtime +7 2>/dev/null)
-    
+        2>/dev/null)
+
     (( count > 0 )) && log "Cleaned $count old download file(s) from ${DOWNLOAD_DIR}"
     (( count == 0 )) && log_verbose "No old downloads to clean in ${DOWNLOAD_DIR}"
     (( protected > 0 )) && log_verbose "Protected $protected current file(s)"
@@ -1371,6 +1460,10 @@ generate_uki() {
 finalize_boot_entries() {
     local active_slot="$1"
     local candidate_slot="$2"
+    # Whether the candidate should get boot-counting tries.
+    # Pass "no-tries" as third arg for rollback/restore paths where both
+    # slots are already known-good and no automatic fallback is wanted.
+    local use_tries="${3:-yes}"
     local esp_mounted=0
 
     if ! mountpoint -q "$ESP" 2>/dev/null; then
@@ -1385,14 +1478,36 @@ finalize_boot_entries() {
 
     mkdir -p "$ESP/loader/entries"
 
-    local active_conf="$ESP/loader/entries/${OS_NAME}-${active_slot}.conf"
-    local candidate_conf="$ESP/loader/entries/${OS_NAME}-${candidate_slot}.conf"
+    # Remove any stale tries-suffixed files for both slots before writing new ones.
+    # After a successful boot bless-boot renames shanios-green+3-0.conf →
+    # shanios-green+3-3.conf; without this cleanup that stale file would
+    # accumulate on the ESP across deploys.
+    rm -f "$ESP/loader/entries/${OS_NAME}-${active_slot}"+*.conf 2>/dev/null || true
+    rm -f "$ESP/loader/entries/${OS_NAME}-${candidate_slot}"+*.conf 2>/dev/null || true
 
+    # Default slot — the new unproven slot being set as the next boot target.
+    # Gets +3-0 boot-count tries on normal deploy so systemd-boot automatically
+    # falls back to the fallback entry if it fails to reach multi-user.target.
+    # bless-boot calls 'bootctl set-good' once the session is healthy, which
+    # renames the file from +3-0 → +3-3 (done == left) and stops counting.
+    # On rollback/restore both slots are known-good so no tries are needed.
+    local active_filename active_conf
+    if [[ "$use_tries" == "yes" ]]; then
+        # +3-0: 3 tries allowed, 0 done. systemd-boot decrements tries-left on
+        # each boot attempt; when it reaches 0 it boots the fallback entry instead.
+        active_filename="${OS_NAME}-${active_slot}+3-0.conf"
+    else
+        active_filename="${OS_NAME}-${active_slot}.conf"
+    fi
+    active_conf="$ESP/loader/entries/${active_filename}"
     cat > "$active_conf" <<EOF
 title   ${OS_NAME}-${active_slot} (Active)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
 EOF
 
+    # Fallback slot — the old proven slot. No tries needed: if the new slot
+    # exhausts its tries systemd-boot falls back to this entry unconditionally.
+    local candidate_conf="$ESP/loader/entries/${OS_NAME}-${candidate_slot}.conf"
     cat > "$candidate_conf" <<EOF
 title   ${OS_NAME}-${candidate_slot} (Candidate)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
@@ -1401,15 +1516,14 @@ EOF
     local loader_conf="$ESP/loader/loader.conf"
     if [[ -f "$loader_conf" ]]; then
         grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
-        echo "default ${OS_NAME}-${active_slot}.conf" >> "${loader_conf}.tmp"
+        echo "default ${active_filename}" >> "${loader_conf}.tmp"
         mv "${loader_conf}.tmp" "$loader_conf"
     else
-        printf 'default %s\ntimeout 5\nconsole-mode max\neditor 0\n' \
-            "${OS_NAME}-${active_slot}.conf" > "$loader_conf"
+        printf 'default %s\ntimeout 5\nconsole-mode max\neditor 0\nauto-entries 0\nbeep 0\n' \
+            "${active_filename}" > "$loader_conf"
     fi
-    log_verbose "loader.conf default set to ${OS_NAME}-${active_slot}.conf"
-    log "Boot default set to: @${active_slot} (${OS_NAME}-${active_slot}.conf)"
-    log_verbose "Boot entries written: active=${OS_NAME}-${active_slot}.conf, candidate=${OS_NAME}-${candidate_slot}.conf"
+    log_verbose "loader.conf default set to ${active_filename}"
+    log "Boot default set to: @${active_slot} (${active_filename}) | Fallback: @${candidate_slot}"
 
     if [[ $esp_mounted -eq 1 ]]; then
         umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"
@@ -1531,8 +1645,11 @@ restore_candidate() {
 
     umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
+    # Clear the reboot-needed marker — the deployment that wrote it was just
+    # rolled back, so showing a restart dialog for that version is misleading.
+    rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
 
-    finalize_boot_entries "${CURRENT_SLOT:-$(get_booted_subvol)}" "$CANDIDATE_SLOT" 2>/dev/null || \
+    finalize_boot_entries "${CURRENT_SLOT:-$(get_booted_subvol)}" "$CANDIDATE_SLOT" "no-tries" || \
         log_warn "Could not update boot entries — you may need to set the default boot slot manually"
 
     log_error "Emergency rollback complete — system remains on @${CURRENT_SLOT:-$(get_booted_subvol)}"
@@ -1579,7 +1696,7 @@ rollback_system() {
         awk -v s="${failed_slot}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
     BACKUP_NAME="${BACKUP_NAME#@}"
 
-	if [[ -z "$BACKUP_NAME" ]]; then
+    if [[ -z "$BACKUP_NAME" ]]; then
         log_warn "No backup snapshot found for @${failed_slot} — will create a fresh snapshot from @${booted} as fallback"
 
         if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
@@ -1612,7 +1729,8 @@ rollback_system() {
             cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
                "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null || true
         }
-        finalize_boot_entries "$booted" "$failed_slot"
+        finalize_boot_entries "$booted" "$failed_slot" "no-tries"
+        rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
         log_success "Fallback slot ready"
         log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         log "  Default boot slot: @${booted}"
@@ -1660,7 +1778,8 @@ rollback_system() {
         cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
            "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null || true
     }
-    finalize_boot_entries "$booted" "$failed_slot"
+    finalize_boot_entries "$booted" "$failed_slot" "no-tries"
+    rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
 
     log_success "Rollback complete"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1767,31 +1886,61 @@ verify_and_create_subvolumes() {
                                 log_warn "Swapfile creation failed"
                         fi
                         ;;
-                        
+
                     data)
-					    [[ "${DRY_RUN}" == "yes" ]] && continue
-					    mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work} 2>/dev/null || \
-					        log_warn "Could not create overlay directories"
-					    mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
-					        log_warn "Could not create downloads directory"
-					    
-					    # Create varlib and varspool directories for bind mounts
-					    mkdir -p "$MOUNT_DIR/@data/varlib" 2>/dev/null || \
-					        log_warn "Could not create varlib directory"
-					    mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
-					        log_warn "Could not create varspool directory"
-					    
-					    if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
-					        echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
-					            log_warn "Could not create current-slot marker"
-					    fi
-					    if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
-					        echo "${CANDIDATE_SLOT:-green}" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
-					            log_warn "Could not create previous-slot marker"
-					    fi
-					    ;;
+                        [[ "${DRY_RUN}" == "yes" ]] && continue
+                        mkdir -p "$MOUNT_DIR/@data/overlay/"{etc,var}/{upper,work} 2>/dev/null || \
+                            log_warn "Could not create overlay directories"
+                        mkdir -p "$MOUNT_DIR/@data/downloads" 2>/dev/null || \
+                            log_warn "Could not create downloads directory"
+
+                        # Create varlib and varspool top-level dirs and all
+                        # individual subdirs that fstab bind-mounts from @data.
+                        # Without these the bind mounts silently fail (nofail)
+                        # on first boot and service state is not persisted.
+                        mkdir -p "$MOUNT_DIR/@data/varlib" 2>/dev/null || \
+                            log_warn "Could not create varlib directory"
+                        mkdir -p "$MOUNT_DIR/@data/varspool" 2>/dev/null || \
+                            log_warn "Could not create varspool directory"
+
+                        local _varlib_dirs=(
+                            AccountsService NetworkManager appimage bluetooth boltd caddy
+                            cloudflared colord cups dbus fail2ban firewalld fontconfig fprint
+                            fwupd gdm geoclue nfs pipewire polkit-1 rclone restic rtkit samba
+                            sane sddm sshd sudo systemd tailscale tpm2-tss upower
+                        )
+                        for _d in "${_varlib_dirs[@]}"; do
+                            mkdir -p "$MOUNT_DIR/@data/varlib/$_d" 2>/dev/null || true
+                        done
+
+                        local _varspool_dirs=(anacron at cron cups postfix samba)
+                        for _d in "${_varspool_dirs[@]}"; do
+                            mkdir -p "$MOUNT_DIR/@data/varspool/$_d" 2>/dev/null || true
+                        done
+
+                        # OverlayFS upper/work dirs — must exist before first boot
+                        # or the /etc overlay mount fails leaving /etc read-only.
+                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/upper" 2>/dev/null || true
+                        mkdir -p "$MOUNT_DIR/@data/overlay/etc/work"  2>/dev/null || true
+                        mkdir -p "$MOUNT_DIR/@data/overlay/var/upper" 2>/dev/null || true
+                        mkdir -p "$MOUNT_DIR/@data/overlay/var/work"  2>/dev/null || true
+
+                        if [[ ! -f "$MOUNT_DIR/@data/current-slot" ]]; then
+                            # :-blue / :-green are intentional first-boot defaults:
+                            # this branch only runs when @data is being created for
+                            # the first time (fresh install). CURRENT_SLOT/CANDIDATE_SLOT
+                            # are set by validate_boot on normal deploys; the defaults
+                            # cover the install-time path where they may not be set yet.
+                            echo "${CURRENT_SLOT:-blue}" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
+                                log_warn "Could not create current-slot marker"
+                        fi
+                        if [[ ! -f "$MOUNT_DIR/@data/previous-slot" ]]; then
+                            echo "${CANDIDATE_SLOT:-green}" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
+                                log_warn "Could not create previous-slot marker"
+                        fi
+                        ;;
                 esac
-                
+
                 log_success "Created: @${sub}"
             done
         fi
@@ -1814,11 +1963,11 @@ verify_and_create_subvolumes() {
             
             if [[ "${DRY_RUN}" == "yes" ]]; then
                 log "[DRY-RUN] Would create: $dir"
-                ((created++))
+                created=$((created + 1))
             else
                 if mkdir -p "$full_path" 2>/dev/null; then
                     log_verbose "Created: $dir"
-                    ((created++))
+                    created=$((created + 1))
                 else
                     log_warn "Failed to create: $dir (non-critical)"
                 fi
@@ -1844,12 +1993,8 @@ validate_boot() {
     CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]')
     
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
-        log_warn "Slot marker is invalid or missing — detecting from live boot..."
+        log_warn "Slot marker is invalid or missing — using live boot slot @${booted}"
         CURRENT_SLOT="$booted"
-        if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
-            log_warn "Could not detect booted slot from kernel cmdline — defaulting to @blue"
-            CURRENT_SLOT="blue"
-        fi
         mkdir -p /data
         echo "$CURRENT_SLOT" > /data/current-slot
         log "Slot marker corrected to: @${CURRENT_SLOT}"
@@ -1860,6 +2005,19 @@ validate_boot() {
     
     if [[ "$booted" != "$CURRENT_SLOT" ]]; then
         if [[ "${FORCE_UPDATE:-no}" == "yes" ]]; then
+            # If a reboot-needed marker exists the user deployed successfully and
+            # just hasn't rebooted yet. Warn clearly before overwriting that slot.
+            if [[ -f "$REBOOT_NEEDED_FILE" ]]; then
+                local pending_ver
+                pending_ver=$(cat "$REBOOT_NEEDED_FILE" 2>/dev/null | tr -cd '0-9A-Za-z.-' | head -c 32)
+                log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                log_warn "  WARNING: A deployment to v${pending_ver} is pending reboot"
+                log_warn "  --force will OVERWRITE @${CURRENT_SLOT} and discard that deployment"
+                log_warn "  To keep it: reboot first, then run shani-deploy again"
+                log_warn "  Continuing in 10 seconds — press Ctrl+C to abort"
+                log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                sleep 10
+            fi
             log_warn "Slot mismatch detected (marker=@${CURRENT_SLOT}, booted=@${booted}) — correcting marker due to --force"
             CURRENT_SLOT="$booted"
             mkdir -p /data
@@ -1907,7 +2065,8 @@ fetch_update() {
     
     local sf_url="https://sourceforge.net/projects/shanios/files/${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
     local r2_path="${LOCAL_PROFILE}/${UPDATE_CHANNEL}.txt"
-    local temp=$(mktemp)
+    local temp
+    temp=$(mktemp /run/shanios-fetchupdate.XXXXXX)
     
     log "Fetching latest version info from ${UPDATE_CHANNEL} channel..."
     download_from_r2 "$r2_path" "$temp" 1 || \
@@ -1927,7 +2086,7 @@ fetch_update() {
         log_warn "Profile mismatch: local=${LOCAL_PROFILE}, remote=${REMOTE_PROFILE} — update may change system profile"
     fi
 
-	if (( REMOTE_VERSION < LOCAL_VERSION )); then
+    if (( REMOTE_VERSION < LOCAL_VERSION )); then
         log_warn "Remote version (v${REMOTE_VERSION}) is older than local (v${LOCAL_VERSION})"
         if [[ "${FORCE_UPDATE:-no}" != "yes" ]]; then
             log_success "System is newer than remote — no update needed"
@@ -2051,7 +2210,7 @@ download_update() {
     local current_mirror="$mirror_url"
 
     while (( download_success == 0 && global_attempt < max_global_attempts )); do
-        ((global_attempt++))
+        global_attempt=$((global_attempt + 1))
         log "Download attempt ${global_attempt}/${max_global_attempts}"
 
         local dl_url
@@ -2176,7 +2335,7 @@ deploy_update() {
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
     trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
     
-	if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -qE "subvol=/@${CANDIDATE_SLOT}([^a-zA-Z]|$)"; then
+    if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -qE "subvol=/@${CANDIDATE_SLOT}([^a-zA-Z]|$)"; then
         die "Candidate slot @${CANDIDATE_SLOT} is currently mounted — cannot deploy to an active mount"
     fi
 
@@ -2191,7 +2350,7 @@ deploy_update() {
     # Backup only — do NOT delete candidate yet. Deletion happens after extraction
     # succeeds so power failure during extraction leaves @CANDIDATE_SLOT intact.
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
-        BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M)"
+        BACKUP_NAME="${CANDIDATE_SLOT}_backup_$(date +%Y%m%d%H%M%S)"
         log "Creating safety backup of @${CANDIDATE_SLOT} → @${BACKUP_NAME}"
         run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || \
             { safe_umount "$MOUNT_DIR"; die "Backup snapshot failed — aborting to protect your system"; }
@@ -2253,7 +2412,7 @@ finalize_update() {
 
     verify_and_create_subvolumes || die "Subvolume verification failed"
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
-    finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT"
+    finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT" || die "Failed to update boot entries — ESP may not be accessible"
 
     mkdir -p /data
     echo "$CURRENT_SLOT" > /data/previous-slot || die "Failed to write previous-slot"
@@ -2261,7 +2420,27 @@ finalize_update() {
     log_verbose "Slot markers written: current=@${CANDIDATE_SLOT}, previous=@${CURRENT_SLOT}"
 
     rm -f "$DEPLOY_PENDING" && log_verbose "Deployment pending flag cleared" || log_warn "Failed to remove deployment pending flag"
-    
+
+    # Write reboot-needed marker so shani-update can surface the reboot dialog
+    # to the desktop session. pkexec strips DISPLAY/WAYLAND_DISPLAY so we cannot
+    # call notify-send here reliably. The marker stores the deployed version so
+    # the dialog can show what was installed.
+    # /run is tmpfs — the file is cleared automatically on the next reboot,
+    # so no explicit cleanup is needed when the user reboots into the new slot.
+    mkdir -p /run/shanios && chmod 755 /run/shanios
+    echo "$REMOTE_VERSION" > "$REBOOT_NEEDED_FILE" && chmod 644 "$REBOOT_NEEDED_FILE" || log_warn "Failed to write reboot-needed marker"
+    log_verbose "Reboot-needed marker written: ${REBOOT_NEEDED_FILE}"
+
+    # Write persistent marker so shani-user-setup runs after reboot into the
+    # new slot. The .path unit watches /etc/passwd and /etc/skel, but skel
+    # lives on the read-only root — inotify will not fire after a slot switch.
+    # This marker is checked by shani-user-setup.service on boot and cleared
+    # after a successful run.
+    mkdir -p /data
+    touch /data/user-setup-needed && chmod 644 /data/user-setup-needed \
+        || log_warn "Failed to write user-setup-needed marker"
+    log_verbose "user-setup-needed marker written — shani-user-setup will run after reboot"
+
     trap - ERR
     set +e
     
@@ -2279,10 +2458,7 @@ finalize_update() {
     fi
     
     cleanup_downloads || log_verbose "Download cleanup warnings"
-    
-    # Storage info shown after deployment so user can see current state
-    analyze_storage || log_verbose "Storage analysis warnings"
-    
+
     set -e
     trap 'restore_candidate' ERR
     
@@ -2295,6 +2471,9 @@ finalize_update() {
     log "  Please reboot to switch to the updated slot"
     log "  Tip: run with --optimize to reclaim disk space via deduplication"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    # Desktop notification is handled by shani-update which reads the
+    # reboot-needed marker above — pkexec strips DISPLAY so notify-send here
+    # would silently fail.
 }
 
 #####################################
@@ -2379,11 +2558,11 @@ main() {
         exit 0
     fi
 
-	check_internet
+    check_internet
     self_update
     persist_state
     inhibit_system
-	validate_boot
+    validate_boot
     check_space
     fetch_update
     
@@ -2410,8 +2589,7 @@ main() {
         fi
 
         cleanup_downloads || log_verbose "Download cleanup warnings"
-        analyze_storage || log_verbose "Storage analysis warnings"
-        
+
         log_success "Maintenance complete"
         log "Tip: run with --optimize to reclaim disk space via deduplication"
         exit 0

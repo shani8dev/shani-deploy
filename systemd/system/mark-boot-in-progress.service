@@ -1,13 +1,19 @@
 [Unit]
 Description=Mark Boot In Progress for Shani OS
 DefaultDependencies=no
+# Requires=data.mount: if /data is not mounted we cannot write the boot marker.
+# A failed write would leave boot_in_progress absent, making the 15-minute
+# failure detection blind for this boot. Hard-fail the service so the condition
+# failure is visible in the journal rather than silently undetected.
+Requires=data.mount
 After=data.mount
 Wants=data.mount
 Before=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'rm -f /data/boot-ok /data/boot_failure /data/boot_hard_failure && touch /data/boot_in_progress'
+ExecStart=rm -f /data/boot-ok /data/boot_failure.acked /data/boot_in_progress
+ExecStart=touch /data/boot_in_progress
 RemainAfterExit=yes
 
 [Install]

@@ -1,10 +1,14 @@
 [Unit]
-Description=Shani OS Update Check UI
-After=graphical-session.target network-online.target
-Wants=network-online.target
+Description=Shani OS Update Check
+# Activated exclusively by shani-update.timer — not started directly.
+# After=graphical-session.target is intentionally omitted; the timer fires
+# unconditionally and shani-update --startup guards against no-display itself.
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/shani-update
+ExecStart=/usr/local/bin/shani-update --startup
 Environment=XDG_RUNTIME_DIR=%t
 TimeoutSec=300
+
+[Install]
+WantedBy=default.target

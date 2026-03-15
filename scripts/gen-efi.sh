@@ -23,8 +23,15 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
 done
 
 if [[ $EUID -ne 0 ]]; then
-    echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Must run as root." >&2
-    exit 1
+    self=$(readlink -f "$0")
+    if command -v pkexec &>/dev/null; then
+        exec pkexec "$self" "$@"
+    elif command -v sudo &>/dev/null; then
+        exec sudo "$self" "$@"
+    else
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Must run as root." >&2
+        exit 1
+    fi
 fi
 
 if [[ "${1:-}" != "configure" ]]; then
@@ -38,6 +45,10 @@ if [[ -z "${2:-}" ]]; then
 fi
 
 TARGET_SLOT="$2"
+if [[ ! "$TARGET_SLOT" =~ ^(blue|green)$ ]]; then
+    echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Invalid target slot '$TARGET_SLOT' — must be 'blue' or 'green'." >&2
+    exit 1
+fi
 
 # Configuration
 OS_NAME="shanios"
@@ -78,15 +89,17 @@ in_chroot() {
     [[ "$root_id" != "$proc_id" ]]
 }
 
-# Get currently booted slot
+# Get currently booted slot — unified implementation matching shani-deploy/shani-update.
 get_booted_slot() {
-    # From kernel cmdline
-    local slot=$(grep -o 'rootflags=[^ ]*' /proc/cmdline 2>/dev/null | sed 's/.*subvol=@//;s/,.*//' || echo "")
-    
-    # Fallback to btrfs
-    [[ -z "$slot" ]] && slot=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
-    
-    echo "${slot:-blue}"
+    local rootflags subvol
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
+    subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
+    subvol="${subvol#@}"
+    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    if [[ -z "$subvol" ]]; then
+        error_exit "Cannot detect booted subvolume — /proc/cmdline has no subvol= and btrfs get-default returned nothing."
+    fi
+    echo "$subvol"
 }
 
 # Validate target slot
@@ -159,9 +172,11 @@ get_kernel_version() {
 
 generate_cmdline() {
     local slot="$1"
+    # Always regenerate — never reuse a cached file. The generation is fast
+    # (one blkid call) and a stale file (e.g. after LUKS UUID change, swap
+    # recreate, or keymap change) would silently produce a broken UKI.
     if [[ -f "$CMDLINE_FILE" ]]; then
-        log "Using existing cmdline for ${slot}"
-        return 0
+        log "Regenerating cmdline for ${slot} (replacing existing ${CMDLINE_FILE})"
     fi
 
     local fs_uuid
@@ -194,7 +209,9 @@ generate_cmdline() {
     if [[ -f /etc/vconsole.conf ]]; then
         local keymap
         keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null | cut -d= -f2 || true)
-        if [[ -n "$keymap" ]]; then
+        # Sanitize: keyboard layout names are alphanumeric with hyphens, dots, underscores only
+        keymap=$(printf '%s' "$keymap" | tr -cd 'A-Za-z0-9._-')
+        if [[ -n "$keymap" && ${#keymap} -le 64 ]]; then
             cmdline+=" rd.vconsole.keymap=$keymap"
         fi
     fi
@@ -215,6 +232,10 @@ generate_cmdline() {
 }
 
 # update_slot_conf updates the boot entry configuration for a given slot.
+# When called standalone (not from shani-deploy chroot), both entries are
+# written without boot-count tries — the booted slot is already proven good
+# and the other slot is whatever is currently on disk (also good or irrelevant).
+# shani-deploy's finalize_boot_entries handles tries for new deployments.
 update_slot_conf() {
     local slot="$1" target_slot="$2"
     local suffix=""
@@ -223,6 +244,9 @@ update_slot_conf() {
     else
         suffix=" (Candidate)"
     fi
+    # Remove any stale tries-suffixed files for this slot before writing the
+    # clean entry — prevents accumulation of +N-M.conf leftovers on the ESP.
+    rm -f "$BOOT_ENTRIES/${OS_NAME}-${slot}"+*.conf 2>/dev/null || true
     local conf_file="$BOOT_ENTRIES/${OS_NAME}-${slot}.conf"
     cat > "$conf_file" <<EOF
 title   ${OS_NAME}-${slot}${suffix}
@@ -234,16 +258,20 @@ EOF
 # generate_uki generates the UKI image and then updates the boot entries for both slots.
 generate_uki() {
     local slot="$1"
-    
+
     # VALIDATE target slot
     validate_target_slot "$slot" || error_exit "Slot validation failed"
-    
+
+    # Ensure ESP is unmounted on any exit from this point
+    trap 'cleanup_esp' EXIT
+
     # Ensure ESP is mounted before we start
     ensure_esp_mounted
     mkdir -p "$EFI_DIR" "$BOOT_ENTRIES"
 
     local kernel_ver
     kernel_ver=$(get_kernel_version)
+    log "Using kernel: $kernel_ver"
     local uki_path="$EFI_DIR/${OS_NAME}-${slot}.efi"
     generate_cmdline "$slot"
     local kernel_cmdline
@@ -253,9 +281,16 @@ generate_uki() {
     fi
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
-    
-    # Unmount ESP if we mounted it
-    cleanup_esp
+
+    # Update boot entry only when called standalone — when called via shani-deploy
+    # (in chroot), finalize_boot_entries handles entries with full slot context
+    if ! in_chroot; then
+        local other_slot
+        [[ "$slot" == "blue" ]] && other_slot="green" || other_slot="blue"
+        update_slot_conf "$slot" "$slot"
+        [[ -f "$EFI_DIR/${OS_NAME}-${other_slot}.efi" ]] && update_slot_conf "$other_slot" "$slot"
+    fi
+    # cleanup_esp is called automatically via EXIT trap set above
 }
 
 case "${1:-}" in

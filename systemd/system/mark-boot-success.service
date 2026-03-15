@@ -5,7 +5,8 @@ ConditionPathExists=/data/boot_in_progress
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'touch /data/boot-ok && rm -f /data/boot_in_progress'
+ExecStart=touch /data/boot-ok
+ExecStart=rm -f /data/boot_in_progress
 RemainAfterExit=yes
 
 [Install]

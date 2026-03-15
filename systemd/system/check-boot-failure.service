@@ -7,7 +7,4 @@ ConditionPathExists=/data/boot_in_progress
 Type=oneshot
 ExecStart=/usr/local/bin/check-boot-failure
 
-[Install]
-WantedBy=multi-user.target
-
 

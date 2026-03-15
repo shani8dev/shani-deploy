@@ -8,7 +8,9 @@ Description=Shani OS Update Check
 Type=oneshot
 ExecStart=/usr/local/bin/shani-update --startup
 Environment=XDG_RUNTIME_DIR=%t
-TimeoutSec=300
+# No timeout — shani-deploy can take several minutes to download and deploy.
+# The update is inhibited by systemd-inhibit so power events won't interrupt it.
+TimeoutSec=infinity
 
 [Install]
 WantedBy=default.target

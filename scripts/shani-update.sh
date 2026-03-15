@@ -181,8 +181,15 @@ _check_fallback_boot() {
     BOOTED_SLOT=$(_get_booted_subvol)
 
     if [[ -f "$BOOT_HARD_FAILURE_FILE" ]]; then
-        log "Hard failure marker present — deferring to shani-deploy --rollback"
-        return 1
+        FAILED_SLOT=$(cat "$BOOT_HARD_FAILURE_FILE" 2>/dev/null | tr -d '[:space:]')
+        # Validate — fall back to current-slot if file is empty or garbage
+        if [[ ! "$FAILED_SLOT" =~ ^(blue|green)$ ]]; then
+            FAILED_SLOT=$(cat "$CURRENT_SLOT_FILE" 2>/dev/null | tr -d '[:space:]')
+        fi
+        [[ ! "$FAILED_SLOT" =~ ^(blue|green)$ ]] && FAILED_SLOT=$(_other_slot "$BOOTED_SLOT")
+        log "Hard failure marker present — slot '@${FAILED_SLOT}' failed to mount"
+        FALLBACK_DETECTED=1
+        return 0
     fi
 
     if [[ -f "$BOOT_OK_FILE" && ! -f "$BOOT_FAILURE_FILE" ]]; then
@@ -434,22 +441,39 @@ _post_rollback_dialog() {
 #####################################
 
 _handle_fallback_boot() {
-    # Called in startup mode when _check_fallback_boot returns 0
-    local text
-    text=$(printf '<b>Boot failure detected!</b>\n\nSlot <b>@%s</b> failed to boot.\nThe system fell back to <b>@%s</b>.\n\nRoll back <b>@%s</b> now so it boots correctly next time?' \
-        "$FAILED_SLOT" "$BOOTED_SLOT" "$FAILED_SLOT")
+    # Called when _check_fallback_boot returns 0 (soft or hard failure).
+    # Hard failures (boot_hard_failure present) show extra context explaining
+    # that the slot failed to mount — not just that it booted incorrectly.
+    local title text hard_failure=0
+    [[ -f "$BOOT_HARD_FAILURE_FILE" ]] && hard_failure=1
 
-    show_dialog "Shani OS — Boot Failure Detected" "$text" "Roll Back Now" "Ignore" 120 "dialog-warning"
+    if (( hard_failure )); then
+        title="Shani OS — Hard Boot Failure"
+        text=$(printf '<b>Hard boot failure detected!</b>\n\nSlot <b>@%s</b> could not be mounted by the bootloader.\nThe system fell back to <b>@%s</b>.\n\nRoll back <b>@%s</b> now to restore a clean state?' \
+            "$FAILED_SLOT" "$BOOTED_SLOT" "$FAILED_SLOT")
+    else
+        title="Shani OS — Boot Failure Detected"
+        text=$(printf '<b>Boot failure detected!</b>\n\nSlot <b>@%s</b> failed to boot.\nThe system fell back to <b>@%s</b>.\n\nRoll back <b>@%s</b> now so it boots correctly next time?' \
+            "$FAILED_SLOT" "$BOOTED_SLOT" "$FAILED_SLOT")
+    fi
+
+    show_dialog "$title" "$text" "Roll Back Now" "Ignore" 120 "dialog-warning"
     local rc=$?
 
     if [[ $rc -eq 2 ]]; then
         # No GUI — console or notify
+        local notify_msg
+        if (( hard_failure )); then
+            notify_msg="Slot @${FAILED_SLOT} failed to mount. Run 'shani-update --rollback'."
+        else
+            notify_msg="Slot @${FAILED_SLOT} failed to boot. Run 'shani-update --rollback'."
+        fi
         command -v notify-send &>/dev/null && \
             notify-send -u critical -i dialog-warning \
-                "Shani OS — Boot Failure" \
-                "Slot @${FAILED_SLOT} failed. Run 'shani-update --rollback'." 2>/dev/null || true
+                "$title" "$notify_msg" 2>/dev/null || true
         if [[ -t 0 && -t 1 ]]; then
             printf '\n===================================\n  Shani OS — Boot Failure\n===================================\n'
+            (( hard_failure )) && printf 'HARD FAILURE (slot failed to mount)\n'
             printf 'Failed: @%s  |  Booted: @%s\n\n' "$FAILED_SLOT" "$BOOTED_SLOT"
             read -rp "Roll back now? [y/N]: " -t 60 response || response="n"
             [[ "${response,,}" == y* ]] && rc=0 || return 0

@@ -2488,6 +2488,37 @@ system_info() {
 
     # Collect actionable recommendations throughout — printed at the end
     local -a recommendations=()
+    # Cross-section state shared between UKI check and hibernate check
+    local uki_booted_bad=0          # set if the booted slot's UKI fails sbverify
+    local hibernate_offset_stale=0  # set if resume_offset in cmdline doesn't match swapfile
+
+    # Pre-compute hibernate offset state early so the UKI section can reference it
+    # (UKI check runs before the Disk/Swap section in the output order).
+    # Use swapon to find the real swapfile path — strip trailing whitespace from
+    # swapon column-padded output before the -f test.
+    if command -v btrfs &>/dev/null; then
+        local _pre_swapfile=""
+        while IFS= read -r _dev; do
+            _dev="${_dev%%[[:space:]]*}"   # strip trailing column padding
+            [[ -z "$_dev" ]] && continue
+            [[ -f "$_dev" ]] && { _pre_swapfile="$_dev"; break; }
+        done < <(swapon --show=NAME --noheadings 2>/dev/null | grep -v zram || true)
+        if [[ -n "$_pre_swapfile" ]]; then
+            local _pre_actual _pre_cmdline _pre_btrfs_out
+            # btrfs inspect-internal map-swapfile output varies by btrfs-progs version:
+            #   newer: "resume_offset: 1972357"
+            #   older: bare number only e.g. "2236549"
+            # Try parsing resume_offset key first, then fall back to last bare number.
+            _pre_btrfs_out=$(btrfs inspect-internal map-swapfile -r "$_pre_swapfile" 2>/dev/null || echo "")
+            _pre_actual=$(echo "$_pre_btrfs_out" \
+                | awk -F'[: \t]+' '/resume_offset/ {print $2; found=1} END {if (!found) exit 1}' 2>/dev/null || \
+                  echo "$_pre_btrfs_out" | awk 'NF {last=$NF} END {print last+0}' 2>/dev/null || echo "")
+            _pre_cmdline=$(grep -o 'resume_offset=[^ ]*' /proc/cmdline \
+                | cut -d= -f2 2>/dev/null || echo "")
+            [[ -n "$_pre_actual" && "$_pre_actual" != "0" && -n "$_pre_cmdline" \
+                && "$_pre_actual" != "$_pre_cmdline" ]] && hibernate_offset_stale=1
+        fi
+    fi
 
     # ── OS Identity ───────────────────────────────────────────────────────────
     local version profile channel slot_current slot_previous
@@ -2535,7 +2566,21 @@ system_info() {
         last_ok=$(stat -c '%y' /data/boot-ok 2>/dev/null | cut -d. -f1 || echo "unknown")
         echo "    Last boot : ✓ Successful (${last_ok})"
     else
-        echo "    Last boot : ⚠ No successful boot recorded yet"
+        # Distinguish a fresh install (version file recent, no failure flag) from
+        # a genuine missing-record situation that might indicate a boot issue.
+        local install_age_days=0
+        if [[ -f /etc/shani-version ]]; then
+            local install_epoch now_epoch
+            install_epoch=$(stat -c '%Y' /etc/shani-version 2>/dev/null || echo "0")
+            now_epoch=$(date +%s)
+            install_age_days=$(( (now_epoch - install_epoch) / 86400 ))
+        fi
+        if (( install_age_days <= 3 )) && [[ ! -f /data/boot_failure ]]; then
+            echo "    Last boot : — No record yet (fresh install, bless-boot pending)"
+        else
+            echo "    Last boot : ⚠ No successful boot recorded"
+            recommendations+=("No successful boot recorded in /data/boot-ok — check bless-boot / boot-success.service")
+        fi
     fi
     if [[ -f /data/boot_hard_failure ]]; then
         local hard_fail_slot
@@ -2546,7 +2591,7 @@ system_info() {
         local fail_slot
         fail_slot=$(cat /data/boot_failure 2>/dev/null | tr -d '[:space:]' || echo "unknown")
         echo "    Failure   : ⚠ Boot failure recorded for @${fail_slot}"
-        recommendations+=("Boot failure recorded for @${fail_slot} — run: shani-deploy --rollback")
+        recommendations+=("Boot failure recorded for @${fail_slot} — run: shani-deploy --rollback (restores slot from backup and regenerates its UKI)")
     fi
     if [[ -f /data/boot_failure.acked ]]; then
         echo "    Acked     : ⚠ Failure acknowledged — rollback dialog was shown (run --rollback if not done)"
@@ -2572,36 +2617,67 @@ system_info() {
     local active_lsms
     active_lsms=$(cat /sys/kernel/security/lsm 2>/dev/null | tr ',' ' ' || echo "unknown")
     echo "    LSMs      : ${active_lsms}"
-    # Check all expected LSMs are loaded
+
+    # Determine whether integrity/IMA is a kernel build choice or a config error.
+    # CONFIG_IMA=n means the integrity LSM never registers — the lsm= cmdline entry
+    # is silently ignored. This is a deliberate build decision, not a misconfiguration.
+    local ima_compiled=0
+    zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_IMA=y' && ima_compiled=1
+
+    # Check all expected LSMs are loaded — exclude 'integrity' when IMA is not compiled in
     local expected_lsms=(landlock lockdown yama integrity apparmor bpf)
-    local missing_lsms=()
+    local missing_lsms=() missing_build=()
     for lsm in "${expected_lsms[@]}"; do
-        echo "$active_lsms" | grep -qw "$lsm" || missing_lsms+=("$lsm")
+        if ! echo "$active_lsms" | grep -qw "$lsm"; then
+            if [[ "$lsm" == "integrity" && $ima_compiled -eq 0 ]]; then
+                missing_build+=("$lsm")
+            else
+                missing_lsms+=("$lsm")
+            fi
+        fi
     done
-    if [[ ${#missing_lsms[@]} -eq 0 ]]; then
-        echo "    LSM check : ✓ All 6 LSMs active"
+
+    local lsm_expected_count=6
+    local lsm_active_count=$(( lsm_expected_count - ${#missing_lsms[@]} - ${#missing_build[@]} ))
+    if [[ ${#missing_lsms[@]} -eq 0 && ${#missing_build[@]} -eq 0 ]]; then
+        echo "    LSM check : ✓ All ${lsm_expected_count} LSMs active"
+    elif [[ ${#missing_lsms[@]} -eq 0 && ${#missing_build[@]} -gt 0 ]]; then
+        echo "    LSM check : — ${lsm_active_count}/${lsm_expected_count} active (${missing_build[*]} not compiled in — intentional)"
     else
         echo "    LSM check : ✗ Missing: ${missing_lsms[*]}"
         recommendations+=("Some LSMs not active: ${missing_lsms[*]} — check kernel cmdline lsm= parameter")
     fi
 
-    # IMA/EVM — integrity LSM is the umbrella; check directory presence
+    # IMA — report accurately based on build config and runtime state
     if [[ -d /sys/kernel/security/ima ]]; then
         local ima_policy
         ima_policy=$(cat /sys/kernel/security/ima/policy 2>/dev/null | wc -l || echo "0")
         echo "    IMA       : ✓ Active (${ima_policy} policy rules)"
+    elif echo "$active_lsms" | grep -qw 'integrity'; then
+        echo "    IMA       : ✓ Active (integrity LSM loaded)"
+    elif (( ima_compiled == 0 )); then
+        echo "    IMA       : — Not compiled in (CONFIG_IMA=n)"
     else
-        if echo "$active_lsms" | grep -qw 'integrity'; then
-            echo "    IMA       : ✓ Active (integrity LSM loaded)"
-        else
-            echo "    IMA       : ✗ Not active"
-        fi
+        echo "    IMA       : ✗ Not active (CONFIG_IMA=y but LSM not loaded — check lsm= cmdline)"
+        recommendations+=("IMA is compiled in but not active — ensure 'integrity' is in lsm= kernel cmdline parameter")
     fi
 
-    # Lockdown mode
+    # Lockdown mode — meaningful only when Secure Boot is active
     local lockdown_mode
     lockdown_mode=$(cat /sys/kernel/security/lockdown 2>/dev/null | grep -o '\[.*\]' | tr -d '[]' || echo "none")
-    echo "    Lockdown  : ${lockdown_mode}"
+    if [[ "$lockdown_mode" == "none" ]]; then
+        # Check if SB is off — if so, lockdown=none is expected/harmless
+        local _sb_check
+        _sb_check=$(mokutil --sb-state 2>/dev/null || echo "")
+        if [[ "$_sb_check" == *"SecureBoot enabled"* ]]; then
+            echo "    Lockdown  : ⚠ none (Secure Boot active but lockdown not enforced)"
+            recommendations+=("Kernel lockdown is 'none' despite Secure Boot being enabled — consider adding lockdown=confidentiality to cmdline")
+        else
+            echo "    Lockdown  : — none (expected without Secure Boot)"
+        fi
+    else
+        echo "    Lockdown  : ✓ ${lockdown_mode}"
+    fi
 
     # ── Secure Boot ───────────────────────────────────────────────────────────
     echo ""
@@ -2647,6 +2723,8 @@ system_info() {
         # UKI signing status — only check if MOK cert is available
         if [[ $mok_ok -eq 1 ]]; then
             local uki_ok=0 uki_bad=0 uki_missing=0
+            local uki_bad_slots=() uki_missing_slots=()
+            # uki_booted_bad is function-scoped (declared at top of system_info)
             for slot in blue green; do
                 local uki="/boot/efi/EFI/${OS_NAME}/${OS_NAME}-${slot}.efi"
                 if [[ -f "$uki" ]]; then
@@ -2654,14 +2732,33 @@ system_info() {
                         uki_ok=$((uki_ok + 1))
                     else
                         uki_bad=$((uki_bad + 1))
+                        uki_bad_slots+=("$slot")
+                        [[ "$slot" == "$booted" ]] && uki_booted_bad=1
                     fi
                 else
                     uki_missing=$((uki_missing + 1))
+                    uki_missing_slots+=("$slot")
                 fi
             done
             if (( uki_bad > 0 || uki_missing > 0 )); then
                 echo "    UKI Sigs  : ✗ ${uki_ok}/2 valid, ${uki_bad} invalid, ${uki_missing} missing"
-                recommendations+=("UKI signatures invalid/missing — run: gen-efi configure <slot>")
+                # Check if the bad slot matches a recorded boot failure — if so,
+                # --rollback is the right fix (it restores the slot AND regenerates its UKI).
+                # gen-efi configure can only be run for the booted slot from the live system.
+                local _boot_fail_slot
+                _boot_fail_slot=$(cat /data/boot_failure 2>/dev/null | tr -d '[:space:]' || echo "")
+                for _bad in "${uki_bad_slots[@]}" "${uki_missing_slots[@]}"; do
+                    if [[ "$_bad" == "$booted" ]]; then
+                        # hibernate_offset_stale is pre-computed before this section runs
+                        local _uki_also_hibernate=""
+                        (( hibernate_offset_stale )) && _uki_also_hibernate=" (also fixes stale hibernate offset)"
+                        recommendations+=("UKI for @${_bad} (booted slot) is invalid — run: gen-efi configure ${_bad}${_uki_also_hibernate}  [AUTOMATABLE]")
+                    elif [[ -n "$_boot_fail_slot" && "$_bad" == "$_boot_fail_slot" ]]; then
+                        recommendations+=("UKI for @${_bad} is invalid (matches boot failure) — fixed automatically by: shani-deploy --rollback")
+                    else
+                        recommendations+=("UKI for @${_bad} is invalid — run: shani-deploy --rollback (regenerates UKI via chroot) or shani-deploy to trigger a fresh deploy")
+                    fi
+                done
             else
                 echo "    UKI Sigs  : ✓ ${uki_ok}/2 valid"
             fi
@@ -2805,15 +2902,28 @@ system_info() {
     if [[ -f /etc/ssh/sshd_config ]] || [[ -d /etc/ssh/sshd_config.d ]]; then
         local ssh_root_login
         ssh_root_login=$(grep -rh '^PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
-            | tail -1 | awk '{print $2}' || echo "default")
-        case "$ssh_root_login" in
-            no)            echo "    SSH Root  : ✓ Disabled" ;;
-            prohibit-password|without-password)
-                           echo "    SSH Root  : ✓ Key-only (no password)" ;;
-            yes)           echo "    SSH Root  : ✗ Enabled (password login as root allowed)"
-                           recommendations+=("SSH root login enabled — set PermitRootLogin no in sshd_config  [AUTOMATABLE]") ;;
-            *)             echo "    SSH Root  : ⚠ Default (may allow root login)" ;;
-        esac
+            | tail -1 | awk '{print $2}' || echo "")
+        # OpenSSH >= 8.x default is prohibit-password (key-only), not "yes".
+        # Only warn when the value is explicitly set to something risky or truly unknown.
+        if [[ -z "$ssh_root_login" ]]; then
+            local ssh_ver
+            ssh_ver=$(ssh -V 2>&1 | grep -oP 'OpenSSH_\K[0-9]+' | head -1 || echo "0")
+            if (( ssh_ver >= 8 )); then
+                echo "    SSH Root  : ✓ Default (OpenSSH ${ssh_ver}.x — key-only by default)"
+            else
+                echo "    SSH Root  : ⚠ Default (OpenSSH <8 — explicit PermitRootLogin no recommended)"
+                recommendations+=("Set PermitRootLogin no explicitly in sshd_config (OpenSSH <8 default may allow root login)")
+            fi
+        else
+            case "$ssh_root_login" in
+                no)                       echo "    SSH Root  : ✓ Disabled" ;;
+                prohibit-password|without-password)
+                                          echo "    SSH Root  : ✓ Key-only (no password)" ;;
+                yes)                      echo "    SSH Root  : ✗ Enabled (password login as root allowed)"
+                                          recommendations+=("SSH root login enabled — set PermitRootLogin no in sshd_config  [AUTOMATABLE]") ;;
+                *)                        echo "    SSH Root  : ⚠ Unknown value: ${ssh_root_login}" ;;
+            esac
+        fi
 
         # SSH port
         local ssh_port
@@ -2842,6 +2952,93 @@ system_info() {
     elif [[ "$shadow_perms" != "unknown" ]]; then
         echo "    Shadow    : ⚠ Unexpected permissions: ${shadow_perms} (expected 640 root shadow)"
         recommendations+=("/etc/shadow has unexpected permissions (${shadow_perms}) — expected 640 root shadow")
+    fi
+
+    # ── Kernel sysctl hardening ───────────────────────────────────────────────
+    echo ""
+    echo "  Kernel Hardening"
+    # Flat array of tuples: key  target  cmp  label
+    #   cmp=min  → actual must be >= target  (higher = stricter, e.g. kptr_restrict=2 is fine when target=1)
+    #   cmp=max  → actual must be <= target  (lower  = stricter, e.g. accept_redirects=0)
+    #   cmp=eq   → actual must equal target  exactly (e.g. dmesg_restrict, tcp_syncookies)
+    # Keys absent from this kernel are silently skipped from the denominator.
+    # Keys marked info=1 are advisory only — don't count against the score.
+    local sysctl_keys=(
+    #   key                                      target  cmp   label
+        "kernel.kptr_restrict"                   "1"    "min"  "hide kernel pointers"
+        "kernel.dmesg_restrict"                  "1"    "eq"   "restrict dmesg to root"
+        "kernel.unprivileged_bpf_disabled"       "1"    "min"  "disable unprivileged BPF"
+        "net.core.bpf_jit_harden"                "2"    "min"  "harden BPF JIT"
+        "kernel.yama.ptrace_scope"               "1"    "min"  "restrict ptrace"
+        "net.ipv4.conf.all.accept_redirects"     "0"    "max"  "ignore IPv4 ICMP redirects"
+        "net.ipv6.conf.all.accept_redirects"     "0"    "max"  "ignore IPv6 ICMP redirects"
+        "net.ipv4.tcp_syncookies"                "1"    "eq"   "TCP SYN cookies"
+        "net.ipv4.conf.all.rp_filter"            "1"    "info" "reverse path filtering (may be 0 with NetworkManager)"
+        "kernel.unprivileged_userns_clone"       "0"    "info" "restrict user namespaces (Arch: read-only)"
+    )
+    local sysctl_ok=0 sysctl_total=0 sysctl_warn=() sysctl_info=()
+    local i=0
+    while (( i < ${#sysctl_keys[@]} )); do
+        local key="${sysctl_keys[$i]}"
+        local target="${sysctl_keys[$((i+1))]}"
+        local cmp="${sysctl_keys[$((i+2))]}"
+        local label="${sysctl_keys[$((i+3))]}"
+        i=$(( i + 4 ))
+
+        local actual
+        actual=$(sysctl -n "$key" 2>/dev/null || echo "")
+        [[ -z "$actual" ]] && continue   # key absent on this kernel — skip entirely
+
+        # info-only keys: show as advisory, never count against score
+        if [[ "$cmp" == "info" ]]; then
+            if [[ "$actual" != "$target" ]]; then
+                sysctl_info+=("${key}=${actual} (recommended ${target} — ${label})")
+            fi
+            continue
+        fi
+
+        sysctl_total=$(( sysctl_total + 1 ))
+
+        local ok=0
+        case "$cmp" in
+            min) [[ "$actual" =~ ^[0-9]+$ ]] && (( actual >= target )) && ok=1 ;;
+            max) [[ "$actual" =~ ^[0-9]+$ ]] && (( actual <= target )) && ok=1 ;;
+            eq)  [[ "$actual" == "$target" ]] && ok=1 ;;
+        esac
+
+        if (( ok )); then
+            sysctl_ok=$(( sysctl_ok + 1 ))
+        else
+            case "$cmp" in
+                min) sysctl_warn+=("${key}=${actual} (want >=${target} — ${label})") ;;
+                max) sysctl_warn+=("${key}=${actual} (want ${target} — ${label})") ;;
+                eq)  sysctl_warn+=("${key}=${actual} (want ${target} — ${label})") ;;
+            esac
+        fi
+    done
+
+    if [[ ${#sysctl_warn[@]} -eq 0 ]]; then
+        echo "    Sysctl    : ✓ ${sysctl_ok}/${sysctl_total} hardening keys correct"
+    else
+        echo "    Sysctl    : ⚠ ${sysctl_ok}/${sysctl_total} correct — mismatches:"
+        for w in "${sysctl_warn[@]}"; do
+            printf "              ✗ %s\n" "$w"
+        done
+        recommendations+=("Some sysctl hardening keys are not at recommended values — check /etc/sysctl.d/")
+    fi
+    for info in "${sysctl_info[@]}"; do
+        printf "              — %s\n" "$info"
+    done
+
+    # USB device authorisation — check if new USB devices require explicit auth
+    local usb_auth
+    usb_auth=$(cat /sys/bus/usb/devices/usbX/authorized_default 2>/dev/null \
+        || find /sys/bus/usb/devices -name 'authorized_default' -maxdepth 2 \
+            -exec cat {} \; 2>/dev/null | head -1 || echo "")
+    if [[ "$usb_auth" == "0" ]]; then
+        echo "    USB Auth  : ✓ New devices require explicit authorisation"
+    elif [[ "$usb_auth" == "1" ]]; then
+        echo "    USB Auth  : — All USB devices auto-authorised (default)"
     fi
 
     # ── Disk ─────────────────────────────────────────────────────────────────
@@ -2875,6 +3072,44 @@ system_info() {
             else
                 echo "    SMART     : — Not available (NVMe may need nvme-cli)"
             fi
+            # SSD wear / temperature — NVMe and SATA differ in attribute names
+            local smart_json
+            smart_json=$(smartctl -j -A "/dev/${root_disk}" 2>/dev/null || true)
+            if [[ -n "$smart_json" ]]; then
+                # NVMe: percentage_used and temperature
+                local nvme_wear nvme_temp
+                nvme_wear=$(echo "$smart_json" | grep -o '"percentage_used"[^,}]*' \
+                    | grep -o '[0-9]*' | head -1 || echo "")
+                nvme_temp=$(echo "$smart_json" | grep -o '"temperature"[^,}]*' \
+                    | grep -o '[0-9]\{2,3\}' | head -1 || echo "")
+                # SATA: wear_leveling_count (ID 177) and airflow_temperature (ID 190/194)
+                local sata_wear sata_temp
+                sata_wear=$(echo "$smart_json" | grep -A5 '"id" *: *177' \
+                    | grep '"value"' | grep -o '[0-9]*' | head -1 || echo "")
+                sata_temp=$(echo "$smart_json" | grep -A5 '"id" *: *19[04]' \
+                    | grep '"value"' | grep -o '[0-9]*' | head -1 || echo "")
+                local wear="${nvme_wear:-$sata_wear}" temp="${nvme_temp:-$sata_temp}"
+                if [[ -n "$wear" ]]; then
+                    if (( wear >= 90 )); then
+                        echo "    SSD Wear  : ✗ ${wear}% used — replace soon"
+                        recommendations+=("SSD wear at ${wear}% — plan replacement before failure")
+                    elif (( wear >= 70 )); then
+                        echo "    SSD Wear  : ⚠ ${wear}% used"
+                    else
+                        echo "    SSD Wear  : ✓ ${wear}% used"
+                    fi
+                fi
+                if [[ -n "$temp" ]]; then
+                    if (( temp >= 70 )); then
+                        echo "    Disk Temp : ✗ ${temp}°C (critically hot)"
+                        recommendations+=("Disk temperature is ${temp}°C — check cooling")
+                    elif (( temp > 55 )); then
+                        echo "    Disk Temp : ⚠ ${temp}°C (warm)"
+                    else
+                        echo "    Disk Temp : ✓ ${temp}°C"
+                    fi
+                fi
+            fi
         else
             echo "    SMART     : — smartctl not installed"
         fi
@@ -2882,7 +3117,7 @@ system_info() {
         echo "    Device    : — Could not detect root disk"
     fi
 
-    # Swap
+    # Swap — detect all active swap devices (zram + swapfile can coexist)
     local swap_total swap_used
     swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}' || echo "0")
     swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}' || echo "0")
@@ -2890,12 +3125,91 @@ system_info() {
         echo "    Swap      : ⚠ No swap active (hibernate unavailable, memory pressure unmanaged)"
     else
         echo "    Swap      : ✓ ${swap_used} used / ${swap_total} total"
-        # Check for zram vs swapfile
-        if swapon --show=NAME 2>/dev/null | grep -q zram; then
-            echo "    Swap type : zram (compressed RAM)"
-        elif [[ -f /swap/swapfile ]]; then
-            echo "    Swap type : swapfile (hibernate supported)"
+
+        local has_zram=0 has_swapfile=0 swapfile_path=""
+        swapon --show=NAME --noheadings 2>/dev/null | grep -q zram && has_zram=1
+        while IFS= read -r swapdev; do
+            swapdev="${swapdev%%[[:space:]]*}"   # strip trailing column padding
+            [[ -z "$swapdev" ]] && continue
+            if [[ -f "$swapdev" ]]; then
+                has_swapfile=1
+                swapfile_path="$swapdev"
+            fi
+        done < <(swapon --show=NAME --noheadings 2>/dev/null | grep -v zram || true)
+
+        if (( has_zram && has_swapfile )); then
+            echo "    Swap type : zram (memory pressure) + swapfile (hibernate)"
+        elif (( has_zram )); then
+            echo "    Swap type : zram only (compressed RAM — hibernate not available)"
+        elif (( has_swapfile )); then
+            echo "    Swap type : swapfile ${swapfile_path}"
         fi
+
+        # Hibernate readiness — validate resume= and resume_offset= are in the active cmdline
+        if (( has_swapfile )); then
+            local cmdline
+            cmdline=$(cat /proc/cmdline 2>/dev/null || echo "")
+            local resume_ok=0 offset_ok=0
+            echo "$cmdline" | grep -q 'resume=' && resume_ok=1
+            echo "$cmdline" | grep -q 'resume_offset=' && offset_ok=1
+
+            if (( resume_ok && offset_ok )); then
+                # Verify the resume_offset matches the actual physical swapfile offset.
+                # btrfs inspect-internal map-swapfile is authoritative for Btrfs swapfiles.
+                # filefrag is a fallback for non-Btrfs (ext4 etc).
+                local actual_offset=""
+                configured_offset=$(echo "$cmdline" \
+                    | grep -o 'resume_offset=[^ ]*' | cut -d= -f2 || echo "")
+
+                if command -v btrfs &>/dev/null; then
+                    local _btrfs_out
+                    _btrfs_out=$(btrfs inspect-internal map-swapfile -r "$swapfile_path" 2>/dev/null || echo "")
+                    actual_offset=$(echo "$_btrfs_out" \
+                        | awk -F'[: \t]+' '/resume_offset/ {print $2; found=1} END {if (!found) exit 1}' 2>/dev/null || \
+                          echo "$_btrfs_out" | awk 'NF {last=$NF} END {if (last+0>0) print last+0}' 2>/dev/null || echo "")
+                fi
+                # Fallback: filefrag — parse the physical start of the first extent
+                # Output format: "0:        0..    7 :    2236549..   2236556 : 8 : last,eof"
+                # Field 4 after the second colon is the physical start block.
+                if [[ -z "$actual_offset" ]] && command -v filefrag &>/dev/null; then
+                    actual_offset=$(filefrag -v -e "$swapfile_path" 2>/dev/null \
+                        | awk 'NR>3 && /^\s*0:/ {gsub(/\.+/,"",$4); print $4; exit}' || echo "")
+                fi
+
+                if [[ -n "$actual_offset" && -n "$configured_offset" \
+                        && "$actual_offset" == "$configured_offset" ]]; then
+                    echo "    Hibernate : ✓ resume= and resume_offset=${configured_offset} correct"
+                elif [[ -n "$actual_offset" && -n "$configured_offset" ]]; then
+                    hibernate_offset_stale=1
+                    echo "    Hibernate : ✗ resume_offset stale — cmdline=${configured_offset}, swapfile=${actual_offset}"
+                    echo "    Hibernate   (swapfile recreated — regenerate booted slot UKI before hibernating)"
+                    # gen-efi can only regenerate the currently booted slot directly.
+                    # The candidate slot UKI will be regenerated automatically by the
+                    # next shani-deploy run (via chroot) or --rollback.
+                    # Only add a separate hibernate rec if the booted UKI rec doesn't already
+                    # cover this (it does when uki_booted_bad=1, since it mentions the fix).
+                    if (( ! uki_booted_bad )); then
+                        recommendations+=("Hibernate resume_offset stale (cmdline=${configured_offset}, actual=${actual_offset}) — run: gen-efi configure ${booted}  (candidate slot updated automatically on next deploy/rollback)  [AUTOMATABLE]")
+                    fi
+                else
+                    echo "    Hibernate : ✓ resume= and resume_offset= present in cmdline (offset unverifiable)"
+                fi
+            elif (( has_swapfile && ! resume_ok )); then
+                echo "    Hibernate : ✗ swapfile present but resume= missing from cmdline"
+                recommendations+=("Swapfile exists but resume= not in kernel cmdline — hibernate will not work — run: gen-efi configure ${booted}  [AUTOMATABLE]")
+            fi
+        fi
+    fi
+
+    # OOM kills since last boot — check kernel log for oom_kill events
+    local oom_count
+    oom_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null \
+        | grep -c 'Out of memory\|oom_kill_process\|Killed process' || echo "0")
+    if [[ "$oom_count" =~ ^[0-9]+$ ]] && (( oom_count > 0 )); then
+        echo "    OOM kills : ⚠ ${oom_count} OOM event(s) this boot — system under memory pressure"
+        recommendations+=("${oom_count} OOM kill event(s) since last boot — consider adding more RAM or swap")
+    else
+        echo "    OOM kills : ✓ None this boot"
     fi
 
     # ── /etc Overlay health ───────────────────────────────────────────────────
@@ -2908,6 +3222,14 @@ system_info() {
         echo "    Files     : ${overlay_count} modified/added file(s) vs base"
         if [[ "$overlay_count" =~ ^[0-9]+$ ]] && (( overlay_count > 200 )); then
             echo "    Size      : ⚠ Large overlay — significant config drift from base image"
+            recommendations+=("Large /etc overlay (${overlay_count} files) — consider upstreaming config to base image")
+        elif [[ "$overlay_count" =~ ^[0-9]+$ ]] && (( overlay_count > 0 )); then
+            # Show top-level dirs with most changes for quick orientation
+            local top_dirs
+            top_dirs=$(find "$overlay_upper" -mindepth 2 -maxdepth 2 2>/dev/null \
+                | sed "s|${overlay_upper}/||" | cut -d/ -f1 | sort | uniq -c | sort -rn \
+                | head -5 | awk '{printf "%s(%s) ", $2, $1}' || echo "")
+            [[ -n "$top_dirs" ]] && echo "    Top dirs  : ${top_dirs}"
         fi
         # Check if /etc is actually mounted as overlay
         if findmnt -n -t overlay /etc &>/dev/null; then
@@ -2962,6 +3284,17 @@ system_info() {
         echo "    Network   : ⚠ NetworkManager not running"
     fi
 
+    # Failed systemd units — catch any service that has crashed and not recovered
+    local failed_units
+    mapfile -t failed_units < <(systemctl list-units --state=failed --no-legend --no-pager \
+        2>/dev/null | awk '{print $1}' || true)
+    if [[ ${#failed_units[@]} -eq 0 ]]; then
+        echo "    Units     : ✓ No failed systemd units"
+    else
+        echo "    Units     : ✗ ${#failed_units[@]} failed unit(s): ${failed_units[*]}"
+        recommendations+=("Failed systemd units: ${failed_units[*]} — run: systemctl status <unit> to investigate")
+    fi
+
     # ── Boot entries ─────────────────────────────────────────────────────────
     echo ""
     echo "  Boot"
@@ -2976,6 +3309,22 @@ system_info() {
         entries=$(ls /boot/efi/loader/entries/*.conf 2>/dev/null \
             | xargs -I{} basename {} .conf | tr '\n' '  ' || echo "none")
         echo "    Entries   : ${entries}"
+
+        # Detect orphaned plain .conf entries that coexist with a tries-suffixed
+        # version of the same slot — left behind by interrupted deploys or manual edits.
+        local orphan_entries=()
+        for slot in blue green; do
+            local plain="$ESP/loader/entries/${OS_NAME}-${slot}.conf"
+            local has_tries
+            has_tries=$(ls "$ESP/loader/entries/${OS_NAME}-${slot}"+*.conf 2>/dev/null | head -1 || echo "")
+            if [[ -f "$plain" && -n "$has_tries" ]]; then
+                orphan_entries+=("${OS_NAME}-${slot}.conf")
+            fi
+        done
+        if [[ ${#orphan_entries[@]} -gt 0 ]]; then
+            echo "    Orphans   : ⚠ Stale entries alongside tries-suffixed versions: ${orphan_entries[*]}"
+            recommendations+=("Orphaned boot entries found (${orphan_entries[*]}) — run: shani-deploy --fix-security or remove manually from ESP/loader/entries/")
+        fi
         local editor_val
         editor_val=$(grep '^editor' /boot/efi/loader/loader.conf 2>/dev/null | awk '{print $2}' || echo "not set")
         if [[ "$editor_val" == "0" ]]; then
@@ -2998,7 +3347,20 @@ system_info() {
             echo "    fwupd     : ⚠ ${fw_count} update(s) available (run: fwupdmgr update)"
             recommendations+=("${fw_count} firmware update(s) available — run: fwupdmgr update")
         else
-            echo "    fwupd     : ✓ Up to date (cached)"
+            # --offline reads cached metadata only — check how stale the cache is
+            local fw_cache_age=""
+            local fw_cache_dir="/var/cache/fwupd"
+            if [[ -d "$fw_cache_dir" ]]; then
+                local fw_cache_epoch now_epoch fw_cache_days
+                fw_cache_epoch=$(find "$fw_cache_dir" -name "*.gz" -o -name "*.xml" 2>/dev/null \
+                    | xargs stat -c '%Y' 2>/dev/null | sort -rn | head -1 || echo "0")
+                now_epoch=$(date +%s)
+                fw_cache_days=$(( (now_epoch - fw_cache_epoch) / 86400 ))
+                if (( fw_cache_epoch > 0 && fw_cache_days > 7 )); then
+                    fw_cache_age=" — cache ${fw_cache_days}d old, run: fwupdmgr refresh"
+                fi
+            fi
+            echo "    fwupd     : ✓ Up to date (cached${fw_cache_age})"
         fi
     else
         echo "    fwupd     : — Not available"
@@ -3028,14 +3390,23 @@ system_info() {
     local scrub_timer_active
     scrub_timer_active=$(systemctl is-active btrfs-scrub.timer 2>/dev/null || echo "inactive")
     if [[ "$scrub_timer_active" == "active" ]]; then
-        # Extract human-readable last/next from systemctl status
-        local scrub_timer_last scrub_timer_next
-        scrub_timer_last=$(systemctl status btrfs-scrub.timer 2>/dev/null \
-            | awk '/Trigger:/ {$1=""; sub(/^[[:space:]]*/,"",$0); print; exit}' || echo "unknown")
-        scrub_timer_next=$(systemctl status btrfs-scrub.timer 2>/dev/null \
-            | awk '/Next trigger:/ {$1=$2=""; sub(/^[[:space:]]*/,"",$0); print; exit}' \
-            || awk '/Trigger:/ {$1=""; sub(/^[[:space:]]*/,"",$0); print; exit}' \
-            || echo "unknown")
+        # Use systemctl show for machine-readable next trigger — avoids awk fragility
+        # on localised or multi-line 'systemctl status' output.
+        local scrub_timer_next
+        scrub_timer_next=$(systemctl show btrfs-scrub.timer --property=NextElapseUSecRealtime \
+            --value 2>/dev/null || echo "")
+        if [[ -z "$scrub_timer_next" || "$scrub_timer_next" == "0" ]]; then
+            # Monotonic timer (not calendar-based) — try that property instead
+            scrub_timer_next=$(systemctl show btrfs-scrub.timer --property=NextElapseUSecMonotonic \
+                --value 2>/dev/null || echo "")
+        fi
+        # Convert microseconds to human date if we got a number
+        if [[ "$scrub_timer_next" =~ ^[0-9]+$ ]] && (( scrub_timer_next > 0 )); then
+            scrub_timer_next=$(date -d "@$(( scrub_timer_next / 1000000 ))" '+%Y-%m-%d %H:%M' 2>/dev/null \
+                || echo "${scrub_timer_next}")
+        elif [[ -z "$scrub_timer_next" || "$scrub_timer_next" == "0" ]]; then
+            scrub_timer_next="unknown"
+        fi
         echo "    Scrub tmr : ✓ Active (next: ${scrub_timer_next})"
     else
         echo "    Scrub tmr : ✗ btrfs-scrub.timer not active"
@@ -3081,12 +3452,15 @@ system_info() {
             timer_bad+=("$name")
         fi
     done
-    [[ ${#timer_ok[@]} -gt 0 ]] && echo "    Maint tmr : ✓ Active: ${timer_ok[*]}"
+    local timer_ok_str timer_bad_str
+    timer_ok_str=$(IFS=' '; echo "${timer_ok[*]}")
+    timer_bad_str=$(IFS=' '; echo "${timer_bad[*]}")
+    [[ ${#timer_ok[@]} -gt 0 ]] && echo "    Maint tmr : ✓ Active: ${timer_ok_str}"
     if [[ ${#timer_bad[@]} -gt 0 ]]; then
-        echo "    Maint tmr : ✗ Inactive: ${timer_bad[*]}"
+        echo "    Maint tmr : ✗ Inactive: ${timer_bad_str}"
         local timer_units
         timer_units=$(printf '%s.timer ' "${timer_bad[@]}")
-        recommendations+=("Btrfs maintenance timers inactive (${timer_bad[*]}) — run: systemctl enable --now ${timer_units% }  [AUTOMATABLE]")
+        recommendations+=("Btrfs maintenance timers inactive (${timer_bad_str}) — run: systemctl enable --now ${timer_units% }  [AUTOMATABLE]")
     fi
 
     echo "    ↳ Full analysis: shani-deploy --storage-info"
@@ -3200,7 +3574,7 @@ fix_security() {
         fi
     fi
 
-    # systemd-boot editor
+    # systemd-boot editor + orphaned boot entries
     local _fix_esp_mounted=0
     if ! mountpoint -q /boot/efi 2>/dev/null; then
         mount /boot/efi 2>/dev/null && _fix_esp_mounted=1
@@ -3218,6 +3592,24 @@ fix_security() {
             log_success "systemd-boot editor disabled"
             fixed=$((fixed + 1))
         fi
+
+        # Remove orphaned plain slot .conf files that coexist with tries-suffixed versions
+        for slot in blue green; do
+            local plain_entry="$ESP/loader/entries/${OS_NAME}-${slot}.conf"
+            local tries_entry
+            tries_entry=$(ls "$ESP/loader/entries/${OS_NAME}-${slot}"+*.conf 2>/dev/null | head -1 || echo "")
+            if [[ -f "$plain_entry" && -n "$tries_entry" ]]; then
+                log "Removing orphaned boot entry: $(basename "$plain_entry")"
+                if rm -f "$plain_entry" 2>/dev/null; then
+                    log_success "Removed orphaned entry: $(basename "$plain_entry")"
+                    fixed=$((fixed + 1))
+                else
+                    log_warn "Failed to remove: $(basename "$plain_entry")"
+                    failed=$((failed + 1))
+                fi
+            fi
+        done
+
         [[ $_fix_esp_mounted -eq 1 ]] && umount /boot/efi 2>/dev/null || true
     fi
 
@@ -3270,6 +3662,37 @@ fix_security() {
         fi
     fi
 
+    # Hibernate resume_offset — regenerate booted slot UKI if swapfile offset has drifted.
+    # gen-efi can only be called for the currently booted slot from the live system.
+    # The candidate slot UKI is handled automatically by the next deploy or rollback.
+    if [[ -f /swap/swapfile ]] && command -v btrfs &>/dev/null; then
+        local _fix_swapfile="/swap/swapfile"
+        local _fix_actual_offset _fix_cmdline_offset
+        _fix_actual_offset=$(btrfs inspect-internal map-swapfile -r "$_fix_swapfile" \
+            2>/dev/null | awk -F'[: \t]+' '/resume_offset/ {print $2}' || echo "")
+        _fix_cmdline_offset=$(grep -o 'resume_offset=[^ ]*' /proc/cmdline \
+            | cut -d= -f2 || echo "")
+        if [[ -n "$_fix_actual_offset" && -n "$_fix_cmdline_offset" \
+                && "$_fix_actual_offset" != "$_fix_cmdline_offset" ]]; then
+            local _fix_booted
+            _fix_booted=$(get_booted_subvol 2>/dev/null || echo "")
+            if [[ -n "$_fix_booted" ]] && [[ -x "$GENEFI_SCRIPT" ]]; then
+                log "Regenerating UKI for @${_fix_booted} to fix stale resume_offset (${_fix_cmdline_offset} → ${_fix_actual_offset})..."
+                if "$GENEFI_SCRIPT" configure "$_fix_booted" 2>&1; then
+                    log_success "UKI regenerated for @${_fix_booted} — hibernate resume_offset now correct"
+                    log "Candidate slot @$([[ "$_fix_booted" == "blue" ]] && echo green || echo blue) will be updated on next deploy or rollback"
+                    fixed=$((fixed + 1))
+                else
+                    log_warn "UKI regeneration failed — hibernate may not work correctly until next deploy"
+                    failed=$((failed + 1))
+                fi
+            else
+                log_warn "Cannot fix hibernate offset — gen-efi not found at ${GENEFI_SCRIPT} or booted slot unknown"
+                failed=$((failed + 1))
+            fi
+        fi
+    fi
+
     echo ""
     if (( fixed > 0 || failed > 0 )); then
         log "Fixed: ${fixed} | Failed: ${failed}"
@@ -3291,7 +3714,7 @@ Usage: $0 [OPTIONS]
 Options:
   -h, --help              Show help
   -i, --info              Show system status (Secure Boot, encryption, slots, TPM2)
-  --fix-security          Auto-fix security issues found by --info (services, SSH, boot editor)
+  --fix-security          Auto-fix security issues found by --info (services, SSH, boot editor, hibernate offset)
   -r, --rollback          Roll back the non-booted slot. IMPORTANT: run from the slot you want to KEEP.
   -c, --cleanup           Manual cleanup
   -s, --storage-info      Storage analysis (read-only)

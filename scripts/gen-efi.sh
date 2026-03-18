@@ -225,8 +225,10 @@ validate_target_slot() {
         log "ERROR: This would use @${booted}'s kernel for @${target}'s boot entry!"
         echo "" >&2
         log "ERROR: Solutions:"
-        log "ERROR:   1. Run: gen-efi configure ${booted}  (generate for current slot)"
-        log "ERROR:   2. Use: shani-deploy  (it chroots correctly)"
+        log "ERROR:   1. Run: gen-efi configure ${booted}  (regenerate current booted slot)"
+        log "ERROR:      Or:  shani-deploy --fix-security  (auto-fixes booted slot UKI)"
+        log "ERROR:   2. Use: shani-deploy  (handles @${target} via chroot on next deploy)"
+        log "ERROR:      Or:  shani-deploy --rollback  (restores @${target} and regenerates its UKI)"
         echo "" >&2
         return 1
     fi
@@ -254,14 +256,21 @@ cleanup_esp() {
 
 sign_efi_binary() {
     local file="$1"
-    sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$file" "$file" || error_exit "sbsign failed for $file"
-    sbverify --cert "$MOK_CRT" "$file" || error_exit "sbverify failed for $file"
+    local tmp_signed
+    tmp_signed=$(mktemp "${file}.signed.XXXXXX")
+    if sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$tmp_signed" "$file"; then
+        mv "$tmp_signed" "$file"
+    else
+        rm -f "$tmp_signed"
+        error_exit "sbsign failed for $file"
+    fi
+    sbverify --cert "$MOK_CRT" "$file" || { error_exit "sbverify failed for $file"; }
 }
 
 get_kernel_version() {
     local kernel_ver
-    kernel_ver=$(ls -1 /usr/lib/modules/ 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || true)
-    kernel_ver=$(echo "$kernel_ver" | sort -V | tail -n 1)
+    kernel_ver=$(find /usr/lib/modules/ -maxdepth 1 -mindepth 1 -type d \
+        2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^/]*$' | sort -V | tail -n 1)
     if [[ -z "$kernel_ver" ]]; then
         error_exit "No valid kernel version found in /usr/lib/modules/"
     fi
@@ -315,12 +324,23 @@ generate_cmdline() {
     fi
 
     if [[ -f /swap/swapfile ]]; then
-        local swap_offset
-        swap_offset=$(btrfs inspect-internal map-swapfile -r /swap/swapfile | awk '{print $NF}' 2>/dev/null || true)
-        if [[ -n "$swap_offset" ]]; then
+        local swap_offset btrfs_out
+
+        # Get raw output (supports both old and new btrfs-progs)
+        btrfs_out=$(btrfs inspect-internal map-swapfile -r /swap/swapfile 2>/dev/null || echo "")
+
+        # Try parsing "resume_offset: <num>" first, fallback to last numeric field
+        swap_offset=$(
+            echo "$btrfs_out" \
+            | awk -F'[: \t]+' '/resume_offset/ {print $2; found=1} END {if (!found) exit 1}' 2>/dev/null \
+            || echo "$btrfs_out" | awk 'NF {last=$NF} END {print last+0}' 2>/dev/null \
+            || echo ""
+        )
+
+        if [[ -n "$swap_offset" && "$swap_offset" != "0" ]]; then
             cmdline+=" resume=UUID=${resume_uuid} resume_offset=${swap_offset}"
         else
-            log "WARNING: Swap file exists but failed to determine swap offset."
+            log "WARNING: Swap file exists but failed to determine valid swap offset."
         fi
     fi
 

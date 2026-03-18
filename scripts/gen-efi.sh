@@ -443,7 +443,7 @@ update_bootloader() {
         if [[ ! -f "$shim_dst" ]] || [[ "$shim_src" -nt "$shim_dst" ]]; then
             log "Updating shim: ${shim_dst}"
             cp "$shim_src" "$shim_dst" || error_exit "Failed to copy shim"
-            sign_efi_binary "$shim_dst"
+            # DO NOT sign shim (Microsoft-signed)
             updated=1
         else
             log "shim is up to date"

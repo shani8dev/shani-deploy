@@ -1523,17 +1523,21 @@ title   ${OS_NAME}-${candidate_slot} (Candidate)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
 EOF
 
+    # Use a glob pattern so the default keeps matching as systemd-boot's boot-counting
+    # renames the file from +3-0 → +2-1 → +1-2 → +0-3 across successive boots.
+    # A hardcoded +3-0 suffix would stop matching after the first successful boot.
+    local loader_default="${OS_NAME}-${active_slot}+*.conf"
     local loader_conf="$ESP/loader/loader.conf"
     if [[ -f "$loader_conf" ]]; then
         grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
-        echo "default ${active_filename}" >> "${loader_conf}.tmp"
+        echo "default ${loader_default}" >> "${loader_conf}.tmp"
         mv "${loader_conf}.tmp" "$loader_conf"
     else
         printf 'default %s\ntimeout 5\nconsole-mode max\neditor 0\nauto-entries 0\nbeep 0\n' \
-            "${active_filename}" > "$loader_conf"
+            "${loader_default}" > "$loader_conf"
     fi
-    log_verbose "loader.conf default set to ${active_filename}"
-    log "Boot default set to: @${active_slot} (${active_filename}) | Fallback: @${candidate_slot}"
+    log_verbose "loader.conf default set to ${loader_default}"
+    log "Boot default set to: @${active_slot} (${loader_default}) | Fallback: @${candidate_slot}"
 
     if [[ $esp_mounted -eq 1 ]]; then
         umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"

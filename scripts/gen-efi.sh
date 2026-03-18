@@ -59,6 +59,97 @@ MOK_KEY="/etc/secureboot/keys/MOK.key"
 MOK_CRT="/etc/secureboot/keys/MOK.crt"
 ROOTLABEL="shani_root"
 
+# Ensure MOK keys exist — they are normally placed by build-base-image.sh and
+# verified by configure.sh at install time. If missing (e.g. custom image built
+# without keys), generate a fresh set and set MOK_KEYS_GENERATED=1 so
+# reenroll_mok_keys can re-sign existing EFI binaries and stage enrollment.
+MOK_KEYS_GENERATED=0
+
+ensure_mok_keys() {
+    if [[ -f "$MOK_KEY" && -f "$MOK_CRT" ]]; then
+        log "MOK keys present"
+        return 0
+    fi
+
+    # MOK.der is the public cert only — the private key is never stored in the
+    # EFI partition, so we cannot recover signing capability from MOK.der alone.
+    if [[ -f /etc/secureboot/keys/MOK.der ]]; then
+        log_warn "MOK.key or MOK.crt missing but MOK.der exists — keypair is partially corrupted"
+        log_warn "The private key cannot be recovered from MOK.der"
+    fi
+
+    log_warn "Generating new MOK keypair"
+    mkdir -p /etc/secureboot/keys
+    openssl req -newkey rsa:2048 -nodes \
+        -keyout "$MOK_KEY" \
+        -new -x509 -sha256 -days 3650 \
+        -out "$MOK_CRT" \
+        -subj "/CN=Shani OS Secure Boot Key/" \
+        || error_exit "MOK key generation failed"
+
+    openssl x509 -in "$MOK_CRT" -outform DER \
+        -out /etc/secureboot/keys/MOK.der \
+        || error_exit "MOK DER export failed"
+
+    chmod 0600 "$MOK_KEY"
+    MOK_KEYS_GENERATED=1
+    log "MOK keys generated"
+}
+
+# Re-sign all existing EFI binaries with the newly generated keys and stage
+# MOK enrollment. Called only when MOK_KEYS_GENERATED=1, after ESP is mounted.
+reenroll_mok_keys() {
+    log "Re-signing existing EFI binaries with new MOK keys"
+
+    # Re-sign shim and systemd-boot (grubx64.efi) — these were signed with the
+    # old keys and must be updated before the next boot.
+    local efi_bins=(
+        "$ESP/EFI/BOOT/BOOTX64.EFI"
+        "$ESP/EFI/BOOT/grubx64.efi"
+    )
+    for bin in "${efi_bins[@]}"; do
+        if [[ -f "$bin" ]]; then
+            log "Re-signing ${bin}"
+            sign_efi_binary "$bin" || log_warn "Failed to re-sign ${bin} — continuing"
+        else
+            log_warn "EFI binary not found, skipping: ${bin}"
+        fi
+    done
+
+    # Copy updated DER to EFI partition so MokManager can offer enrollment
+    cp /etc/secureboot/keys/MOK.der "$ESP/EFI/BOOT/MOK.der" \
+        || log_warn "Failed to copy MOK.der to ESP — manual enrollment may be required"
+
+    # Stage MOK enrollment — use --root-pw if root has a password, otherwise
+    # use --hash-file with a generated hash.
+    local mok_der="/etc/secureboot/keys/MOK.der"
+    if [[ -s /etc/shadow ]] && awk -F: '$1=="root" && $2!="" && $2!="*" && $2!="!" {found=1} END{exit !found}' /etc/shadow 2>/dev/null; then
+        log "Staging MOK enrollment via --root-pw"
+        if ! mokutil --import "$mok_der" --root-pw >/dev/null 2>&1; then
+            log_warn "mokutil --root-pw failed — falling back to hash-file method"
+            _mokutil_hash_enroll "$mok_der"
+        fi
+    else
+        log "No root password set — staging MOK enrollment via password hash"
+        _mokutil_hash_enroll "$mok_der"
+    fi
+
+    log_warn "SYSTEM REBOOT REQUIRED — confirm MOK enrollment in MokManager on next boot"
+}
+
+_mokutil_hash_enroll() {
+    local der_file="$1"
+    local tmp_hash
+    tmp_hash=$(mktemp)
+    if mokutil --generate-hash=shanios > "$tmp_hash" 2>/dev/null \
+        && mokutil --import "$der_file" --hash-file "$tmp_hash" >/dev/null 2>&1; then
+        log "MOK enrollment staged — confirm with password 'shanios' in MokManager on first boot"
+    else
+        log_warn "mokutil enrollment staging failed — MOK.der is in ESP for manual enrollment"
+    fi
+    rm -f "$tmp_hash"
+}
+
 # Track if we mounted ESP
 ESP_WAS_UNMOUNTED=0
 
@@ -230,6 +321,139 @@ generate_cmdline() {
     log "Kernel cmdline generated for ${slot} (saved in ${CMDLINE_FILE})"
 }
 
+# ensure_crypttab — create /etc/crypttab and /etc/dracut.conf.d/99-crypt-key.conf
+# if either is missing. Both are checked independently.
+#
+# Handles two install configurations:
+#   PIN/passphrase (OSI_ENCRYPTION_PIN set at install):
+#     crypttab keyfile field = "none" → dracut conf has no keyfile in install_items
+#   Keyfile (no OSI_ENCRYPTION_PIN at install):
+#     keyfile at /etc/cryptsetup-keys.d/shani_root.bin → dracut conf includes it
+#
+# Keyfile recovery order when crypttab is missing:
+#   1. Already present at /etc/cryptsetup-keys.d/shani_root.bin → use as-is
+#   2. Present on ESP at /boot/efi/crypto_keyfile.bin → copy into place
+#   3. Neither found → "none" (PIN/passphrase at boot)
+ensure_crypttab() {
+    local underlying
+    underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+        | sed -n 's/^ *device: //p' || true)
+    [[ -z "$underlying" ]] && error_exit "Could not determine underlying device for /dev/mapper/${ROOTLABEL}"
+
+    local luks_uuid
+    luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
+    [[ -z "$luks_uuid" ]] && error_exit "Could not retrieve LUKS UUID from $underlying"
+
+    local keyfile_dest="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
+    local keyfile_opt="none"
+
+    # /etc/crypttab — checked first so we can read keyfile_opt from it if present
+    if [[ -f /etc/crypttab ]]; then
+        log "/etc/crypttab already present — skipping"
+        # Read keyfile field from existing crypttab (field 3) so dracut conf
+        # is consistent with it — avoids adding a keyfile that crypttab doesn't use.
+        local existing_keyfile
+        existing_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || true)
+        if [[ -n "$existing_keyfile" && "$existing_keyfile" != "none" ]]; then
+            keyfile_opt="$existing_keyfile"
+        fi
+    else
+        # Detect keyfile from disk — keyfile systems vs PIN/passphrase systems
+        if [[ -f "$keyfile_dest" ]]; then
+            log "Keyfile present at ${keyfile_dest}"
+            keyfile_opt="$keyfile_dest"
+        elif [[ -f "${ESP}/crypto_keyfile.bin" ]]; then
+            log "Recovering keyfile from ESP"
+            mkdir -p "$(dirname "$keyfile_dest")"
+            cp "${ESP}/crypto_keyfile.bin" "$keyfile_dest"
+            chmod 0400 "$keyfile_dest"
+            keyfile_opt="$keyfile_dest"
+            log "Keyfile recovered to ${keyfile_dest}"
+        else
+            log "No keyfile found — PIN/passphrase system, crypttab will use 'none'"
+        fi
+
+        local entry="${ROOTLABEL} UUID=${luks_uuid} ${keyfile_opt} luks,discard"
+        printf '%s\n' "$entry" > /etc/crypttab
+        chmod 0644 /etc/crypttab
+        log "/etc/crypttab written: ${entry}"
+    fi
+
+    # /etc/dracut.conf.d/99-crypt-key.conf — checked independently
+    # Must be consistent with crypttab: include keyfile in install_items only
+    # if crypttab actually references it. PIN systems use "none" — no keyfile
+    # needed in the initrd.
+    if [[ ! -f /etc/dracut.conf.d/99-crypt-key.conf ]]; then
+        log "/etc/dracut.conf.d/99-crypt-key.conf missing — generating"
+        mkdir -p /etc/dracut.conf.d
+        local install_items="/etc/crypttab"
+        [[ "$keyfile_opt" != "none" ]] && install_items+=" ${keyfile_opt}"
+        printf 'install_items+=" %s "\n' "$install_items" \
+            > /etc/dracut.conf.d/99-crypt-key.conf
+        log "dracut crypt config written (install_items: ${install_items})"
+    else
+        log "/etc/dracut.conf.d/99-crypt-key.conf already present — skipping"
+    fi
+}
+
+# update_bootloader — update shim and systemd-boot on the ESP if the source
+# binaries are newer than what is currently installed. Re-signs after update.
+# configure.sh installs these at install time; gen-efi.sh keeps them current
+# on subsequent kernel/systemd updates since bootctl update would deploy
+# an unsigned binary on this immutable signed system.
+update_bootloader() {
+    local shim_src="/usr/share/shim-signed/shimx64.efi"
+    local shim_dst="${ESP}/EFI/BOOT/BOOTX64.EFI"
+    local sdboot_src="/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+    local sdboot_dst="${ESP}/EFI/BOOT/grubx64.efi"
+    local mmx64_src="/usr/share/shim-signed/mmx64.efi"
+    local mmx64_dst="${ESP}/EFI/BOOT/mmx64.efi"
+    local updated=0
+
+    # shim (BOOTX64.EFI)
+    if [[ -f "$shim_src" ]]; then
+        if [[ ! -f "$shim_dst" ]] || [[ "$shim_src" -nt "$shim_dst" ]]; then
+            log "Updating shim: ${shim_dst}"
+            cp "$shim_src" "$shim_dst" || error_exit "Failed to copy shim"
+            sign_efi_binary "$shim_dst"
+            updated=1
+        else
+            log "shim is up to date"
+        fi
+    else
+        log_warn "shim source not found at ${shim_src} — skipping shim update"
+    fi
+
+    # MokManager (mmx64.efi) — not signed, shim verifies it via its own hash
+    if [[ -f "$mmx64_src" ]]; then
+        if [[ ! -f "$mmx64_dst" ]] || [[ "$mmx64_src" -nt "$mmx64_dst" ]]; then
+            log "Updating MokManager: ${mmx64_dst}"
+            cp "$mmx64_src" "$mmx64_dst" || error_exit "Failed to copy mmx64.efi"
+            updated=1
+        else
+            log "MokManager is up to date"
+        fi
+    else
+        log_warn "mmx64.efi source not found at ${mmx64_src} — skipping MokManager update"
+    fi
+
+    # systemd-boot (grubx64.efi — loaded by shim as the second-stage bootloader)
+    if [[ -f "$sdboot_src" ]]; then
+        if [[ ! -f "$sdboot_dst" ]] || [[ "$sdboot_src" -nt "$sdboot_dst" ]]; then
+            log "Updating systemd-boot: ${sdboot_dst}"
+            cp "$sdboot_src" "$sdboot_dst" || error_exit "Failed to copy systemd-boot"
+            sign_efi_binary "$sdboot_dst"
+            updated=1
+        else
+            log "systemd-boot is up to date"
+        fi
+    else
+        log_warn "systemd-boot source not found at ${sdboot_src} — skipping bootloader update"
+    fi
+
+    [[ $updated -eq 1 ]] && log "Bootloader update complete" || log "All bootloader components up to date"
+}
+
 # generate_uki generates the UKI image for the given slot.
 generate_uki() {
     local slot="$1"
@@ -237,12 +461,26 @@ generate_uki() {
     # VALIDATE target slot
     validate_target_slot "$slot" || error_exit "Slot validation failed"
 
+    # Ensure keys exist — generate if missing
+    ensure_mok_keys
+
     # Ensure ESP is unmounted on any exit from this point
     trap 'cleanup_esp' EXIT
 
     # Ensure ESP is mounted before we start
     ensure_esp_mounted
     mkdir -p "$EFI_DIR"
+
+    # If keys were just generated, re-sign existing EFI binaries and stage enrollment
+    # now that ESP is mounted.
+    if [[ $MOK_KEYS_GENERATED -eq 1 ]]; then
+        reenroll_mok_keys
+    fi
+
+    # Update shim and systemd-boot on the ESP if source binaries are newer.
+    # Must run after reenroll_mok_keys (which may have just installed new keys)
+    # so the sign step uses the correct current keys.
+    update_bootloader
 
     local kernel_ver
     kernel_ver=$(get_kernel_version)
@@ -254,6 +492,13 @@ generate_uki() {
     if [[ -z "$kernel_cmdline" ]]; then
         error_exit "Kernel command line is empty."
     fi
+    # If the root device is encrypted, ensure /etc/crypttab exists before dracut.
+    # Without it dracut builds a UKI with no LUKS unlock support.
+    # We derive everything from the live mapping — no external service needed.
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        ensure_crypttab
+    fi
+
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
 

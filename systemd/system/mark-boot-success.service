@@ -1,12 +1,27 @@
 [Unit]
 Description=Mark Boot Success for Shani OS
 After=multi-user.target data.mount
+Requires=data.mount
 ConditionPathExists=/data/boot_in_progress
 
 [Service]
 Type=oneshot
+# Mark boot successful
 ExecStart=touch /data/boot-ok
+
+# Clear in-progress marker
 ExecStart=rm -f /data/boot_in_progress
+
+# If we successfully booted the same slot that was previously marked failed,
+# the failure marker is now stale and must be cleared to avoid false rollback.
+ExecStart=/bin/sh -c '\
+  BOOTED_SLOT=$(grep -o "rootflags=[^ ]*" /proc/cmdline | cut -d= -f2- 2>/dev/null | awk -F"subvol=" "{print \$2}" | cut -d, -f1 | sed "s/^@//"); \
+  FAILED_SLOT=$(cat /data/boot_failure 2>/dev/null | tr -cd "a-z"); \
+  if [ -n "$FAILED_SLOT" ] && [ "$BOOTED_SLOT" = "$FAILED_SLOT" ]; then \
+    rm -f /data/boot_failure /data/boot_failure.acked; \
+    logger -t boot-success "Recovered slot '@${BOOTED_SLOT}' booted successfully — cleared stale failure marker."; \
+  fi'
+
 RemainAfterExit=yes
 
 [Install]

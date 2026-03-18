@@ -21,7 +21,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 declare -a ORIGINAL_ARGS=("$@")
-declare DEPLOYMENT_START_TIME=$(date +%s)
+declare DEPLOYMENT_START_TIME
+DEPLOYMENT_START_TIME=$(date +%s)
 export ORIGINAL_ARGS DEPLOYMENT_START_TIME
 
 #####################################
@@ -140,38 +141,44 @@ persist_state() {
 #####################################
 
 log() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') [INFO] $*"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') [INFO] $*"
     echo "$msg" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_verbose() {
     [[ "${VERBOSE}" == "yes" ]] || return 0
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $*"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] $*"
     echo "$msg" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_success() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] $*"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] $*"
     echo -e "\033[0;32m${msg}\033[0m" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_warn() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') [WARNING] $*"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') [WARNING] $*"
     echo -e "\033[0;33m${msg}\033[0m" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_error() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*"
     echo -e "\033[0;31m${msg}\033[0m" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 die() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') [FATAL] $*"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') [FATAL] $*"
     echo -e "\033[1;31m${msg}\033[0m" >&2
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
     exit 1
@@ -361,7 +368,11 @@ btrfs_subvol_exists() {
 get_btrfs_available_mb() {
     local bytes
     bytes=$(btrfs filesystem usage -b "$1" 2>/dev/null | awk '/Free \(estimated\):/ {gsub(/[^0-9]/,"",$3); print $3}')
-    [[ -n "$bytes" && "$bytes" -gt 0 ]] && echo "$((bytes / 1024 / 1024))" || echo "0"
+    if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
+        echo "$((bytes / 1024 / 1024))"
+    else
+        echo "0"
+    fi
 }
 
 #####################################
@@ -634,7 +645,8 @@ get_mirror_url() {
         log_verbose "Testing mirror: $full_url"
 
         if validate_mirror "$full_url"; then
-            local mirror_host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|')
+            local mirror_host
+            mirror_host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|')
             log_success "Mirror validated: $mirror_host"
             mkdir -p "$DOWNLOAD_DIR"
             echo "$base_url" > "$mirror_cache"
@@ -674,7 +686,7 @@ validate_download() {
     fi
 
     if (( size < min_size )); then
-        log_error "File too small: $(basename "$file") is $(format_bytes $size), expected at least $(format_bytes $min_size)"
+        log_error "File too small: $(basename "$file") is $(format_bytes "size"), expected at least $(format_bytes "min_size")"
         return 1
     fi
 
@@ -683,8 +695,9 @@ validate_download() {
     disk_usage=$(du -b "$file" 2>/dev/null | awk '{print $1}')
 
     if (( disk_usage > 0 && size > 0 )); then
-        local usage_ratio=$((disk_usage * 100 / size))
-        log_verbose "Disk usage: $(format_bytes $disk_usage) / $(format_bytes $size) (${usage_ratio}%)"
+        local usage_ratio
+        usage_ratio=$((disk_usage * 100 / size))
+        log_verbose "Disk usage: $(format_bytes "disk_usage") / $(format_bytes "size") (${usage_ratio}%)"
 
         # ONLY check for sparse files if this is a final validation
         # (i.e., download tool claims to be done)
@@ -692,7 +705,7 @@ validate_download() {
             # Only flag as preallocated if disk usage is extremely low (< 5%)
             # — btrfs transparent compression can legitimately yield 40-60% ratios
             if (( expected_size > 0 && size == expected_size && usage_ratio < 5 )); then
-                log_error "File appears preallocated but incomplete: $(format_bytes $disk_usage) actual vs $(format_bytes $size) apparent"
+                log_error "File appears preallocated but incomplete: $(format_bytes "disk_usage") actual vs $(format_bytes "size") apparent"
                 return 1
             fi
         fi
@@ -724,7 +737,7 @@ validate_download() {
         fi
     fi
 
-    log_verbose "Validation passed: $(format_bytes $size)"
+    log_verbose "Validation passed: $(format_bytes "size")"
     return 0
 }
 
@@ -879,16 +892,19 @@ download_file() {
 
             # Check existing file state before download
             if [[ -f "$output" ]]; then
-                local current_size=$(get_file_size "$output")
-                local disk_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
+                local current_size
+                current_size=$(get_file_size "$output")
+                local disk_usage
+                disk_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
 
                 if (( current_size > 0 && disk_usage == 0 )); then
                     # Completely preallocated, no real data
                     log_verbose "Removing completely preallocated file"
                     rm -f "$output" "${output}.aria2"
                 elif (( current_size > 0 )); then
-                    local usage_ratio=$((disk_usage * 100 / current_size))
-                    log_verbose "Found partial: $(format_bytes $disk_usage) actual / $(format_bytes $current_size) apparent (${usage_ratio}%)"
+                    local usage_ratio
+                    usage_ratio=$((disk_usage * 100 / current_size))
+                    log_verbose "Found partial: $(format_bytes "disk_usage") actual / $(format_bytes "current_size") apparent (${usage_ratio}%)"
 
                     # ANY real data is worth keeping for resume
                     # Don't delete partial downloads just because they're sparse
@@ -898,11 +914,14 @@ download_file() {
             if download_with_tool "$tool" "$url" "$output"; then
                 if [[ -f "$output" ]] && [[ -s "$output" ]]; then
                     # Check if download tool actually completed or just preallocated
-                    local final_size=$(get_file_size "$output")
-                    local final_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
+                    local final_size
+                    final_size=$(get_file_size "$output")
+                    local final_usage
+                    final_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
 
                     if (( final_usage > 0 )); then
-                        local final_ratio=$((final_usage * 100 / final_size))
+                        local final_ratio
+                        final_ratio=$((final_usage * 100 / final_size))
 
                         # If tool claims done but file is mostly empty, it's preallocated
                         if (( expected_size > 0 && final_ratio < 5 )); then
@@ -924,11 +943,13 @@ download_file() {
 
             # Check if we made actual progress
             if [[ -f "$output" ]]; then
-                local new_size=$(get_file_size "$output")
-                local new_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
+                local new_size
+                new_size=$(get_file_size "$output")
+                local new_usage
+                new_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
 
                 if (( new_usage > 0 )); then
-                    log_verbose "Progress: $(format_bytes $new_usage) actual data written"
+                    log_verbose "Progress: $(format_bytes "new_usage") actual data written"
                     # If we have real partial data, retry with same tool
                     if (( attempt < max_tool_attempts )); then
                         log_verbose "Retrying with $tool to resume..."
@@ -961,8 +982,10 @@ verify_sha256() {
     local file="$1" sha_file="$2"
     log_verbose "Verifying SHA256 checksum..."
 
-    local expected=$(awk '{print $1}' "$sha_file" 2>/dev/null | head -1 | tr -d '[:space:]')
-    local actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')
+    local expected
+    expected=$(awk '{print $1}' "$sha_file" 2>/dev/null | head -1 | tr -d '[:space:]')
+    local actual
+    actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')
 
     [[ -z "$expected" || -z "$actual" ]] && { log_error "Could not read checksums for verification"; return 1; }
 
@@ -1024,7 +1047,11 @@ verify_gpg() {
     fi
 
     rm -rf "$gpg_temp"
-    [[ -n "$old_gnupghome" ]] && export GNUPGHOME="$old_gnupghome" || unset GNUPGHOME
+    if [[ -n "$old_gnupghome" ]]; then
+        export GNUPGHOME="$old_gnupghome"
+    else
+        unset GNUPGHOME
+    fi
     return $result
 }
 
@@ -1079,8 +1106,8 @@ set_environment() {
     [[ -f /etc/shani-version && -f /etc/shani-profile ]] || \
         die "Missing system identity files (/etc/shani-version or /etc/shani-profile) — system may be corrupted"
 
-    LOCAL_VERSION=$(< /etc/shani-version)
-    LOCAL_PROFILE=$(< /etc/shani-profile)
+    LOCAL_VERSION=$(tr -cd '0-9' < /etc/shani-version)
+    LOCAL_PROFILE=$(tr -cd 'a-z0-9_-' < /etc/shani-profile)
 
     validate_nonempty "$LOCAL_VERSION" "LOCAL_VERSION"
     validate_nonempty "$LOCAL_PROFILE" "LOCAL_PROFILE"
@@ -1122,7 +1149,11 @@ self_update() {
                 log_success "Script updated — re-executing with new version..."
                 # Clean up STATE_DIR before exec — EXIT trap won't fire after exec
                 cleanup_state
-                [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]] && exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}" || exec /bin/bash "$temp"
+                if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+                    exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
+                else
+                    exec /bin/bash "$temp"
+                fi
             else
                 log_verbose "Script is already up to date"
             fi
@@ -1161,15 +1192,17 @@ inhibit_system() {
     [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && \
         state_env=(env "SHANIOS_DEPLOY_STATE_FILE=$SHANIOS_DEPLOY_STATE_FILE")
 
-    [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]] && \
-        exec "${state_env[@]}" systemd-inhibit \
-            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="System update in progress" \
-            "$script_path" "${ORIGINAL_ARGS[@]}" || \
-        exec "${state_env[@]}" systemd-inhibit \
-            --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch \
-            --who="shanios-deployment" --why="System update in progress" \
+    local _inhibit_opts=(
+        --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch
+        --who="shanios-deployment" --why="System update in progress"
+    )
+    if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+        exec "${state_env[@]}" systemd-inhibit "${_inhibit_opts[@]}" \
+            "$script_path" "${ORIGINAL_ARGS[@]}"
+    else
+        exec "${state_env[@]}" systemd-inhibit "${_inhibit_opts[@]}" \
             "$script_path"
+    fi
 }
 
 #####################################
@@ -1212,8 +1245,11 @@ cleanup_old_backups() {
                 [[ -n "${BACKUP_NAME:-}" && "$backup" == "@${BACKUP_NAME}" ]] && continue
 
                 [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would delete: ${backup}"; continue; }
-                btrfs subvolume delete "$MOUNT_DIR/${backup}" &>/dev/null && \
-                    log_success "Deleted: ${backup}" || log_warn "Failed to delete: ${backup}"
+                if btrfs subvolume delete "$MOUNT_DIR/${backup}" &>/dev/null; then
+                    log_success "Deleted: ${backup}"
+                else
+                    log_warn "Failed to delete: ${backup}"
+                fi
             done
         fi
     done
@@ -1323,11 +1359,11 @@ optimize_storage() {
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Could not mount root filesystem for deduplication — check ${ROOT_DEV}"; set -e; return 1; }
     trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
 
-    btrfs_subvol_exists "$MOUNT_DIR/@blue" && btrfs_subvol_exists "$MOUNT_DIR/@green" || {
+    if ! btrfs_subvol_exists "$MOUNT_DIR/@blue" || ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
         log_warn "Skipping deduplication (missing blue/green subvolumes)"
         set -e
         return 0
-    }
+    fi
 
     command -v duperemove &>/dev/null || { log_error "duperemove not installed — install it to use --optimize"; set -e; return 1; }
 
@@ -1345,7 +1381,8 @@ optimize_storage() {
     if ! btrfs_subvol_exists "$MOUNT_DIR/@data"; then
         log_warn "@data subvolume missing — skipping hashfile, deduplication will proceed without cache"
     fi
-    local dedupe_start=$(date +%s)
+    local dedupe_start
+    dedupe_start=$(date +%s)
 
     local dedupe_hashfile_opts=()
     btrfs_subvol_exists "$MOUNT_DIR/@data" && \
@@ -1356,11 +1393,15 @@ optimize_storage() {
         "${dedupe_hashfile_opts[@]}" "${targets[@]}"
 
     local dedupe_status=$?
-    local dedupe_duration=$(( $(date +%s) - dedupe_start ))
+    local dedupe_duration
+    dedupe_duration=$(( $(date +%s) - dedupe_start ))
 
     echo ""
-    [[ $dedupe_status -eq 0 ]] && log_success "Deduplication completed in ${dedupe_duration}s" || \
+    if [[ $dedupe_status -eq 0 ]]; then
+        log_success "Deduplication completed in ${dedupe_duration}s"
+    else
         log_warn "Deduplication completed with warnings (exit: $dedupe_status)"
+    fi
 
     echo ""
     log "=== Post-Deduplication Results ==="
@@ -1460,8 +1501,12 @@ generate_uki() {
 
     log "Generating unified kernel image (UKI) for @${slot}..."
     local result=0
-    chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot" && \
-        log_success "UKI generated successfully for @${slot}" || { log_error "UKI generation failed for @${slot}"; result=1; }
+    if chroot "$MOUNT_DIR" "$GENEFI_SCRIPT" configure "$slot"; then
+        log_success "UKI generated successfully for @${slot}"
+    else
+        log_error "UKI generation failed for @${slot}"
+        result=1
+    fi
 
     return $result
 }
@@ -1599,8 +1644,11 @@ restore_candidate() {
         found=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | \
             awk -v s="${CANDIDATE_SLOT}_backup_" '$NF ~ s {print $NF}' | sort | tail -1)
         BACKUP_NAME="${found#@}"
-        [[ -n "$BACKUP_NAME" ]] && log "Found backup on disk: @${BACKUP_NAME}" || \
+        if [[ -n "$BACKUP_NAME" ]]; then
+            log "Found backup on disk: @${BACKUP_NAME}"
+        else
             log_warn "No backup found on disk for @${CANDIDATE_SLOT}"
+        fi
     fi
 
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
@@ -1637,9 +1685,11 @@ restore_candidate() {
                 btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null || true
             fi
             btrfs subvolume snapshot "$MOUNT_DIR/@${CURRENT_SLOT}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null && \
-                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null && \
-                log "Snapshotted @${CURRENT_SLOT} → @${CANDIDATE_SLOT}" || \
-                log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
+                if btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null; then
+                    log "Snapshotted @${CURRENT_SLOT} → @${CANDIDATE_SLOT}"
+                else
+                    log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
+                fi
 
             local _rc_slot="${CURRENT_SLOT:-$(get_booted_subvol)}"
             echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
@@ -1649,13 +1699,13 @@ restore_candidate() {
 
             # Unmount before chroot for UKI generation
             umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
-            generate_uki "$CANDIDATE_SLOT" && {
+            if generate_uki "$CANDIDATE_SLOT"; then
                 log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
-            } || {
+            else
                 log_warn "UKI generation failed — copying @${CURRENT_SLOT} UKI as fallback"
                 cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CURRENT_SLOT}.efi" \
                    "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CANDIDATE_SLOT}.efi" 2>/dev/null || true
-            }
+            fi
         else
             log_error "Cannot restore @${CANDIDATE_SLOT} — no backup and cannot safely snapshot. System remains on @${CURRENT_SLOT:-booted slot}. Run --rollback after next reboot to clean up."
         fi
@@ -1705,7 +1755,12 @@ rollback_system() {
     booted=$(get_booted_subvol)
     [[ ! "$booted" =~ ^(blue|green)$ ]] && die "Cannot determine booted slot (got: '${booted}') — check /proc/cmdline and btrfs subvolume get-default /"
 
-    local failed_slot=$([[ "$booted" == "blue" ]] && echo "green" || echo "blue")
+    local failed_slot
+    if [[ "$booted" == "blue" ]]; then
+        failed_slot="green"
+    else
+        failed_slot="blue"
+    fi
 
     # Cross-check against /data/boot_failure if it exists — it contains the slot
     # that actually failed. If it disagrees with our derivation (which should never
@@ -1932,8 +1987,10 @@ verify_and_create_subvolumes() {
 
                         local swapfile="$MOUNT_DIR/@${sub}/swapfile"
                         if [[ ! -f "$swapfile" ]]; then
-                            local mem=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "2048")
-                            local avail=$(get_btrfs_available_mb "$MOUNT_DIR")
+                            local mem
+                            mem=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "2048")
+                            local avail
+                            avail=$(get_btrfs_available_mb "$MOUNT_DIR")
                             create_swapfile "$swapfile" "$mem" "$avail" || \
                                 log_warn "Swapfile creation failed"
                         fi
@@ -2056,7 +2113,11 @@ validate_boot() {
     fi
 
     log_success "Boot slot validated: @${booted}"
-    CANDIDATE_SLOT=$([[ "$CURRENT_SLOT" == "blue" ]] && echo "green" || echo "blue")
+    if [[ "$CURRENT_SLOT" == "blue" ]]; then
+        CANDIDATE_SLOT="green"
+    else
+        CANDIDATE_SLOT="blue"
+    fi
     log "Active slot: @${CURRENT_SLOT} | Update target (candidate): @${CANDIDATE_SLOT}"
 }
 
@@ -2066,7 +2127,8 @@ check_space() {
     if ! mountpoint -q /data 2>/dev/null && ! [ -d /data ]; then
         die "/data is not available — cannot check disk space. Ensure the data subvolume is mounted."
     fi
-    local free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 ))
+    local free_mb
+    free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 ))
     log "Available space: ${free_mb}MB | Required: ${MIN_FREE_SPACE_MB}MB"
 
     (( free_mb >= MIN_FREE_SPACE_MB )) || \
@@ -2147,9 +2209,10 @@ download_update() {
 
     # Check cache
     if [[ -f "$marker" && -f "$image" ]]; then
-        local existing_size=$(get_file_size "$image")
+        local existing_size
+        existing_size=$(get_file_size "$image")
         if (( existing_size > 0 )); then
-            log_success "Using verified cached image: ${IMAGE_NAME} ($(format_bytes $existing_size))"
+            log_success "Using verified cached image: ${IMAGE_NAME} ($(format_bytes "existing_size"))"
             return 0
         fi
         rm -f "$marker" "$image" "$sha" "$asc" "${image}.aria2"
@@ -2175,7 +2238,7 @@ download_update() {
         local r2_size
         r2_size=$(get_remote_file_size "$r2_image_url")
         if (( r2_size > MIN_FILE_SIZE )); then
-            log_success "Primary server available — image size: $(format_bytes $r2_size)"
+            log_success "Primary server available — image size: $(format_bytes "r2_size")"
             use_r2=1
         else
             log_verbose "Primary server unavailable or returned unexpected size, falling back to SourceForge mirror"
@@ -2201,18 +2264,19 @@ download_update() {
         active_url="$mirror_url"
     fi
     expected_size=$(get_remote_file_size "$active_url")
-    (( expected_size > 0 )) && log "Expected: $(format_bytes $expected_size)"
+    (( expected_size > 0 )) && log "Expected: $(format_bytes "expected_size")"
 
     # Check for existing partial download
     if [[ -f "$image" ]]; then
-        local current_size=$(get_file_size "$image")
+        local current_size
+        current_size=$(get_file_size "$image")
         if (( current_size > 0 )); then
-            log "Found partial download: $(format_bytes $current_size)"
+            log "Found partial download: $(format_bytes "current_size")"
             if (( expected_size > 0 )); then
                 if (( current_size >= expected_size )); then
                     log "Existing file matches expected size — skipping download, will verify integrity"
                 elif (( current_size < expected_size )); then
-                    log "Will resume from $(format_bytes $current_size)"
+                    log "Will resume from $(format_bytes "current_size")"
                 fi
             else
                 log_warn "Cannot determine expected image size from server — will attempt resume and validate after"
@@ -2248,18 +2312,19 @@ download_update() {
                 continue
             fi
 
-            local current_size=$(get_file_size "$image")
-            log_verbose "Downloaded: $(format_bytes $current_size)"
+            local current_size
+            current_size=$(get_file_size "$image")
+            log_verbose "Downloaded: $(format_bytes "current_size")"
 
             # Check if download is complete
             if (( expected_size > 0 )); then
                 if (( current_size < expected_size )); then
-                    log_warn "Download incomplete: $(format_bytes $current_size) / $(format_bytes $expected_size)"
+                    log_warn "Download incomplete: $(format_bytes "current_size") / $(format_bytes "expected_size")"
                     log "Will retry to resume..."
                     sleep 5
                     continue
                 elif (( current_size > expected_size )); then
-                    log_error "Download too large: $(format_bytes $current_size) > $(format_bytes $expected_size)"
+                    log_error "Download too large: $(format_bytes "current_size") > $(format_bytes "expected_size")"
                     rm -f "$image" "${image}.aria2"
                     sleep 5
                     continue
@@ -2267,7 +2332,7 @@ download_update() {
             fi
 
             download_success=1
-            log_success "Downloaded: $(format_bytes $current_size)"
+            log_success "Downloaded: $(format_bytes "current_size")"
             break
         fi
 
@@ -2304,7 +2369,8 @@ download_update() {
         fi
 
         if (( global_attempt < max_global_attempts )); then
-            local delay=$((5 + global_attempt * 5))
+            local delay
+            delay=$((5 + global_attempt * 5))
             log "Retrying in ${delay}s..."
             sleep "$delay"
         fi
@@ -2333,10 +2399,10 @@ download_update() {
         }
 
     log "Verifying image integrity..."
-    verify_sha256 "$image" "$sha" && verify_gpg "$image" "$asc" || {
+    if ! { verify_sha256 "$image" "$sha" && verify_gpg "$image" "$asc"; }; then
         rm -f "$image" "$sha" "$asc" "${image}.aria2"
         die "Image verification failed — the download may be corrupt or tampered with"
-    }
+    fi
 
     # Clean up all control files on successful verification
     rm -f "$DOWNLOAD_DIR/mirror.url" "${image}.aria2"
@@ -2387,8 +2453,11 @@ deploy_update() {
     run_cmd btrfs subvolume create "$temp"
 
     log "Extracting system image into @${CANDIDATE_SLOT} (this may take a few minutes)..."
-    [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would extract"; } || {
-        local start=$(date +%s)
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[DRY-RUN] Would extract"
+    else
+        local start
+        start=$(date +%s)
         if (( HAS_PV )); then
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 pv -p -t -e -r -b | btrfs receive "$temp" || {
@@ -2407,7 +2476,7 @@ deploy_update() {
             }
         fi
         log_success "Extracted in $(($(date +%s) - start))s"
-    }
+    fi
 
     # Extraction succeeded — now safe to replace candidate.
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
@@ -2439,7 +2508,11 @@ finalize_update() {
     echo "$CANDIDATE_SLOT" > /data/current-slot || die "Failed to write current-slot"
     log_verbose "Slot markers written: current=@${CANDIDATE_SLOT}, previous=@${CURRENT_SLOT}"
 
-    rm -f "$DEPLOY_PENDING" && log_verbose "Deployment pending flag cleared" || log_warn "Failed to remove deployment pending flag"
+    if rm -f "$DEPLOY_PENDING"; then
+        log_verbose "Deployment pending flag cleared"
+    else
+        log_warn "Failed to remove deployment pending flag"
+    fi
 
     # Write reboot-needed marker so shani-update can surface the reboot dialog
     # to the desktop session. pkexec strips DISPLAY/WAYLAND_DISPLAY so we cannot
@@ -2448,7 +2521,11 @@ finalize_update() {
     # /run is tmpfs — the file is cleared automatically on the next reboot,
     # so no explicit cleanup is needed when the user reboots into the new slot.
     mkdir -p /run/shanios && chmod 755 /run/shanios
-    echo "$REMOTE_VERSION" > "$REBOOT_NEEDED_FILE" && chmod 644 "$REBOOT_NEEDED_FILE" || log_warn "Failed to write reboot-needed marker"
+    if echo "$REMOTE_VERSION" > "$REBOOT_NEEDED_FILE"; then
+        chmod 644 "$REBOOT_NEEDED_FILE" || true
+    else
+        log_warn "Failed to write reboot-needed marker"
+    fi
     log_verbose "Reboot-needed marker written: ${REBOOT_NEEDED_FILE}"
 
     # Write persistent marker so shani-user-setup runs after reboot into the
@@ -2457,8 +2534,11 @@ finalize_update() {
     # This marker is checked by shani-user-setup.service on boot and cleared
     # after a successful run.
     mkdir -p /data
-    touch /data/user-setup-needed && chmod 644 /data/user-setup-needed \
-        || log_warn "Failed to write user-setup-needed marker"
+    if touch /data/user-setup-needed; then
+        chmod 644 /data/user-setup-needed || true
+    else
+        log_warn "Failed to write user-setup-needed marker"
+    fi
     log_verbose "user-setup-needed marker written — shani-user-setup will run after reboot"
 
     trap - ERR
@@ -2482,7 +2562,8 @@ finalize_update() {
     set -e
     trap 'restore_candidate' ERR
 
-    local total_time=$(( $(date +%s) - DEPLOYMENT_START_TIME ))
+    local total_time
+    total_time=$(( $(date +%s) - DEPLOYMENT_START_TIME ))
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log "  Deployment successful!"
     log "  Next boot will load: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
@@ -2515,9 +2596,8 @@ set_channel_persistent() {
         return 0
     fi
 
-    echo "$chan" > "$CHANNEL_FILE" \
-        && chmod 0644 "$CHANNEL_FILE" \
-        || die "Failed to write channel to ${CHANNEL_FILE}"
+    echo "$chan" > "$CHANNEL_FILE" || die "Failed to write channel to ${CHANNEL_FILE}"
+    chmod 0644 "$CHANNEL_FILE" || die "Failed to set permissions on ${CHANNEL_FILE}"
 
     log_success "Channel set to '${chan}' (was '${current:-unset}') — persisted to ${CHANNEL_FILE}"
     log "Next update will use the '${chan}' channel automatically"
@@ -2537,9 +2617,10 @@ Options:
   -f, --force             Deploy even if version matches or boot mismatch
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
-  --set-channel           permantly set channel in /etc/shani-channel (latest|stable)
+  --set-channel           permanently set channel in /etc/shani-channel (latest|stable)
   --skip-self-update      Skip auto-update
 EOF
+}
 
 main() {
     local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no" STORAGE_OPTIMIZE="no"

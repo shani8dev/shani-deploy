@@ -50,6 +50,7 @@ fi
 #####################################
 
 readonly OS_NAME="shanios"
+readonly ROOTLABEL="shani_root"
 readonly DOWNLOAD_DIR="/data/downloads"
 readonly MOUNT_DIR="/mnt"
 readonly ROOT_DEV="/dev/disk/by-label/shani_root"
@@ -472,9 +473,9 @@ download_from_r2() {
         return 1
     fi
 
-    download_with_tool "${HAS_ARIA2C:+aria2c}" "$url" "$output" 2>/dev/null || \
-    download_with_tool "${HAS_WGET:+wget}" "$url" "$output" 2>/dev/null || \
-    download_with_tool "${HAS_CURL:+curl}" "$url" "$output" 2>/dev/null || \
+    (( HAS_ARIA2C )) && { download_with_tool aria2c "$url" "$output" 2>/dev/null && return 0; }
+    (( HAS_WGET ))   && { download_with_tool wget   "$url" "$output" 2>/dev/null && return 0; }
+    (( HAS_CURL ))   && { download_with_tool curl   "$url" "$output" 2>/dev/null && return 0; }
     return 1
 }
 
@@ -1690,6 +1691,19 @@ rollback_system() {
 
     local failed_slot=$([[ "$booted" == "blue" ]] && echo "green" || echo "blue")
 
+    # Cross-check against /data/boot_failure if it exists — it contains the slot
+    # that actually failed. If it disagrees with our derivation (which should never
+    # happen in practice), warn but proceed with the derived value since the user
+    # is running from the working slot.
+    if [[ -f /data/boot_failure ]]; then
+        local recorded_fail
+        recorded_fail=$(cat /data/boot_failure 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ -n "$recorded_fail" && "$recorded_fail" =~ ^(blue|green)$ && "$recorded_fail" != "$failed_slot" ]]; then
+            log_warn "boot_failure records @${recorded_fail} but booted slot @${booted} implies @${failed_slot} failed"
+            log_warn "Using @${failed_slot} (derived from booted slot) — boot_failure may be stale"
+        fi
+    fi
+
     CURRENT_SLOT="$booted"
     CANDIDATE_SLOT="$failed_slot"
 
@@ -2454,6 +2468,818 @@ finalize_update() {
     # would silently fail.
 }
 
+_info_cleanup_esp() {
+    (( _INFO_ESP_MOUNTED == 1 )) && umount /boot/efi 2>/dev/null || true
+}
+
+system_info() {
+    # system_info is read-only — don't pollute the deploy log
+    echo ""
+    echo "  =========================================="
+    echo "    System Information"
+    echo "  =========================================="
+
+    # Track if we mounted ESP — mount early so UKI checks can access it
+    _INFO_ESP_MOUNTED=0
+    trap '_info_cleanup_esp' RETURN
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        mount /boot/efi 2>/dev/null && _INFO_ESP_MOUNTED=1
+    fi
+
+    # Collect actionable recommendations throughout — printed at the end
+    local -a recommendations=()
+
+    # ── OS Identity ───────────────────────────────────────────────────────────
+    local version profile channel slot_current slot_previous
+    version=$(cat /etc/shani-version 2>/dev/null || echo "unknown")
+    profile=$(cat /etc/shani-profile 2>/dev/null || echo "unknown")
+    channel=$(cat /etc/shani-channel 2>/dev/null || echo "unknown")
+    slot_current=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    slot_previous=$(cat /data/previous-slot 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    local booted
+    booted=$(get_booted_subvol 2>/dev/null || echo "unknown")
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────┐"
+    echo "  │           ShaniOS System Status             │"
+    echo "  └─────────────────────────────────────────────┘"
+    echo ""
+    echo "  OS"
+    echo "    Version   : ${version}"
+    echo "    Profile   : ${profile}"
+    echo "    Channel   : ${channel}"
+    echo "    Kernel    : $(uname -r 2>/dev/null || echo "unknown")"
+    echo "    Uptime    : $(uptime -p 2>/dev/null | sed 's/^up //' || echo "unknown")"
+    echo ""
+    echo "  Slots"
+    printf "    Active    : @%-10s" "${slot_current}"
+    [[ "$booted" == "$slot_current" ]] && echo " ✓ (booted)" || echo " ✗ (mismatch — reboot pending?)"
+    echo "    Fallback  : @${slot_previous}"
+    echo "    Booted    : @${booted}"
+
+    # ── Hardware ──────────────────────────────────────────────────────────────
+    echo ""
+    echo "  Hardware"
+    local cpu_model cpu_cores ram_total
+    cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//' || echo "unknown")
+    cpu_cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "?")
+    ram_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || echo "unknown")
+    echo "    CPU       : ${cpu_model} (${cpu_cores} cores)"
+    echo "    RAM       : ${ram_total} total"
+
+    # ── Boot health ───────────────────────────────────────────────────────────
+    echo ""
+    echo "  Boot Health"
+    if [[ -f /data/boot-ok ]]; then
+        local last_ok
+        last_ok=$(stat -c '%y' /data/boot-ok 2>/dev/null | cut -d. -f1 || echo "unknown")
+        echo "    Last boot : ✓ Successful (${last_ok})"
+    else
+        echo "    Last boot : ⚠ No successful boot recorded yet"
+    fi
+    if [[ -f /data/boot_hard_failure ]]; then
+        local hard_fail_slot
+        hard_fail_slot=$(cat /data/boot_hard_failure 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+        echo "    Hard fail : ✗ Root mount FAILED for @${hard_fail_slot} — manual intervention required"
+        recommendations+=("HARD BOOT FAILURE: @${hard_fail_slot} failed to mount — run: shani-deploy --rollback")
+    elif [[ -f /data/boot_failure ]]; then
+        local fail_slot
+        fail_slot=$(cat /data/boot_failure 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+        echo "    Failure   : ⚠ Boot failure recorded for @${fail_slot}"
+        recommendations+=("Boot failure recorded for @${fail_slot} — run: shani-deploy --rollback")
+    fi
+    if [[ -f /data/boot_failure.acked ]]; then
+        echo "    Acked     : ⚠ Failure acknowledged — rollback dialog was shown (run --rollback if not done)"
+    fi
+
+    # ── Immutability ─────────────────────────────────────────────────────────
+    echo ""
+    echo "  Immutability"
+    local root_opts
+    root_opts=$(findmnt -n -o OPTIONS / 2>/dev/null || true)
+    if echo "$root_opts" | grep -qw 'ro'; then
+        echo "    Root (/)  : ✓ Read-only"
+    else
+        echo "    Root (/)  : ✗ Writable — immutability may be compromised"
+        recommendations+=("Root filesystem is writable — reboot may be required")
+    fi
+
+    # ── Kernel Security ───────────────────────────────────────────────────────
+    echo ""
+    echo "  Kernel Security"
+
+    # Active LSMs
+    local active_lsms
+    active_lsms=$(cat /sys/kernel/security/lsm 2>/dev/null | tr ',' ' ' || echo "unknown")
+    echo "    LSMs      : ${active_lsms}"
+    # Check all expected LSMs are loaded
+    local expected_lsms=(landlock lockdown yama integrity apparmor bpf)
+    local missing_lsms=()
+    for lsm in "${expected_lsms[@]}"; do
+        echo "$active_lsms" | grep -qw "$lsm" || missing_lsms+=("$lsm")
+    done
+    if [[ ${#missing_lsms[@]} -eq 0 ]]; then
+        echo "    LSM check : ✓ All 6 LSMs active"
+    else
+        echo "    LSM check : ✗ Missing: ${missing_lsms[*]}"
+        recommendations+=("Some LSMs not active: ${missing_lsms[*]} — check kernel cmdline lsm= parameter")
+    fi
+
+    # IMA/EVM — integrity LSM is the umbrella; check directory presence
+    if [[ -d /sys/kernel/security/ima ]]; then
+        local ima_policy
+        ima_policy=$(cat /sys/kernel/security/ima/policy 2>/dev/null | wc -l || echo "0")
+        echo "    IMA       : ✓ Active (${ima_policy} policy rules)"
+    else
+        if echo "$active_lsms" | grep -qw 'integrity'; then
+            echo "    IMA       : ✓ Active (integrity LSM loaded)"
+        else
+            echo "    IMA       : ✗ Not active"
+        fi
+    fi
+
+    # Lockdown mode
+    local lockdown_mode
+    lockdown_mode=$(cat /sys/kernel/security/lockdown 2>/dev/null | grep -o '\[.*\]' | tr -d '[]' || echo "none")
+    echo "    Lockdown  : ${lockdown_mode}"
+
+    # ── Secure Boot ───────────────────────────────────────────────────────────
+    echo ""
+    echo "  Secure Boot"
+    if [[ ! -d /sys/firmware/efi ]]; then
+        echo "    Status    : N/A (BIOS/Legacy boot)"
+    else
+        local sb_state
+        sb_state=$(mokutil --sb-state 2>/dev/null || echo "unknown")
+        if [[ "$sb_state" == *"SecureBoot enabled"* ]]; then
+            echo "    Status    : ✓ Enabled"
+        else
+            echo "    Status    : ✗ Disabled"
+            recommendations+=("Enable Secure Boot in BIOS/UEFI for full boot chain protection")
+        fi
+
+        # MOK enrollment in firmware
+        local mok_enrolled_count
+        mok_enrolled_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
+        if (( mok_enrolled_count > 0 )); then
+            echo "    MOK Enrol : ✓ ${mok_enrolled_count} key(s) enrolled in firmware"
+        else
+            echo "    MOK Enrol : ✗ No MOK keys enrolled in firmware"
+            recommendations+=("Enroll MOK key: reboot and confirm in MokManager, or run: mokutil --import /etc/secureboot/keys/MOK.der --root-pw")
+        fi
+
+        # MOK keys on disk
+        local mok_key="/etc/secureboot/keys/MOK.key"
+        local mok_crt="/etc/secureboot/keys/MOK.crt"
+        local mok_der="/etc/secureboot/keys/MOK.der"
+        local mok_ok=0
+        if [[ -f "$mok_key" && -f "$mok_crt" && -f "$mok_der" ]]; then
+            mok_ok=1
+            local expiry
+            expiry=$(openssl x509 -in "$mok_crt" -noout -enddate 2>/dev/null \
+                | sed 's/notAfter=//' || echo "unknown")
+            echo "    MOK Keys  : ✓ Present (expires: ${expiry})"
+        else
+            echo "    MOK Keys  : ✗ Missing"
+            recommendations+=("MOK signing keys missing — run: gen-efi configure <slot>")
+        fi
+
+        # UKI signing status — only check if MOK cert is available
+        if [[ $mok_ok -eq 1 ]]; then
+            local uki_ok=0 uki_bad=0 uki_missing=0
+            for slot in blue green; do
+                local uki="/boot/efi/EFI/${OS_NAME}/${OS_NAME}-${slot}.efi"
+                if [[ -f "$uki" ]]; then
+                    if sbverify --cert "$mok_crt" "$uki" &>/dev/null 2>&1; then
+                        uki_ok=$((uki_ok + 1))
+                    else
+                        uki_bad=$((uki_bad + 1))
+                    fi
+                else
+                    uki_missing=$((uki_missing + 1))
+                fi
+            done
+            if (( uki_bad > 0 || uki_missing > 0 )); then
+                echo "    UKI Sigs  : ✗ ${uki_ok}/2 valid, ${uki_bad} invalid, ${uki_missing} missing"
+                recommendations+=("UKI signatures invalid/missing — run: gen-efi configure <slot>")
+            else
+                echo "    UKI Sigs  : ✓ ${uki_ok}/2 valid"
+            fi
+        else
+            echo "    UKI Sigs  : — Cannot verify (MOK cert missing)"
+        fi
+    fi
+
+    # ── Encryption ────────────────────────────────────────────────────────────
+    echo ""
+    echo "  Encryption"
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        echo "    LUKS      : ✓ Active (/dev/mapper/${ROOTLABEL})"
+
+        local underlying
+        underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+            | sed -n 's/^ *device: //p' || true)
+        if [[ -n "$underlying" ]]; then
+            local luks_uuid
+            luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || echo "unknown")
+            echo "    Device    : ${underlying}"
+            echo "    UUID      : ${luks_uuid}"
+
+            # Single luksDump call — reused for cipher, KDF
+            local luks_dump
+            luks_dump=$(cryptsetup luksDump "$underlying" 2>/dev/null || true)
+            local luks_cipher luks_kdf
+            luks_cipher=$(echo "$luks_dump" | awk '/cipher:/ {print $2; exit}' || echo "unknown")
+            luks_kdf=$(echo "$luks_dump" | awk '/PBKDF:/ {print $2; exit}' || echo "unknown")
+            echo "    Cipher    : ${luks_cipher}"
+            if [[ "$luks_kdf" == "argon2id" ]]; then
+                echo "    KDF       : ✓ ${luks_kdf} (strong)"
+            else
+                echo "    KDF       : ⚠ ${luks_kdf} (argon2id recommended)"
+                recommendations+=("LUKS KDF is ${luks_kdf} — consider re-encrypting with argon2id for stronger brute-force protection")
+            fi
+
+            # Single systemd-cryptenroll call — reused for keyslot count and TPM2 check
+            local enroll_out
+            enroll_out=$(systemd-cryptenroll "$underlying" 2>/dev/null || true)
+            # Subtract 1 for the header line (SLOT TYPE)
+            local keyslot_count
+            keyslot_count=$(echo "$enroll_out" | grep -c '.' || echo "1")
+            keyslot_count=$(( keyslot_count > 0 ? keyslot_count - 1 : 0 ))
+            echo "    Keyslots  : ${keyslot_count} active"
+
+            if echo "$enroll_out" | grep -q "tpm2"; then
+                echo "    TPM2      : ✓ Enrolled (auto-unlock active)"
+            else
+                echo "    TPM2      : ✗ Not enrolled"
+                if [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then
+                    recommendations+=("TPM2 not enrolled — automate disk unlock: gen-efi enroll-tpm2  [AUTOMATABLE]")
+                fi
+            fi
+
+            # Keyfile
+            local keyfile="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
+            if [[ -f "$keyfile" ]]; then
+                echo "    Keyfile   : ✓ Present (${keyfile})"
+            else
+                echo "    Keyfile   : — Not used (PIN/passphrase system)"
+            fi
+        fi
+    else
+        echo "    LUKS      : — Not encrypted"
+        recommendations+=("Disk is not encrypted — re-install with LUKS2 encryption enabled for data protection")
+    fi
+
+    # ── TPM2 ─────────────────────────────────────────────────────────────────
+    echo ""
+    echo "  TPM2"
+    if [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then
+        local tpm_info
+        tpm_info=$(systemd-cryptenroll --tpm2-device=list 2>/dev/null | grep -v '^PATH' | tail -1 || true)
+        echo "    Hardware  : ✓ Present"
+        [[ -n "$tpm_info" ]] && echo "    Device    : ${tpm_info}"
+    else
+        echo "    Hardware  : ✗ Not found or not enabled in BIOS"
+    fi
+
+    # ── Security Services ─────────────────────────────────────────────────────
+    echo ""
+    echo "  Security Services"
+
+    # AppArmor — redirect aa-status --enabled stdout so it doesn't pollute output
+    if command -v aa-status &>/dev/null; then
+        if aa-status --enabled >/dev/null 2>&1; then
+            local aa_enforced
+            aa_enforced=$(aa-status 2>/dev/null | awk '/profiles are in enforce mode/ {print $1}' || echo "?")
+            echo "    AppArmor  : ✓ Active (${aa_enforced} profiles enforcing)"
+        else
+            echo "    AppArmor  : ✗ Not enforcing"
+            recommendations+=("AppArmor not enforcing — run: systemctl enable --now apparmor  [AUTOMATABLE]")
+        fi
+    else
+        echo "    AppArmor  : — aa-status not found"
+    fi
+
+    # Firewall
+    if command -v firewall-cmd &>/dev/null; then
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+            local fw_default
+            fw_default=$(firewall-cmd --get-default-zone 2>/dev/null || echo "unknown")
+            echo "    Firewall  : ✓ Active (default zone: ${fw_default})"
+        else
+            echo "    Firewall  : ✗ firewalld not running"
+            recommendations+=("Firewall not active — run: systemctl enable --now firewalld  [AUTOMATABLE]")
+        fi
+    else
+        echo "    Firewall  : — Not installed"
+    fi
+
+    # fail2ban
+    if command -v fail2ban-client &>/dev/null; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            local jail_count
+            jail_count=$(fail2ban-client status 2>/dev/null \
+                | awk -F',' '/Jail list/{gsub(/[[:space:]]/,"",$0); print NF}' || echo "?")
+            echo "    fail2ban  : ✓ Active (${jail_count} jail(s))"
+        else
+            echo "    fail2ban  : ✗ Not running"
+            recommendations+=("fail2ban not active — run: systemctl enable --now fail2ban  [AUTOMATABLE]")
+        fi
+    else
+        echo "    fail2ban  : — Not installed"
+    fi
+
+    # Root account
+    local root_locked
+    root_locked=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
+    if [[ "$root_locked" == "L" || "$root_locked" == "LK" ]]; then
+        echo "    Root acct : ✓ Locked (sudo via wheel only)"
+    elif [[ "$root_locked" == "P" ]]; then
+        echo "    Root acct : ⚠ Has password (locked root recommended)"
+        recommendations+=("Root account has a password set — consider locking it: passwd -l root  [AUTOMATABLE]")
+    else
+        echo "    Root acct : — Status unknown"
+    fi
+
+    # SSH root login
+    if [[ -f /etc/ssh/sshd_config ]] || [[ -d /etc/ssh/sshd_config.d ]]; then
+        local ssh_root_login
+        ssh_root_login=$(grep -rh '^PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
+            | tail -1 | awk '{print $2}' || echo "default")
+        case "$ssh_root_login" in
+            no)            echo "    SSH Root  : ✓ Disabled" ;;
+            prohibit-password|without-password)
+                           echo "    SSH Root  : ✓ Key-only (no password)" ;;
+            yes)           echo "    SSH Root  : ✗ Enabled (password login as root allowed)"
+                           recommendations+=("SSH root login enabled — set PermitRootLogin no in sshd_config  [AUTOMATABLE]") ;;
+            *)             echo "    SSH Root  : ⚠ Default (may allow root login)" ;;
+        esac
+
+        # SSH port
+        local ssh_port
+        ssh_port=$(grep -rh '^Port ' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
+            | tail -1 | awk '{print $2}' || echo "22")
+        echo "    SSH Port  : ${ssh_port:-22}"
+    fi
+
+    # Blacklisted kernel modules — Intel ME and pcspkr should not be loaded
+    local bad_modules=()
+    for mod in mei mei_me pcspkr; do
+        lsmod 2>/dev/null | grep -qw "$mod" && bad_modules+=("$mod")
+    done
+    if [[ ${#bad_modules[@]} -eq 0 ]]; then
+        echo "    Blacklist : ✓ mei/mei_me/pcspkr not loaded"
+    else
+        echo "    Blacklist : ⚠ Loaded modules that should be blacklisted: ${bad_modules[*]}"
+        recommendations+=("Modules ${bad_modules[*]} are loaded but should be blacklisted — check /etc/modprobe.d/")
+    fi
+
+    # /etc/shadow permissions — 640 root shadow or 600 root root are both acceptable
+    local shadow_perms
+    shadow_perms=$(stat -c '%a %U %G' /etc/shadow 2>/dev/null || echo "unknown")
+    if [[ "$shadow_perms" =~ ^(640\ root\ shadow|600\ root\ root)$ ]]; then
+        echo "    Shadow    : ✓ Permissions OK (${shadow_perms})"
+    elif [[ "$shadow_perms" != "unknown" ]]; then
+        echo "    Shadow    : ⚠ Unexpected permissions: ${shadow_perms} (expected 640 root shadow)"
+        recommendations+=("/etc/shadow has unexpected permissions (${shadow_perms}) — expected 640 root shadow")
+    fi
+
+    # ── Disk ─────────────────────────────────────────────────────────────────
+    echo ""
+    echo "  Disk"
+    # Root disk device
+    local root_disk
+    root_disk=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*//')" 2>/dev/null \
+        | head -1 || true)
+    if [[ -z "$root_disk" ]]; then
+        root_disk=$(lsblk -no PKNAME "/dev/disk/by-label/${ROOTLABEL}" 2>/dev/null | head -1 || echo "unknown")
+    fi
+    if [[ -n "$root_disk" && "$root_disk" != "unknown" ]]; then
+        local disk_model disk_size disk_type
+        disk_model=$(lsblk -dno MODEL "/dev/${root_disk}" 2>/dev/null | sed 's/[[:space:]]*$//' || echo "unknown")
+        disk_size=$(lsblk -dno SIZE "/dev/${root_disk}" 2>/dev/null || echo "unknown")
+        disk_type=$(lsblk -dno ROTA "/dev/${root_disk}" 2>/dev/null || echo "?")
+        [[ "$disk_type" == "0" ]] && disk_type="SSD/NVMe" || disk_type="HDD"
+        echo "    Device    : /dev/${root_disk} — ${disk_model} (${disk_size}, ${disk_type})"
+
+        # SMART health (brief — smartctl short form)
+        if command -v smartctl &>/dev/null; then
+            local smart_health
+            smart_health=$(smartctl -H "/dev/${root_disk}" 2>/dev/null \
+                | awk '/overall-health|result/ {print $NF}' | head -1 || echo "unknown")
+            if [[ "$smart_health" == "PASSED" ]]; then
+                echo "    SMART     : ✓ PASSED"
+            elif [[ -n "$smart_health" && "$smart_health" != "unknown" ]]; then
+                echo "    SMART     : ✗ ${smart_health}"
+                recommendations+=("SMART health check failed for /dev/${root_disk} — backup data immediately")
+            else
+                echo "    SMART     : — Not available (NVMe may need nvme-cli)"
+            fi
+        else
+            echo "    SMART     : — smartctl not installed"
+        fi
+    else
+        echo "    Device    : — Could not detect root disk"
+    fi
+
+    # Swap
+    local swap_total swap_used
+    swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}' || echo "0")
+    swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}' || echo "0")
+    if [[ "$swap_total" == "0" || "$swap_total" == "0B" ]]; then
+        echo "    Swap      : ⚠ No swap active (hibernate unavailable, memory pressure unmanaged)"
+    else
+        echo "    Swap      : ✓ ${swap_used} used / ${swap_total} total"
+        # Check for zram vs swapfile
+        if swapon --show=NAME 2>/dev/null | grep -q zram; then
+            echo "    Swap type : zram (compressed RAM)"
+        elif [[ -f /swap/swapfile ]]; then
+            echo "    Swap type : swapfile (hibernate supported)"
+        fi
+    fi
+
+    # ── /etc Overlay health ───────────────────────────────────────────────────
+    echo ""
+    echo "  /etc Overlay"
+    local overlay_upper="/data/overlay/etc/upper"
+    if [[ -d "$overlay_upper" ]]; then
+        local overlay_count
+        overlay_count=$(find "$overlay_upper" -mindepth 1 2>/dev/null | wc -l || echo "0")
+        echo "    Files     : ${overlay_count} modified/added file(s) vs base"
+        if [[ "$overlay_count" =~ ^[0-9]+$ ]] && (( overlay_count > 200 )); then
+            echo "    Size      : ⚠ Large overlay — significant config drift from base image"
+        fi
+        # Check if /etc is actually mounted as overlay
+        if findmnt -n -t overlay /etc &>/dev/null; then
+            echo "    Mount     : ✓ Overlay active"
+        else
+            echo "    Mount     : ✗ Overlay not mounted — /etc may be from read-only root"
+            recommendations+=("/etc overlay not mounted — check etc-overlay.mount unit")
+        fi
+    else
+        echo "    Upper     : ✗ ${overlay_upper} missing"
+        recommendations+=("/etc overlay upper directory missing — run shanios-tmpfiles-data.service")
+    fi
+
+    # ── Background Services ───────────────────────────────────────────────────
+    echo ""
+    echo "  Background Services"
+
+    # bees deduplication daemon — UUID from blkid matching beesd-setup method
+    local bees_uuid bees_unit bees_state
+    bees_uuid=$(blkid -s UUID -o value /dev/disk/by-label/${ROOTLABEL} 2>/dev/null || true)
+    if [[ -z "$bees_uuid" ]] && [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        bees_uuid=$(blkid -s UUID -o value /dev/mapper/${ROOTLABEL} 2>/dev/null || true)
+    fi
+    if [[ -n "$bees_uuid" ]]; then
+        bees_unit="beesd@${bees_uuid}"
+        bees_state=$(systemctl is-active "$bees_unit" 2>/dev/null || echo "inactive")
+        if [[ "$bees_state" == "active" ]]; then
+            echo "    bees dedup: ✓ Running (${bees_unit})"
+        else
+            echo "    bees dedup: ✗ Not running (${bees_unit} is ${bees_state})"
+            if [[ ! -f "/etc/bees/${bees_uuid}.conf" ]]; then
+                recommendations+=("bees not configured — run beesd-setup first, then: systemctl enable --now ${bees_unit}  [AUTOMATABLE]")
+            else
+                recommendations+=("bees deduplication not running — run: systemctl enable --now ${bees_unit}  [AUTOMATABLE]")
+            fi
+        fi
+    else
+        echo "    bees dedup: — Could not determine Btrfs UUID"
+    fi
+
+    # fwupd
+    if systemctl is-active --quiet fwupd 2>/dev/null; then
+        echo "    fwupd     : ✓ Running"
+    else
+        echo "    fwupd     : — Not running (on-demand)"
+    fi
+
+    # NetworkManager
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        echo "    Network   : ✓ NetworkManager active"
+    else
+        echo "    Network   : ⚠ NetworkManager not running"
+    fi
+
+    # ── Boot entries ─────────────────────────────────────────────────────────
+    echo ""
+    echo "  Boot"
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        echo "    ESP       : ✗ Could not mount — boot entries unavailable"
+    elif mountpoint -q /boot/efi 2>/dev/null; then
+        local loader_default
+        loader_default=$(grep '^default' /boot/efi/loader/loader.conf 2>/dev/null \
+            | awk '{print $2}' || echo "unknown")
+        echo "    Default   : ${loader_default}"
+        local entries
+        entries=$(ls /boot/efi/loader/entries/*.conf 2>/dev/null \
+            | xargs -I{} basename {} .conf | tr '\n' '  ' || echo "none")
+        echo "    Entries   : ${entries}"
+        local editor_val
+        editor_val=$(grep '^editor' /boot/efi/loader/loader.conf 2>/dev/null | awk '{print $2}' || echo "not set")
+        if [[ "$editor_val" == "0" ]]; then
+            echo "    Editor    : ✓ Disabled"
+        else
+            echo "    Editor    : ✗ Not disabled (cmdline editable at boot)"
+            recommendations+=("systemd-boot editor not disabled — add 'editor 0' to loader.conf  [AUTOMATABLE]")
+        fi
+    fi
+
+    # ── Firmware updates ─────────────────────────────────────────────────────
+    echo ""
+    echo "  Firmware"
+    if command -v fwupdmgr &>/dev/null; then
+        local fw_output
+        fw_output=$(fwupdmgr get-updates --offline 2>/dev/null || true)
+        if echo "$fw_output" | grep -q 'GUID\|Version'; then
+            local fw_count
+            fw_count=$(echo "$fw_output" | grep -c 'GUID' || echo "1")
+            echo "    fwupd     : ⚠ ${fw_count} update(s) available (run: fwupdmgr update)"
+            recommendations+=("${fw_count} firmware update(s) available — run: fwupdmgr update")
+        else
+            echo "    fwupd     : ✓ Up to date (cached)"
+        fi
+    else
+        echo "    fwupd     : — Not available"
+    fi
+
+    # ── Storage ───────────────────────────────────────────────────────────────
+    echo ""
+    echo "  Storage"
+    local free_mb_raw
+    free_mb_raw=$(df --output=avail /data 2>/dev/null | tail -1 | tr -d '[:space:]')
+    if [[ "$free_mb_raw" =~ ^[0-9]+$ ]]; then
+        echo "    Free      : $(( free_mb_raw / 1024 )) MB"
+    else
+        echo "    Free      : — (/data not mounted)"
+    fi
+    local btrfs_usage
+    btrfs_usage=$(btrfs filesystem usage -b / 2>/dev/null \
+        | awk '/Free \(estimated\):/ {printf "%.1f GB", $3/1024/1024/1024}' || echo "unknown")
+    echo "    Btrfs free: ${btrfs_usage}"
+
+    local backup_count
+    backup_count=$(btrfs subvolume list / 2>/dev/null \
+        | grep -cE '(blue|green)_backup_' || echo "0")
+    echo "    Backups   : ${backup_count} snapshot(s) on disk"
+
+    # Btrfs scrub — managed by btrfs-scrub.timer (btrfsmaintenance)
+    local scrub_timer_active
+    scrub_timer_active=$(systemctl is-active btrfs-scrub.timer 2>/dev/null || echo "inactive")
+    if [[ "$scrub_timer_active" == "active" ]]; then
+        # Extract human-readable last/next from systemctl status
+        local scrub_timer_last scrub_timer_next
+        scrub_timer_last=$(systemctl status btrfs-scrub.timer 2>/dev/null \
+            | awk '/Trigger:/ {$1=""; sub(/^[[:space:]]*/,"",$0); print; exit}' || echo "unknown")
+        scrub_timer_next=$(systemctl status btrfs-scrub.timer 2>/dev/null \
+            | awk '/Next trigger:/ {$1=$2=""; sub(/^[[:space:]]*/,"",$0); print; exit}' \
+            || awk '/Trigger:/ {$1=""; sub(/^[[:space:]]*/,"",$0); print; exit}' \
+            || echo "unknown")
+        echo "    Scrub tmr : ✓ Active (next: ${scrub_timer_next})"
+    else
+        echo "    Scrub tmr : ✗ btrfs-scrub.timer not active"
+        recommendations+=("btrfs-scrub.timer not active — run: systemctl enable --now btrfs-scrub.timer  [AUTOMATABLE]")
+    fi
+
+    # Last scrub result
+    local scrub_status scrub_result
+    scrub_status=$(btrfs scrub status / 2>/dev/null || true)
+    scrub_result=$(echo "$scrub_status" | awk '/Status:/ {print $2}' | head -1 || echo "")
+    if [[ "$scrub_result" == "finished" ]]; then
+        # Check specific error counters — any non-zero means data corruption
+        local read_err csum_err corr_err
+        read_err=$(echo "$scrub_status" | awk '/read_errors:/ {print $2}' | head -1 || echo "0")
+        csum_err=$(echo "$scrub_status" | awk '/csum_errors:/ {print $2}' | head -1 || echo "0")
+        corr_err=$(echo "$scrub_status" | awk '/corrected_errors:/ {print $2}' | head -1 || echo "0")
+        if [[ "${read_err:-0}" != "0" || "${csum_err:-0}" != "0" || "${corr_err:-0}" != "0" ]]; then
+            echo "    Scrub     : ✗ Errors found (read:${read_err} csum:${csum_err} corrected:${corr_err})"
+            recommendations+=("Btrfs scrub found errors — investigate: btrfs scrub status /")
+        else
+            echo "    Scrub     : ✓ Last run clean"
+        fi
+    elif [[ "$scrub_result" == "running" ]]; then
+        echo "    Scrub     : ↻ In progress"
+    elif [[ -z "$scrub_result" ]]; then
+        echo "    Scrub     : — No scrub recorded yet (first run scheduled by timer)"
+    else
+        echo "    Scrub     : ⚠ Status: ${scrub_result}"
+    fi
+
+    # Other btrfsmaintenance timers
+    local -A btrfs_timers=(
+        [balance]="btrfs-balance.timer"
+        [defrag]="btrfs-defrag.timer"
+        [trim]="btrfs-trim.timer"
+    )
+    local timer_ok=() timer_bad=()
+    for name in balance defrag trim; do
+        local unit="${btrfs_timers[$name]}"
+        if [[ "$(systemctl is-active "$unit" 2>/dev/null)" == "active" ]]; then
+            timer_ok+=("$name")
+        else
+            timer_bad+=("$name")
+        fi
+    done
+    [[ ${#timer_ok[@]} -gt 0 ]] && echo "    Maint tmr : ✓ Active: ${timer_ok[*]}"
+    if [[ ${#timer_bad[@]} -gt 0 ]]; then
+        echo "    Maint tmr : ✗ Inactive: ${timer_bad[*]}"
+        local timer_units
+        timer_units=$(printf '%s.timer ' "${timer_bad[@]}")
+        recommendations+=("Btrfs maintenance timers inactive (${timer_bad[*]}) — run: systemctl enable --now ${timer_units% }  [AUTOMATABLE]")
+    fi
+
+    echo "    ↳ Full analysis: shani-deploy --storage-info"
+
+    # ── Deployment status ─────────────────────────────────────────────────────
+    echo ""
+    echo "  Deployment"
+    if [[ -f "$DEPLOY_PENDING" ]]; then
+        echo "    State     : ⚠ Pending (interrupted deploy?) — run: shani-deploy --rollback"
+    elif [[ -f "$REBOOT_NEEDED_FILE" ]]; then
+        local pending_ver
+        pending_ver=$(cat "$REBOOT_NEEDED_FILE" 2>/dev/null | tr -cd '0-9A-Za-z.-' | head -c 32)
+        echo "    State     : ⚠ Reboot required to activate v${pending_ver}"
+    else
+        echo "    State     : ✓ Clean"
+    fi
+    # Last successful update — timestamp of /etc/shani-version as proxy
+    if [[ -f /etc/shani-version ]]; then
+        local ver_ts
+        ver_ts=$(stat -c '%y' /etc/shani-version 2>/dev/null | cut -d. -f1 || echo "unknown")
+        echo "    Installed : v${version} (since ${ver_ts})"
+    fi
+
+    # ── Security Recommendations ──────────────────────────────────────────────
+    echo ""
+    if [[ ${#recommendations[@]} -eq 0 ]]; then
+        echo "  Security   : ✓ No issues found"
+    else
+        echo "  Security Recommendations"
+        local i=1
+        for rec in "${recommendations[@]}"; do
+            printf "    %2d. %s\n" "$i" "$rec"
+            i=$((i + 1))
+        done
+        echo ""
+        echo "  Items marked [AUTOMATABLE] can be fixed by shani-deploy --fix-security"
+    fi
+
+    echo ""
+}
+
+fix_security() {
+    log_section "Security Hardening"
+    local fixed=0 failed=0
+
+    # AppArmor
+    if command -v aa-status &>/dev/null && ! aa-status --enabled >/dev/null 2>&1; then
+        log "Enabling AppArmor..."
+        if systemctl enable --now apparmor 2>/dev/null; then
+            log_success "AppArmor enabled"
+            fixed=$((fixed + 1))
+        else
+            log_warn "Failed to enable AppArmor"
+            failed=$((failed + 1))
+        fi
+    fi
+
+    # Firewall
+    if command -v firewall-cmd &>/dev/null && ! systemctl is-active --quiet firewalld 2>/dev/null; then
+        log "Enabling firewalld..."
+        if systemctl enable --now firewalld 2>/dev/null; then
+            log_success "firewalld enabled"
+            fixed=$((fixed + 1))
+        else
+            log_warn "Failed to enable firewalld"
+            failed=$((failed + 1))
+        fi
+    fi
+
+    # fail2ban
+    if command -v fail2ban-client &>/dev/null && ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+        log "Enabling fail2ban..."
+        if systemctl enable --now fail2ban 2>/dev/null; then
+            log_success "fail2ban enabled"
+            fixed=$((fixed + 1))
+        else
+            log_warn "Failed to enable fail2ban"
+            failed=$((failed + 1))
+        fi
+    fi
+
+    # Lock root account
+    local root_locked
+    root_locked=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
+    if [[ "$root_locked" == "P" ]]; then
+        log "Locking root account..."
+        if passwd -l root 2>/dev/null; then
+            log_success "Root account locked"
+            fixed=$((fixed + 1))
+        else
+            log_warn "Failed to lock root account"
+            failed=$((failed + 1))
+        fi
+    fi
+
+    # Disable SSH root login
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        local ssh_root_login
+        ssh_root_login=$(grep -rh '^PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
+            | tail -1 | awk '{print $2}' || echo "default")
+        if [[ "$ssh_root_login" == "yes" ]]; then
+            log "Disabling SSH root login..."
+            if sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config 2>/dev/null \
+                && systemctl reload sshd 2>/dev/null; then
+                log_success "SSH root login disabled"
+                fixed=$((fixed + 1))
+            else
+                log_warn "Failed to disable SSH root login"
+                failed=$((failed + 1))
+            fi
+        fi
+    fi
+
+    # systemd-boot editor
+    local _fix_esp_mounted=0
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        mount /boot/efi 2>/dev/null && _fix_esp_mounted=1
+    fi
+    if mountpoint -q /boot/efi 2>/dev/null; then
+        local editor_val
+        editor_val=$(grep '^editor' /boot/efi/loader/loader.conf 2>/dev/null | awk '{print $2}' || echo "not set")
+        if [[ "$editor_val" != "0" ]]; then
+            log "Disabling systemd-boot editor..."
+            if grep -q '^editor' /boot/efi/loader/loader.conf 2>/dev/null; then
+                sed -i 's/^editor .*/editor 0/' /boot/efi/loader/loader.conf
+            else
+                echo "editor 0" >> /boot/efi/loader/loader.conf
+            fi
+            log_success "systemd-boot editor disabled"
+            fixed=$((fixed + 1))
+        fi
+        [[ $_fix_esp_mounted -eq 1 ]] && umount /boot/efi 2>/dev/null || true
+    fi
+
+    # btrfsmaintenance timers
+    for timer in btrfs-scrub.timer btrfs-balance.timer btrfs-defrag.timer btrfs-trim.timer; do
+        if [[ "$(systemctl is-active "$timer" 2>/dev/null)" != "active" ]]; then
+            log "Enabling ${timer}..."
+            if systemctl enable --now "$timer" 2>/dev/null; then
+                log_success "${timer} enabled"
+                fixed=$((fixed + 1))
+            else
+                log_warn "Failed to enable ${timer}"
+                failed=$((failed + 1))
+            fi
+        fi
+    done
+
+    # bees deduplication daemon
+    local bees_uuid
+    bees_uuid=$(blkid -s UUID -o value /dev/disk/by-label/${ROOTLABEL} 2>/dev/null || true)
+    if [[ -z "$bees_uuid" ]] && [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        bees_uuid=$(blkid -s UUID -o value /dev/mapper/${ROOTLABEL} 2>/dev/null || true)
+    fi
+    if [[ -n "$bees_uuid" ]]; then
+        local bees_unit="beesd@${bees_uuid}"
+        if [[ "$(systemctl is-active "$bees_unit" 2>/dev/null)" != "active" ]]; then
+            if [[ ! -f "/etc/bees/${bees_uuid}.conf" ]]; then
+                log_warn "bees not configured yet — run beesd-setup.service first"
+                log_warn "  systemctl start beesd-setup.service"
+                failed=$((failed + 1))
+            else
+                log "Enabling ${bees_unit}..."
+                if systemctl enable --now "$bees_unit" 2>/dev/null; then
+                    log_success "${bees_unit} enabled"
+                    fixed=$((fixed + 1))
+                else
+                    log_warn "Failed to enable ${bees_unit}"
+                    failed=$((failed + 1))
+                fi
+            fi
+        fi
+    fi
+
+    # TPM2 enrollment — prompt user, cannot do silently
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]] && [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then
+        if ! systemd-cryptenroll "$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+            | sed -n 's/^ *device: //p')" 2>/dev/null | grep -q "tpm2"; then
+            log_warn "TPM2 not enrolled — cannot automate (requires credential input)"
+            log_warn "Run manually: gen-efi enroll-tpm2"
+        fi
+    fi
+
+    echo ""
+    if (( fixed > 0 || failed > 0 )); then
+        log "Fixed: ${fixed} | Failed: ${failed}"
+    else
+        log_success "Nothing to fix — system already hardened"
+    fi
+    echo ""
+    log "Run 'shani-deploy --info' to verify current security status"
+}
+
 #####################################
 ### Main Entry Point              ###
 #####################################
@@ -2464,6 +3290,8 @@ Usage: $0 [OPTIONS]
 
 Options:
   -h, --help              Show help
+  -i, --info              Show system status (Secure Boot, encryption, slots, TPM2)
+  --fix-security          Auto-fix security issues found by --info (services, SSH, boot editor)
   -r, --rollback          Roll back the non-booted slot. IMPORTANT: run from the slot you want to KEEP.
   -c, --cleanup           Manual cleanup
   -s, --storage-info      Storage analysis (read-only)
@@ -2477,11 +3305,13 @@ EOF
 }
 
 main() {
-    local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no" STORAGE_OPTIMIZE="no"
+    local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no" STORAGE_OPTIMIZE="no" SYSTEM_INFO="no" FIX_SECURITY="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
+            -i|--info) SYSTEM_INFO="yes"; shift ;;
+            --fix-security) FIX_SECURITY="yes"; shift ;;
             -r|--rollback) ROLLBACK="yes"; shift ;;
             -c|--cleanup) CLEANUP="yes"; shift ;;
             -s|--storage-info) STORAGE_INFO="yes"; shift ;;
@@ -2498,6 +3328,16 @@ main() {
 
     check_root
     [[ "${DRY_RUN}" == "yes" ]] && log_warn "[DRY-RUN] Simulation mode active — no changes will be made to the system"
+
+    if [[ "$SYSTEM_INFO" == "yes" ]]; then
+        system_info
+        exit 0
+    fi
+
+    if [[ "$FIX_SECURITY" == "yes" ]]; then
+        fix_security
+        exit 0
+    fi
     check_tools
     set_update_channel "${UPDATE_CHANNEL:-}"
     set_environment
@@ -2575,7 +3415,11 @@ main() {
 
     download_update || die "Download failed"
     deploy_update || die "Deployment failed"
-    [[ -f "$DEPLOY_PENDING" ]] && finalize_update || log_warn "Deployment pipeline completed but no pending flag was found — state may be inconsistent"
+    if [[ -f "$DEPLOY_PENDING" ]]; then
+        finalize_update
+    else
+        log_warn "Deployment pipeline completed but no pending flag was found — state may be inconsistent"
+    fi
 }
 
 main "$@"

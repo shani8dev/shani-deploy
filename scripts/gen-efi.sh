@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # gen-efi.sh – Generate and update the Unified Kernel Image (UKI) for Secure Boot.
 #
 # Usage: ./gen-efi.sh configure <target_slot>
@@ -34,30 +34,37 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" ]]; then
-    echo "Usage: $0 configure <target_slot>"
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-tpm2" ]]; then
+    echo "Usage:"
+    echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
+    echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     exit 1
 fi
 
-if [[ -z "${2:-}" ]]; then
-    echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Missing target slot. Usage: $0 configure <target_slot>" >&2
-    exit 1
-fi
-
-TARGET_SLOT="$2"
-if [[ ! "$TARGET_SLOT" =~ ^(blue|green)$ ]]; then
-    echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Invalid target slot '$TARGET_SLOT' — must be 'blue' or 'green'." >&2
-    exit 1
+# TARGET_SLOT only required for configure
+if [[ "${1:-}" == "configure" ]]; then
+    if [[ -z "${2:-}" ]]; then
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Missing target slot. Usage: $0 configure <target_slot>" >&2
+        exit 1
+    fi
+    TARGET_SLOT="$2"
+    if [[ ! "$TARGET_SLOT" =~ ^(blue|green)$ ]]; then
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Invalid target slot '$TARGET_SLOT' — must be 'blue' or 'green'." >&2
+        exit 1
+    fi
+    CMDLINE_FILE="/etc/kernel/install_cmdline_${TARGET_SLOT}"
+else
+    TARGET_SLOT=""
+    CMDLINE_FILE=""
 fi
 
 # Configuration
-OS_NAME="shanios"
-ESP="/boot/efi"
-EFI_DIR="$ESP/EFI/${OS_NAME}"
-CMDLINE_FILE="/etc/kernel/install_cmdline_${TARGET_SLOT}"
-MOK_KEY="/etc/secureboot/keys/MOK.key"
-MOK_CRT="/etc/secureboot/keys/MOK.crt"
-ROOTLABEL="shani_root"
+readonly OS_NAME="shanios"
+readonly ESP="/boot/efi"
+readonly EFI_DIR="$ESP/EFI/${OS_NAME}"
+readonly MOK_KEY="/etc/secureboot/keys/MOK.key"
+readonly MOK_CRT="/etc/secureboot/keys/MOK.crt"
+readonly ROOTLABEL="shani_root"
 
 # Ensure MOK keys exist — they are normally placed by build-base-image.sh and
 # verified by configure.sh at install time. If missing (e.g. custom image built
@@ -180,7 +187,7 @@ in_chroot() {
 }
 
 # Get currently booted slot — unified implementation matching shani-deploy/shani-update.
-get_booted_slot() {
+get_booted_subvol() {
     local rootflags subvol
     rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
     subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
@@ -203,7 +210,8 @@ validate_target_slot() {
     fi
 
     # Get booted slot
-    local booted=$(get_booted_slot)
+    local booted
+    booted=$(get_booted_subvol)
     log "Booted slot: @${booted}"
     log "Target slot: @${target}"
 
@@ -501,16 +509,124 @@ generate_uki() {
 
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
+}
 
+# enroll_tpm2 — enroll the TPM2 chip into the LUKS2 volume for automatic unlock.
+#
+# Must run on the LIVE booted system (not in a chroot) — it talks to real TPM
+# hardware and seals against current PCR values.
+#
+# PCR policy (matches wiki.shani.dev instructions):
+#   With Secure Boot:    PCR 0+7
+#     PCR 0 — firmware/BIOS measurements (detects firmware tampering)
+#     PCR 7 — Secure Boot state (UEFI db/dbx/pk certificates)
+#   Without Secure Boot: PCR 0 only
+#
+# The sealed key is released only if the firmware and Secure Boot state
+# match exactly what was recorded at enrollment time. An attacker with a
+# different boot chain cannot unseal the key.
+#
+# Your LUKS passphrase remains valid as a fallback at all times.
+# Re-enroll after: firmware updates, enabling/disabling Secure Boot, MOK changes.
+enroll_tpm2() {
+    # Must run on live system — TPM hardware not accessible in chroot
+    if in_chroot; then
+        error_exit "enroll-tpm2 must run on the live booted system, not inside a chroot"
+    fi
 
+    # Encryption must be active
+    if [[ ! -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        error_exit "No LUKS mapper /dev/mapper/${ROOTLABEL} found — system does not appear to be encrypted"
+    fi
+
+    # systemd-cryptenroll required
+    if ! command -v systemd-cryptenroll &>/dev/null; then
+        error_exit "systemd-cryptenroll not found — install systemd (tpm2-tss must also be installed)"
+    fi
+
+    # Verify TPM2 device is present
+    log "Checking TPM2 device..."
+    if ! systemd-cryptenroll --tpm2-device=list 2>/dev/null | grep -q .; then
+        error_exit "No TPM2 device found — ensure TPM 2.0 is enabled in BIOS/UEFI"
+    fi
+
+    # Derive the underlying LUKS block device
+    local underlying
+    underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+        | sed -n 's/^ *device: //p' || true)
+    [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
+    log "LUKS device: ${underlying}"
+
+    # Choose PCR policy based on Secure Boot state
+    local pcrs
+    local sb_state
+    sb_state=$(mokutil --sb-state 2>/dev/null || true)
+    if [[ "$sb_state" == *"SecureBoot enabled"* ]]; then
+        pcrs="0+7"
+        log "Secure Boot is enabled — using PCR policy: ${pcrs} (firmware + Secure Boot state)"
+    else
+        pcrs="0"
+        log_warn "Secure Boot is not enabled — using PCR policy: ${pcrs} (firmware only)"
+        log_warn "Without Secure Boot, an attacker with physical access could replace the bootloader to steal the key"
+        log_warn "Consider enabling Secure Boot for maximum protection"
+    fi
+
+    # Check if TPM2 is already enrolled — wipe old slot before re-enrolling
+    local wipe_flag=""
+    if systemd-cryptenroll "$underlying" 2>/dev/null | grep -q tpm2; then
+        log_warn "TPM2 slot already enrolled — wiping old slot before re-enrolling"
+        wipe_flag="--wipe-slot=tpm2"
+    fi
+
+    log "Enrolling TPM2..."
+    local keyfile="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
+    if [[ -f "$keyfile" ]]; then
+        # Keyfile-based system (no PIN set at install) — must unlock via keyfile
+        # since no passphrase was set. The keyfile is the only non-TPM credential.
+        log "Keyfile system detected — unlocking via ${keyfile}"
+        systemd-cryptenroll \
+            --tpm2-device=auto \
+            --tpm2-pcrs="${pcrs}" \
+            ${wipe_flag:+"$wipe_flag"} \
+            --unlock-key-file="$keyfile" \
+            "$underlying" \
+            || error_exit "TPM2 enrollment failed"
+    else
+        # PIN system — LUKS passphrase was set at install, prompt interactively
+        log "PIN system detected — you will be prompted for your LUKS passphrase"
+        systemd-cryptenroll \
+            --tpm2-device=auto \
+            --tpm2-pcrs="${pcrs}" \
+            ${wipe_flag:+"$wipe_flag"} \
+            "$underlying" \
+            || error_exit "TPM2 enrollment failed"
+    fi
+
+    log "TPM2 enrolled successfully with PCR policy: ${pcrs}"
+    log "The disk will unlock automatically on next boot"
+    log ""
+    log "Important reminders:"
+    log "  - Your LUKS passphrase remains valid as fallback"
+    log "  - Re-enroll after firmware updates, Secure Boot changes, or MOK changes:"
+    log "      gen-efi enroll-tpm2"
+    log "  - To remove TPM enrollment:"
+    log "      systemd-cryptenroll --wipe-slot=tpm2 ${underlying}"
+    log "  - Verify enrollment:"
+    log "      cryptsetup luksDump ${underlying} | grep systemd-tpm2"
+}
 
 case "${1:-}" in
     configure)
         generate_uki "$TARGET_SLOT"
         log "UKI generated for ${TARGET_SLOT}"
         ;;
+    enroll-tpm2)
+        enroll_tpm2
+        ;;
     *)
-        echo "Usage: $0 configure <target_slot>"
+        echo "Usage:"
+        echo "  $0 configure <target_slot>"
+        echo "  $0 enroll-tpm2"
         exit 1
         ;;
 esac

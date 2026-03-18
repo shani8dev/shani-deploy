@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # shani-update — ShaniOS update manager
 #
 # Handles fallback-boot detection, candidate-boot testing, rollback, and
@@ -13,6 +13,8 @@
 #   shani-update --verbose        Verbose output from shani-deploy
 #   shani-update --dry-run        Simulate without changes
 #   shani-update --storage-info   Show disk/storage analysis
+#   shani-update --info           Show system status (Secure Boot, encryption, TPM2…)
+#   shani-update --fix-security   Auto-fix security issues found by --info
 #
 # Install: /usr/local/bin/shani-update
 # Autostart desktop entry: Exec=shani-update --startup
@@ -63,7 +65,7 @@ mkdir -p "$LOG_DIR"
 ### Global State                  ###
 #####################################
 
-MODE="interactive"          # interactive | startup | rollback | storage-info
+MODE="interactive"          # interactive | startup | rollback | storage-info | info | fix-security
 FORCE_UPDATE="no"
 DEPLOY_CHANNEL="$UPDATE_CHANNEL_DEFAULT"
 VERBOSE_DEPLOY="no"
@@ -404,6 +406,7 @@ _run_rollback() {
     _build_pkexec_env pkexec_args
     pkexec_args+=("$DEPLOY_BIN" --rollback)
     [[ "$VERBOSE_DEPLOY" == "yes" ]] && pkexec_args+=(--verbose)
+    [[ "$DRY_RUN_DEPLOY" == "yes" ]] && pkexec_args+=(--dry-run)
 
     local -a terminal_args
     _build_terminal_args "$TERMINAL" "$title" terminal_args "${pkexec_args[@]}"
@@ -486,6 +489,9 @@ _handle_fallback_boot() {
         log "User approved rollback of @${FAILED_SLOT}"
         if _run_rollback "Shani OS — Rollback"; then
             log "Rollback succeeded"
+            # Clear failure markers now that rollback is done
+            rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" \
+                  "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
             _post_rollback_dialog
             _cleanup_and_exit 0
         else
@@ -814,6 +820,8 @@ main() {
             --startup)          MODE="startup";       shift ;;
             -r|--rollback)      MODE="rollback";      shift ;;
             -s|--storage-info)  MODE="storage-info";  shift ;;
+            -i|--info)          MODE="info";           shift ;;
+            --fix-security)     MODE="fix-security";  shift ;;
             -f|--force)         FORCE_UPDATE="yes";   shift ;;
             -t|--channel)       DEPLOY_CHANNEL="$2";  shift 2 ;;
             -v|--verbose)       VERBOSE_DEPLOY="yes"; shift ;;
@@ -824,6 +832,8 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --startup           Run at login: fallback check → candidate check → update check
+  -i, --info          Show system status (Secure Boot, encryption, slots, TPM2, services)
+  --fix-security      Auto-fix security issues found by --info
   -r, --rollback      Roll back the inactive slot immediately
   -f, --force         Force deploy even if version matches or slot mismatch
   -t, --channel CHAN  Update channel: stable|latest  (default: $UPDATE_CHANNEL_DEFAULT)
@@ -841,9 +851,19 @@ EOF
 
     log "shani-update v${SCRIPT_VERSION} mode=${MODE}"
 
-    # storage-info: no lock needed, just pass through
+    # storage-info / info / fix-security: no lock needed, just pass through to shani-deploy
     if [[ "$MODE" == "storage-info" ]]; then
         pkexec "$DEPLOY_BIN" --storage-info
+        exit $?
+    fi
+
+    if [[ "$MODE" == "info" ]]; then
+        pkexec "$DEPLOY_BIN" --info
+        exit $?
+    fi
+
+    if [[ "$MODE" == "fix-security" ]]; then
+        pkexec "$DEPLOY_BIN" --fix-security
         exit $?
     fi
 

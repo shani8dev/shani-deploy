@@ -78,6 +78,9 @@ KEEP_DOWNLOADS="no"
 WIPE_HOME="no"
 SKIP_CONFIRM="no"
 
+# Save original args before parsing — needed to re-exec with pkexec/sudo
+declare -a ORIGINAL_ARGS=("$@")
+
 usage() {
     cat >&2 <<EOF
 
@@ -133,9 +136,9 @@ done
 if [[ $(id -u) -ne 0 ]]; then
     self=$(readlink -f "$0")
     if command -v pkexec &>/dev/null; then
-        exec pkexec "$self" "$@"
+        exec pkexec "$self" "${ORIGINAL_ARGS[@]}"
     elif command -v sudo &>/dev/null; then
-        exec sudo "$self" "$@"
+        exec sudo "$self" "${ORIGINAL_ARGS[@]}"
     else
         die "Must run as root."
     fi
@@ -175,6 +178,13 @@ BOOTED_SLOT="${BOOTED_SLOT#@}"
     die "Cannot detect booted slot from /proc/cmdline or btrfs get-default. Aborting."
 
 log "Booted slot: @${BOOTED_SLOT}"
+
+# Guard: refuse to reset while a deployment is mid-flight
+if [[ -f "${DATA_DIR}/deployment_pending" ]]; then
+    die "A shani-deploy is currently in progress (${DATA_DIR}/deployment_pending exists). " \
+        "Complete or roll back the deployment before resetting. " \
+        "Run: shani-deploy --rollback"
+fi
 
 ##############################################################################
 ### Confirmation
@@ -265,14 +275,20 @@ else
 
     log "Wiping persistent service state (/data/varlib)..."
     if [[ -d "${DATA_DIR}/varlib" ]]; then
-        run find "${DATA_DIR}/varlib" -mindepth 2 -delete 2>/dev/null || true
-        log_ok "  /data/varlib/* cleared (directories preserved for bind mounts)"
+        # -mindepth 3: delete files/dirs inside service dirs (e.g. /data/varlib/NM/file)
+        # but preserve the service dirs themselves (e.g. /data/varlib/NetworkManager/)
+        # so bind mount targets still exist on next boot.
+        # Also remove any plain files at depth 2 (stale state files directly in varlib/).
+        run find "${DATA_DIR}/varlib" -mindepth 3 -delete 2>/dev/null || true
+        run find "${DATA_DIR}/varlib" -mindepth 2 -maxdepth 2 -type f -delete 2>/dev/null || true
+        log_ok "  /data/varlib/* cleared (service directories preserved for bind mounts)"
     fi
 
     log "Wiping job scheduler spools (/data/varspool)..."
     if [[ -d "${DATA_DIR}/varspool" ]]; then
-        run find "${DATA_DIR}/varspool" -mindepth 2 -delete 2>/dev/null || true
-        log_ok "  /data/varspool/* cleared"
+        run find "${DATA_DIR}/varspool" -mindepth 3 -delete 2>/dev/null || true
+        run find "${DATA_DIR}/varspool" -mindepth 2 -maxdepth 2 -type f -delete 2>/dev/null || true
+        log_ok "  /data/varspool/* cleared (spool directories preserved)"
     fi
 
     log "Wiping boot state markers..."
@@ -308,10 +324,27 @@ if [[ "$DRY_RUN" == "yes" ]]; then
     echo "  [DRY-RUN] Would write: /data/current-slot=${BOOTED_SLOT}" >&2
     echo "  [DRY-RUN] Would write: /data/previous-slot=${INACTIVE_SLOT}" >&2
 else
-    echo "$BOOTED_SLOT"  > "${DATA_DIR}/current-slot"
+    echo "$BOOTED_SLOT"   > "${DATA_DIR}/current-slot"
     echo "$INACTIVE_SLOT" > "${DATA_DIR}/previous-slot"
     log_ok "  current-slot=${BOOTED_SLOT}, previous-slot=${INACTIVE_SLOT}"
 fi
+
+# ── Write user-setup-needed marker ─────────────────────────────────────────────
+# After reset the /etc overlay is empty — all user accounts are gone. On next
+# boot shani-user-setup.service must run to provision any newly created user.
+# This mirrors what shani-deploy does after every slot switch.
+if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "  [DRY-RUN] Would write: /data/user-setup-needed" >&2
+else
+    touch "${DATA_DIR}/user-setup-needed" && chmod 644 "${DATA_DIR}/user-setup-needed" \
+        || log_warn "Failed to write user-setup-needed marker (non-fatal)"
+    log_ok "  user-setup-needed marker written"
+fi
+
+# ── Clear any stale reboot-needed marker ───────────────────────────────────────
+# /run is tmpfs and will be cleared on reboot anyway, but clean it now so the
+# update notification dialog doesn't appear immediately after the reset boot.
+rm -f /run/shanios/reboot-needed 2>/dev/null || true
 
 # ── Optional: wipe /home ───────────────────────────────────────────────────────
 if [[ "$WIPE_HOME" == "yes" ]]; then

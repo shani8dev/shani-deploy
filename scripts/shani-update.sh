@@ -12,9 +12,7 @@
 #   shani-update --channel CHAN   Update channel: stable|latest (default: stable)
 #   shani-update --verbose        Verbose output from shani-deploy
 #   shani-update --dry-run        Simulate without changes
-#   shani-update --storage-info   Show disk/storage analysis
-#   shani-update --info           Show system status (Secure Boot, encryption, TPM2…)
-#   shani-update --fix-security   Auto-fix security issues found by --info
+#   shani-update
 #
 # Install: /usr/local/bin/shani-update
 # Autostart desktop entry: Exec=shani-update --startup
@@ -65,7 +63,7 @@ mkdir -p "$LOG_DIR"
 ### Global State                  ###
 #####################################
 
-MODE="interactive"          # interactive | startup | rollback | storage-info | info | fix-security
+MODE="interactive"          # interactive | startup | rollback
 FORCE_UPDATE="no"
 DEPLOY_CHANNEL="$UPDATE_CHANNEL_DEFAULT"
 VERBOSE_DEPLOY="no"
@@ -489,7 +487,9 @@ _handle_fallback_boot() {
         log "User approved rollback of @${FAILED_SLOT}"
         if _run_rollback "Shani OS — Rollback"; then
             log "Rollback succeeded"
-            # Clear failure markers now that rollback is done
+            # Clear failure markers now that rollback is done.
+            # shani-deploy --rollback also clears these, but we do it here too
+            # for the case where rollback is invoked via shani-update's GUI path.
             rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" \
                   "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
             _post_rollback_dialog
@@ -502,7 +502,11 @@ _handle_fallback_boot() {
             _cleanup_and_exit 1
         fi
     else
-        log "User declined rollback"
+        log "User declined rollback — exiting to avoid running update check in degraded state"
+        # Do not fall through to _check_candidate_boot or _run_update_check:
+        # current-slot still points to the failed slot, so shani-deploy would
+        # hit a slot mismatch. The user must rollback or reboot before updating.
+        _cleanup_and_exit 0
     fi
 }
 
@@ -524,6 +528,11 @@ _handle_candidate_boot() {
         FAILED_SLOT="$candidate"
         if _run_rollback "Shani OS — Rollback"; then
             log "Rollback from candidate boot succeeded"
+            # Clear any failure markers left from earlier in this session or a
+            # prior boot — shani-deploy --rollback clears them too, but be
+            # explicit here for symmetry with _handle_fallback_boot.
+            rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" \
+                  "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
             _post_rollback_dialog
             _cleanup_and_exit 0
         else
@@ -819,9 +828,6 @@ main() {
         case "$1" in
             --startup)          MODE="startup";       shift ;;
             -r|--rollback)      MODE="rollback";      shift ;;
-            -s|--storage-info)  MODE="storage-info";  shift ;;
-            -i|--info)          MODE="info";           shift ;;
-            --fix-security)     MODE="fix-security";  shift ;;
             -f|--force)         FORCE_UPDATE="yes";   shift ;;
             -t|--channel)       DEPLOY_CHANNEL="$2";  shift 2 ;;
             -v|--verbose)       VERBOSE_DEPLOY="yes"; shift ;;
@@ -832,14 +838,11 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --startup           Run at login: fallback check → candidate check → update check
-  -i, --info          Show system status (Secure Boot, encryption, slots, TPM2, services)
-  --fix-security      Auto-fix security issues found by --info
   -r, --rollback      Roll back the inactive slot immediately
   -f, --force         Force deploy even if version matches or slot mismatch
   -t, --channel CHAN  Update channel: stable|latest  (default: $UPDATE_CHANNEL_DEFAULT)
   -v, --verbose       Verbose output from shani-deploy
   -d, --dry-run       Simulate deployment without changes
-  -s, --storage-info  Show disk usage and storage analysis
   -h, --help          Show this help
 
 Autostart:  Exec=shani-update --startup
@@ -852,20 +855,6 @@ EOF
     log "shani-update v${SCRIPT_VERSION} mode=${MODE}"
 
     # storage-info / info / fix-security: no lock needed, just pass through to shani-deploy
-    if [[ "$MODE" == "storage-info" ]]; then
-        pkexec "$DEPLOY_BIN" --storage-info
-        exit $?
-    fi
-
-    if [[ "$MODE" == "info" ]]; then
-        pkexec "$DEPLOY_BIN" --info
-        exit $?
-    fi
-
-    if [[ "$MODE" == "fix-security" ]]; then
-        pkexec "$DEPLOY_BIN" --fix-security
-        exit $?
-    fi
 
     _validate_environment
 
@@ -890,15 +879,19 @@ EOF
     # ── Startup mode (continued after lock) ───────────────────────────────────
     if [[ "$MODE" == "startup" ]]; then
 
+        # Fallback/failure check runs first — it is the most urgent condition
+        # and must not be masked by a stale reboot-needed marker. A boot failure
+        # means the system is in a degraded state; showing a "restart to activate
+        # update" dialog instead would be misleading and block recovery.
+        log "=== Startup: checking fallback boot ==="
+        if _check_fallback_boot; then
+            _handle_fallback_boot
+        fi
+
         log "=== Startup: checking reboot needed ==="
         if _check_reboot_needed; then
             _handle_reboot_needed
             _cleanup_and_exit 0
-        fi
-
-        log "=== Startup: checking fallback boot ==="
-        if _check_fallback_boot; then
-            _handle_fallback_boot
         fi
 
         log "=== Startup: checking candidate boot ==="
@@ -919,6 +912,10 @@ EOF
         FAILED_SLOT=$(_other_slot "$BOOTED_SLOT")
         if _run_rollback "Shani OS — Rollback"; then
             log "Rollback succeeded"
+            # shani-deploy --rollback clears these, but also clear here so the
+            # markers are gone regardless of which binary does the actual work.
+            rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" \
+                  "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
             _post_rollback_dialog
             _cleanup_and_exit 0
         else
@@ -928,15 +925,15 @@ EOF
     fi
 
     # ── Interactive update mode ───────────────────────────────────────────────
+    log "=== Interactive: checking fallback boot ==="
+    if _check_fallback_boot; then
+        _handle_fallback_boot
+    fi
+
     log "=== Interactive: checking reboot needed ==="
     if _check_reboot_needed; then
         _handle_reboot_needed
         _cleanup_and_exit 0
-    fi
-
-    log "=== Interactive: checking fallback boot ==="
-    if _check_fallback_boot; then
-        _handle_fallback_boot
     fi
 
     log "=== Interactive: checking candidate boot ==="

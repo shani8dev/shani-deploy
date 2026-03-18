@@ -2523,6 +2523,24 @@ set_channel_persistent() {
     log "Next update will use the '${chan}' channel automatically"
 }
 
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  -h, --help              Show help
+  -r, --rollback          Roll back the non-booted slot. IMPORTANT: run from the slot you want to KEEP.
+  -c, --cleanup           Manual cleanup
+  -s, --storage-info      Storage analysis (read-only)
+  -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
+  -t, --channel <chan>    Update channel (latest|stable)
+  -f, --force             Deploy even if version matches or boot mismatch
+  -d, --dry-run           Simulate
+  -v, --verbose           Verbose output
+  --set-channel           permantly set channel in /etc/shani-channel (latest|stable)
+  --skip-self-update      Skip auto-update
+EOF
+
 main() {
     local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no" STORAGE_OPTIMIZE="no"
     local SET_CHANNEL="no" SET_CHANNEL_VAL=""

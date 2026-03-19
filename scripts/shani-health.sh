@@ -9,7 +9,7 @@
 #   shani-health --fix      Auto-fix all [auto] issues
 #   shani-health --verify            Deep integrity check: UKI sigs + Btrfs scrub
 #   shani-health --history [N]       Last N deploy/rollback events (default: 50)
-#   shani-health --storage-info      Btrfs storage analysis (delegates to shani-deploy)
+#   shani-health --storage-info      Btrfs storage analysis (native, no shani-deploy needed)
 #   shani-health --export-logs [DIR] Bundle logs + state for bug reports
 #
 # Install:  cp shani-health /usr/local/bin/shani-health && chmod +x $_
@@ -26,7 +26,7 @@ IFS=$'\n\t'
 ### Constants                                                                ###
 ###############################################################################
 
-readonly SCRIPT_VERSION="2.4"
+readonly SCRIPT_VERSION="3.3"
 readonly OS_NAME="shanios"
 readonly ROOTLABEL="shani_root"
 readonly ROOT_DEV="/dev/disk/by-label/shani_root"
@@ -36,6 +36,8 @@ readonly DEPLOY_BIN="/usr/local/bin/shani-deploy"
 readonly USER_SETUP_BIN="/usr/local/bin/shani-user-setup"
 readonly DEPLOY_LOG="/var/log/shanios-deploy.log"
 readonly CHANNEL_FILE="/etc/shani-channel"
+readonly GPG_SIGNING_KEY="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
+readonly GPG_SIGNING_KEY_FILE="/etc/shani-keys/signing.asc"
 
 # /data state markers
 readonly DATA_BOOT_OK="/data/boot-ok"
@@ -49,6 +51,10 @@ readonly DATA_REBOOT_NEEDED="/run/shanios/reboot-needed"
 
 declare -a ORIGINAL_ARGS=("$@")
 VERBOSE="no"
+
+# Caller identity — resolved once; used everywhere sudo/pkexec was invoked
+# Priority: SUDO_USER (sudo) → SHANI_CALLER_USER (pkexec env) → USER → id -un
+_CALLER_USER="${SUDO_USER:-${SHANI_CALLER_USER:-${USER:-$(id -un 2>/dev/null || echo "")}}}"
 
 ###############################################################################
 ### Privilege escalation                                                     ###
@@ -210,6 +216,60 @@ declare -a _RECS=()
 _rec()        { _RECS+=("$*"); }
 _recs_reset() { _RECS=(); }
 
+# Join array elements with a space, regardless of IFS.
+# Usage: local s; s=$(_join "${arr[@]}")
+_join() { local IFS=' '; echo "$*"; }
+
+# Populate an array with all interactive login users (uid>=1000, real shell).
+# Usage: local -a users=(); _get_login_users users
+_get_login_users() {
+    local -n _glu_arr="$1"
+    _glu_arr=()
+    while IFS=: read -r name _ uid _ _ _ shell; do
+        [[ "$uid" -ge 1000 ]] 2>/dev/null || continue
+        [[ "$name" == "nobody" ]] && continue
+        [[ "$shell" == */nologin || "$shell" == */false ]] && continue
+        _glu_arr+=("$name")
+    done < /etc/passwd 2>/dev/null || true
+}
+
+# Resolve the Btrfs filesystem UUID for the shani_root label (LUKS-aware).
+# Echoes UUID or "".
+_get_bees_uuid() {
+    local uuid
+    uuid=$(blkid -s UUID -o value "/dev/disk/by-label/${ROOTLABEL}" 2>/dev/null || true)
+    [[ -z "$uuid" && -e "/dev/mapper/${ROOTLABEL}" ]] && \
+        uuid=$(blkid -s UUID -o value "/dev/mapper/${ROOTLABEL}" 2>/dev/null || true)
+    echo "${uuid:-}"
+}
+
+# Recursive unmount helper used by analyze_storage (uses existing _is_mounted).
+_umount_r() {
+    local tgt="$1"
+    _is_mounted "$tgt" || return 0
+    umount -R "$tgt" 2>/dev/null || umount -R -l "$tgt" 2>/dev/null || true
+}
+
+# Run a systemctl --user command as the calling user's session.
+# Must be called after _CALLER_USER is set.
+# Usage: _sysd_user is-active foo.service
+_sysd_user() {
+    if [[ "$_CALLER_USER" != "root" && -n "$_CALLER_USER" ]]; then
+        local _uid; _uid=$(id -u "$_CALLER_USER" 2>/dev/null || echo "")
+        if [[ -n "$_uid" ]]; then
+            sudo -u "$_CALLER_USER" \
+                env \
+                XDG_RUNTIME_DIR="/run/user/${_uid}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${_uid}/bus" \
+                systemctl --user "$@"
+        else
+            sudo -u "$_CALLER_USER" systemctl --user "$@"
+        fi
+    else
+        systemctl --user "$@"
+    fi
+}
+
 ###############################################################################
 ### Section helpers                                                          ###
 ###############################################################################
@@ -279,7 +339,13 @@ _section_os_slots() {
         _row "Active"    "!   @${booted}  (new v${rver} ready — reboot to activate @${slot_current})"
     elif [[ -f "$DATA_BOOT_FAIL" || -f "$DATA_BOOT_HARD_FAIL" ]]; then
         # Booted slot != current-slot AND failure marker present = fallback boot
-        _row "Active"    "!!  @${booted}  (FALLBACK — @${slot_current} failed to boot)"
+        # Read the actual failed slot from the marker file rather than assuming it's slot_current
+        local _failed_slot
+        _failed_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' || \
+                       cat "$DATA_BOOT_HARD_FAIL" 2>/dev/null | tr -d '[:space:]' || \
+                       echo "$slot_current")
+        [[ -z "$_failed_slot" ]] && _failed_slot="$slot_current"
+        _row "Active"    "!!  @${booted}  (FALLBACK — @${_failed_slot} failed to boot)"
         _rec "Fallback boot confirmed — run: shani-deploy --rollback"
     else
         # Mismatch with no reboot-needed and no failure = unexpected
@@ -301,6 +367,10 @@ _section_os_slots() {
             # an emergency. Inform the user but don't trigger rollback rec here
             # (Boot Health section handles the rec).
             _row "Fallback"  "!   @${_fallback_slot}  (prior boot failure recorded — may need: shani-deploy --rollback)"
+        elif [[ "$_fail_slot" == "$booted" ]]; then
+            # The failing slot IS the one we're currently booted into — it had a
+            # prior failure but succeeded this boot. The previous slot is the fallback.
+            _row "Fallback"  "--  @${slot_previous}  (active slot @${booted} had prior failure — run: shani-health --clear-boot-failure)"
         elif [[ "$_fail_slot" == "$slot_previous" ]]; then
             _row "Fallback"  "!   @${slot_previous}  (has recorded boot failure — run: shani-deploy --rollback)"
         else
@@ -331,8 +401,8 @@ _section_boot_health() {
         fi
     done
     if [[ ${#chain_failed[@]} -gt 0 ]]; then
-        _row "Boot chain" "!!  failed this boot: ${chain_failed[*]}"
-        _rec "Boot chain service(s) failed: ${chain_failed[*]} — run: systemctl status <unit>"
+        _row "Boot chain" "!!  failed this boot: $(_join "${chain_failed[@]}")"
+        _rec "Boot chain service(s) failed: $(_join "${chain_failed[@]}") — run: systemctl status <unit>"
     fi
 
     # ── Overlay boot services ─────────────────────────────────────────────────
@@ -347,8 +417,8 @@ _section_boot_health() {
         fi
     done
     if [[ ${#overlay_boot_failed[@]} -gt 0 ]]; then
-        _row "Overlay boot" "!!  failed: ${overlay_boot_failed[*]}"
-        _rec "Overlay boot service(s) failed: ${overlay_boot_failed[*]} — run: systemctl status <unit>"
+        _row "Overlay boot" "!!  failed: $(_join "${overlay_boot_failed[@]}")"
+        _rec "Overlay boot service(s) failed: $(_join "${overlay_boot_failed[@]}") — run: systemctl status <unit>"
     fi
 
     # ── boot-ok: written by mark-boot-success after multi-user.target ────────
@@ -393,10 +463,15 @@ _section_boot_health() {
             # Healthy: booted into the right slot; failure is for the other (fallback) slot.
             # This is a stale marker from a previous incident — not an emergency.
             _row "Failure"    "--  prior boot failure recorded for @${s} (current boot is healthy)"
-            _rec "Stale boot failure marker for @${s} — system is running correctly on @${booted_slot}; run: shani-deploy --rollback to repair @${s} and clear the marker"
+            _rec "Stale boot failure marker for @${s} — run: shani-health --clear-boot-failure to remove it  [auto]"
+        elif [[ "$s" == "$booted_slot" ]]; then
+            # The failure marker names the slot we're currently booted into —
+            # it had a prior failed attempt but succeeded this boot.
+            _row "Failure"    "--  prior boot failure recorded for @${s} (booted successfully this time)"
+            _rec "Stale boot failure marker for @${s} — run: shani-health --clear-boot-failure to remove it  [auto]"
         else
             _row "Failure"    "!   boot failure recorded for @${s}"
-            _rec "Boot failure for @${s} — run: shani-deploy --rollback"
+            # Slots section already emits a rollback rec for this case; skip duplicate
         fi
     fi
 
@@ -449,7 +524,162 @@ _section_boot_health() {
         _rec "check-boot-failure.timer is disabled — automatic boot failure detection is broken"
     elif [[ "$cbf_active" == "failed" ]]; then
         _row "Fail timer" "!!  check-boot-failure.timer failed — boot failure detection broken"
-        _rec "check-boot-failure.timer failed — run: systemctl reset-failed check-boot-failure.timer && systemctl start check-boot-failure.timer"
+        _rec "check-boot-failure.timer failed — run: systemctl reset-failed check-boot-failure.timer && systemctl start check-boot-failure.timer  [auto]"
+    fi
+}
+_section_boot_entries() {
+    _head "Boot Entries"
+
+    if ! mountpoint -q "$ESP" 2>/dev/null; then
+        _row "ESP"       "!!  could not mount — boot entries unavailable"
+        return
+    fi
+
+    # ── ESP free space ────────────────────────────────────────────────────────
+    # UKIs are ~100MB each; gen-efi fails silently if ESP fills up
+    local esp_avail_mb
+    esp_avail_mb=$(df -BM "$ESP" 2>/dev/null | awk 'NR==2{gsub(/M/,"",$4); print $4}' || echo "")
+    if [[ "$esp_avail_mb" =~ ^[0-9]+$ ]]; then
+        if (( esp_avail_mb < 50 )); then
+            _row "ESP space"  "!!  ${esp_avail_mb} MB free — gen-efi will fail"
+            _rec "ESP nearly full (${esp_avail_mb} MB) — clean old entries or expand ESP"
+        elif (( esp_avail_mb < 150 )); then
+            _row "ESP space"  "!   ${esp_avail_mb} MB free — getting tight"
+        else
+            _row "ESP space"  "OK  ${esp_avail_mb} MB free"
+        fi
+    fi
+
+    # ── Shim and MokManager on ESP ────────────────────────────────────────────
+    # shim (BOOTX64.EFI) — first-stage loader, Microsoft-signed
+    # mmx64.efi — MokManager, needed for MOK enrollment at boot
+    local shim_dst="$ESP/EFI/BOOT/BOOTX64.EFI"
+    local mmx64_dst="$ESP/EFI/BOOT/mmx64.efi"
+    local sdboot_dst="$ESP/EFI/BOOT/grubx64.efi"
+    local efi_ok=() efi_missing=()
+    [[ -f "$shim_dst"   ]] && efi_ok+=("shim")    || efi_missing+=("BOOTX64.EFI")
+    [[ -f "$mmx64_dst"  ]] && efi_ok+=("mmx64")   || efi_missing+=("mmx64.efi")
+    [[ -f "$sdboot_dst" ]] && efi_ok+=("sd-boot")  || efi_missing+=("grubx64.efi")
+    if [[ ${#efi_missing[@]} -eq 0 ]]; then
+        _row "EFI files"  "OK  shim + mmx64 + sd-boot present"
+        # Check if source shim/sd-boot is newer than ESP copy — gen-efi auto-updates
+        # but only when run; health warns so the user knows to trigger a UKI rebuild.
+        local shim_src="/usr/share/shim-signed/shimx64.efi"
+        local sdboot_src="/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+        local stale_efi=()
+        [[ -f "$shim_src"   && "$shim_src"   -nt "$shim_dst"   ]] && stale_efi+=("shim")
+        [[ -f "$sdboot_src" && "$sdboot_src" -nt "$sdboot_dst" ]] && stale_efi+=("sd-boot")
+        if [[ ${#stale_efi[@]} -gt 0 ]]; then
+            local _stale_str; _stale_str=$(IFS='+'; echo "${stale_efi[*]}")
+            _row2 "!  ${_stale_str} source newer than ESP copy — run: gen-efi configure <booted_slot>  [auto]"
+            _rec "ESP ${_stale_str} is stale (newer source available) — run: gen-efi configure <booted_slot>  [auto]"
+        fi
+    else
+        local _em_str; _em_str=$(IFS=' '; echo "${efi_missing[*]}")
+        _row "EFI files"  "!!  missing: ${_em_str}"
+        _rec "EFI boot files missing (${_em_str}) — run: gen-efi configure <booted_slot>"
+    fi
+
+    local loader_conf="$ESP/loader/loader.conf"
+
+    # ── vconsole.conf keymap ──────────────────────────────────────────────────
+    # gen-efi embeds KEYMAP from /etc/vconsole.conf into the UKI as rd.vconsole.keymap.
+    # If missing or unset, the UKI omits the keymap — LUKS passphrase entry at
+    # boot may use the wrong keyboard layout, locking users out.
+    local vconsole_keymap=""
+    if [[ ! -f /etc/vconsole.conf ]]; then
+        _row "Keymap"     "!   /etc/vconsole.conf missing — UKI will have no keymap"
+        _rec "Create /etc/vconsole.conf with KEYMAP= set (e.g. KEYMAP=us) and regenerate UKI"
+    else
+        vconsole_keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+            | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+        if [[ -z "$vconsole_keymap" ]]; then
+            _row "Keymap"     "!   KEYMAP not set in /etc/vconsole.conf — UKI will have no keymap"
+            _rec "Set KEYMAP= in /etc/vconsole.conf (e.g. KEYMAP=us) and regenerate UKI: gen-efi configure <slot>"
+        else
+            # Cross-check: is the embedded keymap in the running UKI consistent?
+            local cmdline_keymap
+            cmdline_keymap=$(grep -o 'rd.vconsole.keymap=[^ ]*' /proc/cmdline 2>/dev/null \
+                | cut -d= -f2 || echo "")
+            if [[ -n "$cmdline_keymap" && "$cmdline_keymap" != "$vconsole_keymap" ]]; then
+                _row "Keymap"     "!   mismatch: UKI has '${cmdline_keymap}', vconsole.conf has '${vconsole_keymap}'"
+                _rec "Keymap mismatch between running UKI and vconsole.conf — regenerate: gen-efi configure <slot>  [auto]"
+            else
+                _row "Keymap"     "OK  ${vconsole_keymap}${cmdline_keymap:+ (matches UKI)}"
+            fi
+        fi
+    fi
+
+    # ── UKI presence and relative age ────────────────────────────────────────
+    # Both UKIs must exist; the candidate shouldn't be drastically older than current
+    local booted_uki candidate_uki booted_ts candidate_ts
+    local current_slot; current_slot=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
+    local candidate_slot
+    [[ "$current_slot" == "blue" ]] && candidate_slot="green" || candidate_slot="blue"
+
+    booted_uki="$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi"
+    candidate_uki="$ESP/EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi"
+
+    if [[ ! -f "$booted_uki" ]]; then
+        _row "UKI"       "!!  current slot UKI missing: $(basename "$booted_uki")"
+        _rec "Current slot UKI missing — run: gen-efi configure ${current_slot}  [auto]"
+    elif [[ ! -f "$candidate_uki" ]]; then
+        _row "UKI"       "!   candidate slot UKI missing: $(basename "$candidate_uki")"
+        _rec "Candidate slot UKI missing — run: shani-deploy to rebuild it"
+    else
+        booted_ts=$(stat -c '%Y' "$booted_uki" 2>/dev/null || echo "0")
+        candidate_ts=$(stat -c '%Y' "$candidate_uki" 2>/dev/null || echo "0")
+        local age_diff=$(( booted_ts - candidate_ts ))
+        if (( age_diff > 86400 * 30 )); then
+            # Candidate UKI is >30 days older than current — likely stale rollback target
+            local age_days=$(( age_diff / 86400 ))
+            _row "UKI"   "!   candidate @${candidate_slot} UKI is ${age_days}d older than current"
+            _rec "Candidate slot UKI is stale — run shani-deploy to refresh it"
+        else
+            _row "UKI"   "OK  both slots present"
+        fi
+    fi
+
+    # ── loader.conf default= slot cross-check ────────────────────────────────
+    # The default= entry in loader.conf controls which UKI boots by default.
+    # It must point to the current slot; a mismatch means the wrong OS version
+    # activates on next boot even though deployment succeeded.
+    if [[ -f "$loader_conf" ]]; then
+        local default_entry
+        default_entry=$(grep '^default' "$loader_conf" 2>/dev/null | awk '{print $2}' || echo "")
+        # default= is written as a glob by finalize_boot_entries:
+        #   tries path  → shanios-blue+*.conf  (matches +3-0, +2-1 … as boot counting renames it)
+        #   no-tries    → shanios-blue.conf    (rollback/restore — both slots known-good)
+        # Check that the glob/filename contains the current-slot name as a distinct token.
+        if [[ -n "$default_entry" && -n "$current_slot" ]]; then
+            if echo "$default_entry" | grep -qiE "(^|[-_])${current_slot}([-_+.]|$)"; then
+                _row "Boot default" "OK  default entry targets @${current_slot}  (${default_entry})"
+            else
+                _row "Boot default" "!!  default '${default_entry}' does not match current slot @${current_slot}"
+                _rec "loader.conf default= points to wrong slot — run: gen-efi configure ${current_slot}"
+            fi
+        fi
+    fi
+
+    local orphans=()
+    for slot in blue green; do
+        local plain="$ESP/loader/entries/${OS_NAME}-${slot}.conf"
+        local tries; tries=$(ls "$ESP/loader/entries/${OS_NAME}-${slot}"+*.conf \
+            2>/dev/null | head -1 || echo "")
+        [[ -f "$plain" && -n "$tries" ]] && orphans+=("${OS_NAME}-${slot}.conf")
+    done
+    if [[ ${#orphans[@]} -gt 0 ]]; then
+        _row "Orphans"   "!   $(_join "${orphans[@]}")"
+        _rec "Orphaned boot entries ($(_join "${orphans[@]}")) — run: shani-health --fix  [auto]"
+    fi
+
+    local editor; editor=$(grep '^editor' "$loader_conf" 2>/dev/null \
+        | awk '{print $2}' || echo "not set")
+    if [[ "$editor" == "0" ]]; then
+        _row "Editor"    "OK  disabled"
+    else
+        _row "Editor"    "!!  not disabled (cmdline editable at boot)"
+        _rec "systemd-boot editor not disabled — add 'editor 0' to loader.conf  [auto]"
     fi
 }
 
@@ -514,8 +744,8 @@ _section_deployment() {
             _row "Cmdline"    "OK  install_cmdline_{blue,green} present and correct"
         fi
     else
-        _row "Cmdline"    "!!  missing for: ${cmdline_missing[*]} — next gen-efi may produce wrong UKI"
-        _rec "Cmdline files missing for @${cmdline_missing[*]} — run: gen-efi configure <slot> for each  [auto]"
+        _row "Cmdline"    "!!  missing for: $(_join "${cmdline_missing[@]}") — next gen-efi may produce wrong UKI"
+        _rec "Cmdline files missing for @$(_join "${cmdline_missing[@]}") — run: gen-efi configure <slot> for each  [auto]"
     fi
 
     # ── Slot backup snapshots ─────────────────────────────────────────────────
@@ -526,16 +756,38 @@ _section_deployment() {
         has_backup=$(btrfs subvolume list / 2>/dev/null \
             | awk -v s="${slot}_backup_" '$NF ~ s {print $NF; exit}' || echo "")
         if [[ -n "$has_backup" ]]; then
-            backup_found+=("@${slot}:$(basename "$has_backup")")
+            # Try to get the referenced size of the backup subvolume
+            local bk_size=""
+            local bk_path="/${has_backup}"
+            if [[ -d "$bk_path" ]]; then
+                local bk_mb; bk_mb=$(du -sm "$bk_path" 2>/dev/null | awk '{print $1}' || echo "")
+                [[ "$bk_mb" =~ ^[0-9]+$ ]] && bk_size=" (${bk_mb} MB)"
+            fi
+            backup_found+=("@${slot}:$(basename "$has_backup")${bk_size}")
         else
             backup_missing+=("@${slot}")
         fi
     done
     if [[ ${#backup_missing[@]} -eq 0 ]]; then
         _row "Backups"    "OK  $(IFS=' '; echo "${backup_found[*]}")"
+        # Warn if any backup snapshot is very old (>30 days)
+        local _now_dep; _now_dep=$(date +%s)
+        for slot in blue green; do
+            local _bk_path; _bk_path=$(btrfs subvolume list / 2>/dev/null                 | awk -v s="${slot}_backup_" '$NF ~ s {print $NF; exit}' || echo "")
+            [[ -z "$_bk_path" ]] && continue
+            local _bk_created; _bk_created=$(btrfs subvolume show "/${_bk_path}" 2>/dev/null                 | awk -F'\t' '/Creation time:/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || true)
+            [[ -z "$_bk_created" ]] && continue
+            local _bk_ep; _bk_ep=$(date -d "$_bk_created" +%s 2>/dev/null || echo "")
+            [[ -z "$_bk_ep" ]] && continue
+            local _bk_age=$(( (_now_dep - _bk_ep) / 86400 ))
+            if (( _bk_age > 30 )); then
+                _row2 "!   @${slot} backup is ${_bk_age}d old — deploy to refresh"
+                _rec "Backup snapshot for @${slot} is ${_bk_age} days old — run shani-deploy to refresh"
+            fi
+        done
     else
-        _row "Backups"    "!   no backup snapshot for: ${backup_missing[*]} — rollback unavailable"
-        _rec "No rollback backup for ${backup_missing[*]} — run shani-deploy to create one"
+        _row "Backups"    "!   no backup snapshot for: $(_join "${backup_missing[@]}") — rollback unavailable"
+        _rec "No rollback backup for $(_join "${backup_missing[@]}") — run shani-deploy to create one"
     fi
 
     # ── Shani signing key file ────────────────────────────────────────────────
@@ -578,7 +830,7 @@ _section_deployment() {
     # ── Stale shani-update lock ───────────────────────────────────────────────
     # Lock file is in XDG_RUNTIME_DIR or ~/.cache — if it survives across boots
     # (i.e. lives in a persistent location) and is old, the update process died
-    local _login_u_dep="${SUDO_USER:-${SHANI_CALLER_USER:-${USER:-}}}"
+    local _login_u_dep="$_CALLER_USER"
     local _uhome_dep; _uhome_dep=$(getent passwd "${_login_u_dep}" 2>/dev/null | cut -d: -f6 || echo "")
     if [[ -n "$_uhome_dep" ]]; then
         local _lock="${_uhome_dep}/.cache/shani-update.lock"
@@ -592,18 +844,16 @@ _section_deployment() {
     fi
 
     # ── GPG signing key ───────────────────────────────────────────────────────
-    # Key 7B927BFFD4A9EAAA8B666B77DE217F3DA8014792 must be imported for image verification.
-    # The key ships locally at /etc/shani-keys/signing.asc — no network required.
-    local gpg_key="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
-    local gpg_key_file="/etc/shani-keys/signing.asc"
-    if gpg --batch --list-keys "$gpg_key" &>/dev/null 2>&1; then
+    # Key must be imported for image verification.
+    # Ships locally at GPG_SIGNING_KEY_FILE — no network required.
+    if gpg --batch --list-keys "$GPG_SIGNING_KEY" &>/dev/null 2>&1; then
         _row "GPG key"    "OK  signing key imported"
-    elif [[ -f "$gpg_key_file" ]]; then
+    elif [[ -f "$GPG_SIGNING_KEY_FILE" ]]; then
         _row "GPG key"    "!!  signing key not in keyring — image verification will fail"
-        _rec "Import GPG signing key: gpg --import ${gpg_key_file}  [auto]"
+        _rec "Import GPG signing key: gpg --import ${GPG_SIGNING_KEY_FILE}  [auto]"
     else
         _row "GPG key"    "!!  signing key not in keyring — image verification will fail"
-        _rec "Import GPG signing key: gpg --keyserver keys.openpgp.org --recv-keys ${gpg_key}  [auto]"
+        _rec "Import GPG signing key: gpg --keyserver keys.openpgp.org --recv-keys ${GPG_SIGNING_KEY}  [auto]"
     fi
 
     # ── Download tools ────────────────────────────────────────────────────────
@@ -621,20 +871,107 @@ _section_deployment() {
             _row2 "--  pv not installed (no extraction progress display)"
     fi
 
-    # ── shani-update last check ───────────────────────────────────────────────
-    # Shows the last line from the user's shani-update.log so the report gives
-    # a quick snapshot of when the update checker last ran and what it found.
-    local _upd_login_u="${SUDO_USER:-${SHANI_CALLER_USER:-${USER:-}}}"
-    local _upd_home; _upd_home=$(getent passwd "${_upd_login_u}" 2>/dev/null | cut -d: -f6 || echo "$HOME")
-    local upd_log="${_upd_home}/.cache/shani-update.log"
-    if [[ -f "$upd_log" ]]; then
-        local last_raw; last_raw=$(tail -1 "$upd_log" 2>/dev/null || echo "")
-        if [[ -n "$last_raw" ]]; then
-            local last_ts; last_ts=$(echo "$last_raw" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1 || echo "?")
-            local last_line; last_line=$(echo "$last_raw" | sed 's/\[[0-9 :-]*\] *//' | sed 's/^[0-9-]* [0-9:]* //' || echo "$last_raw")
-            _row "Upd log"    "--  ${last_ts}: ${last_line:0:60}"
+    # ── Last deploy action ────────────────────────────────────────────────────
+    # Extract most recent DEPLOY/ROLLBACK event from the deploy log using the
+    # same _scan_log_file helper that --history uses.
+    if [[ -f "$DEPLOY_LOG" ]]; then
+        local _dep_tmp; _dep_tmp=$(mktemp)
+        _scan_log_file "$DEPLOY_LOG"       "$_dep_tmp"
+        _scan_log_file "${DEPLOY_LOG}.old" "$_dep_tmp"
+        local _last_event
+        _last_event=$(sort "$_dep_tmp" 2>/dev/null | tail -1 || echo "")
+        rm -f "$_dep_tmp"
+        if [[ -n "$_last_event" ]]; then
+            local _ev_ts _ev_type _ev_detail
+            _ev_ts=$(echo "$_last_event" | cut -c1-19)
+            _ev_type=$(echo "$_last_event" | awk '{print $3}')
+            _ev_detail=$(echo "$_last_event" | cut -d' ' -f4-)
+            case "$_ev_type" in
+                DEPLOY)   _row "Last deploy" "OK  ${_ev_ts}  deployed ${_ev_detail}" ;;
+                ROLLBACK) _row "Last deploy" "!   ${_ev_ts}  rollback — ${_ev_detail}" ;;
+                START)    _row "Last deploy" "--  ${_ev_ts}  boot ${_ev_detail}" ;;
+                *)        _row "Last deploy" "--  ${_ev_ts}  ${_ev_type} ${_ev_detail}" ;;
+            esac
         fi
     fi
+}
+_section_data_state() {
+    _head "Data State"
+
+    # ── /data subvolume mount ─────────────────────────────────────────────────
+    if ! findmnt -n /data &>/dev/null; then
+        _row "/data"          "!!  not mounted — system state unavailable"
+        _rec "/data subvolume not mounted — check fstab and Btrfs subvolume list"
+        return
+    fi
+    _row "/data"          "OK  mounted"
+
+    # ── shanios-tmpfiles-data.service ─────────────────────────────────────────
+    # Creates /data/varlib, /data/varspool, /data/overlay/{upper,work} and other
+    # persistent dirs on first boot or after a fresh @data subvolume. If it
+    # failed, bind-mounts and the /etc overlay will be broken.
+    local tmpfiles_res
+    tmpfiles_res=$(systemctl show shanios-tmpfiles-data.service \
+        --property=Result --value 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ "$tmpfiles_res" == "exit-code" || "$tmpfiles_res" == "core-dump" || "$tmpfiles_res" == "signal" ]]; then
+        _row "tmpfiles"   "!!  shanios-tmpfiles-data.service failed — /data dirs may be missing"
+        _rec "shanios-tmpfiles-data.service failed — run: systemctl restart shanios-tmpfiles-data.service  [auto]"
+    elif [[ "$tmpfiles_res" == "success" || "$tmpfiles_res" == "" ]]; then
+        : # OK or never ran (fresh boot) — dirs checked individually below
+    fi
+    # Written by shani-deploy on install/slot-switch.
+    # Cleared by shani-user-setup after it runs successfully.
+    # Setup is triggered by running the binary directly (no path/service unit).
+    if [[ -f /data/user-setup-needed ]]; then
+        local marker_age_days=0
+        local marker_epoch; marker_epoch=$(stat -c '%Y' /data/user-setup-needed 2>/dev/null || echo "0")
+        (( marker_epoch > 0 )) && \
+            marker_age_days=$(( ( $(date +%s) - marker_epoch ) / 86400 ))
+
+        if [[ ! -x "$USER_SETUP_BIN" ]]; then
+            _row "User setup" "!!  marker present but ${USER_SETUP_BIN} missing or not executable"
+            _rec "shani-user-setup binary missing — reinstall: ${USER_SETUP_BIN}"
+        elif (( marker_age_days >= 1 )); then
+            _row "User setup" "!   marker ${marker_age_days}d old — setup not yet run"
+            _rec "user-setup-needed marker is ${marker_age_days}d old — run: shani-user-setup  [auto]"
+        else
+            _row "User setup" "--  pending (marker present, will run shortly)"
+        fi
+    else
+        _row "User setup"  "OK  complete"
+    fi
+
+    # ── varlib / varspool bind-mount directories ───────────────────────────────
+    # These live under /data and are bind-mounted into /var/lib and /var/spool
+    # for services that need persistent state across the volatile /var tmpfs.
+    local varlib_ok=0 varspool_ok=0
+    [[ -d /data/varlib   ]] && varlib_ok=1
+    [[ -d /data/varspool ]] && varspool_ok=1
+
+    if (( varlib_ok )); then
+        local varlib_svcs; varlib_svcs=$(ls /data/varlib 2>/dev/null | wc -l || echo "0")
+        _row "varlib"   "OK  ${varlib_svcs} service dir(s) in /data/varlib"
+    else
+        _row "varlib"   "!   /data/varlib missing — service state bind-mounts may fail"
+        _rec "/data/varlib directory missing — run: mkdir -p /data/varlib  [auto]"
+    fi
+
+    if (( varspool_ok )); then
+        local varspool_svcs; varspool_svcs=$(ls /data/varspool 2>/dev/null | wc -l || echo "0")
+        _row "varspool" "OK  ${varspool_svcs} spool dir(s) in /data/varspool"
+    else
+        _row "varspool" "!   /data/varspool missing — spool bind-mounts may fail"
+        _rec "/data/varspool directory missing — run: mkdir -p /data/varspool  [auto]"
+    fi
+
+    # ── /data overlay directories (for /etc overlay) ──────────────────────────
+    local overlay_upper="/data/overlay/etc/upper"
+    local overlay_work="/data/overlay/etc/work"
+    if [[ ! -d "$overlay_upper" || ! -d "$overlay_work" ]]; then
+        _row "overlay"  "!   /data/overlay/etc/{upper,work} missing"
+        _rec "/data/overlay dirs missing — run shanios-tmpfiles-data.service or: mkdir -p /data/overlay/etc/{upper,work}"
+    fi
+
 }
 
 _section_immutability() {
@@ -720,8 +1057,8 @@ _section_immutability() {
     if [[ ${#sv_missing[@]} -eq 0 ]]; then
         _row "Subvolumes"  "OK  all ${sv_ok} critical subvolumes mounted"
     else
-        _row "Subvolumes"  "!!  not mounted: ${sv_missing[*]}"
-        _rec "Critical Btrfs subvolumes not mounted (${sv_missing[*]}) — check fstab / shanios-tmpfiles-data.service"
+        _row "Subvolumes"  "!!  not mounted: $(_join "${sv_missing[@]}")"
+        _rec "Critical Btrfs subvolumes not mounted ($(_join "${sv_missing[@]}")) — check fstab / shanios-tmpfiles-data.service"
     fi
 }
 
@@ -748,11 +1085,31 @@ _section_secureboot() {
 
     local mok_count
     mok_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
+    local mok_der_check="/etc/secureboot/keys/MOK.der"
     if (( mok_count > 0 )); then
-        _row "MOK enrol" "OK  ${mok_count} key(s) enrolled"
+        # Verify the enrolled key actually matches the local MOK.der —
+        # a regenerated keypair would show "enrolled" but the UKIs signed
+        # with the new key would be rejected at boot.
+        local enrolled_match=0
+        if [[ -f "$mok_der_check" ]] && command -v openssl &>/dev/null; then
+            local local_fp
+            local_fp=$(openssl x509 -in "$mok_der_check" -inform DER -noout -fingerprint -sha1 \
+                2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+            if [[ -n "$local_fp" ]] && \
+               mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+               | grep -q "$local_fp"; then
+                enrolled_match=1
+            fi
+        fi
+        if (( enrolled_match )); then
+            _row "MOK enrol" "OK  ${mok_count} key(s) enrolled  (local key confirmed)"
+        else
+            _row "MOK enrol" "!   ${mok_count} key(s) enrolled but local MOK.der not matched — key may be stale"
+            _rec "Enrolled MOK key does not match local MOK.der — re-enroll: gen-efi enroll-mok  [auto]"
+        fi
     else
         _row "MOK enrol" "!!  no keys enrolled"
-        _rec "Enroll MOK: mokutil --import /etc/secureboot/keys/MOK.der --root-pw, then reboot"
+        _rec "Enroll MOK: gen-efi enroll-mok  [auto]"
     fi
 
     local mok_key="/etc/secureboot/keys/MOK.key"
@@ -770,7 +1127,7 @@ _section_secureboot() {
         days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
         if (( expiry_epoch > 0 && days_left < 0 )); then
             _row "MOK keys"  "!!  EXPIRED (${expiry}) — re-enroll MOK key"
-            _rec "MOK signing key has expired — regenerate: gen-efi configure <slot> then re-enroll via mokutil"
+            _rec "MOK signing key has expired — regenerate keys and re-enroll: gen-efi configure ${booted} then gen-efi enroll-mok"
         elif (( expiry_epoch > 0 && days_left < 90 )); then
             _row "MOK keys"  "!   expires in ${days_left} days (${expiry})"
             _rec "MOK cert expires in ${days_left} days — plan renewal before expiry to avoid Secure Boot breakage"
@@ -779,7 +1136,7 @@ _section_secureboot() {
         fi
     else
         _row "MOK keys"  "!!  missing"
-        _rec "MOK signing keys missing — run: gen-efi configure <slot>"
+        _rec "MOK signing keys missing — run: gen-efi configure ${booted}  (generates keys + rebuilds UKI), then: gen-efi enroll-mok"
     fi
 
     if (( mok_ok )); then
@@ -796,7 +1153,7 @@ _section_secureboot() {
         cert_mod=$(openssl x509 -in "$mok_crt" -noout -modulus 2>/dev/null | md5sum 2>/dev/null || echo "")
         if [[ -n "$key_mod" && -n "$cert_mod" && "$key_mod" != "$cert_mod" ]]; then
             _row "MOK pair"   "!!  MOK.key and MOK.crt do not match — UKI signing will fail"
-            _rec "MOK key/cert mismatch — regenerate: gen-efi configure <slot>"
+            _rec "MOK key/cert mismatch — regenerate: gen-efi configure ${booted} then gen-efi enroll-mok"
         fi
 
         local uki_ok=0 uki_bad=0 uki_miss=0
@@ -844,8 +1201,8 @@ _section_secureboot() {
         command -v "$tool" &>/dev/null || missing_tools+=("$tool")
     done
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        _row "UKI tools"  "!!  missing: ${missing_tools[*]} — gen-efi / UKI rebuild will fail"
-        _rec "Install missing UKI build tools: ${missing_tools[*]}"
+        _row "UKI tools"  "!!  missing: $(_join "${missing_tools[@]}") — gen-efi / UKI rebuild will fail"
+        _rec "Install missing UKI build tools: $(_join "${missing_tools[@]}")"
     fi
 }
 
@@ -888,10 +1245,10 @@ _section_kernel_security() {
     elif [[ ${#missing_lsms[@]} -eq 0 && ${#missing_build[@]} -eq 0 ]]; then
         _row "LSMs"  "OK  all ${total} active"
     elif [[ ${#missing_lsms[@]} -eq 0 ]]; then
-        _row "LSMs"  "--  ${active}/${total} active (${missing_build[*]} not compiled in)"
+        _row "LSMs"  "--  ${active}/${total} active ($(_join "${missing_build[@]}") not compiled in)"
     else
-        _row "LSMs"  "!!  missing at runtime: ${missing_lsms[*]}"
-        _rec "LSMs not active: ${missing_lsms[*]} — check lsm= kernel cmdline"
+        _row "LSMs"  "!!  missing at runtime: $(_join "${missing_lsms[@]}")"
+        _rec "LSMs not active: $(_join "${missing_lsms[@]}") — check lsm= kernel cmdline"
     fi
 
     # Lockdown — advisory rec only when SB is on and lockdown is none
@@ -911,8 +1268,8 @@ _section_kernel_security() {
     if [[ ${#bad_mods[@]} -eq 0 ]]; then
         _row "Blacklist"  "OK  mei/mei_me/pcspkr not loaded"
     else
-        _row "Blacklist"  "!   loaded but should be blacklisted: ${bad_mods[*]}"
-        _rec "Modules ${bad_mods[*]} should be blacklisted — check /etc/modprobe.d/"
+        _row "Blacklist"  "!   loaded but should be blacklisted: $(_join "${bad_mods[@]}")"
+        _rec "Modules $(_join "${bad_mods[@]}") should be blacklisted — check /etc/modprobe.d/"
     fi
 
 }
@@ -991,10 +1348,35 @@ _section_tpm2() {
         _row "Hardware"  "OK  present${tpm_info:+  (${tpm_info})}"
         if [[ -n "$underlying" ]]; then
             if echo "$enroll_out" | grep -q "tpm2"; then
-                _row "Enrolled"  "OK  auto-unlock active"
+                # Show PCR policy — parse from cryptsetup luksDump
+                # gen-efi uses PCR 0+7 with Secure Boot, PCR 0 without
+                local pcr_policy=""
+                pcr_policy=$(cryptsetup luksDump "$underlying" 2>/dev/null \
+                    | grep -A5 "systemd-tpm2" | grep -oP 'pcr-selection.*' \
+                    | head -1 || echo "")
+                [[ -z "$pcr_policy" ]] && \
+                    pcr_policy=$(systemd-cryptenroll "$underlying" 2>/dev/null \
+                        | awk '/tpm2/{print $0}' | head -1 || echo "")
+                _row "Enrolled"  "OK  auto-unlock active${pcr_policy:+  (${pcr_policy})}"
+                # Check PCR policy matches current Secure Boot state (gen-efi logic:
+                # SB on → PCR 0+7, SB off → PCR 0 only)
+                local _tpm_sb_state
+                _tpm_sb_state=$(mokutil --sb-state 2>/dev/null || echo "")
+                local _sb_on=0
+                [[ "$_tpm_sb_state" == *"SecureBoot enabled"* ]] && _sb_on=1
+                local _expected_pcrs; (( _sb_on )) && _expected_pcrs="0+7" || _expected_pcrs="0"
+                # Detect enrolled PCR set from luksDump token section
+                local _enrolled_pcrs=""
+                _enrolled_pcrs=$(cryptsetup luksDump "$underlying" 2>/dev/null \
+                    | grep -oP '(?<=tpm2-pcrs=)[0-9+]+' | head -1 || echo "")
+                if [[ -n "$_enrolled_pcrs" && "$_enrolled_pcrs" != "$_expected_pcrs" ]]; then
+                    local _sb_str; (( _sb_on )) && _sb_str="on" || _sb_str="off"
+                    _row2 "!   PCR policy ${_enrolled_pcrs} but SB is ${_sb_str} — expected ${_expected_pcrs}"
+                    _rec "TPM2 PCR policy mismatch (enrolled: ${_enrolled_pcrs}, expected: ${_expected_pcrs}) — re-enroll: gen-efi enroll-tpm2"
+                fi
             else
                 _row "Enrolled"  "!!  not enrolled"
-                _rec "TPM2 not enrolled for auto-unlock — run: gen-efi enroll-tpm2  [auto]"
+                _rec "TPM2 not enrolled for auto-unlock — run: gen-efi enroll-tpm2"
             fi
         else
             _row "Enrolled"  "--  disk not encrypted (TPM2 enroll not applicable)"
@@ -1051,6 +1433,19 @@ _section_security_services() {
         | grep -c 'apparmor.*DENIED' || echo "0")
     if [[ "$aa_denials" =~ ^[0-9]+$ ]] && (( aa_denials > 0 )); then
         _row "AA denials" "!   ${aa_denials} DENIED event(s) this boot"
+        # Show top offending profiles inline (saves running a separate command)
+        local _aa_journal
+        _aa_journal=$(journalctl -k -b 0 --no-pager -q 2>/dev/null | grep 'apparmor.*DENIED' || true)
+        if [[ -n "$_aa_journal" ]]; then
+            local _aa_top
+            _aa_top=$(echo "$_aa_journal" \
+                | grep -oP 'profile="[^"]+"' \
+                | sort | uniq -c | sort -rn | head -3 \
+                | awk '{printf "%s (%d denial(s))\n", $2, $1}' || true)
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && _row2 "--  $line"
+            done <<< "$_aa_top"
+        fi
         _rec "${aa_denials} AppArmor denial(s) this boot — check: journalctl -k -b 0 | grep 'apparmor.*DENIED'"
     fi
 
@@ -1085,6 +1480,289 @@ _section_security_services() {
         fi
     fi
 }
+_section_groups() {
+    _head "Groups"
+
+    # ── Source of truth: /etc/shani-extra-groups ──────────────────────────────
+    # build-base-image.sh creates these groups and writes the list to
+    # /etc/shani-extra-groups. shani-user-setup reads the same file to add
+    # users. We check:
+    #   1. Each group exists (getent works on overlayfs merged /etc/group)
+    #   2. Static-GID groups have the expected GID (udev rules depend on exact GIDs)
+    #   3. Every login user is a member of every group that exists
+    #
+    # Static GIDs from Arch archwiki / systemd basic.conf (same as build-base-image.sh):
+    local -A STATIC_GIDS=([sys]=3 [lp]=7 [kvm]=78 [video]=91 [scanner]=96 [input]=97 [cups]=209)
+    # Dynamic groups (no fixed GID — just need to exist):
+    local DYNAMIC_GROUPS=(realtime nixbld lxd libvirt)
+    # Also check storage/network — not in shani-extra-groups but critical for desktop use:
+    local EXTRA_SYSTEM=(storage network audio)
+
+    # Build login user list once
+    local login_users=()
+    _get_login_users login_users
+
+    local groups_missing=() groups_ok=0
+    local membership_missing=()  # "user:group" pairs
+
+    # ── Check shani-extra-groups static-GID groups ────────────────────────────
+    for grp in "${!STATIC_GIDS[@]}"; do
+        local actual_gid; actual_gid=$(getent group "$grp" 2>/dev/null | cut -d: -f3 || echo "")
+        if [[ -z "$actual_gid" ]]; then
+            groups_missing+=("$grp")
+        else
+            groups_ok=$(( groups_ok + 1 ))
+        fi
+    done
+
+    # ── Check dynamic groups ──────────────────────────────────────────────────
+    for grp in "${DYNAMIC_GROUPS[@]}"; do
+        if ! getent group "$grp" &>/dev/null; then
+            groups_missing+=("$grp")
+        else
+            groups_ok=$(( groups_ok + 1 ))
+        fi
+    done
+
+    # ── Check extra system groups ─────────────────────────────────────────────
+    local sys_missing=()
+    for grp in "${EXTRA_SYSTEM[@]}"; do
+        getent group "$grp" &>/dev/null || sys_missing+=("$grp")
+    done
+
+    # ── Report group existence ────────────────────────────────────────────────
+    if [[ ${#groups_missing[@]} -eq 0 ]]; then
+        local total=$(( ${#STATIC_GIDS[@]} + ${#DYNAMIC_GROUPS[@]} ))
+        _row "System grps" "OK  all ${total} shani groups present"
+    else
+        # Build a filtered list — omit optional groups when the feature isn't installed
+        local _reportable_missing=()
+        for grp in "${groups_missing[@]}"; do
+            case "$grp" in
+                libvirt) command -v virsh &>/dev/null || [[ -d /data/varlib/libvirt ]] && _reportable_missing+=("$grp") ;;
+                lxd)     findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]] && _reportable_missing+=("$grp") ;;
+                *)       _reportable_missing+=("$grp") ;;
+            esac
+        done
+
+        if [[ ${#_reportable_missing[@]} -gt 0 ]]; then
+            local _miss_str; _miss_str=$(IFS=' '; echo "${_reportable_missing[*]}")
+            _row "System grps" "!!  missing: ${_miss_str}"
+        else
+            local total=$(( ${#STATIC_GIDS[@]} + ${#DYNAMIC_GROUPS[@]} ))
+            _row "System grps" "OK  all ${total} shani groups present (optional groups skipped)"
+        fi
+
+        for grp in "${groups_missing[@]}"; do
+            case "$grp" in
+                nixbld)   _row2 "!!  nixbld missing — 'nix build' and nix-daemon will fail"
+                          _rec "Group 'nixbld' missing — Nix builds will fail: groupadd -r nixbld  [auto]" ;;
+                kvm)      _row2 "!!  kvm missing — /dev/kvm inaccessible, VMs broken"
+                          _rec "Group 'kvm' missing — VMs inaccessible: groupadd -r kvm  [auto]" ;;
+                video)    _row2 "!!  video missing — GPU/display access broken"
+                          _rec "Group 'video' missing — GPU access broken: groupadd -r video  [auto]" ;;
+                input)    _row2 "!!  input missing — raw input devices inaccessible (Wayland)"
+                          _rec "Group 'input' missing — Wayland input broken: groupadd -r input  [auto]" ;;
+                realtime) _row2 "!   realtime missing — PipeWire RT scheduling unavailable"
+                          _rec "Group 'realtime' missing — audio RT unavailable: groupadd -r realtime  [auto]" ;;
+                libvirt)
+                    if command -v virsh &>/dev/null || [[ -d /data/varlib/libvirt ]]; then
+                        _row2 "!   libvirt missing — libvirt socket inaccessible"
+                        _rec "Group 'libvirt' missing: groupadd -r libvirt  [auto]"
+                    fi ;;
+                lxd)
+                    if findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]]; then
+                        _row2 "!   lxd missing — LXD socket inaccessible"
+                        _rec "Group 'lxd' missing: groupadd -r lxd  [auto]"
+                    fi ;;
+                cups)     _row2 "!   cups missing — printing broken"
+                          _rec "Group 'cups' missing: groupadd -r cups  [auto]" ;;
+                *)        _rec "Group '${grp}' missing: groupadd -r ${grp}  [auto]" ;;
+            esac
+        done
+    fi
+
+    if [[ ${#sys_missing[@]} -gt 0 ]]; then
+        local _sm_str; _sm_str=$(IFS=' '; echo "${sys_missing[*]}")
+        _row "Util grps"  "!   missing: ${_sm_str} — udisks2/NM may not work"
+        _rec "System groups missing (${_sm_str}) — automounting/networking may break"
+    fi
+
+    # ── User membership check ─────────────────────────────────────────────────
+    # Read the actual wanted groups from /etc/shani-extra-groups (single source of truth)
+    local wanted_groups=()
+    if [[ -f /etc/shani-extra-groups ]]; then
+        local _eg; _eg=$(head -n1 /etc/shani-extra-groups 2>/dev/null | tr -d '[:space:]')
+        IFS=',' read -ra wanted_groups <<< "$_eg"
+    fi
+
+    if [[ ${#wanted_groups[@]} -gt 0 && ${#login_users[@]} -gt 0 ]]; then
+        local mem_ok=0 mem_bad=()
+        for u in "${login_users[@]}"; do
+            local user_groups; user_groups=$(id -nG "$u" 2>/dev/null || true)
+            local u_missing=()
+            for grp in "${wanted_groups[@]}"; do
+                # Only check groups that actually exist — skip missing ones (already reported above)
+                getent group "$grp" &>/dev/null || continue
+                echo "$user_groups" | grep -qw "$grp" || u_missing+=("$grp")
+            done
+            if [[ ${#u_missing[@]} -gt 0 ]]; then
+                local _um_str; _um_str=$(IFS=,; echo "${u_missing[*]}")
+                mem_bad+=("${u}:${_um_str}")
+            else
+                mem_ok=$(( mem_ok + 1 ))
+            fi
+        done
+
+        if [[ ${#mem_bad[@]} -eq 0 ]]; then
+            _row "Membership" "OK  all users in required groups"
+        else
+            for entry in "${mem_bad[@]}"; do
+                local _u="${entry%%:*}" _missing_g="${entry#*:}"
+                _row "Membership" "!   ${_u} missing: ${_missing_g}"
+                _rec "User ${_u} not in groups (${_missing_g}) — run: shani-user-setup  [auto]"
+            done
+        fi
+    fi
+}
+
+_section_users() {
+    _head "Users & Access Control"
+
+    # ── Login users ───────────────────────────────────────────────────────────
+    local login_users=()
+    _get_login_users login_users
+    local _login_str; _login_str=$(IFS=' '; echo "${login_users[*]:-none detected}")
+    _row "Login"     "--  ${_login_str}"
+
+    # ── Login user password status ────────────────────────────────────────────
+    local no_pass=()
+    if [[ ${#login_users[@]} -gt 0 ]]; then
+        for u in "${login_users[@]}"; do
+            local pw_st; pw_st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}' || echo "")
+            [[ "$pw_st" == "NP" ]] && no_pass+=("$u")
+        done
+    fi
+    if [[ ${#no_pass[@]} -gt 0 ]]; then
+        _row "Passwords"  "!!  no password set for: $(_join "${no_pass[@]}")"
+        _rec "User(s) $(_join "${no_pass[@]}") have no password — set one: passwd <username>"
+    fi
+
+    local wheel_line wheel_members=()
+    wheel_line=$(getent group wheel 2>/dev/null || grep '^wheel:' /etc/group 2>/dev/null || true)
+    local wheel_sudoers
+    wheel_sudoers=$(grep -h '^%wheel' /etc/sudoers.d/wheel 2>/dev/null \
+        | grep -v '^[[:space:]]*#' | head -1 || true)
+    if [[ -z "$wheel_line" ]]; then
+        _row "Wheel"     "!!  group does not exist — sudo access broken"
+        _rec "wheel group missing — create it: groupadd wheel, then add users: usermod -aG wheel <username>"
+    else
+        IFS=',' read -ra wheel_members <<< "${wheel_line##*:}"
+        if [[ -z "$wheel_sudoers" ]]; then
+            _row "Wheel"     "!!  group exists but no sudoers rule found for %wheel"
+            _rec "No sudoers rule for wheel — add: %wheel ALL=(ALL:ALL) ALL to /etc/sudoers.d/wheel"
+        elif [[ ${#wheel_members[@]} -gt 0 && -n "${wheel_members[0]}" ]]; then
+            # Check at least one wheel member is a real login user (uid >= 1000)
+            local wheel_has_login=0
+            for m in "${wheel_members[@]}"; do
+                local m_uid; m_uid=$(id -u "$m" 2>/dev/null || echo "")
+                [[ "$m_uid" =~ ^[0-9]+$ ]] && (( m_uid >= 1000 )) && { wheel_has_login=1; break; }
+            done
+            if (( wheel_has_login )); then
+                local _wheel_str; _wheel_str=$(IFS=' '; echo "${wheel_members[*]}")
+                _row "Wheel"     "OK  ${_wheel_str}"
+            else
+                _row "Wheel"     "!!  no regular user (uid≥1000) in wheel — sudo access effectively broken"
+                _rec "wheel group has no regular login users — add one: usermod -aG wheel <username>"
+            fi
+        else
+            _row "Wheel"     "!!  sudoers rule present but group has no members — no user can sudo"
+            _rec "wheel group is empty — add a user: usermod -aG wheel <username>"
+        fi
+    fi
+
+    # ── Duplicate UID 0 accounts ──────────────────────────────────────────────
+    local uid0_accounts=()
+    while IFS=: read -r name _ uid _; do
+        [[ "$uid" -eq 0 && "$name" != "root" ]] && uid0_accounts+=("$name")
+    done < /etc/passwd 2>/dev/null || true
+    if [[ ${#uid0_accounts[@]} -gt 0 ]]; then
+        local _uid0_str; _uid0_str=$(_join "${uid0_accounts[@]}")
+        _row "UID 0"      "!!  non-root accounts with UID 0: ${_uid0_str}"
+        _rec "Accounts with UID 0 besides root (${_uid0_str}) — remove or reassign UID"
+    fi
+
+    local nopasswd=()
+    while IFS= read -r line; do
+        echo "$line" | grep -qE 'NOPASSWD.*ALL\s*$|NOPASSWD.*ALL\)' && nopasswd+=("$line")
+    done < <(grep -rh NOPASSWD /etc/sudoers /etc/sudoers.d/ 2>/dev/null \
+        | grep -v '^[[:space:]]*#' || true)
+    if [[ ${#nopasswd[@]} -gt 0 ]]; then
+        _row "NOPASSWD"  "!   passwordless sudo entries found:"
+        for e in "${nopasswd[@]}"; do _row2 "$(echo "$e" | xargs)"; done
+        _rec "Passwordless sudo (NOPASSWD ALL) found — review /etc/sudoers.d/"
+    else
+        _row "NOPASSWD"  "OK  no unrestricted passwordless sudo"
+    fi
+
+    # ── Root account ──────────────────────────────────────────────────────────
+    local root_st; root_st=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
+    case "$root_st" in
+        L|LK) _row "Root acct"  "OK  locked" ;;
+        P)    _row "Root acct"  "!   has a password (locked root recommended)"
+              _rec "Root has a password — to lock: passwd -l root  [auto]" ;;
+        *)    _row "Root acct"  "--  status unknown" ;;
+    esac
+
+    # ── SSH ───────────────────────────────────────────────────────────────────
+    if [[ -f /etc/ssh/sshd_config ]] || [[ -d /etc/ssh/sshd_config.d ]]; then
+        local ssh_root
+        ssh_root=$(grep -rh '^PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ \
+            2>/dev/null | tail -1 | awk '{print $2}' || echo "")
+        if [[ -z "$ssh_root" ]]; then
+            local ssh_ver; ssh_ver=$(ssh -V 2>&1 | grep -oP 'OpenSSH_\K[0-9]+' | head -1 || echo "0")
+            if (( ssh_ver < 8 )); then
+                _row "SSH root"   "!   default may allow login (OpenSSH <8)"
+                _rec "Set PermitRootLogin no in sshd_config (OpenSSH <8 default risky)"
+            fi
+        else
+            case "$ssh_root" in
+                no|prohibit-password|without-password) ;;  # OK — no row needed
+                yes)  _row "SSH root"  "!!  enabled (password login allowed)"
+                      _rec "SSH root password login enabled — disable in sshd_config  [auto]" ;;
+                *)    _row "SSH root"  "!   unknown value: ${ssh_root}" ;;
+            esac
+        fi
+    fi
+
+    # ── Rootless container namespaces (subuid/subgid) ─────────────────────────
+    # /etc/subuid and /etc/subgid must have entries for every login user so
+    # Podman and Distrobox can create rootless containers. This is a per-user
+    # access control setting, not a service config.
+    if command -v podman &>/dev/null || command -v distrobox &>/dev/null; then
+        local sub_missing=()
+        local _sub_login_users=()
+        _get_login_users _sub_login_users
+        for u in "${_sub_login_users[@]}"; do
+            if ! grep -q "^${u}:" /etc/subuid 2>/dev/null || \
+               ! grep -q "^${u}:" /etc/subgid 2>/dev/null; then
+                sub_missing+=("$u")
+            fi
+        done
+        if [[ ${#sub_missing[@]} -gt 0 ]]; then
+            _row "subuid"   "!!  missing for: $(_join "${sub_missing[@]}") — rootless Podman/Distrobox will fail"
+            _rec "subuid/subgid missing for $(_join "${sub_missing[@]}") — run: usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <user>"
+        else
+            _row "subuid"   "OK  configured for all users"
+        fi
+    fi
+}
+
+
+###############################################################################
+### system_info — master status report                                       ###
+###############################################################################
+
 
 _section_hardware() {
     _head "Hardware"
@@ -1324,11 +2002,11 @@ _section_disk() {
                     fi
                 fi
                 if [[ -n "$temp" ]]; then
-                    if (( temp >= 70 )); then
+                    if (( temp >= 65 )); then
                         _row "Disk temp"  "!!  ${temp}°C — critically hot"
                         _rec "Disk temperature is ${temp}°C — check cooling"
                     elif (( temp > 55 )); then
-                        _row "Disk temp"  "!   ${temp}°C (warm)"
+                        _row "Disk temp"  "!   ${temp}°C (warm — SSDs throttle at 70°C)"
                     else
                         _row "Disk temp"  "OK  ${temp}°C"
                     fi
@@ -1403,16 +2081,20 @@ _section_disk() {
     fi
 }
 
-_section_storage() {
-    _head "Storage"
+###############################################################################
+### Shared Btrfs storage helpers (used by _section_storage + analyze_storage)
+###############################################################################
 
-    # Free space with threshold warning — Btrfs can ENOSPC before df shows 0
-    local btrfs_free_bytes btrfs_free_gb
-    btrfs_free_bytes=$(btrfs filesystem usage -b / 2>/dev/null \
+# Print free-space row. Pass mount point (/ for live system, STOR_MNT for subvolid=5).
+# Reads btrfs filesystem usage -b for byte-accurate free space.
+_stor_check_free() {
+    local mnt="${1:-/}"
+    local btrfs_free_bytes
+    btrfs_free_bytes=$(btrfs filesystem usage -b "$mnt" 2>/dev/null \
         | awk '/Free \(estimated\):/{print $3}' || echo "0")
     if [[ "$btrfs_free_bytes" =~ ^[0-9]+$ ]] && (( btrfs_free_bytes > 0 )); then
-        btrfs_free_gb=$(awk "BEGIN{printf \"%.1f\", $btrfs_free_bytes/1073741824}")
-        local free_gb_int; free_gb_int=$(awk "BEGIN{printf \"%d\", $btrfs_free_bytes/1073741824}")
+        local btrfs_free_gb; btrfs_free_gb=$(awk "BEGIN{printf \"%.1f\", $btrfs_free_bytes/1073741824}")
+        local free_gb_int;   free_gb_int=$(awk "BEGIN{printf \"%d\",   $btrfs_free_bytes/1073741824}")
         if (( free_gb_int < 5 )); then
             _row "Free"  "!!  ${btrfs_free_gb} GB — critically low (Btrfs may ENOSPC soon)"
             _rec "Btrfs free space is critically low (${btrfs_free_gb} GB) — run: shani-health --storage-info"
@@ -1424,19 +2106,60 @@ _section_storage() {
     else
         _row "Free"  "--  unknown"
     fi
+}
 
-    # Btrfs device error stats — most actionable low-level corruption signal
-    local dev_stats; dev_stats=$(btrfs device stats / 2>/dev/null || true)
-    if [[ -n "$dev_stats" ]]; then
-        local nonzero; nonzero=$(echo "$dev_stats" | awk '$NF != "0" {print}' || true)
-        if [[ -n "$nonzero" ]]; then
-            _row "Dev errors" "!!  non-zero error counters detected"
-            echo "$nonzero" | while IFS= read -r line; do _row2 "!  $line"; done
-            _rec "Btrfs device errors detected — run: btrfs device stats / and check drive health"
-        else
-            _row "Dev errors" "OK  all zero"
-        fi
+# Print device error stats row. Pass mount point.
+_stor_check_device_errors() {
+    local mnt="${1:-/}"
+    local dev_stats; dev_stats=$(btrfs device stats "$mnt" 2>/dev/null || true)
+    [[ -z "$dev_stats" ]] && return
+    local nonzero; nonzero=$(echo "$dev_stats" | awk '$NF != "0"' || true)
+    if [[ -n "$nonzero" ]]; then
+        _row "Dev errors" "!!  non-zero error counters detected"
+        echo "$nonzero" | while IFS= read -r line; do _row2 "!  $line"; done
+        _rec "Btrfs device errors detected — run: btrfs device stats ${mnt} and check drive health"
+    else
+        _row "Dev errors" "OK  all zero"
     fi
+}
+
+# Print bees dedup daemon status row.
+_stor_check_bees() {
+    local bees_uuid; bees_uuid=$(_get_bees_uuid)
+    if [[ -z "$bees_uuid" ]]; then
+        _row "bees"  "--  could not determine Btrfs UUID for ${ROOTLABEL}"
+        return
+    fi
+    local bees_unit="beesd@${bees_uuid}"
+    local bees_conf="/etc/bees/${bees_uuid}.conf"
+    local bees_st;  bees_st=$(systemctl is-active  "$bees_unit" 2>/dev/null | tr -d '[:space:]' || echo "inactive")
+    local bees_en;  bees_en=$(systemctl is-enabled "$bees_unit" 2>/dev/null | tr -d '[:space:]' || echo "disabled")
+    local bees_short="${bees_uuid:0:8}…"
+    if [[ "$bees_st" == "active" ]]; then
+        local bees_dedup=""
+        bees_dedup=$(journalctl -u "$bees_unit" -n 50 --no-pager -q 2>/dev/null \
+            | grep -oE 'deduped [0-9.]+ [KMGT]?B' | tail -1 || echo "")
+        _row "bees"  "OK  beesd@${bees_short} running${bees_dedup:+  (${bees_dedup})}"
+    elif [[ ! -f "$bees_conf" ]]; then
+        _row "bees"  "--  not configured (run beesd-setup to enable dedup)"
+        _rec "bees not configured — run: beesd-setup, then: systemctl enable --now ${bees_unit}"
+    elif [[ "$bees_en" == "enabled" ]]; then
+        _row "bees"  "!!  beesd@${bees_short} enabled but not running"
+        _rec "bees enabled but not running — run: systemctl start ${bees_unit}  [auto]"
+    else
+        _row "bees"  "!   beesd@${bees_short} configured but not enabled"
+        _rec "bees not running — run: systemctl enable --now ${bees_unit}  [auto]"
+    fi
+}
+
+_section_storage() {
+    _head "Storage"
+
+    # Free space — shared helper
+    _stor_check_free /
+
+    # Device error stats — shared helper
+    _stor_check_device_errors /
 
     # ── Btrfs quota consistency ───────────────────────────────────────────────
     # Quota groups (qgroups) can become inconsistent after unclean shutdowns or
@@ -1531,37 +2254,31 @@ _section_storage() {
         _rec "Btrfs timers inactive (${t_bad_str}) — run: systemctl enable --now ${units% }  [auto]"
     fi
 
+    # ── Btrfs subvolume size breakdown ────────────────────────────────────────
+    # Enumerate mounted Btrfs subvolumes by matching findmnt subvol options
+    # against btrfs subvolume list. This reliably catches /data, /nix, /home, etc.
+    local _svol_sizes=()
+    while IFS=$'\t' read -r mp opts; do
+        [[ -z "$mp" || -z "$opts" ]] && continue
+        local _subvol; _subvol=$(echo "$opts" | grep -oP '(?<=subvol=)[^,\s]+' | head -1 || echo "")
+        [[ -z "$_subvol" || "$_subvol" == "/" ]] && continue
+        # Only report named shani subvolumes (start with @)
+        [[ "$_subvol" == @* ]] || continue
+        local _sz; _sz=$(df -BM --output=used "$mp" 2>/dev/null | tail -1 | tr -d ' M' || echo "")
+        [[ "$_sz" =~ ^[0-9]+$ ]] || continue
+        (( _sz > 0 )) || continue
+        _svol_sizes+=("${_subvol}:${_sz}MB")
+    done < <(findmnt --list -n -o TARGET,OPTIONS -t btrfs 2>/dev/null || true)
+    if [[ ${#_svol_sizes[@]} -gt 0 ]]; then
+        _row "Subvol sz"  "--  $(_join "${_svol_sizes[@]}")"
+    fi
+
     # ── Btrfs dedup (bees) ────────────────────────────────────────────────────
-    # beesd@<uuid> deduplicates the Btrfs filesystem in the background.
-    # The unit name is derived from the filesystem UUID — check both the plain
-    # label device and the LUKS mapper so encrypted systems are covered.
-    local bees_uuid
-    bees_uuid=$(blkid -s UUID -o value "/dev/disk/by-label/${ROOTLABEL}" 2>/dev/null || true)
-    [[ -z "$bees_uuid" && -e "/dev/mapper/${ROOTLABEL}" ]] && \
-        bees_uuid=$(blkid -s UUID -o value "/dev/mapper/${ROOTLABEL}" 2>/dev/null || true)
-    if [[ -n "$bees_uuid" ]]; then
-        local bees_unit="beesd@${bees_uuid}"
-        local bees_conf="/etc/bees/${bees_uuid}.conf"
-        local bees_st; bees_st=$(systemctl is-active "$bees_unit" 2>/dev/null || echo "inactive")
-        local bees_en; bees_en=$(systemctl is-enabled "$bees_unit" 2>/dev/null || echo "disabled")
-        if [[ "$bees_st" == "active" ]]; then
-            # Show last-run stats if available from the journal
-            local bees_dedup=""
-            bees_dedup=$(journalctl -u "$bees_unit" -n 50 --no-pager -q 2>/dev/null \
-                | grep -oE 'deduped [0-9.]+ [KMGT]?B' | tail -1 || echo "")
-            _row "bees"      "OK  ${bees_unit} running${bees_dedup:+  (${bees_dedup})}"
-        elif [[ ! -f "$bees_conf" ]]; then
-            _row "bees"      "--  not configured (run beesd-setup to enable dedup)"
-            _rec "bees not configured — run: beesd-setup, then: systemctl enable --now ${bees_unit}"
-        elif [[ "$bees_en" == "enabled" ]]; then
-            _row "bees"      "!!  ${bees_unit} enabled but not running (${bees_st})"
-            _rec "bees enabled but not running — run: systemctl start ${bees_unit}  [auto]"
-        else
-            _row "bees"      "!   ${bees_unit} configured but not enabled"
-            _rec "bees not running — run: systemctl enable --now ${bees_unit}  [auto]"
-        fi
-    else
-        _row "bees"      "--  could not determine Btrfs UUID for ${ROOTLABEL}"
+    _stor_check_bees
+
+    # ── Tool hints ────────────────────────────────────────────────────────────
+    if ! command -v compsize &>/dev/null; then
+        _row "compsize"  "--  not installed — run: pacman -S compsize (needed for --storage-info)"
     fi
 }
 
@@ -1658,87 +2375,9 @@ _section_battery() {
     fi
 }
 
-_section_data_state() {
-    _head "Data State"
 
-    # ── /data subvolume mount ─────────────────────────────────────────────────
-    if ! findmnt -n /data &>/dev/null; then
-        _row "/data"          "!!  not mounted — system state unavailable"
-        _rec "/data subvolume not mounted — check fstab and Btrfs subvolume list"
-        return
-    fi
-    _row "/data"          "OK  mounted"
-
-    # ── shanios-tmpfiles-data.service ─────────────────────────────────────────
-    # Creates /data/varlib, /data/varspool, /data/overlay/{upper,work} and other
-    # persistent dirs on first boot or after a fresh @data subvolume. If it
-    # failed, bind-mounts and the /etc overlay will be broken.
-    local tmpfiles_res
-    tmpfiles_res=$(systemctl show shanios-tmpfiles-data.service \
-        --property=Result --value 2>/dev/null | tr -d '[:space:]' || echo "")
-    if [[ "$tmpfiles_res" == "exit-code" || "$tmpfiles_res" == "core-dump" || "$tmpfiles_res" == "signal" ]]; then
-        _row "tmpfiles"   "!!  shanios-tmpfiles-data.service failed — /data dirs may be missing"
-        _rec "shanios-tmpfiles-data.service failed — run: systemctl restart shanios-tmpfiles-data.service  [auto]"
-    elif [[ "$tmpfiles_res" == "success" || "$tmpfiles_res" == "" ]]; then
-        : # OK or never ran (fresh boot) — dirs checked individually below
-    fi
-    # Written by shani-deploy on install/slot-switch.
-    # Cleared by shani-user-setup after it runs successfully.
-    # Setup is triggered by running the binary directly (no path/service unit).
-    if [[ -f /data/user-setup-needed ]]; then
-        local marker_age_days=0
-        local marker_epoch; marker_epoch=$(stat -c '%Y' /data/user-setup-needed 2>/dev/null || echo "0")
-        (( marker_epoch > 0 )) && \
-            marker_age_days=$(( ( $(date +%s) - marker_epoch ) / 86400 ))
-
-        if [[ ! -x "$USER_SETUP_BIN" ]]; then
-            _row "User setup" "!!  marker present but ${USER_SETUP_BIN} missing or not executable"
-            _rec "shani-user-setup binary missing — reinstall: ${USER_SETUP_BIN}"
-        elif (( marker_age_days >= 1 )); then
-            _row "User setup" "!   marker ${marker_age_days}d old — setup not yet run"
-            _rec "user-setup-needed marker is ${marker_age_days}d old — run: shani-user-setup  [auto]"
-        else
-            _row "User setup" "--  pending (marker present, will run shortly)"
-        fi
-    else
-        _row "User setup"  "OK  complete"
-    fi
-
-    # ── varlib / varspool bind-mount directories ───────────────────────────────
-    # These live under /data and are bind-mounted into /var/lib and /var/spool
-    # for services that need persistent state across the volatile /var tmpfs.
-    local varlib_ok=0 varspool_ok=0
-    [[ -d /data/varlib   ]] && varlib_ok=1
-    [[ -d /data/varspool ]] && varspool_ok=1
-
-    if (( varlib_ok )); then
-        local varlib_svcs; varlib_svcs=$(ls /data/varlib 2>/dev/null | wc -l || echo "0")
-        _row "varlib"   "OK  ${varlib_svcs} service dir(s) in /data/varlib"
-    else
-        _row "varlib"   "!   /data/varlib missing — service state bind-mounts may fail"
-        _rec "/data/varlib directory missing — run: mkdir -p /data/varlib  [auto]"
-    fi
-
-    if (( varspool_ok )); then
-        local varspool_svcs; varspool_svcs=$(ls /data/varspool 2>/dev/null | wc -l || echo "0")
-        _row "varspool" "OK  ${varspool_svcs} spool dir(s) in /data/varspool"
-    else
-        _row "varspool" "!   /data/varspool missing — spool bind-mounts may fail"
-        _rec "/data/varspool directory missing — run: mkdir -p /data/varspool  [auto]"
-    fi
-
-    # ── /data overlay directories (for /etc overlay) ──────────────────────────
-    local overlay_upper="/data/overlay/etc/upper"
-    local overlay_work="/data/overlay/etc/work"
-    if [[ ! -d "$overlay_upper" || ! -d "$overlay_work" ]]; then
-        _row "overlay"  "!   /data/overlay/etc/{upper,work} missing"
-        _rec "/data/overlay dirs missing — run shanios-tmpfiles-data.service or: mkdir -p /data/overlay/etc/{upper,work}"
-    fi
-
-}
-
-_section_services() {
-    _head "Services"
+_section_system_services() {
+    _head "System Services"
 
     # ── CUPS printing ─────────────────────────────────────────────────────────
     if getent group cups &>/dev/null; then
@@ -1834,6 +2473,10 @@ _section_services() {
     else
         _row "timesyncd"  "--  timedatectl not available"
     fi
+}
+
+_section_network() {
+    _head "Network"
 
     # ── Network ───────────────────────────────────────────────────────────────
     systemctl is-active --quiet NetworkManager 2>/dev/null \
@@ -1865,6 +2508,37 @@ _section_services() {
         _rec "/etc/resolv.conf has no nameserver lines — check openresolv configuration"
     fi
 
+
+    # ── Tailscale connectivity ────────────────────────────────────────────────
+    if systemctl is-active --quiet tailscaled 2>/dev/null; then
+        local ts_out; ts_out=$(tailscale status 2>/dev/null || echo "")
+        local ts_ip;  ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+        if echo "$ts_out" | grep -qiE 'logged out|not logged in|stopped'; then
+            _row "Tailscale"  "!   daemon running but not authenticated — run: tailscale up"
+        elif [[ -n "$ts_ip" ]]; then
+            _row "Tailscale"  "OK  connected  (${ts_ip})"
+        else
+            _row "Tailscale"  "--  daemon active (status unclear)"
+        fi
+    fi
+
+
+    # ── Avahi mDNS ────────────────────────────────────────────────────────────
+    # Needed for printer/scanner auto-discovery (cups-browsed), .local resolution
+    if command -v avahi-daemon &>/dev/null; then
+        if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+            _row "Avahi"      "OK  mDNS/DNS-SD active"
+        elif systemctl is-enabled --quiet avahi-daemon 2>/dev/null; then
+            _row "Avahi"      "!   enabled but not running"
+            _rec "avahi-daemon not running — run: systemctl start avahi-daemon  [auto]"
+        fi
+        # Silent if not enabled — it's optional
+    fi
+}
+
+_section_audio_display() {
+    _head "Audio & Display"
+
     # ── Realtime audio ────────────────────────────────────────────────────────
     local rtkit_st; rtkit_st=$(systemctl is-active rtkit-daemon 2>/dev/null || echo "inactive")
     if [[ "$rtkit_st" == "active" ]]; then
@@ -1881,21 +2555,16 @@ _section_services() {
         _rec "'realtime' group missing — install: pacman -S realtime-privileges"
     else
         IFS=',' read -ra rt_members <<< "${rt_line##*:}"
-        local rt_display; rt_display=$(echo "${rt_members[*]}" | tr -s ' ' | xargs)
+        local rt_display; rt_display=$(IFS=' '; echo "${rt_members[*]}" | tr -s ' ' | xargs)
         # Check every login user is in the realtime group
         local _rt_login=() _missing_rt=()
-        while IFS=: read -r name _ uid _ _ _ shell; do
-            [[ "$uid" -ge 1000 ]] 2>/dev/null || continue
-            [[ "$name" == "nobody" ]] && continue
-            [[ "$shell" == */nologin || "$shell" == */false ]] && continue
-            _rt_login+=("$name")
-        done < /etc/passwd 2>/dev/null || true
+        _get_login_users _rt_login
         for u in "${_rt_login[@]}"; do
             id -nG "$u" 2>/dev/null | grep -qw realtime || _missing_rt+=("$u")
         done
         if [[ ${#_missing_rt[@]} -gt 0 ]]; then
-            _row "realtime"  "!   users missing from group: ${_missing_rt[*]}"
-            _rec "User(s) ${_missing_rt[*]} not in 'realtime' group — add: usermod -aG realtime <user>"
+            _row "realtime"  "!   users missing from group: $(_join "${_missing_rt[@]}")"
+            _rec "User(s) $(_join "${_missing_rt[@]}") not in 'realtime' group — add: usermod -aG realtime <user>"
         elif [[ -z "$rt_display" ]]; then
             _row "realtime"  "!   group empty"
             _rec "'realtime' group empty — add users: usermod -aG realtime <user>"
@@ -1918,19 +2587,6 @@ _section_services() {
 
 
 
-    # ── Tailscale connectivity ────────────────────────────────────────────────
-    if systemctl is-active --quiet tailscaled 2>/dev/null; then
-        local ts_out; ts_out=$(tailscale status 2>/dev/null || echo "")
-        local ts_ip;  ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
-        if echo "$ts_out" | grep -qiE 'logged out|not logged in|stopped'; then
-            _row "Tailscale"  "!   daemon running but not authenticated — run: tailscale up"
-        elif [[ -n "$ts_ip" ]]; then
-            _row "Tailscale"  "OK  connected  (${ts_ip})"
-        else
-            _row "Tailscale"  "--  daemon active (status unclear)"
-        fi
-    fi
-
     # ── PipeWire audio stack ──────────────────────────────────────────────────
     if command -v pipewire &>/dev/null; then
         local pw_st wp_st
@@ -1946,9 +2602,9 @@ _section_services() {
             # Under sudo without a session, user services legitimately appear inactive
             local _has_session=0
             loginctl list-sessions --no-legend 2>/dev/null \
-                | awk '{print $3}' | grep -qx "$_LOGIN_USER" && _has_session=1
+                | awk '{print $3}' | grep -qx "$_CALLER_USER" && _has_session=1
             if (( _has_session )); then
-                _row "PipeWire"  "!   not running for ${_LOGIN_USER} — audio will be silent"
+                _row "PipeWire"  "!   not running for ${_CALLER_USER} — audio will be silent"
                 _rec "PipeWire not running — systemctl --user enable --now pipewire wireplumber"
             fi
             # Silent if no active session — running health at boot/tty before login is normal
@@ -1970,18 +2626,6 @@ _section_services() {
             _row "Display mgr" "!!  ${dm_svc} not enabled"
             _rec "${dm_svc} not enabled — run: systemctl enable --now ${dm_svc}  [auto]"
         fi
-    fi
-
-    # ── Avahi mDNS ────────────────────────────────────────────────────────────
-    # Needed for printer/scanner auto-discovery (cups-browsed), .local resolution
-    if command -v avahi-daemon &>/dev/null; then
-        if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
-            _row "Avahi"      "OK  mDNS/DNS-SD active"
-        elif systemctl is-enabled --quiet avahi-daemon 2>/dev/null; then
-            _row "Avahi"      "!   enabled but not running"
-            _rec "avahi-daemon not running — run: systemctl start avahi-daemon  [auto]"
-        fi
-        # Silent if not enabled — it's optional
     fi
 
     # ── switcheroo-control (hybrid GPU) ───────────────────────────────────────
@@ -2007,45 +2651,59 @@ _section_services() {
         _row "ananicy-cpp" "!   enabled but not running — CPU scheduling rules inactive"
         _rec "ananicy-cpp not running — run: systemctl enable --now ananicy-cpp  [auto]"
     fi
+}
+
+_section_units() {
+    _head "Units"
 
     # ── Failed units ──────────────────────────────────────────────────────────
     local failed_units=()
+    # Filter known transient oneshot units that legitimately enter failed state
+    # (e.g. systemd-suspend.service fails after every suspend cycle by design)
+    local _transient_ok="systemd-suspend.service|systemd-hibernate.service|systemd-hybrid-sleep.service"
     mapfile -t failed_units < <(
         systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
-            | awk '{print $1}' || true)
+            | awk '{print $2}' | grep -v '^$' | grep '\.' \
+            | grep -vE "^(${_transient_ok})$" || true)
     if [[ ${#failed_units[@]} -eq 0 ]]; then
         _row "Units"     "OK  no failed systemd units"
     else
-        _row "Units"     "!!  ${#failed_units[@]} failed: ${failed_units[*]}"
-        _rec "Failed units: ${failed_units[*]} — run: systemctl status <unit>"
+        local _fu_str; _fu_str=$(IFS=' '; echo "${failed_units[*]}")
+        _row "Units"     "!!  ${#failed_units[@]} failed: ${_fu_str}"
+        _rec "Failed units: ${_fu_str} — run: systemctl status ${_fu_str}"
     fi
 }
 
-_section_packages() {
-    _head "Packages & Containers"
+_section_package_managers() {
+    _head "Package Managers"
 
     # ── Flatpak ───────────────────────────────────────────────────────────────
     if command -v flatpak &>/dev/null; then
         local flatpak_sys; flatpak_sys=$(systemctl is-active flatpak-update-system.timer 2>/dev/null || echo "inactive")
-        local flatpak_apps flatpak_remotes
+        local flatpak_apps flatpak_remotes flatpak_mb
         flatpak_apps=$(timeout 5 flatpak list --app --columns=application 2>/dev/null | wc -l || echo "?")
         flatpak_remotes=$(flatpak remotes 2>/dev/null | grep -c '.' || echo "0")
+        flatpak_mb=$(du -sm /var/lib/flatpak 2>/dev/null | awk '{print $1}' || echo "")
+        local fp_sz_str=""
+        [[ "$flatpak_mb" =~ ^[0-9]+$ ]] && fp_sz_str=", ${flatpak_mb} MB"
         if [[ "$flatpak_sys" == "active" ]]; then
-            _row "Flatpak"    "OK  auto-update active  (${flatpak_apps} apps, ${flatpak_remotes} remote(s))"
+            _row "Flatpak"    "OK  auto-update active  (${flatpak_apps} apps, ${flatpak_remotes} remote(s)${fp_sz_str})"
         else
-            _row "Flatpak"    "!   auto-update timer not active  (${flatpak_apps} apps)"
+            _row "Flatpak"    "!   auto-update timer not active  (${flatpak_apps} apps${fp_sz_str})"
             _rec "Flatpak auto-update timer not active — run: systemctl enable --now flatpak-update-system.timer  [auto]"
         fi
-        # Flatpak storage — runtimes and old app versions accumulate
-        local flatpak_mb
-        flatpak_mb=$(du -sm /var/lib/flatpak 2>/dev/null | awk '{print $1}' || echo "")
+        # Flatpak runtime count as continuation (size detail in --storage-info)
         if [[ "$flatpak_mb" =~ ^[0-9]+$ ]]; then
-            if (( flatpak_mb > 20480 )); then
-                _row "Flatpak sz"  "!   ${flatpak_mb} MB — run: flatpak uninstall --unused"
-                _rec "Flatpak storage is ${flatpak_mb} MB — free space: flatpak uninstall --unused"
-            elif (( flatpak_mb > 8192 )); then
-                _row "Flatpak sz"  "--  ${flatpak_mb} MB (consider: flatpak uninstall --unused)"
-            fi
+            local fp_unused=""
+            fp_unused=$(timeout 10 flatpak list --runtime --columns=application 2>/dev/null | wc -l || echo "")
+            [[ "$fp_unused" =~ ^[0-9]+$ ]] && (( fp_unused > 0 )) && \
+                _row2 "--  ${fp_unused} runtime(s) installed"
+        fi
+        # Pending flatpak updates
+        local flatpak_updates
+        flatpak_updates=$(timeout 15 flatpak remote-ls --updates 2>/dev/null | wc -l || echo "")
+        if [[ "$flatpak_updates" =~ ^[0-9]+$ ]] && (( flatpak_updates > 0 )); then
+            _row "Flatpak upd" "--  ${flatpak_updates} update(s) pending (timer will apply automatically)"
         fi
     fi
 
@@ -2057,8 +2715,13 @@ _section_packages() {
         if [[ "$snapd_sock" == "active" ]] && command -v snap &>/dev/null; then
             snap_count=$(timeout 5 snap list 2>/dev/null | tail -n +2 | wc -l || echo "")
         fi
+        # Pre-compute store size so it can go on the main row
+        local snap_store_mb
+        snap_store_mb=$(du -sm /var/lib/snapd/snaps 2>/dev/null | awk '{print $1}' || echo "")
+        local snap_sz_str=""
+        [[ "$snap_store_mb" =~ ^[0-9]+$ ]] && snap_sz_str=", ${snap_store_mb} MB"
         if [[ "$snapd_sock" == "active" && "$snapd_aa" == "active" ]]; then
-            _row "Snap"       "OK  snapd + AppArmor active${snap_count:+  (${snap_count} snaps)}"
+            _row "Snap"       "OK  snapd + AppArmor active${snap_count:+  (${snap_count} snaps${snap_sz_str})}"
         elif [[ "$snapd_sock" == "active" ]]; then
             _row "Snap"       "!   snapd active but AppArmor service is ${snapd_aa} — confinement not enforced"
             _rec "snapd.apparmor.service not active — snap confinement broken  [auto]"
@@ -2066,44 +2729,59 @@ _section_packages() {
             _row "Snap"       "!!  @snapd mounted but snapd.socket is ${snapd_sock}"
             _rec "snapd.socket not active — run: systemctl enable --now snapd.socket snapd.apparmor.service  [auto]"
         fi
-        # Snap storage size — old revisions accumulate silently
-        local snap_store_mb
-        snap_store_mb=$(du -sm /var/lib/snapd/snaps 2>/dev/null | awk '{print $1}' || echo "")
-        if [[ "$snap_store_mb" =~ ^[0-9]+$ ]]; then
-            if (( snap_store_mb > 10240 )); then
-                _row "Snap store" "!   ${snap_store_mb} MB — run: snap set system refresh.retain=2"
-                _rec "Snap storage is ${snap_store_mb} MB — limit old revisions: snap set system refresh.retain=2"
-            elif (( snap_store_mb > 3072 )); then
-                _row "Snap store" "--  ${snap_store_mb} MB (consider: snap set system refresh.retain=2)"
+        # Check for stale snap revisions — warn if present
+        local snap_stale_count=""
+        command -v snap &>/dev/null && \
+            snap_stale_count=$(timeout 5 snap list --all 2>/dev/null \
+                | awk '/disabled/{c++} END{print c+0}' || echo "")
+        if [[ "$snap_stale_count" =~ ^[0-9]+$ ]] && (( snap_stale_count > 0 )); then
+            _row2 "--  ${snap_stale_count} stale revision(s) — run: snap set system refresh.retain=2"
+            _rec "Snap has ${snap_stale_count} stale revision(s) — free space: snap set system refresh.retain=2  [auto]"
+        fi
+        # Pending snap updates
+        if [[ "$snapd_sock" == "active" ]] && command -v snap &>/dev/null; then
+            local snap_updates
+            snap_updates=$(timeout 10 snap refresh --list 2>/dev/null | tail -n +2 | wc -l || echo "")
+            if [[ "$snap_updates" =~ ^[0-9]+$ ]] && (( snap_updates > 0 )); then
+                _row "Snap upd"   "!   ${snap_updates} snap(s) with pending updates — run: snap refresh  [auto]"
+                _rec "${snap_updates} snap update(s) available — run: snap refresh  [auto]"
             fi
         fi
     fi
 
     # ── Nix ───────────────────────────────────────────────────────────────────
     if findmnt -n /nix &>/dev/null; then
+        # Store size and generation count — computed before the main row so they can be inlined
+        local nix_store_mb
+        nix_store_mb=$(du -sm /nix/store 2>/dev/null | awk '{print $1}' || echo "")
+        local nix_gen_count=""
+        local _nix_prof="/nix/var/nix/profiles"
+        if [[ -d "$_nix_prof" ]]; then
+            nix_gen_count=$(ls "$_nix_prof" 2>/dev/null | grep -cE '^system-[0-9]+-link$' || echo "")
+        fi
+        local nix_sz_str=""
+        [[ "$nix_store_mb" =~ ^[0-9]+$ ]] && nix_sz_str=", ${nix_store_mb} MB"
+        local nix_gen_str=""
+        [[ "$nix_gen_count" =~ ^[0-9]+$ ]] && (( nix_gen_count > 0 )) && \
+            nix_gen_str=", ${nix_gen_count} generation(s)"
+
         if systemctl is-active --quiet nix-daemon.socket 2>/dev/null; then
             local nix_ver=""
             nix_ver=$(nix --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
             local nix_channels=""
-            local _nix_user="${SUDO_USER:-${SHANI_CALLER_USER:-${USER:-}}}"
+            local _nix_user="$_CALLER_USER"
             if [[ -n "$_nix_user" ]]; then
                 nix_channels=$(timeout 5 runuser -u "$_nix_user" -- nix-channel --list 2>/dev/null | wc -l || echo "")
             fi
-            _row "Nix"        "OK  nix-daemon active${nix_ver:+  (v${nix_ver})}${nix_channels:+  ${nix_channels} channel(s)}"
+            _row "Nix" "OK  nix-daemon active${nix_ver:+  (v${nix_ver})}${nix_channels:+  ${nix_channels} channel(s)}${nix_sz_str}${nix_gen_str}"
         else
-            _row "Nix"        "!!  @nix mounted but nix-daemon.socket not active"
+            _row "Nix" "!!  @nix mounted but nix-daemon.socket not active"
             _rec "nix-daemon.socket not active — run: systemctl enable --now nix-daemon.socket  [auto]"
         fi
-        # Nix store size — grows unboundedly without garbage collection
-        local nix_store_mb
-        nix_store_mb=$(du -sm /nix/store 2>/dev/null | awk '{print $1}' || echo "")
-        if [[ "$nix_store_mb" =~ ^[0-9]+$ ]]; then
-            if (( nix_store_mb > 51200 )); then
-                _row "Nix store"  "!   ${nix_store_mb} MB — run: nix-collect-garbage -d"
-                _rec "Nix store is ${nix_store_mb} MB — free space: nix-collect-garbage -d"
-            elif (( nix_store_mb > 20480 )); then
-                _row "Nix store"  "--  ${nix_store_mb} MB (consider: nix-collect-garbage -d)"
-            fi
+        # Nix store: warn only when critically large (detail in --storage-info)
+        if [[ "$nix_store_mb" =~ ^[0-9]+$ ]] && (( nix_store_mb > 51200 )); then
+            _row2 "!   ${nix_store_mb} MB — run: nix-collect-garbage -d"
+            _rec "Nix store is ${nix_store_mb} MB — free space: nix-collect-garbage -d"
         fi
     fi
 
@@ -2131,8 +2809,12 @@ _section_packages() {
         _row "shani-upd"  "--  enabled, not yet started (starts at login)"
     else
         _row "shani-upd"  "!   shani-update.timer not enabled — OS updates won't be auto-checked"
-        _rec "shani-update.timer not enabled — run as your user: systemctl --user enable --now shani-update.timer"
+        _rec "shani-update.timer not enabled — run: systemctl --user enable --now shani-update.timer  [auto]"
     fi
+}
+
+_section_containers() {
+    _head "Containers"
 
     # ── Podman ────────────────────────────────────────────────────────────────
     if command -v podman &>/dev/null; then
@@ -2142,7 +2824,7 @@ _section_packages() {
         podman_ver=$(podman --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
         # Rootless capable: needs unprivileged userns + subuid
         local rootless_ok=1
-        local _rl_user="${SUDO_USER:-${SHANI_CALLER_USER:-${USER:-}}}"
+        local _rl_user="$_CALLER_USER"
         [[ -n "$_rl_user" ]] && { grep -q "^${_rl_user}:" /etc/subuid 2>/dev/null || rootless_ok=0; }
         local userns_val; userns_val=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "1")
         [[ "$userns_val" == "0" ]] && rootless_ok=0
@@ -2160,16 +2842,12 @@ _section_packages() {
            [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
             _row2 "!  Distrobox installed but Podman socket not active — containers won't start"
         fi
-        # Image storage size — dangling images silently fill @containers
+        # Image storage — warn only when critically large (detail in --storage-info)
         local podman_img_mb
         podman_img_mb=$(du -sm /var/lib/containers/storage/overlay 2>/dev/null | awk '{print $1}' || echo "")
-        if [[ "$podman_img_mb" =~ ^[0-9]+$ ]]; then
-            if (( podman_img_mb > 20480 )); then
-                _row "Podman img" "!   ${podman_img_mb} MB in image storage — run: podman image prune"
-                _rec "Podman image storage is ${podman_img_mb} MB — free space: podman image prune"
-            elif (( podman_img_mb > 5120 )); then
-                _row "Podman img" "--  ${podman_img_mb} MB in image storage"
-            fi
+        if [[ "$podman_img_mb" =~ ^[0-9]+$ ]] && (( podman_img_mb > 20480 )); then
+            _row2 "!   ${podman_img_mb} MB in image storage — run: podman image prune"
+            _rec "Podman image storage is ${podman_img_mb} MB — free space: podman image prune"
         fi
     fi
 
@@ -2199,21 +2877,27 @@ _section_packages() {
                 _rec "lxcfs not running — run: systemctl enable --now lxcfs  [auto]"
             fi
         fi
-        # LXD storage size
+        # LXD storage — warn only when large (detail in --storage-info)
         local lxd_mb
         lxd_mb=$(du -sm /var/lib/lxd /data/varlib/lxd 2>/dev/null | awk '{s+=$1} END{print s}' || echo "")
         if [[ "$lxd_mb" =~ ^[0-9]+$ ]] && (( lxd_mb > 20480 )); then
-            _row "LXD store"  "--  ${lxd_mb} MB (review with: lxc storage info default)"
+            _row2 "!   ${lxd_mb} MB — review with: lxc storage info default"
+            _rec "LXD storage is ${lxd_mb} MB — review: lxc storage info default"
         fi
     fi
 
     # ── Waydroid ─────────────────────────────────────────────────────────────
     if findmnt -n /var/lib/waydroid &>/dev/null; then
         local waydroid_st; waydroid_st=$(systemctl is-active waydroid-container 2>/dev/null || echo "inactive")
+        # Storage size — Android images can be several GB
+        local waydroid_mb
+        waydroid_mb=$(du -sm /var/lib/waydroid 2>/dev/null | awk '{print $1}' || echo "")
+        local wd_sz_str=""
+        [[ "$waydroid_mb" =~ ^[0-9]+$ ]] && wd_sz_str="  (${waydroid_mb} MB)"
         if [[ "$waydroid_st" == "active" ]]; then
-            _row "Waydroid"   "OK  Android container active"
+            _row "Waydroid"   "OK  Android container active${wd_sz_str}"
         else
-            _row "Waydroid"   "!   @waydroid mounted but container service is ${waydroid_st}"
+            _row "Waydroid"   "!   @waydroid mounted but container service is ${waydroid_st}${wd_sz_str}"
             _rec "Waydroid container not running — run: systemctl enable --now waydroid-container  [auto]"
         fi
     fi
@@ -2237,12 +2921,7 @@ _section_packages() {
                 _row "nspawn"     "!   machines present but systemd-machined is ${machined_st}"
                 _rec "systemd-machined not active — run: systemctl start systemd-machined  [auto]"
             fi
-            # nspawn storage size
-            local nspawn_mb
-            nspawn_mb=$(du -sm "$machines_dir" 2>/dev/null | awk '{print $1}' || echo "")
-            if [[ "$nspawn_mb" =~ ^[0-9]+$ ]] && (( nspawn_mb > 10240 )); then
-                _row "nspawn sz"  "--  ${nspawn_mb} MB in ${machines_dir}"
-            fi
+            # nspawn storage detail in --storage-info
         fi
     fi
 
@@ -2258,160 +2937,10 @@ _section_packages() {
         else
             _row "Apptainer"  "OK  ${apt_bin}${apt_ver:+  v${apt_ver}}  (rootless-capable)"
         fi
+        # Apptainer cache detail in --storage-info
     fi
 }
 
-_section_boot_entries() {
-    _head "Boot Entries"
-
-    if ! mountpoint -q "$ESP" 2>/dev/null; then
-        _row "ESP"       "!!  could not mount — boot entries unavailable"
-        return
-    fi
-
-    # ── ESP free space ────────────────────────────────────────────────────────
-    # UKIs are ~100MB each; gen-efi fails silently if ESP fills up
-    local esp_avail_mb
-    esp_avail_mb=$(df -BM "$ESP" 2>/dev/null | awk 'NR==2{gsub(/M/,"",$4); print $4}' || echo "")
-    if [[ "$esp_avail_mb" =~ ^[0-9]+$ ]]; then
-        if (( esp_avail_mb < 50 )); then
-            _row "ESP space"  "!!  ${esp_avail_mb} MB free — gen-efi will fail"
-            _rec "ESP nearly full (${esp_avail_mb} MB) — clean old entries or expand ESP"
-        elif (( esp_avail_mb < 150 )); then
-            _row "ESP space"  "!   ${esp_avail_mb} MB free — getting tight"
-        else
-            _row "ESP space"  "OK  ${esp_avail_mb} MB free"
-        fi
-    fi
-
-    # ── Shim and MokManager on ESP ────────────────────────────────────────────
-    # shim (BOOTX64.EFI) — first-stage loader, Microsoft-signed
-    # mmx64.efi — MokManager, needed for MOK enrollment at boot
-    local shim_dst="$ESP/EFI/BOOT/BOOTX64.EFI"
-    local mmx64_dst="$ESP/EFI/BOOT/mmx64.efi"
-    local sdboot_dst="$ESP/EFI/BOOT/grubx64.efi"
-    local efi_ok=() efi_missing=()
-    [[ -f "$shim_dst"   ]] && efi_ok+=("shim")    || efi_missing+=("BOOTX64.EFI")
-    [[ -f "$mmx64_dst"  ]] && efi_ok+=("mmx64")   || efi_missing+=("mmx64.efi")
-    [[ -f "$sdboot_dst" ]] && efi_ok+=("sd-boot")  || efi_missing+=("grubx64.efi")
-    if [[ ${#efi_missing[@]} -eq 0 ]]; then
-        _row "EFI files"  "OK  shim + mmx64 + sd-boot present"
-        # Check if source shim/sd-boot is newer than ESP copy — gen-efi auto-updates
-        # but only when run; health warns so the user knows to trigger a UKI rebuild.
-        local shim_src="/usr/share/shim-signed/shimx64.efi"
-        local sdboot_src="/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
-        local stale_efi=()
-        [[ -f "$shim_src"   && "$shim_src"   -nt "$shim_dst"   ]] && stale_efi+=("shim")
-        [[ -f "$sdboot_src" && "$sdboot_src" -nt "$sdboot_dst" ]] && stale_efi+=("sd-boot")
-        if [[ ${#stale_efi[@]} -gt 0 ]]; then
-            local _stale_str; _stale_str=$(IFS='+'; echo "${stale_efi[*]}")
-            _row2 "!  ${_stale_str} source newer than ESP copy — run: gen-efi configure <booted_slot>  [auto]"
-            _rec "ESP ${_stale_str} is stale (newer source available) — run: gen-efi configure <booted_slot>  [auto]"
-        fi
-    else
-        local _em_str; _em_str=$(IFS=' '; echo "${efi_missing[*]}")
-        _row "EFI files"  "!!  missing: ${_em_str}"
-        _rec "EFI boot files missing (${_em_str}) — run: gen-efi configure <booted_slot>"
-    fi
-
-    local loader_conf="$ESP/loader/loader.conf"
-
-    # ── vconsole.conf keymap ──────────────────────────────────────────────────
-    # gen-efi embeds KEYMAP from /etc/vconsole.conf into the UKI as rd.vconsole.keymap.
-    # If missing or unset, the UKI omits the keymap — LUKS passphrase entry at
-    # boot may use the wrong keyboard layout, locking users out.
-    local vconsole_keymap=""
-    if [[ ! -f /etc/vconsole.conf ]]; then
-        _row "Keymap"     "!   /etc/vconsole.conf missing — UKI will have no keymap"
-        _rec "Create /etc/vconsole.conf with KEYMAP= set (e.g. KEYMAP=us) and regenerate UKI"
-    else
-        vconsole_keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
-            | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
-        if [[ -z "$vconsole_keymap" ]]; then
-            _row "Keymap"     "!   KEYMAP not set in /etc/vconsole.conf — UKI will have no keymap"
-            _rec "Set KEYMAP= in /etc/vconsole.conf (e.g. KEYMAP=us) and regenerate UKI: gen-efi configure <slot>"
-        else
-            # Cross-check: is the embedded keymap in the running UKI consistent?
-            local cmdline_keymap
-            cmdline_keymap=$(grep -o 'rd.vconsole.keymap=[^ ]*' /proc/cmdline 2>/dev/null \
-                | cut -d= -f2 || echo "")
-            if [[ -n "$cmdline_keymap" && "$cmdline_keymap" != "$vconsole_keymap" ]]; then
-                _row "Keymap"     "!   mismatch: UKI has '${cmdline_keymap}', vconsole.conf has '${vconsole_keymap}'"
-                _rec "Keymap mismatch between running UKI and vconsole.conf — regenerate: gen-efi configure <slot>  [auto]"
-            else
-                _row "Keymap"     "OK  ${vconsole_keymap}${cmdline_keymap:+ (matches UKI)}"
-            fi
-        fi
-    fi
-
-    # ── UKI presence and relative age ────────────────────────────────────────
-    # Both UKIs must exist; the candidate shouldn't be drastically older than current
-    local booted_uki candidate_uki booted_ts candidate_ts
-    local current_slot; current_slot=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
-    local candidate_slot
-    [[ "$current_slot" == "blue" ]] && candidate_slot="green" || candidate_slot="blue"
-
-    booted_uki="$ESP/EFI/${OS_NAME}/${OS_NAME}-${current_slot}.efi"
-    candidate_uki="$ESP/EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi"
-
-    if [[ ! -f "$booted_uki" ]]; then
-        _row "UKI"       "!!  current slot UKI missing: $(basename "$booted_uki")"
-        _rec "Current slot UKI missing — run: gen-efi configure ${current_slot}  [auto]"
-    elif [[ ! -f "$candidate_uki" ]]; then
-        _row "UKI"       "!   candidate slot UKI missing: $(basename "$candidate_uki")"
-        _rec "Candidate slot UKI missing — run: shani-deploy to rebuild it"
-    else
-        booted_ts=$(stat -c '%Y' "$booted_uki" 2>/dev/null || echo "0")
-        candidate_ts=$(stat -c '%Y' "$candidate_uki" 2>/dev/null || echo "0")
-        local age_diff=$(( booted_ts - candidate_ts ))
-        if (( age_diff > 86400 * 30 )); then
-            # Candidate UKI is >30 days older than current — likely stale rollback target
-            local age_days=$(( age_diff / 86400 ))
-            _row "UKI"   "!   candidate @${candidate_slot} UKI is ${age_days}d older than current"
-            _rec "Candidate slot UKI is stale — run shani-deploy to refresh it"
-        else
-            _row "UKI"   "OK  both slots present"
-        fi
-    fi
-
-    # ── loader.conf default= slot cross-check ────────────────────────────────
-    # The default= entry in loader.conf controls which UKI boots by default.
-    # It must point to the current slot; a mismatch means the wrong OS version
-    # activates on next boot even though deployment succeeded.
-    if [[ -f "$loader_conf" ]]; then
-        local default_entry
-        default_entry=$(grep '^default' "$loader_conf" 2>/dev/null | awk '{print $2}' || echo "")
-        if [[ -n "$default_entry" && -n "$current_slot" ]]; then
-            if echo "$default_entry" | grep -qi "$current_slot"; then
-                _row "Boot default" "OK  default entry targets @${current_slot}"
-            else
-                _row "Boot default" "!!  default entry '${default_entry}' does not match current slot @${current_slot}"
-                _rec "loader.conf default= points to wrong slot — run: gen-efi configure ${current_slot}  [auto]"
-            fi
-        fi
-    fi
-
-    local orphans=()
-    for slot in blue green; do
-        local plain="$ESP/loader/entries/${OS_NAME}-${slot}.conf"
-        local tries; tries=$(ls "$ESP/loader/entries/${OS_NAME}-${slot}"+*.conf \
-            2>/dev/null | head -1 || echo "")
-        [[ -f "$plain" && -n "$tries" ]] && orphans+=("${OS_NAME}-${slot}.conf")
-    done
-    if [[ ${#orphans[@]} -gt 0 ]]; then
-        _row "Orphans"   "!   ${orphans[*]}"
-        _rec "Orphaned boot entries (${orphans[*]}) — run: shani-health --fix  [auto]"
-    fi
-
-    local editor; editor=$(grep '^editor' "$loader_conf" 2>/dev/null \
-        | awk '{print $2}' || echo "not set")
-    if [[ "$editor" == "0" ]]; then
-        _row "Editor"    "OK  disabled"
-    else
-        _row "Editor"    "!!  not disabled (cmdline editable at boot)"
-        _rec "systemd-boot editor not disabled — add 'editor 0' to loader.conf  [auto]"
-    fi
-}
 
 _section_firmware() {
     _head "Firmware"
@@ -2532,6 +3061,12 @@ _section_runtime_health() {
             bt_sec=$(echo "$bt" | grep -oE '^[0-9]+' || echo "0")
             if (( bt_sec >= 30 )); then
                 _row "Boot time"  "!   ${bt}  (slow — run: systemd-analyze blame)"
+                # Inline top 3 slowest units to save the extra command
+                local _blame
+                _blame=$(systemd-analyze blame 2>/dev/null | head -3 | sed 's/^ *//' || true)
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] && _row2 "--  $line"
+                done <<< "$_blame"
             else
                 _row "Boot time"  "OK  ${bt}"
             fi
@@ -2551,7 +3086,7 @@ _section_runtime_health() {
 
     # ── /home usage per user ──────────────────────────────────────────────────
     if findmnt -n /home &>/dev/null; then
-        local home_warn=() home_crit=()
+        local home_warn=() home_crit=() home_info=()
         for user_dir in /home/*/; do
             [[ -d "$user_dir" ]] || continue
             local uname; uname=$(basename "$user_dir")
@@ -2562,13 +3097,20 @@ _section_runtime_health() {
                 home_crit+=("${uname}:${used_mb}MB")
             elif (( used_mb > 20480 )); then    # > 20 GB
                 home_warn+=("${uname}:${used_mb}MB")
+            else
+                home_info+=("${uname}:${used_mb}MB")
             fi
         done
         if [[ ${#home_crit[@]} -gt 0 ]]; then
-            _row "Home usage" "!   large: ${home_crit[*]}"
-            _rec "Home directories using significant space (${home_crit[*]}) — review with: du -sh /home/*"
+            _row "Home usage" "!   large: $(_join "${home_crit[@]}")"
+            _rec "Home directories using significant space ($(_join "${home_crit[@]}")) — review with: du -sh /home/*"
         elif [[ ${#home_warn[@]} -gt 0 ]]; then
-            _row "Home usage" "--  ${home_warn[*]}"
+            _row "Home usage" "--  $(_join "${home_warn[@]}")"
+        fi
+        # Always show all users' usage so nothing is invisible
+        if [[ ${#home_info[@]} -gt 0 ]]; then
+            local _info_str; _info_str=$(IFS=' '; echo "${home_info[*]}")
+            _row2 "--  also: ${_info_str}"
         fi
     fi
 
@@ -2586,328 +3128,67 @@ _section_runtime_health() {
     fi
 }
 
-_section_groups() {
-    _head "Groups"
+security_report() {
+    _recs_reset
 
-    # ── Source of truth: /etc/shani-extra-groups ──────────────────────────────
-    # build-base-image.sh creates these groups and writes the list to
-    # /etc/shani-extra-groups. shani-user-setup reads the same file to add
-    # users. We check:
-    #   1. Each group exists (getent works on overlayfs merged /etc/group)
-    #   2. Static-GID groups have the expected GID (udev rules depend on exact GIDs)
-    #   3. Every login user is a member of every group that exists
-    #
-    # Static GIDs from Arch archwiki / systemd basic.conf (same as build-base-image.sh):
-    local -A STATIC_GIDS=([sys]=3 [lp]=7 [kvm]=78 [video]=91 [scanner]=96 [input]=97 [cups]=209)
-    # Dynamic groups (no fixed GID — just need to exist):
-    local DYNAMIC_GROUPS=(realtime nixbld lxd libvirt)
-    # Also check storage/network — not in shani-extra-groups but critical for desktop use:
-    local EXTRA_SYSTEM=(storage network audio)
+    local _esp_mounted=0
+    _esp_mount
 
-    # Build login user list once
-    local login_users=()
-    while IFS=: read -r name _ uid _ _ _ shell; do
-        [[ "$uid" -ge 1000 ]] 2>/dev/null || continue
-        [[ "$name" == "nobody" ]] && continue
-        [[ "$shell" == */nologin || "$shell" == */false ]] && continue
-        login_users+=("$name")
-    done < /etc/passwd 2>/dev/null || true
+    local booted; booted=$(_get_booted_subvol)
+    local uki_booted_bad="0"
+    local hibernate_stale="0"
 
-    local groups_missing=() groups_ok=0
-    local membership_missing=()  # "user:group" pairs
+    # Pre-compute hibernate offset staleness — same logic as system_info
+    local swapfile; swapfile=$(_find_swapfile)
+    if [[ -n "$swapfile" ]] && command -v btrfs &>/dev/null; then
+        local a_off; a_off=$(_swapfile_offset "$swapfile")
+        local c_off; c_off=$(grep -o 'resume_offset=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2 || echo "")
+        [[ -n "$a_off" && -n "$c_off" && "$a_off" != "$c_off" ]] && hibernate_stale="1"
+    fi
 
-    # ── Check shani-extra-groups static-GID groups ────────────────────────────
-    for grp in "${!STATIC_GIDS[@]}"; do
-        local actual_gid; actual_gid=$(getent group "$grp" 2>/dev/null | cut -d: -f3 || echo "")
-        if [[ -z "$actual_gid" ]]; then
-            groups_missing+=("$grp")
-        else
-            groups_ok=$(( groups_ok + 1 ))
-        fi
-    done
+    local sb_active="no"
+    [[ -d /sys/firmware/efi ]] && \
+        [[ "$(mokutil --sb-state 2>/dev/null)" == *"SecureBoot enabled"* ]] && sb_active="yes"
 
-    # ── Check dynamic groups ──────────────────────────────────────────────────
-    for grp in "${DYNAMIC_GROUPS[@]}"; do
-        if ! getent group "$grp" &>/dev/null; then
-            groups_missing+=("$grp")
-        else
-            groups_ok=$(( groups_ok + 1 ))
-        fi
-    done
+    echo ""
+    printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
+    printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Security Report"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
 
-    # ── Check extra system groups ─────────────────────────────────────────────
-    local sys_missing=()
-    for grp in "${EXTRA_SYSTEM[@]}"; do
-        getent group "$grp" &>/dev/null || sys_missing+=("$grp")
-    done
+    _section_secureboot         "$booted" uki_booted_bad "$hibernate_stale"
+    _section_kernel_security    "$sb_active"
+    _section_encryption
+    _section_tpm2
+    _section_security_services
+    _section_users
+    _section_groups
 
-    # ── Report group existence ────────────────────────────────────────────────
-    if [[ ${#groups_missing[@]} -eq 0 ]]; then
-        local total=$(( ${#STATIC_GIDS[@]} + ${#DYNAMIC_GROUPS[@]} ))
-        _row "System grps" "OK  all ${total} shani groups present"
+    echo ""
+    if [[ ${#_RECS[@]} -eq 0 ]]; then
+        printf "  ${_C_GREEN}${_C_BOLD}${_SYM_OK}  No security issues found${_C_RESET}\n"
     else
-        # Build a filtered list — omit optional groups when the feature isn't installed
-        local _reportable_missing=()
-        for grp in "${groups_missing[@]}"; do
-            case "$grp" in
-                libvirt) command -v virsh &>/dev/null || [[ -d /data/varlib/libvirt ]] && _reportable_missing+=("$grp") ;;
-                lxd)     findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]] && _reportable_missing+=("$grp") ;;
-                *)       _reportable_missing+=("$grp") ;;
-            esac
+        printf "  ${_C_BOLD}${_C_YELLOW}Security Recommendations (${#_RECS[@]})${_C_RESET}\n"
+        printf "  ${_C_DIM}%.54s${_C_RESET}\n" "──────────────────────────────────────────────────────"
+        local i=1
+        for rec in "${_RECS[@]}"; do
+            local display="${rec/\[auto\]/${_C_CYAN}[auto]${_C_RESET}}"
+            printf "    ${_C_BOLD}%2d.${_C_RESET}  %b\n" "$i" "$display"
+            i=$(( i + 1 ))
         done
-
-        if [[ ${#_reportable_missing[@]} -gt 0 ]]; then
-            local _miss_str; _miss_str=$(IFS=' '; echo "${_reportable_missing[*]}")
-            _row "System grps" "!!  missing: ${_miss_str}"
-        else
-            local total=$(( ${#STATIC_GIDS[@]} + ${#DYNAMIC_GROUPS[@]} ))
-            _row "System grps" "OK  all ${total} shani groups present (optional groups skipped)"
-        fi
-
-        for grp in "${groups_missing[@]}"; do
-            case "$grp" in
-                nixbld)   _row2 "!!  nixbld missing — 'nix build' and nix-daemon will fail"
-                          _rec "Group 'nixbld' missing — Nix builds will fail: groupadd -r nixbld  [auto]" ;;
-                kvm)      _row2 "!!  kvm missing — /dev/kvm inaccessible, VMs broken"
-                          _rec "Group 'kvm' missing — VMs inaccessible: groupadd -r kvm  [auto]" ;;
-                video)    _row2 "!!  video missing — GPU/display access broken"
-                          _rec "Group 'video' missing — GPU access broken: groupadd -r video  [auto]" ;;
-                input)    _row2 "!!  input missing — raw input devices inaccessible (Wayland)"
-                          _rec "Group 'input' missing — Wayland input broken: groupadd -r input  [auto]" ;;
-                realtime) _row2 "!   realtime missing — PipeWire RT scheduling unavailable"
-                          _rec "Group 'realtime' missing — audio RT unavailable: groupadd -r realtime  [auto]" ;;
-                libvirt)
-                    if command -v virsh &>/dev/null || [[ -d /data/varlib/libvirt ]]; then
-                        _row2 "!   libvirt missing — libvirt socket inaccessible"
-                        _rec "Group 'libvirt' missing: groupadd -r libvirt  [auto]"
-                    fi ;;
-                lxd)
-                    if findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]]; then
-                        _row2 "!   lxd missing — LXD socket inaccessible"
-                        _rec "Group 'lxd' missing: groupadd -r lxd  [auto]"
-                    fi ;;
-                cups)     _row2 "!   cups missing — printing broken"
-                          _rec "Group 'cups' missing: groupadd -r cups  [auto]" ;;
-                *)        _rec "Group '${grp}' missing: groupadd -r ${grp}  [auto]" ;;
-            esac
-        done
+        echo ""
+        printf "  ${_C_DIM}Items marked ${_C_CYAN}[auto]${_C_DIM} can be fixed by: shani-health --fix${_C_RESET}\n"
     fi
+    echo ""
 
-    if [[ ${#sys_missing[@]} -gt 0 ]]; then
-        local _sm_str; _sm_str=$(IFS=' '; echo "${sys_missing[*]}")
-        _row "Util grps"  "!   missing: ${_sm_str} — udisks2/NM may not work"
-        _rec "System groups missing (${_sm_str}) — automounting/networking may break"
-    fi
-
-    # ── User membership check ─────────────────────────────────────────────────
-    # Read the actual wanted groups from /etc/shani-extra-groups (single source of truth)
-    local wanted_groups=()
-    if [[ -f /etc/shani-extra-groups ]]; then
-        local _eg; _eg=$(head -n1 /etc/shani-extra-groups 2>/dev/null | tr -d '[:space:]')
-        IFS=',' read -ra wanted_groups <<< "$_eg"
-    fi
-
-    if [[ ${#wanted_groups[@]} -gt 0 && ${#login_users[@]} -gt 0 ]]; then
-        local mem_ok=0 mem_bad=()
-        for u in "${login_users[@]}"; do
-            local user_groups; user_groups=$(id -nG "$u" 2>/dev/null || true)
-            local u_missing=()
-            for grp in "${wanted_groups[@]}"; do
-                # Only check groups that actually exist — skip missing ones (already reported above)
-                getent group "$grp" &>/dev/null || continue
-                echo "$user_groups" | grep -qw "$grp" || u_missing+=("$grp")
-            done
-            if [[ ${#u_missing[@]} -gt 0 ]]; then
-                local _um_str; _um_str=$(IFS=,; echo "${u_missing[*]}")
-                mem_bad+=("${u}:${_um_str}")
-            else
-                mem_ok=$(( mem_ok + 1 ))
-            fi
-        done
-
-        if [[ ${#mem_bad[@]} -eq 0 ]]; then
-            _row "Membership" "OK  all users in required groups"
-        else
-            for entry in "${mem_bad[@]}"; do
-                local _u="${entry%%:*}" _missing_g="${entry#*:}"
-                _row "Membership" "!   ${_u} missing: ${_missing_g}"
-                _rec "User ${_u} not in groups (${_missing_g}) — run: shani-user-setup  [auto]"
-            done
-        fi
-    fi
+    _esp_umount
 }
-
-_section_users() {
-    _head "Users & Access Control"
-
-    # ── Login users ───────────────────────────────────────────────────────────
-    local login_users=()
-    while IFS=: read -r name _ uid _ _ _ shell; do
-        [[ "$uid" -ge 1000 ]] 2>/dev/null || continue
-        [[ "$name" == "nobody" ]] && continue
-        [[ "$shell" == */nologin || "$shell" == */false ]] && continue
-        login_users+=("$name")
-    done < /etc/passwd 2>/dev/null || true
-    _row "Login"     "--  ${login_users[*]:-none detected}"
-
-    # ── Login user password status ────────────────────────────────────────────
-    local no_pass=()
-    if [[ ${#login_users[@]} -gt 0 ]]; then
-        for u in "${login_users[@]}"; do
-            local pw_st; pw_st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}' || echo "")
-            [[ "$pw_st" == "NP" ]] && no_pass+=("$u")
-        done
-    fi
-    if [[ ${#no_pass[@]} -gt 0 ]]; then
-        _row "Passwords"  "!!  no password set for: ${no_pass[*]}"
-        _rec "User(s) ${no_pass[*]} have no password — set one: passwd <username>"
-    fi
-
-    local wheel_line wheel_members=()
-    wheel_line=$(getent group wheel 2>/dev/null || grep '^wheel:' /etc/group 2>/dev/null || true)
-    local wheel_sudoers
-    wheel_sudoers=$(grep -h '^%wheel' /etc/sudoers.d/wheel 2>/dev/null \
-        | grep -v '^[[:space:]]*#' | head -1 || true)
-    if [[ -z "$wheel_line" ]]; then
-        _row "Wheel"     "!!  group does not exist — sudo access broken"
-        _rec "wheel group missing — create it: groupadd wheel, then add users: usermod -aG wheel <username>"
-    else
-        IFS=',' read -ra wheel_members <<< "${wheel_line##*:}"
-        if [[ -z "$wheel_sudoers" ]]; then
-            _row "Wheel"     "!!  group exists but no sudoers rule found for %wheel"
-            _rec "No sudoers rule for wheel — add: %wheel ALL=(ALL:ALL) ALL to /etc/sudoers.d/wheel"
-        elif [[ ${#wheel_members[@]} -gt 0 && -n "${wheel_members[0]}" ]]; then
-            # Check at least one wheel member is a real login user (uid >= 1000)
-            local wheel_has_login=0
-            for m in "${wheel_members[@]}"; do
-                local m_uid; m_uid=$(id -u "$m" 2>/dev/null || echo "")
-                [[ "$m_uid" =~ ^[0-9]+$ ]] && (( m_uid >= 1000 )) && { wheel_has_login=1; break; }
-            done
-            if (( wheel_has_login )); then
-                _row "Wheel"     "OK  ${wheel_members[*]}"
-            else
-                _row "Wheel"     "!!  no regular user (uid≥1000) in wheel — sudo access effectively broken"
-                _rec "wheel group has no regular login users — add one: usermod -aG wheel <username>"
-            fi
-        else
-            _row "Wheel"     "!!  sudoers rule present but group has no members — no user can sudo"
-            _rec "wheel group is empty — add a user: usermod -aG wheel <username>"
-        fi
-    fi
-
-    # ── Duplicate UID 0 accounts ──────────────────────────────────────────────
-    local uid0_accounts=()
-    while IFS=: read -r name _ uid _; do
-        [[ "$uid" -eq 0 && "$name" != "root" ]] && uid0_accounts+=("$name")
-    done < /etc/passwd 2>/dev/null || true
-    if [[ ${#uid0_accounts[@]} -gt 0 ]]; then
-        _row "UID 0"      "!!  non-root accounts with UID 0: ${uid0_accounts[*]}"
-        _rec "Accounts with UID 0 besides root (${uid0_accounts[*]}) — remove or reassign UID"
-    fi
-
-    local nopasswd=()
-    while IFS= read -r line; do
-        echo "$line" | grep -qE 'NOPASSWD.*ALL\s*$|NOPASSWD.*ALL\)' && nopasswd+=("$line")
-    done < <(grep -rh NOPASSWD /etc/sudoers /etc/sudoers.d/ 2>/dev/null \
-        | grep -v '^[[:space:]]*#' || true)
-    if [[ ${#nopasswd[@]} -gt 0 ]]; then
-        _row "NOPASSWD"  "!   passwordless sudo entries found:"
-        for e in "${nopasswd[@]}"; do _row2 "$(echo "$e" | xargs)"; done
-        _rec "Passwordless sudo (NOPASSWD ALL) found — review /etc/sudoers.d/"
-    else
-        _row "NOPASSWD"  "OK  no unrestricted passwordless sudo"
-    fi
-
-    # ── Root account ──────────────────────────────────────────────────────────
-    local root_st; root_st=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
-    case "$root_st" in
-        L|LK) _row "Root acct"  "OK  locked" ;;
-        P)    _row "Root acct"  "!   has a password (locked root recommended)"
-              _rec "Root has a password — to lock: passwd -l root" ;;
-        *)    _row "Root acct"  "--  status unknown" ;;
-    esac
-
-    # ── SSH ───────────────────────────────────────────────────────────────────
-    if [[ -f /etc/ssh/sshd_config ]] || [[ -d /etc/ssh/sshd_config.d ]]; then
-        local ssh_root
-        ssh_root=$(grep -rh '^PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ \
-            2>/dev/null | tail -1 | awk '{print $2}' || echo "")
-        if [[ -z "$ssh_root" ]]; then
-            local ssh_ver; ssh_ver=$(ssh -V 2>&1 | grep -oP 'OpenSSH_\K[0-9]+' | head -1 || echo "0")
-            if (( ssh_ver < 8 )); then
-                _row "SSH root"   "!   default may allow login (OpenSSH <8)"
-                _rec "Set PermitRootLogin no in sshd_config (OpenSSH <8 default risky)"
-            fi
-        else
-            case "$ssh_root" in
-                no|prohibit-password|without-password) ;;  # OK — no row needed
-                yes)  _row "SSH root"  "!!  enabled (password login allowed)"
-                      _rec "SSH root password login enabled — disable in sshd_config  [auto]" ;;
-                *)    _row "SSH root"  "!   unknown value: ${ssh_root}" ;;
-            esac
-        fi
-    fi
-
-    # ── Rootless container namespaces (subuid/subgid) ─────────────────────────
-    # /etc/subuid and /etc/subgid must have entries for every login user so
-    # Podman and Distrobox can create rootless containers. This is a per-user
-    # access control setting, not a service config.
-    if command -v podman &>/dev/null || command -v distrobox &>/dev/null; then
-        local sub_missing=()
-        local _sub_login_users=()
-        while IFS=: read -r name _ uid _ _ _ shell; do
-            [[ "$uid" -ge 1000 ]] 2>/dev/null || continue
-            [[ "$name" == "nobody" ]] && continue
-            [[ "$shell" == */nologin || "$shell" == */false ]] && continue
-            _sub_login_users+=("$name")
-        done < /etc/passwd 2>/dev/null || true
-        for u in "${_sub_login_users[@]}"; do
-            if ! grep -q "^${u}:" /etc/subuid 2>/dev/null || \
-               ! grep -q "^${u}:" /etc/subgid 2>/dev/null; then
-                sub_missing+=("$u")
-            fi
-        done
-        if [[ ${#sub_missing[@]} -gt 0 ]]; then
-            _row "subuid"   "!!  missing for: ${sub_missing[*]} — rootless Podman/Distrobox will fail"
-            _rec "subuid/subgid missing for ${sub_missing[*]} — run: usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <user>"
-        else
-            _row "subuid"   "OK  configured for all users"
-        fi
-    fi
-}
-
-
-###############################################################################
-### system_info — master status report                                       ###
-###############################################################################
 
 system_info() {
     _recs_reset
 
     local _esp_mounted=0
     _esp_mount
-
-    # When running under sudo/pkexec, --user systemctl queries must target the
-    # real user's session. Priority: SUDO_USER (sudo) → SHANI_CALLER_USER (pkexec)
-    # → current USER. _sysd_user() also sets DBUS_SESSION_BUS_ADDRESS so that
-    # systemctl --user can talk to the user's D-Bus socket when needed.
-    local _LOGIN_USER="${SUDO_USER:-${SHANI_CALLER_USER:-${USER:-$(id -un)}}}"
-    _sysd_user() {
-        if [[ "$_LOGIN_USER" != "root" && -n "$_LOGIN_USER" ]]; then
-            local _uid; _uid=$(id -u "$_LOGIN_USER" 2>/dev/null || echo "")
-            if [[ -n "$_uid" ]]; then
-                sudo -u "$_LOGIN_USER" \
-                    env \
-                    XDG_RUNTIME_DIR="/run/user/${_uid}" \
-                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${_uid}/bus" \
-                    systemctl --user "$@"
-            else
-                sudo -u "$_LOGIN_USER" systemctl --user "$@"
-            fi
-        else
-            systemctl --user "$@"
-        fi
-    }
 
     local booted; booted=$(_get_booted_subvol)
     local uki_booted_bad="0"
@@ -2962,8 +3243,12 @@ system_info() {
     _section_firmware
 
     # ── Services ──────────────────────────────────────────────────────────────
-    _section_services
-    _section_packages
+    _section_system_services
+    _section_network
+    _section_audio_display
+    _section_units
+    _section_package_managers
+    _section_containers
 
     # ── Runtime ───────────────────────────────────────────────────────────────
     _section_runtime_health
@@ -2995,10 +3280,13 @@ system_info() {
 ###############################################################################
 
 fix() {
-    _log_section "Security Auto-Fix"
-    local fixed=0 failed=0
+    _log_section "Auto-Fix"
+
+    # Resolve booted slot once — reused by all UKI regeneration steps below
+    local _fix_booted; _fix_booted=$(_get_booted_subvol)
 
     # Internal helper: run a fix, updating counters
+    # Each _fix_* sub-function declares its own local fixed/failed and calls _apply_fix.
     _apply_fix() {
         local desc="$1"; shift
         _log "Fixing: ${desc}..."
@@ -3011,6 +3299,19 @@ fix() {
         fi
     }
 
+    _fix_services
+    _fix_security
+    _fix_boot
+    _fix_data
+    _fix_users
+
+    echo ""
+    _log "Run 'shani-health' to verify fixes"
+}
+
+_fix_services() {
+    local fixed=0 failed=0
+    _log_section "Services & Daemons"
     # CUPS socket
     if getent group cups &>/dev/null; then
         if { systemctl is-enabled cups.service &>/dev/null 2>&1 || \
@@ -3094,13 +3395,19 @@ fix() {
         _apply_fix "Stop conflicting auto-cpufreq"  systemctl disable --now auto-cpufreq
     fi
 
+    echo ""
+    (( fixed + failed > 0 )) && _log "  fixed: ${fixed}  failed: ${failed}"
+}
+
+_fix_security() {
+    local fixed=0 failed=0
+    _log_section "Security"
     # Stale boot failure marker — clear it if current boot is healthy
     if [[ -f "$DATA_BOOT_FAIL" ]]; then
-        local _bfail_booted; _bfail_booted=$(_get_booted_subvol)
         local _bfail_current; _bfail_current=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
-        if [[ "$_bfail_booted" == "$_bfail_current" ]]; then
-            local _bfail_slot; _bfail_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' || echo "?")
-            _log "Clearing stale boot_failure marker for @${_bfail_slot} (current boot @${_bfail_booted} is healthy)..."
+        local _bfail_slot; _bfail_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' || echo "?")
+        if [[ "$_fix_booted" == "$_bfail_current" || "$_bfail_slot" == "$_fix_booted" ]]; then
+            _log "Clearing stale boot_failure marker for @${_bfail_slot} (currently booted @${_fix_booted} successfully)..."
             if rm -f "$DATA_BOOT_FAIL" "$DATA_BOOT_FAIL_ACKED" 2>/dev/null; then
                 _log_ok "Stale boot_failure marker cleared"
                 fixed=$(( fixed + 1 ))
@@ -3111,7 +3418,17 @@ fix() {
         fi
     fi
 
-    # Missing system groups — create without fixed GIDs (Arch assigns them dynamically)
+    # check-boot-failure.timer — reset and restart if failed
+    if systemctl is-failed --quiet check-boot-failure.timer 2>/dev/null; then
+        _apply_fix "Reset check-boot-failure.timer" \
+            bash -c "systemctl reset-failed check-boot-failure.timer && systemctl start check-boot-failure.timer"
+    fi
+
+    # Lock root account if it has a password
+    local _root_st; _root_st=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "")
+    if [[ "$_root_st" == "P" ]]; then
+        _apply_fix "Lock root account"  passwd -l root
+    fi
     declare -A _FIX_STATIC_GIDS=([sys]=1 [lp]=1 [kvm]=1 [video]=1 [scanner]=1 [input]=1 [cups]=1)
     local _fix_dynamic=(realtime nixbld lxd libvirt)
     for grp in "${!_FIX_STATIC_GIDS[@]}"; do
@@ -3158,6 +3475,13 @@ fix() {
         fi
     fi
 
+    echo ""
+    (( fixed + failed > 0 )) && _log "  fixed: ${fixed}  failed: ${failed}"
+}
+
+_fix_boot() {
+    local fixed=0 failed=0
+    _log_section "Boot & UKI"
     # systemd-boot editor + orphaned entries
     local _esp_mounted=0
     _esp_mount
@@ -3173,6 +3497,37 @@ fix() {
             fi
             _log_ok "systemd-boot editor disabled"
             fixed=$(( fixed + 1 ))
+        fi
+
+        # Fix default= slot mismatch — rewrite using same glob logic as finalize_boot_entries:
+        #   tries path  → shanios-<slot>+*.conf
+        #   no-tries    → shanios-<slot>.conf  (rollback/restore — plain .conf, no boot counting)
+        local _fix_current_slot
+        _fix_current_slot=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
+        if [[ -n "$_fix_current_slot" ]]; then
+            local _def_entry
+            _def_entry=$(grep '^default' "$loader_conf" 2>/dev/null | awk '{print $2}' || echo "")
+            if [[ -n "$_def_entry" ]] && \
+               ! echo "$_def_entry" | grep -qiE "(^|[-_])${_fix_current_slot}([-_+.]|$)"; then
+                # Determine correct glob: use tries if a +N-N entry exists for this slot,
+                # else use the plain filename (rollback/no-tries path)
+                local _new_default
+                if ls "$ESP/loader/entries/${OS_NAME}-${_fix_current_slot}"+*.conf \
+                        &>/dev/null 2>&1; then
+                    _new_default="${OS_NAME}-${_fix_current_slot}+*.conf"
+                else
+                    _new_default="${OS_NAME}-${_fix_current_slot}.conf"
+                fi
+                if grep -q '^default' "$loader_conf" 2>/dev/null; then
+                    grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
+                    echo "default ${_new_default}" >> "${loader_conf}.tmp"
+                    mv "${loader_conf}.tmp" "$loader_conf"
+                else
+                    echo "default ${_new_default}" >> "$loader_conf"
+                fi
+                _log_ok "loader.conf default= updated to ${_new_default}"
+                fixed=$(( fixed + 1 ))
+            fi
         fi
 
         for slot in blue green; do
@@ -3228,13 +3583,32 @@ fix() {
             _apply_fix "Enable snapd.socket"  systemctl enable --now snapd.socket
         [[ "$(systemctl is-active snapd.apparmor.service 2>/dev/null)" != "active" ]] && \
             _apply_fix "Enable snapd.apparmor"  systemctl enable --now snapd.apparmor.service
+        # Snap pending updates
+        if command -v snap &>/dev/null && \
+           [[ "$(systemctl is-active snapd.socket 2>/dev/null)" == "active" ]]; then
+            local _snap_upd
+            _snap_upd=$(timeout 10 snap refresh --list 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            if [[ "$_snap_upd" =~ ^[0-9]+$ ]] && (( _snap_upd > 0 )); then
+                _apply_fix "Refresh ${_snap_upd} snap(s)"  snap refresh
+            fi
+        fi
+    fi
+
+    # shani-update.timer — enable as the calling user
+    if ! _sysd_user is-active --quiet shani-update.timer 2>/dev/null && \
+       _sysd_user is-enabled --quiet shani-update.timer 2>/dev/null; then
+        _log "Enabling shani-update.timer for ${_CALLER_USER}..."
+        if _sysd_user enable --now shani-update.timer 2>/dev/null; then
+            _log_ok "shani-update.timer enabled"
+            fixed=$(( fixed + 1 ))
+        else
+            _log_warn "shani-update.timer enable failed"
+            failed=$(( failed + 1 ))
+        fi
     fi
 
     # bees
-    local bees_uuid
-    bees_uuid=$(blkid -s UUID -o value "/dev/disk/by-label/${ROOTLABEL}" 2>/dev/null || true)
-    [[ -z "$bees_uuid" && -e "/dev/mapper/${ROOTLABEL}" ]] && \
-        bees_uuid=$(blkid -s UUID -o value "/dev/mapper/${ROOTLABEL}" 2>/dev/null || true)
+    local bees_uuid; bees_uuid=$(_get_bees_uuid)
     if [[ -n "$bees_uuid" ]]; then
         local bees_unit="beesd@${bees_uuid}"
         if [[ "$(systemctl is-active "$bees_unit" 2>/dev/null)" != "active" ]]; then
@@ -3248,31 +3622,59 @@ fix() {
     fi
 
     # GPG signing key — import from local file (no network needed)
-    local _gpg_key="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
-    local _gpg_key_file="/etc/shani-keys/signing.asc"
-    if ! gpg --batch --list-keys "$_gpg_key" &>/dev/null 2>&1; then
-        if [[ -f "$_gpg_key_file" ]]; then
-            _log "Importing ShaniOS signing key from ${_gpg_key_file}..."
-            if gpg --batch --import "$_gpg_key_file" 2>/dev/null; then
+    if ! gpg --batch --list-keys "$GPG_SIGNING_KEY" &>/dev/null 2>&1; then
+        if [[ -f "$GPG_SIGNING_KEY_FILE" ]]; then
+            _log "Importing ShaniOS signing key from ${GPG_SIGNING_KEY_FILE}..."
+            if gpg --batch --import "$GPG_SIGNING_KEY_FILE" 2>/dev/null; then
                 _log_ok "GPG signing key imported"
                 fixed=$(( fixed + 1 ))
             else
-                _log_warn "GPG key import failed — check: gpg --import ${_gpg_key_file}"
+                _log_warn "GPG key import failed — check: gpg --import ${GPG_SIGNING_KEY_FILE}"
                 failed=$(( failed + 1 ))
             fi
         else
             _log "Fetching ShaniOS signing key from keyserver (local file absent)..."
-            if gpg --batch --keyserver keys.openpgp.org --recv-keys "$_gpg_key" 2>/dev/null; then
+            if gpg --batch --keyserver keys.openpgp.org --recv-keys "$GPG_SIGNING_KEY" 2>/dev/null; then
                 _log_ok "GPG signing key imported from keyserver"
                 fixed=$(( fixed + 1 ))
             else
-                _log_warn "GPG key fetch failed — try manually: gpg --keyserver keys.openpgp.org --recv-keys ${_gpg_key}"
+                _log_warn "GPG key fetch failed — try manually: gpg --keyserver keys.openpgp.org --recv-keys ${GPG_SIGNING_KEY}"
                 failed=$(( failed + 1 ))
             fi
         fi
     fi
 
-    # TPM2 — requires user interaction
+    # MOK enroll — if local MOK.der not matched in firmware, re-enroll via gen-efi
+    # gen-efi configure handles both key generation and reenroll_mok_keys staging
+    local _mok_der="/etc/secureboot/keys/MOK.der"
+    if [[ -f "$_mok_der" ]] && command -v mokutil &>/dev/null; then
+        local _mok_enrolled_count
+        _mok_enrolled_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
+        local _local_fp
+        _local_fp=$(openssl x509 -in "$_mok_der" -inform DER -noout -fingerprint -sha1 \
+            2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+        local _enrolled_match=0
+        if [[ -n "$_local_fp" ]]; then
+            mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+                | grep -q "$_local_fp" && _enrolled_match=1
+        fi
+        if (( _mok_enrolled_count == 0 )) || (( ! _enrolled_match )); then
+            if [[ "$_fix_booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
+                _log "MOK key not enrolled or stale — running gen-efi enroll-mok..."
+                if "$GENEFI_BIN" enroll-mok 2>&1; then
+                    _log_ok "gen-efi enroll-mok succeeded — reboot and confirm MOK enrollment in MokManager"
+                    fixed=$(( fixed + 1 ))
+                else
+                    _log_warn "gen-efi enroll-mok failed — check manually"
+                    failed=$(( failed + 1 ))
+                fi
+            else
+                _log_warn "MOK not enrolled — run: gen-efi enroll-mok"
+            fi
+        fi
+    fi
+
+    # TPM2 — requires user interaction (cannot auto-enroll without passphrase/keyfile)
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]] && [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then
         local underlying
         underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
@@ -3288,11 +3690,10 @@ fix() {
     local actual_lsm_param; actual_lsm_param=$(grep -o 'lsm=[^ ]*' /proc/cmdline 2>/dev/null \
         | cut -d= -f2 || echo "")
     if [[ "$actual_lsm_param" != "$expected_lsm_param" && -x "$GENEFI_BIN" ]]; then
-        local _lsm_booted; _lsm_booted=$(_get_booted_subvol)
-        if [[ "$_lsm_booted" != "unknown" ]]; then
-            _log "lsm= cmdline incorrect — regenerating UKI for @${_lsm_booted}..."
-            if "$GENEFI_BIN" configure "$_lsm_booted" 2>&1; then
-                _log_ok "UKI regenerated for @${_lsm_booted} — reboot to apply correct lsm="
+        if [[ "$_fix_booted" != "unknown" ]]; then
+            _log "lsm= cmdline incorrect — regenerating UKI for @${_fix_booted}..."
+            if "$GENEFI_BIN" configure "$_fix_booted" 2>&1; then
+                _log_ok "UKI regenerated for @${_fix_booted} — reboot to apply correct lsm="
                 fixed=$(( fixed + 1 ))
             else
                 _log_warn "UKI regeneration failed — lsm= param still incorrect"
@@ -3308,11 +3709,10 @@ fix() {
         local cmdline_off
         cmdline_off=$(grep -o 'resume_offset=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2 || echo "")
         if [[ -n "$actual_off" && -n "$cmdline_off" && "$actual_off" != "$cmdline_off" ]]; then
-            local booted; booted=$(_get_booted_subvol)
-            if [[ "$booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
-                _log "Regenerating UKI for @${booted} (resume_offset ${cmdline_off} -> ${actual_off})..."
-                if "$GENEFI_BIN" configure "$booted" 2>&1; then
-                    _log_ok "UKI regenerated for @${booted}"
+            if [[ "$_fix_booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
+                _log "Regenerating UKI for @${_fix_booted} (resume_offset ${cmdline_off} -> ${actual_off})..."
+                if "$GENEFI_BIN" configure "$_fix_booted" 2>&1; then
+                    _log_ok "UKI regenerated for @${_fix_booted}"
                     fixed=$(( fixed + 1 ))
                 else
                     _log_warn "UKI regeneration failed"
@@ -3322,6 +3722,13 @@ fix() {
         fi
     fi
 
+    echo ""
+    (( fixed + failed > 0 )) && _log "  fixed: ${fixed}  failed: ${failed}"
+}
+
+_fix_data() {
+    local fixed=0 failed=0
+    _log_section "Data & Filesystem"
     # systemd-timesyncd + NTP + RTC sync
     if command -v timedatectl &>/dev/null; then
         local td ntp_a ntp_s tsync_a _ntp_fixed=0
@@ -3429,11 +3836,10 @@ fix() {
     _cmdline_km=$(grep -o 'rd.vconsole.keymap=[^ ]*' /proc/cmdline 2>/dev/null \
         | cut -d= -f2 || echo "")
     if [[ -n "$_vconsole_km" && -n "$_cmdline_km" && "$_vconsole_km" != "$_cmdline_km" ]]; then
-        local _km_booted; _km_booted=$(_get_booted_subvol)
-        if [[ "$_km_booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
-            _log "Keymap mismatch (UKI: ${_cmdline_km}, vconsole: ${_vconsole_km}) — regenerating UKI for @${_km_booted}..."
-            if "$GENEFI_BIN" configure "$_km_booted" 2>&1; then
-                _log_ok "UKI regenerated for @${_km_booted} with keymap ${_vconsole_km}"
+        if [[ "$_fix_booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
+            _log "Keymap mismatch (UKI: ${_cmdline_km}, vconsole: ${_vconsole_km}) — regenerating UKI for @${_fix_booted}..."
+            if "$GENEFI_BIN" configure "$_fix_booted" 2>&1; then
+                _log_ok "UKI regenerated for @${_fix_booted} with keymap ${_vconsole_km}"
                 fixed=$(( fixed + 1 ))
             else
                 _log_warn "UKI regeneration failed"
@@ -3442,6 +3848,13 @@ fix() {
         fi
     fi
 
+    echo ""
+    (( fixed + failed > 0 )) && _log "  fixed: ${fixed}  failed: ${failed}"
+}
+
+_fix_users() {
+    local fixed=0 failed=0
+    _log_section "Users & Setup"
     # user-setup-needed — run binary directly then remove marker
     if [[ -f /data/user-setup-needed ]]; then
         if [[ ! -x "$USER_SETUP_BIN" ]]; then
@@ -3462,13 +3875,7 @@ fix() {
     fi
 
     echo ""
-    if (( fixed + failed == 0 )); then
-        _log_ok "Nothing to fix — system already hardened"
-    else
-        _log "Fixed: ${fixed} | Failed: ${failed}"
-    fi
-    echo ""
-    _log "Run 'shani-health' to verify"
+    (( fixed + failed > 0 )) && _log "  fixed: ${fixed}  failed: ${failed}"
 }
 
 ###############################################################################
@@ -3486,15 +3893,20 @@ clear_boot_failure() {
 
     local failed_slot; failed_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' || echo "?")
 
-    # Only allow clearing when the current boot is healthy (booted == current-slot)
-    if [[ "$booted" != "$current" ]]; then
+    # Allow clearing in two safe cases:
+    #   1. booted == current-slot  — normal healthy boot, failure is for the other slot
+    #   2. failed_slot == booted   — the marker is for the slot we're successfully running now (stale)
+    # In any other case the system is in genuine fallback and --rollback is required first.
+    if [[ "$booted" != "$current" && "$failed_slot" != "$booted" ]]; then
         _die "System is in fallback mode (booted @${booted}, current @${current}) — use 'shani-deploy --rollback' instead"
     fi
 
-    _log "Current boot is healthy (@${booted}). Clearing stale failure marker for @${failed_slot}..."
+    _log "Clearing stale boot_failure marker for @${failed_slot} (currently booted @${booted} successfully)..."
     rm -f "$DATA_BOOT_FAIL" "$DATA_BOOT_FAIL_ACKED"
-    _log_ok "boot_failure marker cleared. @${failed_slot} will be treated as a valid fallback again."
-    _log    "To fully repair @${failed_slot}, run: shani-deploy --rollback"
+    _log_ok "boot_failure marker cleared."
+    if [[ "$booted" != "$current" ]]; then
+        _log "Note: system is still in fallback mode — run: shani-deploy --rollback to fully repair @${current}"
+    fi
 }
 
 
@@ -3600,6 +4012,44 @@ verify_system() {
     fi
     _esp_umount
 
+    # Immutability verification
+    echo ""
+    _log "Checking system immutability..."
+    # Root must be read-only
+    if findmnt -n -o OPTIONS / 2>/dev/null | grep -q '\bro\b'; then
+        _log_ok "Root (/): read-only"
+    else
+        _log_err "Root (/): WRITABLE — immutability compromised"
+        errors=$(( errors + 1 ))
+    fi
+    # /var must be tmpfs
+    local var_fstype; var_fstype=$(findmnt -n -o FSTYPE /var 2>/dev/null || echo "")
+    if [[ "$var_fstype" == "tmpfs" ]]; then
+        _log_ok "/var: tmpfs (volatile)"
+    else
+        _log_warn "/var: not tmpfs (${var_fstype:-unknown}) — volatile state may not be enforced"
+    fi
+    # /etc must have an overlay mount
+    local etc_fstype; etc_fstype=$(findmnt -n -o FSTYPE /etc 2>/dev/null || echo "")
+    if [[ "$etc_fstype" == "overlay" ]]; then
+        local etc_files; etc_files=$(find /etc/. -maxdepth 0 -newer /etc/../usr 2>/dev/null | wc -l || echo "?")
+        _log_ok "/etc: overlay active"
+    else
+        _log_err "/etc: overlay NOT mounted (fstype: ${etc_fstype:-none}) — /etc is from read-only root"
+        errors=$(( errors + 1 ))
+    fi
+    # Critical subvolumes must be mounted
+    local sv_errors=0
+    for sv in data nix home containers; do
+        local mp="/$sv"
+        [[ "$sv" == "containers" ]] && mp="/var/lib/containers"
+        if findmnt -n "$mp" &>/dev/null; then
+            _log_ok "@${sv}: mounted at ${mp}"
+        else
+            _log_warn "@${sv}: not mounted at ${mp} (may not be installed)"
+        fi
+    done
+
     echo ""
     if (( errors == 0 )); then
         _log_ok "Verification passed — no integrity issues"
@@ -3638,6 +4088,114 @@ _scan_log_file() {
             echo "${ts}  START    ${ver}" >> "$tmpfile"
         fi
     done < "$logfile"
+}
+
+show_journal() {
+    local level="${1:-crit}"   # crit, err, warning
+    local since="${2:-}"       # optional: "-1h", "-1d", etc.
+
+    echo ""
+    printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
+    printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Journal — ${level} and above"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
+
+    # Map level name to journalctl priority number for display
+    local level_desc
+    case "$level" in
+        crit)    level_desc="critical (0–2)" ;;
+        err)     level_desc="errors (0–3)" ;;
+        warning) level_desc="warnings (0–4)" ;;
+        *)       level_desc="$level" ;;
+    esac
+
+    local since_args=()
+    [[ -n "$since" ]] && since_args=(--since "$since") || since_args=(-b 0)
+
+    # ── Critical / error journal entries ─────────────────────────────────────
+    _head "Journal Messages (this boot)"
+    local j_crit j_err
+    j_crit=$(journalctl -b 0 -p crit  --no-pager -q 2>/dev/null | wc -l || echo "0")
+    j_err=$( journalctl -b 0 -p err   --no-pager -q 2>/dev/null | wc -l || echo "0")
+    local j_warn
+    j_warn=$(journalctl -b 0 -p warning --no-pager -q 2>/dev/null | wc -l || echo "0")
+    _row "Critical"  "${j_crit:+!!  }${j_crit:-0} message(s)"
+    _row "Errors"    "--  ${j_err:-0} message(s)"
+    _row "Warnings"  "--  ${j_warn:-0} message(s)"
+
+    echo ""
+    printf "  ${_C_DIM}%s${_C_RESET}\n" "── Critical messages ──────────────────────────────────"
+    echo ""
+    journalctl "${since_args[@]}" -p crit --no-pager -o short-precise 2>/dev/null \
+        | grep -v '^--' | sed 's/^/    /' || true
+
+    if [[ "$level" == "err" || "$level" == "warning" ]]; then
+        echo ""
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "── Errors (non-critical) ──────────────────────────────"
+        echo ""
+        journalctl "${since_args[@]}" -p err..err --no-pager -o short-precise 2>/dev/null \
+            | grep -v '^--' | sed 's/^/    /' | head -50 || true
+    fi
+
+    if [[ "$level" == "warning" ]]; then
+        echo ""
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "── Warnings ───────────────────────────────────────────"
+        echo ""
+        journalctl "${since_args[@]}" -p warning..warning --no-pager -o short-precise 2>/dev/null \
+            | grep -v '^--' | sed 's/^/    /' | head -50 || true
+    fi
+
+    # ── AppArmor denials ──────────────────────────────────────────────────────
+    _head "AppArmor Denials (this boot)"
+    local aa_count
+    aa_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null | grep -c 'apparmor.*DENIED' || echo "0")
+    if [[ "$aa_count" =~ ^[0-9]+$ ]] && (( aa_count > 0 )); then
+        _row "Denials"  "!   ${aa_count} total this boot"
+        echo ""
+        journalctl -k -b 0 --no-pager -q 2>/dev/null \
+            | grep 'apparmor.*DENIED' \
+            | grep -oP 'profile="[^"]+"|comm="[^"]+"|name="[^"]+"' \
+            | sort | uniq -c | sort -rn \
+            | sed 's/^/    /' | head -20 || true
+        echo ""
+        printf "    ${_C_DIM}Full log: journalctl -k -b 0 | grep apparmor.*DENIED${_C_RESET}\n"
+    else
+        _row "Denials"  "OK  none this boot"
+    fi
+
+    # ── OOM kills ─────────────────────────────────────────────────────────────
+    _head "OOM Events (this boot)"
+    local oom_count
+    oom_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null \
+        | grep -c 'Out of memory\|oom_kill_process\|Killed process' || echo "0")
+    if [[ "$oom_count" =~ ^[0-9]+$ ]] && (( oom_count > 0 )); then
+        _row "OOM kills" "!   ${oom_count} event(s)"
+        journalctl -k -b 0 --no-pager -q 2>/dev/null \
+            | grep 'Out of memory\|oom_kill_process\|Killed process' \
+            | tail -5 | sed 's/^/    /' || true
+    else
+        _row "OOM kills" "OK  none this boot"
+    fi
+
+    # ── Failed units summary ──────────────────────────────────────────────────
+    _head "Failed Units"
+    local failed_now=()
+    mapfile -t failed_now < <(
+        systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
+            | awk '{print $2}' | grep -v '^$' | grep '\.' || true)
+    if [[ ${#failed_now[@]} -eq 0 ]]; then
+        _row "Units"  "OK  no failed units"
+    else
+        for u in "${failed_now[@]}"; do
+            _row "  ${u}" "!!  failed"
+            # Show the most recent error line from this unit
+            local _uerr
+            _uerr=$(journalctl -u "$u" -b 0 --no-pager -q -n 1 2>/dev/null | tail -1 || true)
+            [[ -n "$_uerr" ]] && _row2 "--  ${_uerr:0:80}"
+        done
+    fi
+
+    echo ""
 }
 
 show_history() {
@@ -3690,12 +4248,365 @@ show_history() {
 }
 
 ###############################################################################
-### analyze_storage — delegates to shani-deploy --storage-info              ###
+### analyze_storage — native Btrfs storage analysis                         ###
 ###############################################################################
 
+# Print one subvolume size row for analyze_storage.
+# Usage: _stor_subvol_row <subvol_name> <path> <now_epoch>
+_stor_subvol_row() {
+    local sv="$1" path="$2" now="$3"
+    [[ -d "$path" ]] || return 0
+
+    # Size — prefer compsize for compression ratio, fall back to btrfs du
+    local excl_size total_size=""
+    if command -v compsize &>/dev/null; then
+        local cs_out; cs_out=$(compsize -x "$path" 2>/dev/null | tail -1 || true)
+        total_size=$(echo "$cs_out" | awk '{print $3}' || true)
+        local ratio;  ratio=$(echo "$cs_out" | awk '{print $NF}' || true)
+        excl_size="${total_size}${ratio:+ (ratio: ${ratio})}"
+    else
+        local du_out; du_out=$(btrfs filesystem du -s "$path" 2>/dev/null | tail -1 || true)
+        local excl; excl=$(echo "$du_out" | awk '{print $2}' || true)
+        local tot;  tot=$( echo "$du_out" | awk '{print $1}' || true)
+        excl_size="${tot:-?} total, ${excl:-?} exclusive"
+    fi
+
+    # Snapshot creation time and age
+    local snap_info; snap_info=$(btrfs subvolume show "$path" 2>/dev/null || true)
+    local created; created=$(echo "$snap_info"         | awk -F'	' '/Creation time:/{gsub(/^[[:space:]]+/,"",$2); print $2}'         | head -1 || true)
+    local age_str=""
+    local parent_uuid; parent_uuid=$(echo "$snap_info"         | awk -F'	' '/Parent UUID:/{gsub(/^[[:space:]]+/,"",$2); print $2}'         | head -1 || true)
+    if [[ -n "$parent_uuid" && "$parent_uuid" != "-" && -n "$created" ]]; then
+        local created_epoch; created_epoch=$(date -d "$created" +%s 2>/dev/null || echo "")
+        if [[ -n "$created_epoch" ]]; then
+            local age_days=$(( (now - created_epoch) / 86400 ))
+            age_str=" — ${age_days}d old"
+        fi
+    fi
+
+    # Warn on stale backup snapshots (>30 days old)
+    local level="--"
+    if [[ "$sv" == *_backup_* ]]; then
+        local age_days_int=0
+        [[ -n "$age_str" ]] && age_days_int=$(echo "$age_str" | grep -oE '[0-9]+' | head -1 || echo 0)
+        (( age_days_int > 30 )) && level="!"
+    fi
+
+    _row "${sv}" "${level}  ${excl_size:-?}${age_str}"
+}
+
 analyze_storage() {
-    [[ -x "$DEPLOY_BIN" ]] && { "$DEPLOY_BIN" --storage-info; return $?; }
-    _die "shani-deploy not found at ${DEPLOY_BIN}"
+    local STOR_MNT; STOR_MNT=$(mktemp -d /tmp/shani-storage-XXXXXX)
+    trap '_umount_r "$STOR_MNT"; rmdir "$STOR_MNT" 2>/dev/null || true' RETURN
+
+    # Mount at subvolid=5 (the Btrfs root) so every subvolume is reachable
+    if ! mount -o subvolid=5,ro "$ROOT_DEV" "$STOR_MNT" 2>/dev/null; then
+        _die "Could not mount ${ROOT_DEV} at subvolid=5 — is ${ROOTLABEL} the correct label?"
+    fi
+
+    echo ""
+    printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
+    printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Storage Analysis"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
+
+    # ── Part 1: Standard storage section (same as main report) ───────────────
+    # Re-initialise recommendations so they print at the end of this run
+    _recs_reset
+
+    # Reuse _section_storage but redirect the shared helpers to use STOR_MNT
+    # so free space and device stats are read from the subvolid=5 view.
+    _stor_check_free "$STOR_MNT"
+
+    # Qgroup consistency
+    local qgroup_out; qgroup_out=$(btrfs qgroup show "$STOR_MNT" 2>&1 || true)
+    if ! echo "$qgroup_out" | grep -q 'ERROR\|quota system is not enabled'; then
+        if echo "$qgroup_out" | grep -qi 'inconsistent\|stale'; then
+            _row "Quotas"    "!!  qgroup inconsistency detected — may cause phantom ENOSPC"
+            _rec "Btrfs qgroup inconsistent — fix: btrfs quota rescan /  [auto]"
+        else
+            _row "Quotas"    "OK  consistent"
+        fi
+    fi
+
+    # Scrub status
+    local scrub_st scrub_res
+    scrub_st=$(btrfs scrub status / 2>/dev/null || true)
+    scrub_res=$(echo "$scrub_st" | awk '/Status:/{print $2}' | head -1 || echo "")
+    local scrub_timer; scrub_timer=$(systemctl is-active btrfs-scrub.timer 2>/dev/null || echo "inactive")
+    if [[ "$scrub_timer" == "active" ]]; then
+        _row "Scrub tmr"  "OK  active"
+    else
+        _row "Scrub tmr"  "!!  btrfs-scrub.timer not active"
+        _rec "btrfs-scrub.timer not active — run: systemctl enable --now btrfs-scrub.timer  [auto]"
+    fi
+    case "$scrub_res" in
+        finished)
+            local re ce co
+            re=$(echo "$scrub_st" | awk '/read_errors:/{print $2}'      | head -1 || echo "0")
+            ce=$(echo "$scrub_st" | awk '/csum_errors:/{print $2}'      | head -1 || echo "0")
+            co=$(echo "$scrub_st" | awk '/corrected_errors:/{print $2}' | head -1 || echo "0")
+            if [[ "${re:-0}" != "0" || "${ce:-0}" != "0" || "${co:-0}" != "0" ]]; then
+                _row "Scrub"    "!!  errors: read=${re} csum=${ce} corrected=${co}"
+                _rec "Btrfs scrub found errors — investigate: btrfs scrub status /"
+            else
+                _row "Scrub"    "OK  last run clean"
+            fi ;;
+        running) _row "Scrub" "->  in progress" ;;
+        "")      _row "Scrub" "--  no scrub recorded yet" ;;
+        *)       _row "Scrub" "!   status: ${scrub_res}" ;;
+    esac
+
+    # Maintenance timers
+    local t_ok=() t_bad=()
+    for name in balance defrag trim; do
+        [[ "$(systemctl is-active "btrfs-${name}.timer" 2>/dev/null)" == "active" ]] \
+            && t_ok+=("$name") || t_bad+=("$name")
+    done
+    local t_ok_str; t_ok_str=$(_join "${t_ok[@]}")
+    local t_bad_str; t_bad_str=$(_join "${t_bad[@]}")
+    if   [[ ${#t_bad[@]} -eq 0 ]]; then _row "Maint tmrs" "OK  active: ${t_ok_str}"
+    elif [[ ${#t_ok[@]}  -eq 0 ]]; then _row "Maint tmrs" "!!  all inactive: ${t_bad_str}"
+    else                                 _row "Maint tmrs" "!   active: ${t_ok_str}  |  inactive: ${t_bad_str}"
+    fi
+
+    # Bees + subvol quick summary (shared helpers)
+    _stor_check_bees
+    _stor_check_device_errors "$STOR_MNT"
+
+    # ── Part 2: Deep analysis (requires subvolid=5 mount) ────────────────────
+    echo ""
+    printf "  ${_C_DIM}%.54s${_C_RESET}\n" "── Deep Analysis ──────────────────────────────────────"
+
+    # ── Filesystem-level usage detail ────────────────────────────────────────
+    _head "Filesystem Usage"
+    local fs_usage; fs_usage=$(btrfs filesystem usage "$STOR_MNT" 2>/dev/null || true)
+    if [[ -n "$fs_usage" ]]; then
+        local fs_total fs_used
+        fs_total=$(echo "$fs_usage" | awk '/Device size:/{print $3}' | head -1)
+        fs_used=$( echo "$fs_usage" | awk '/Used:/{print $2}'        | head -1)
+        [[ -n "$fs_total" ]] && _row "Total"  "--  ${fs_total}"
+        [[ -n "$fs_used"  ]] && _row "Used"   "--  ${fs_used}"
+        echo ""
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "Block group profiles:"
+        echo "$fs_usage" | awk '/^(Data|Metadata|System),/{printf "    %-32s %s\n", $1, $2}' \
+            | sed 's/,/ /' || true
+    fi
+
+    # ── Per-subvolume compression + size ─────────────────────────────────────
+    _head "Subvolume Analysis"
+
+    # Enumerate all subvolumes from the subvolid=5 mount
+    local subvol_list
+    subvol_list=$(btrfs subvolume list "$STOR_MNT" 2>/dev/null | awk '{print $NF}' | sort || true)
+
+    # Decide display order: slots first, then data/swap/nix/containers, then backups, then rest
+    local -a primary=() backups=() others=()
+    while IFS= read -r sv; do
+        [[ -z "$sv" ]] && continue
+        case "$sv" in
+            @blue|@green|@data|@swap|@nix|@containers|@home|@waydroid)
+                primary+=("$sv") ;;
+            *_backup_*)
+                backups+=("$sv") ;;
+            *)
+                others+=("$sv") ;;
+        esac
+    done <<< "$subvol_list"
+
+    local now; now=$(date +%s)
+
+    if [[ ${#primary[@]} -gt 0 ]]; then
+        for sv in "${primary[@]}"; do
+            _stor_subvol_row "$sv" "${STOR_MNT}/${sv}" "$now"
+        done
+    fi
+
+    if [[ ${#backups[@]} -gt 0 ]]; then
+        echo ""
+        printf "    ${_C_DIM}── Backup snapshots ──────────────────────────────${_C_RESET}\n"
+        for sv in "${backups[@]}"; do
+            _stor_subvol_row "$sv" "${STOR_MNT}/${sv}" "$now"
+        done
+    fi
+
+    if [[ ${#others[@]} -gt 0 ]]; then
+        local others_present=()
+        for sv in "${others[@]}"; do
+            [[ -d "${STOR_MNT}/${sv}" ]] && others_present+=("$sv")
+        done
+        if [[ ${#others_present[@]} -gt 0 ]]; then
+            echo ""
+            printf "    ${_C_DIM}── Other subvolumes ──────────────────────────────${_C_RESET}\n"
+            for sv in "${others_present[@]}"; do
+                _stor_subvol_row "$sv" "${STOR_MNT}/${sv}" "$now"
+            done
+        fi
+    fi
+
+    # ── Application & container storage ──────────────────────────────────────
+    _head "Application Storage"
+
+    # Flatpak
+    if command -v flatpak &>/dev/null; then
+        local fp_mb; fp_mb=$(du -sm /var/lib/flatpak 2>/dev/null | awk '{print $1}' || echo "")
+        local fp_apps; fp_apps=$(timeout 5 flatpak list --app --columns=application 2>/dev/null | wc -l || echo "?")
+        local fp_rt;   fp_rt=$(timeout 5 flatpak list --runtime --columns=application 2>/dev/null | wc -l || echo "?")
+        if [[ "$fp_mb" =~ ^[0-9]+$ ]]; then
+            if (( fp_mb > 20480 )); then
+                _row "Flatpak"  "!   ${fp_mb} MB  (${fp_apps} apps, ${fp_rt} runtimes) — run: flatpak uninstall --unused"
+                _rec "Flatpak storage is ${fp_mb} MB — free space: flatpak uninstall --unused"
+            else
+                _row "Flatpak"  "--  ${fp_mb} MB  (${fp_apps} apps, ${fp_rt} runtimes)"
+            fi
+        fi
+    fi
+
+    # Snap
+    if findmnt -n /var/lib/snapd &>/dev/null; then
+        local snap_mb;    snap_mb=$(du -sm /var/lib/snapd/snaps 2>/dev/null | awk '{print $1}' || echo "")
+        local snap_total; snap_total=$(du -sm /var/lib/snapd 2>/dev/null | awk '{print $1}' || echo "")
+        local snap_stale; snap_stale=$(timeout 5 snap list --all 2>/dev/null \
+            | awk '/disabled/{c++} END{print c+0}' || echo "0")
+        local snap_str=""
+        [[ "$snap_stale" =~ ^[0-9]+$ ]] && (( snap_stale > 0 )) && snap_str=", ${snap_stale} stale"
+        if [[ "$snap_mb" =~ ^[0-9]+$ ]]; then
+            if (( snap_mb > 10240 )); then
+                _row "Snap"     "!   ${snap_mb} MB snaps${snap_str} — run: snap set system refresh.retain=2"
+                _rec "Snap storage is ${snap_mb} MB — limit old revisions: snap set system refresh.retain=2"
+            else
+                _row "Snap"     "--  ${snap_mb} MB snaps${snap_str}${snap_total:+  (${snap_total} MB total)}"
+            fi
+        fi
+    fi
+
+    # Nix store
+    if findmnt -n /nix &>/dev/null; then
+        local nix_mb; nix_mb=$(du -sm /nix/store 2>/dev/null | awk '{print $1}' || echo "")
+        local nix_gen; nix_gen=$(ls /nix/var/nix/profiles 2>/dev/null | grep -cE '^system-[0-9]+-link$' || echo "")
+        local nix_str=""
+        [[ "$nix_gen" =~ ^[0-9]+$ ]] && (( nix_gen > 0 )) && nix_str=", ${nix_gen} generation(s)"
+        if [[ "$nix_mb" =~ ^[0-9]+$ ]]; then
+            if (( nix_mb > 51200 )); then
+                _row "Nix"      "!   ${nix_mb} MB${nix_str} — run: nix-collect-garbage -d"
+                _rec "Nix store is ${nix_mb} MB — free space: nix-collect-garbage -d"
+            else
+                _row "Nix"      "--  ${nix_mb} MB${nix_str}"
+            fi
+        fi
+    fi
+
+    # Podman (system + rootless)
+    if command -v podman &>/dev/null; then
+        local pod_sys; pod_sys=$(du -sm /var/lib/containers/storage/overlay 2>/dev/null | awk '{print $1}' || echo "")
+        [[ "$pod_sys" =~ ^[0-9]+$ ]] && _row "Podman sys" "--  ${pod_sys} MB system image storage"
+        local _pod_user="$_CALLER_USER"
+        if [[ -n "$_pod_user" ]]; then
+            local _pod_home; _pod_home=$(getent passwd "$_pod_user" 2>/dev/null | cut -d: -f6 || echo "")
+            if [[ -n "$_pod_home" ]]; then
+                local pod_usr; pod_usr=$(du -sm "${_pod_home}/.local/share/containers/storage/overlay" \
+                    2>/dev/null | awk '{print $1}' || echo "")
+                [[ "$pod_usr" =~ ^[0-9]+$ ]] && (( pod_usr > 0 )) && \
+                    _row "Podman usr" "--  ${pod_usr} MB ${_pod_user} rootless storage"
+            fi
+        fi
+    fi
+
+    # LXD
+    if { findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]]; }; then
+        local lxd_mb; lxd_mb=$(du -sm /var/lib/lxd /data/varlib/lxd 2>/dev/null | awk '{s+=$1} END{print s}' || echo "")
+        [[ "$lxd_mb" =~ ^[0-9]+$ ]] && _row "LXD"        "--  ${lxd_mb} MB"
+    fi
+
+    # Waydroid
+    if findmnt -n /var/lib/waydroid &>/dev/null; then
+        local wd_mb; wd_mb=$(du -sm /var/lib/waydroid 2>/dev/null | awk '{print $1}' || echo "")
+        [[ "$wd_mb" =~ ^[0-9]+$ ]] && _row "Waydroid"    "--  ${wd_mb} MB"
+    fi
+
+    # Apptainer cache
+    if command -v apptainer &>/dev/null || command -v singularity &>/dev/null; then
+        local _apt_user="$_CALLER_USER"
+        if [[ -n "$_apt_user" ]]; then
+            local _apt_home; _apt_home=$(getent passwd "$_apt_user" 2>/dev/null | cut -d: -f6 || echo "")
+            if [[ -n "$_apt_home" ]]; then
+                local _apt_cache="${APPTAINER_CACHEDIR:-${_apt_home}/.apptainer/cache}"
+                local apt_mb; apt_mb=$(du -sm "$_apt_cache" 2>/dev/null | awk '{print $1}' || echo "")
+                if [[ "$apt_mb" =~ ^[0-9]+$ ]] && (( apt_mb > 0 )); then
+                    if (( apt_mb > 10240 )); then
+                        _row "Apptainer"  "!   ${apt_mb} MB cache — run: apptainer cache clean"
+                        _rec "Apptainer cache is ${apt_mb} MB — free space: apptainer cache clean"
+                    else
+                        _row "Apptainer"  "--  ${apt_mb} MB cache"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # /home per-user
+    if findmnt -n /home &>/dev/null; then
+        for user_dir in /home/*/; do
+            [[ -d "$user_dir" ]] || continue
+            local uname; uname=$(basename "$user_dir")
+            local used_mb; used_mb=$(du -sm "$user_dir" 2>/dev/null | awk '{print $1}' || echo "")
+            [[ "$used_mb" =~ ^[0-9]+$ ]] && (( used_mb > 0 )) && \
+                _row "Home/${uname}" "--  ${used_mb} MB"
+        done
+    fi
+
+    # ── Snapshot summary ──────────────────────────────────────────────────────
+    _head "Snapshot Summary"
+    local snap_count; snap_count=$(btrfs subvolume list -s "$STOR_MNT" 2>/dev/null | wc -l || echo "0")
+    _row "Snapshots"  "--  ${snap_count} total"
+
+    # List snapshots with their parent and creation date, newest first
+    btrfs subvolume list -s --sort=-rootid "$STOR_MNT" 2>/dev/null \
+        | awk '{printf "    %-42s  %s %s\n", $NF, $(NF-3), $(NF-2)}' \
+        | head -20 || true
+
+    # ── Space reclaim hints ───────────────────────────────────────────────────
+    _head "Reclaim Hints"
+    local hints=0
+
+    # duperemove hint when cross-slot savings are likely
+    if command -v duperemove &>/dev/null; then
+        hints=$(( hints + 1 ))
+        _row "Dedup"      "--  duperemove available — run: shani-deploy --optimize"
+        _row2 "--  deduplicates @blue/@green and backup snapshots across slots"
+    else
+        hints=$(( hints + 1 ))
+        _row "Dedup"      "--  duperemove not installed — install for cross-slot deduplication"
+        _row2 "--  pacman -S duperemove  then: shani-deploy --optimize"
+    fi
+
+    # bees status — only flag here if not already reported in Part 1 as running
+    local _bees_was_ok=0
+    systemctl is-active --quiet "beesd@$(_get_bees_uuid 2>/dev/null)" 2>/dev/null && _bees_was_ok=1
+    if (( ! _bees_was_ok )); then
+        hints=$(( hints + 1 ))
+        _stor_check_bees
+    fi
+
+    if (( hints == 0 )); then
+        printf "    ${_C_GREEN}${_SYM_OK}${_C_RESET}  No reclaim actions needed\n"
+    fi
+
+    # ── Recommendations summary ───────────────────────────────────────────────
+    echo ""
+    if [[ ${#_RECS[@]} -gt 0 ]]; then
+        printf "  ${_C_BOLD}${_C_YELLOW}Recommendations (${#_RECS[@]})${_C_RESET}\n"
+        printf "  ${_C_DIM}%.54s${_C_RESET}\n" "──────────────────────────────────────────────────────"
+        local i=1
+        for rec in "${_RECS[@]}"; do
+            local display="${rec/\[auto\]/${_C_CYAN}[auto]${_C_RESET}}"
+            printf "    ${_C_BOLD}%2d.${_C_RESET}  %b\n" "$i" "$display"
+            i=$(( i + 1 ))
+        done
+        echo ""
+        printf "  ${_C_DIM}Items marked ${_C_CYAN}[auto]${_C_DIM} can be fixed by: shani-health --fix${_C_RESET}\n"
+    fi
+    echo ""
 }
 
 ###############################################################################
@@ -3782,20 +4693,27 @@ Usage: $(basename "$0") [OPTIONS]
 Options:
   (no args)               Full system status report
   -i, --info              Alias for full system status report
-  --fix          Auto-fix all [auto] issues
-  --verify                UKI signatures + Btrfs data integrity check
+  --fix                   Auto-fix all [auto] issues
+  --verify                Deep integrity check: UKI sigs, Btrfs scrub, immutability
+  --security              Security-focused report: boot chain, encryption, users, groups
+  --journal [level]       Show journal entries (level: crit, err, warning — default: crit)
+  -s, --storage-info      Btrfs storage analysis: subvolume sizes, compression, snapshots
   --history [N]           Last N deploy/rollback events from log (default: 50)
-  -s, --storage-info      Btrfs compression/subvolume analysis (via shani-deploy)
   --clear-boot-failure    Clear a stale boot failure marker (when current boot is healthy)
+  --export-logs [DIR]     Bundle logs + state for bug reports (default: /tmp)
   -v, --verbose           Verbose/debug output
   -h, --help              Show this help
 
 Examples:
-  shani-health                     Full status report
-  shani-health --fix      Auto-fix automatable issues
-  shani-health --verify            Deep integrity check
-  shani-health --history 100       Last 100 deploy events
-  shani-health --clear-boot-failure  Clear stale @green/@blue boot failure marker
+  shani-health                        Full status report
+  shani-health --fix                  Auto-fix automatable issues
+  shani-health --security             Security audit report
+  shani-health --journal              Show critical journal messages
+  shani-health --journal err          Show errors and above
+  shani-health --storage-info         Btrfs subvolume + compression analysis
+  shani-health --verify               Deep integrity check (runs scrub — takes time)
+  shani-health --history 100          Last 100 deploy events
+  shani-health --export-logs ~/       Bundle diagnostics to home dir
 
 Install:
   cp shani-health /usr/local/bin/shani-health
@@ -3811,14 +4729,26 @@ main() {
     local MODE="info"
     local HISTORY_LINES=50
     local EXPORT_DIR="/tmp"
+    local JOURNAL_LEVEL="crit"
+    local JOURNAL_SINCE=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)          usage; exit 0 ;;
             -i|--info)          MODE="info";         shift ;;
-            --fix)     MODE="fix"; shift ;;
+            --fix)              MODE="fix";           shift ;;
             --verify)           MODE="verify";       shift ;;
             -s|--storage-info)  MODE="storage-info"; shift ;;
+            --security)         MODE="security";     shift ;;
+            --journal)
+                MODE="journal"
+                if [[ -n "${2:-}" && "${2:-}" =~ ^(crit|err|warning)$ ]]; then
+                    JOURNAL_LEVEL="$2"; shift 2
+                elif [[ -n "${2:-}" && "${2:-}" != -* ]]; then
+                    JOURNAL_SINCE="$2"; shift 2
+                else
+                    shift
+                fi ;;
             --history)
                 MODE="history"
                 if [[ -n "${2:-}" && "${2:-}" =~ ^[0-9]+$ ]]; then
@@ -3842,13 +4772,15 @@ main() {
     _require_root
 
     case "$MODE" in
-        info)           system_info ;;
-        fix)   fix ;;
-        verify)         verify_system; exit $? ;;
-        history)        show_history "$HISTORY_LINES" ;;
-        storage-info)   analyze_storage ;;
-        clear-boot-failure) clear_boot_failure ;;
-
+        info)                system_info ;;
+        fix)                 fix ;;
+        verify)              verify_system; exit $? ;;
+        security)            security_report ;;
+        journal)             show_journal "$JOURNAL_LEVEL" "$JOURNAL_SINCE" ;;
+        history)             show_history "$HISTORY_LINES" ;;
+        storage-info)        analyze_storage ;;
+        clear-boot-failure)  clear_boot_failure ;;
+        export-logs)         export_logs "$EXPORT_DIR" ;;
     esac
 }
 

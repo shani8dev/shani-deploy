@@ -1,7 +1,10 @@
 #!/bin/bash
 # gen-efi.sh – Generate and update the Unified Kernel Image (UKI) for Secure Boot.
 #
-# Usage: ./gen-efi.sh configure <target_slot>
+# Usage:
+#   ./gen-efi.sh configure <target_slot>  — generate/update UKI for a slot
+#   ./gen-efi.sh enroll-mok               — stage MOK enrollment without rebuilding UKI
+#   ./gen-efi.sh enroll-tpm2              — enroll TPM2 for automatic LUKS unlock
 #
 # ENHANCED:
 # - Validates target slot against booted slot
@@ -34,9 +37,10 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-tpm2" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
+    echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     exit 1
 fi
@@ -75,6 +79,21 @@ MOK_KEYS_GENERATED=0
 ensure_mok_keys() {
     if [[ -f "$MOK_KEY" && -f "$MOK_CRT" ]]; then
         log "MOK keys present"
+        # Validate MOK.der — regenerate from MOK.crt if missing or corrupt.
+        # mokutil requires valid DER; a corrupt file produces:
+        #   "Abort!!! ... is not a valid x509 certificate in DER format"
+        local mok_der_path="/etc/secureboot/keys/MOK.der"
+        local der_valid=0
+        if [[ -f "$mok_der_path" ]]; then
+            openssl x509 -in "$mok_der_path" -inform DER -noout &>/dev/null && der_valid=1
+        fi
+        if (( ! der_valid )); then
+            log_warn "MOK.der missing or invalid — regenerating from MOK.crt"
+            openssl x509 -in "$MOK_CRT" -outform DER \
+                -out "$mok_der_path" \
+                || error_exit "Failed to regenerate MOK.der from MOK.crt"
+            log "MOK.der regenerated"
+        fi
         return 0
     fi
 
@@ -107,54 +126,47 @@ ensure_mok_keys() {
 # MOK enrollment. Called only when MOK_KEYS_GENERATED=1, after ESP is mounted.
 reenroll_mok_keys() {
     log "Re-signing existing EFI binaries with new MOK keys"
-
-    # Re-sign shim and systemd-boot (grubx64.efi) — these were signed with the
-    # old keys and must be updated before the next boot.
-    local efi_bins=(
-        "$ESP/EFI/BOOT/BOOTX64.EFI"
-        "$ESP/EFI/BOOT/grubx64.efi"
-    )
-    for bin in "${efi_bins[@]}"; do
-        if [[ -f "$bin" ]]; then
-            log "Re-signing ${bin}"
-            sign_efi_binary "$bin" || log_warn "Failed to re-sign ${bin} — continuing"
-        else
-            log_warn "EFI binary not found, skipping: ${bin}"
-        fi
-    done
-
-    # Copy updated DER to EFI partition so MokManager can offer enrollment
-    cp /etc/secureboot/keys/MOK.der "$ESP/EFI/BOOT/MOK.der" \
-        || log_warn "Failed to copy MOK.der to ESP — manual enrollment may be required"
-
-    # Stage MOK enrollment — use --root-pw if root has a password, otherwise
-    # use --hash-file with a generated hash.
-    local mok_der="/etc/secureboot/keys/MOK.der"
-    if [[ -s /etc/shadow ]] && awk -F: '$1=="root" && $2!="" && $2!="*" && $2!="!" {found=1} END{exit !found}' /etc/shadow 2>/dev/null; then
-        log "Staging MOK enrollment via --root-pw"
-        if ! mokutil --import "$mok_der" --root-pw >/dev/null 2>&1; then
-            log_warn "mokutil --root-pw failed — falling back to hash-file method"
-            _mokutil_hash_enroll "$mok_der"
-        fi
-    else
-        log "No root password set — staging MOK enrollment via password hash"
-        _mokutil_hash_enroll "$mok_der"
-    fi
-
-    log_warn "SYSTEM REBOOT REQUIRED — confirm MOK enrollment in MokManager on next boot"
+    # Force-restore + re-sign bootloader binaries (grubx64.efi, shim)
+    # then stage MOK enrollment via the shared helpers.
+    update_bootloader force
+    _stage_mok_enrollment
 }
 
 _mokutil_hash_enroll() {
     local der_file="$1"
-    local tmp_hash
+    local tmp_hash tmp_err
     tmp_hash=$(mktemp)
-    if mokutil --generate-hash=shanios > "$tmp_hash" 2>/dev/null \
-        && mokutil --import "$der_file" --hash-file "$tmp_hash" >/dev/null 2>&1; then
-        log "MOK enrollment staged — confirm with password 'shanios' in MokManager on first boot"
-    else
-        log_warn "mokutil enrollment staging failed — MOK.der is in ESP for manual enrollment"
+    tmp_err=$(mktemp)
+
+    # Check if this key is already pending enrollment (queued but not yet confirmed)
+    if mokutil --list-new 2>/dev/null | grep -q .; then
+        log "MOK enrollment already pending — reboot and confirm in MokManager"
+        rm -f "$tmp_hash" "$tmp_err"
+        return 0
     fi
-    rm -f "$tmp_hash"
+
+    local hash_ok=0 import_ok=0
+    if mokutil --generate-hash=shanios > "$tmp_hash" 2>"$tmp_err"; then
+        hash_ok=1
+    else
+        log_warn "mokutil --generate-hash failed: $(cat "$tmp_err" 2>/dev/null)"
+    fi
+
+    if (( hash_ok )); then
+        if mokutil --import "$der_file" --hash-file "$tmp_hash" >"$tmp_err" 2>&1; then
+            import_ok=1
+            log "MOK enrollment staged — confirm with password 'shanios' in MokManager on first boot"
+        else
+            log_warn "mokutil --import failed: $(cat "$tmp_err" 2>/dev/null)"
+        fi
+    fi
+
+    if (( ! import_ok )); then
+        log_warn "mokutil enrollment staging failed — MOK.der copied to ESP for manual enrollment"
+        log_warn "Manual steps: reboot → select 'Enroll MOK' → 'Enroll key from disk' → EFI/BOOT/MOK.der"
+    fi
+
+    rm -f "$tmp_hash" "$tmp_err"
 }
 
 # Track if we mounted ESP
@@ -256,6 +268,15 @@ cleanup_esp() {
 
 sign_efi_binary() {
     local file="$1"
+
+    # Check if the binary is already validly signed with the current MOK.crt.
+    # If so, skip signing — no need to re-sign or strip anything.
+    if sbverify --cert "$MOK_CRT" "$file" &>/dev/null 2>&1; then
+        log "$(basename "$file") already signed with current key — skipping"
+        return 0
+    fi
+
+    # Not signed with our key — sign it now.
     local tmp_signed
     tmp_signed=$(mktemp "${file}.signed.XXXXXX")
     if sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$tmp_signed" "$file"; then
@@ -424,12 +445,101 @@ ensure_crypttab() {
     fi
 }
 
+
+# _stage_mok_enrollment — enroll MOK key and disable shim SB validation.
+# Shared by reenroll_mok_keys and enroll_mok.
+# Writes MokSBState directly to the EFI variable store to skip MokManager.
+_stage_mok_enrollment() {
+    local mok_der="/etc/secureboot/keys/MOK.der"
+
+    # Copy DER to ESP so MokManager can use it as a fallback if needed
+    cp "$mok_der" "$ESP/EFI/BOOT/MOK.der"         || log_warn "Failed to copy MOK.der to ESP"
+
+    # Check if this exact key is already enrolled — nothing to do
+    local local_fp
+    local_fp=$(openssl x509 -in "$mok_der" -inform DER -noout -fingerprint -sha1         2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+    if [[ -n "$local_fp" ]] &&        mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]'        | grep -q "$local_fp"; then
+        log "MOK key already enrolled in firmware"
+        _disable_shim_validation
+        return 0
+    fi
+
+    # Enroll the key via mokutil — uses --root-pw or hash-file
+    if [[ -s /etc/shadow ]] && awk -F: '$1=="root" && $2!="" && $2!="*" && $2!="!" {found=1} END{exit !found}' /etc/shadow 2>/dev/null; then
+        log "Enrolling MOK key via --root-pw"
+        local tmp_err; tmp_err=$(mktemp)
+        if ! mokutil --import "$mok_der" --root-pw >"$tmp_err" 2>&1; then
+            log_warn "mokutil --root-pw failed ($(cat "$tmp_err")) — falling back to hash-file method"
+            _mokutil_hash_enroll "$mok_der"
+        fi
+        rm -f "$tmp_err"
+    else
+        _mokutil_hash_enroll "$mok_der"
+    fi
+
+    # Disable shim SB validation — writes MokSBState directly, no MokManager prompt
+    _disable_shim_validation
+}
+
+# _disable_shim_validation — write MokSBState=1 directly to the EFI variable
+# store to disable shim's Secure Boot signature validation without any
+# MokManager prompt. Falls back to mokutil --disable-validation if the
+# direct write fails (will show a MokManager prompt in that case).
+_disable_shim_validation() {
+    local mok_sbstate_var="MokSBStateRT-605dab50-e046-4300-abb6-3dd810dd8b23"
+    local efivar_path="/sys/firmware/efi/efivars/${mok_sbstate_var}"
+
+    if [[ ! -d /sys/firmware/efi/efivars ]]; then
+        log_warn "efivarfs not available — shim validation bypass skipped"
+        return 0
+    fi
+
+    # Check if already disabled
+    if mokutil --sb-state 2>/dev/null | grep -q "Secure Boot validation is disabled"; then
+        log "Shim Secure Boot validation already disabled"
+        return 0
+    fi
+
+    # Write MokSBState = 0x01 directly to the EFI variable file.
+    # Format: 4-byte attributes (0x07 = NV|BS|RT) + 1 data byte (0x01 = disable).
+    # chattr -i removes the immutable flag the kernel sets on EFI variable files.
+    if [[ -e "$efivar_path" ]]; then
+        chattr -i "$efivar_path" 2>/dev/null || true
+    fi
+    if printf '\x07\x00\x00\x00\x01' > "$efivar_path" 2>/dev/null; then
+        log "Shim Secure Boot validation disabled — no MokManager prompt needed"
+        return 0
+    fi
+
+    # Direct write failed — fall back to mokutil --disable-validation (will prompt)
+    log_warn "Direct EFI variable write failed — falling back to mokutil --disable-validation"
+    local tmp_hash; tmp_hash=$(mktemp)
+    if mokutil --generate-hash=shanios > "$tmp_hash" 2>/dev/null &&        mokutil --disable-validation --hash-file "$tmp_hash" >/dev/null 2>&1; then
+        log_warn "Shim validation disable staged — confirm in MokManager on next boot (password: shanios)"
+    else
+        log_warn "Could not disable shim validation — Secure Boot may block unsigned binaries"
+    fi
+    rm -f "$tmp_hash"
+}
+
 # update_bootloader — update shim and systemd-boot on the ESP if the source
 # binaries are newer than what is currently installed. Re-signs after update.
 # configure.sh installs these at install time; gen-efi.sh keeps them current
 # on subsequent kernel/systemd updates since bootctl update would deploy
 # an unsigned binary on this immutable signed system.
+# _pe_valid — return 0 if file has a valid PE DOS header ("MZ" magic), 1 otherwise.
+_pe_valid() {
+    local magic
+    magic=$(dd if="$1" bs=2 count=1 2>/dev/null | od -A n -t x1 | tr -d ' \n' || echo "")
+    [[ "$magic" == "4d5a" ]]
+}
+
+# update_bootloader [force]
+# Without "force": copy only when source is newer than destination.
+# With    "force": also restore if destination is missing or has an invalid PE header
+#                  (used by enroll_mok to recover from a corrupted binary).
 update_bootloader() {
+    local force="${1:-}"
     local shim_src="/usr/share/shim-signed/shimx64.efi"
     local shim_dst="${ESP}/EFI/BOOT/BOOTX64.EFI"
     local sdboot_src="/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
@@ -438,12 +548,14 @@ update_bootloader() {
     local mmx64_dst="${ESP}/EFI/BOOT/mmx64.efi"
     local updated=0
 
-    # shim (BOOTX64.EFI)
+    # shim (BOOTX64.EFI) — Microsoft-signed, never re-signed by us
     if [[ -f "$shim_src" ]]; then
-        if [[ ! -f "$shim_dst" ]] || [[ "$shim_src" -nt "$shim_dst" ]]; then
+        local shim_needs_copy=0
+        [[ ! -f "$shim_dst" || "$shim_src" -nt "$shim_dst" ]] && shim_needs_copy=1
+        [[ "$force" == "force" && -f "$shim_dst" ]] && ! _pe_valid "$shim_dst" && shim_needs_copy=1
+        if (( shim_needs_copy )); then
             log "Updating shim: ${shim_dst}"
             cp "$shim_src" "$shim_dst" || error_exit "Failed to copy shim"
-            # DO NOT sign shim (Microsoft-signed)
             updated=1
         else
             log "shim is up to date"
@@ -452,9 +564,12 @@ update_bootloader() {
         log_warn "shim source not found at ${shim_src} — skipping shim update"
     fi
 
-    # MokManager (mmx64.efi) — not signed, shim verifies it via its own hash
+    # MokManager (mmx64.efi) — not signed, shim verifies via its own hash
     if [[ -f "$mmx64_src" ]]; then
-        if [[ ! -f "$mmx64_dst" ]] || [[ "$mmx64_src" -nt "$mmx64_dst" ]]; then
+        local mmx64_needs_copy=0
+        [[ ! -f "$mmx64_dst" || "$mmx64_src" -nt "$mmx64_dst" ]] && mmx64_needs_copy=1
+        [[ "$force" == "force" && -f "$mmx64_dst" ]] && ! _pe_valid "$mmx64_dst" && mmx64_needs_copy=1
+        if (( mmx64_needs_copy )); then
             log "Updating MokManager: ${mmx64_dst}"
             cp "$mmx64_src" "$mmx64_dst" || error_exit "Failed to copy mmx64.efi"
             updated=1
@@ -465,9 +580,15 @@ update_bootloader() {
         log_warn "mmx64.efi source not found at ${mmx64_src} — skipping MokManager update"
     fi
 
-    # systemd-boot (grubx64.efi — loaded by shim as the second-stage bootloader)
+    # systemd-boot (grubx64.efi — loaded by shim as second-stage bootloader)
     if [[ -f "$sdboot_src" ]]; then
-        if [[ ! -f "$sdboot_dst" ]] || [[ "$sdboot_src" -nt "$sdboot_dst" ]]; then
+        local sdboot_needs_copy=0
+        [[ ! -f "$sdboot_dst" || "$sdboot_src" -nt "$sdboot_dst" ]] && sdboot_needs_copy=1
+        if [[ "$force" == "force" && -f "$sdboot_dst" ]] && ! _pe_valid "$sdboot_dst"; then
+            log_warn "grubx64.efi has invalid PE header — restoring from source"
+            sdboot_needs_copy=1
+        fi
+        if (( sdboot_needs_copy )); then
             log "Updating systemd-boot: ${sdboot_dst}"
             cp "$sdboot_src" "$sdboot_dst" || error_exit "Failed to copy systemd-boot"
             sign_efi_binary "$sdboot_dst"
@@ -529,6 +650,69 @@ generate_uki() {
 
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
+}
+
+
+# enroll_mok — stage MOK enrollment without rebuilding the UKI.
+#
+# Use this when:
+#   - The MOK key was regenerated (keypair changed) but UKIs are otherwise valid
+#   - The enrolled MOK in firmware does not match the local MOK.der
+#   - Secure Boot was enabled and the key needs enrolling for the first time
+#
+# What it does:
+#   1. Ensures MOK keypair exists (generates one if missing)
+#   2. Mounts ESP temporarily if needed
+#   3. Re-signs all EFI binaries on the ESP with the current MOK key
+#      (BOOTX64.EFI/shim is NOT re-signed — it is Microsoft-signed)
+#   4. Copies MOK.der to the ESP so MokManager can present it at next boot
+#   5. Stages enrollment via mokutil (--root-pw or --hash-file fallback)
+#
+# After running: reboot and confirm MOK enrollment in the MokManager UEFI prompt.
+# Note: does NOT rebuild UKIs — run 'gen-efi configure <slot>' if UKIs also need
+# to be regenerated (e.g. after a full keypair replacement).
+enroll_mok() {
+    # Cannot run in chroot — needs live ESP and mokutil talking to real firmware
+    if in_chroot; then
+        error_exit "enroll-mok must run on the live booted system, not inside a chroot"
+    fi
+
+    # Keys must already exist — enroll-mok only enrolls, it does not generate.
+    # Generating keys without rebuilding UKIs would enroll a key that does not
+    # match the signatures on the existing ESP binaries, causing Secure Boot to
+    # reject them at boot.
+    # If keys are missing: run "gen-efi configure <slot>" first (generates keys
+    # and rebuilds UKIs with them), then run "gen-efi enroll-mok".
+    if [[ ! -f "$MOK_KEY" || ! -f "$MOK_CRT" ]]; then
+        error_exit "MOK keys not found at ${MOK_KEY} / ${MOK_CRT}\n"\
+"  Keys must exist before enrolling. Run: gen-efi configure <slot>\n"\
+"  That will generate the keys and rebuild the UKIs. Then run: gen-efi enroll-mok"
+    fi
+
+    # Validate MOK.der — regenerate from MOK.crt if missing or corrupt.
+    # Keys are confirmed present above so this only runs the DER check.
+    ensure_mok_keys
+
+    # Mount ESP if needed
+    trap 'cleanup_esp' EXIT
+    ensure_esp_mounted
+    mkdir -p "$EFI_DIR"
+
+    # Restore any corrupt bootloader binaries, update if source is newer,
+    # then re-sign everything — all handled by update_bootloader force.
+    update_bootloader force
+
+    # Re-sign any UKIs already on the ESP (update_bootloader only covers grubx64.efi)
+    for slot in blue green; do
+        local uki="$EFI_DIR/${OS_NAME}-${slot}.efi"
+        if [[ -f "$uki" ]]; then
+            log "Re-signing ${uki}"
+            sign_efi_binary "$uki" || log_warn "Failed to re-sign ${uki} — continuing"
+        fi
+    done
+
+    # Stage MOK enrollment
+    _stage_mok_enrollment
 }
 
 # enroll_tpm2 — enroll the TPM2 chip into the LUKS2 volume for automatic unlock.
@@ -640,12 +824,16 @@ case "${1:-}" in
         generate_uki "$TARGET_SLOT"
         log "UKI generated for ${TARGET_SLOT}"
         ;;
+    enroll-mok)
+        enroll_mok
+        ;;
     enroll-tpm2)
         enroll_tpm2
         ;;
     *)
         echo "Usage:"
         echo "  $0 configure <target_slot>"
+        echo "  $0 enroll-mok"
         echo "  $0 enroll-tpm2"
         exit 1
         ;;

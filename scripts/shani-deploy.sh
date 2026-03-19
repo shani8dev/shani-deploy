@@ -8,7 +8,6 @@
 #   -h, --help              Show help
 #   -r, --rollback          Roll back the non-booted slot. IMPORTANT: run this from the slot you want to KEEP.
 #   -c, --cleanup           Manual cleanup (backups, downloads)
-#   -s, --storage-info      Display storage analysis
 #   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
 #   -t, --channel <chan>    Update channel: latest|stable (default: stable)
 #   -f, --force             Deploy even if version matches or boot mismatch
@@ -1303,46 +1302,6 @@ cleanup_downloads() {
     (( protected > 0 )) && log_verbose "Protected $protected current file(s)"
 }
 
-analyze_storage() {
-    log_section "Storage Analysis"
-
-    if is_mounted "$MOUNT_DIR"; then
-        log_verbose "Cleaning up existing mount before storage analysis"
-        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
-    fi
-
-    mkdir -p "$MOUNT_DIR"
-    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Could not mount root filesystem for storage analysis — check ${ROOT_DEV}"; return 1; }
-    trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
-
-    local -a check_subvols=(blue green data swap)
-
-    echo ""
-    log "=== Filesystem Usage ==="
-    echo ""
-    btrfs filesystem df "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to get usage"
-
-    echo ""
-    log "=== Subvolume Compression Analysis ==="
-    for subvol in "${check_subvols[@]}"; do
-        local path="$MOUNT_DIR/@${subvol}"
-        [[ -d "$path" ]] || continue
-        echo ""
-        log "@${subvol}:"
-        if command -v compsize &>/dev/null; then
-            compsize -x "$path" || log_warn "compsize failed"
-        else
-            btrfs filesystem du -s "$path" || log_warn "btrfs du failed"
-        fi
-    done
-
-    echo ""
-    log "=== Subvolume List ==="
-    btrfs subvolume list "$MOUNT_DIR" 2>/dev/null | sed 's/^/  /' || log_warn "Failed to list subvolumes"
-
-    echo ""
-    return 0
-}
 
 optimize_storage() {
     set +e
@@ -2611,7 +2570,6 @@ Options:
   -h, --help              Show help
   -r, --rollback          Roll back the non-booted slot. IMPORTANT: run from the slot you want to KEEP.
   -c, --cleanup           Manual cleanup
-  -s, --storage-info      Storage analysis (read-only)
   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
   -t, --channel <chan>    Update channel (latest|stable)
   -f, --force             Deploy even if version matches or boot mismatch
@@ -2623,7 +2581,7 @@ EOF
 }
 
 main() {
-    local ROLLBACK="no" CLEANUP="no" STORAGE_INFO="no" STORAGE_OPTIMIZE="no"
+    local ROLLBACK="no" CLEANUP="no" STORAGE_OPTIMIZE="no"
     local SET_CHANNEL="no" SET_CHANNEL_VAL=""
 
     while [[ $# -gt 0 ]]; do
@@ -2631,7 +2589,6 @@ main() {
             -h|--help) usage; exit 0 ;;
             -r|--rollback) ROLLBACK="yes"; shift ;;
             -c|--cleanup) CLEANUP="yes"; shift ;;
-            -s|--storage-info) STORAGE_INFO="yes"; shift ;;
             -o|--optimize) STORAGE_OPTIMIZE="yes"; shift ;;
             --set-channel)
                 SET_CHANNEL="yes"
@@ -2677,14 +2634,8 @@ main() {
             log_verbose "Could not mount root filesystem for backup cleanup — skipping"
         fi
         cleanup_downloads
-        analyze_storage || log_verbose "Storage analysis warnings"
 
         log_success "Manual cleanup complete"
-        exit 0
-    fi
-
-    if [[ "$STORAGE_INFO" == "yes" ]]; then
-        analyze_storage
         exit 0
     fi
 

@@ -453,18 +453,25 @@ _stage_mok_enrollment() {
     local mok_der="/etc/secureboot/keys/MOK.der"
 
     # Copy DER to ESP so MokManager can use it as a fallback if needed
-    cp "$mok_der" "$ESP/EFI/BOOT/MOK.der"         || log_warn "Failed to copy MOK.der to ESP"
+    cp "$mok_der" "$ESP/EFI/BOOT/MOK.der" \
+        || log_warn "Failed to copy MOK.der to ESP"
 
-    # Check if this exact key is already enrolled — nothing to do
+    # Check if this exact key is already enrolled in firmware
     local local_fp
-    local_fp=$(openssl x509 -in "$mok_der" -inform DER -noout -fingerprint -sha1         2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
-    if [[ -n "$local_fp" ]] &&        mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]'        | grep -q "$local_fp"; then
-        log "MOK key already enrolled in firmware"
-        _disable_shim_validation
+    local_fp=$(openssl x509 -in "$mok_der" -inform DER -noout -fingerprint -sha1 \
+        2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+    if [[ -n "$local_fp" ]] && \
+       mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+       | grep -q "$local_fp"; then
+        # Key is enrolled — re-enable shim validation (bypass no longer needed)
+        log "MOK key confirmed enrolled in firmware"
+        _enable_shim_validation
         return 0
     fi
 
-    # Enroll the key via mokutil — uses --root-pw or hash-file
+    # Key not yet enrolled — stage enrollment and disable shim validation to skip
+    # the MokManager prompt. After rebooting, run 'gen-efi enroll-mok' once more
+    # to re-enable shim validation now that the key will be in firmware.
     if [[ -s /etc/shadow ]] && awk -F: '$1=="root" && $2!="" && $2!="*" && $2!="!" {found=1} END{exit !found}' /etc/shadow 2>/dev/null; then
         log "Enrolling MOK key via --root-pw"
         local tmp_err; tmp_err=$(mktemp)
@@ -477,14 +484,49 @@ _stage_mok_enrollment() {
         _mokutil_hash_enroll "$mok_der"
     fi
 
-    # Disable shim SB validation — writes MokSBState directly, no MokManager prompt
     _disable_shim_validation
+    log_warn "ACTION REQUIRED: reboot, then run: gen-efi enroll-mok"
+    log_warn "  (re-enables shim validation once key is confirmed in firmware)"
+}
+
+# _enable_shim_validation — re-enable shim Secure Boot validation by removing
+# the MokSBState bypass. Called once the MOK key is confirmed enrolled in firmware.
+_enable_shim_validation() {
+    local mok_sbstate_var="MokSBStateRT-605dab50-e046-4300-abb6-3dd810dd8b23"
+    local efivar_path="/sys/firmware/efi/efivars/${mok_sbstate_var}"
+
+    if [[ ! -d /sys/firmware/efi/efivars ]]; then
+        log_warn "efivarfs not available — cannot re-enable shim validation"
+        return 0
+    fi
+
+    # Already enabled — nothing to do
+    if ! mokutil --sb-state 2>/dev/null | grep -q "Secure Boot validation is disabled"; then
+        log "Shim Secure Boot validation already enabled"
+        return 0
+    fi
+
+    # Remove or zero the bypass variable
+    if [[ -e "$efivar_path" ]]; then
+        chattr -i "$efivar_path" 2>/dev/null || true
+        if rm -f "$efivar_path" 2>/dev/null || \
+           printf '\x07\x00\x00\x00\x00' > "$efivar_path" 2>/dev/null; then
+            log "Shim Secure Boot validation re-enabled"
+            return 0
+        fi
+    fi
+
+    # Fall back to mokutil --enable-validation
+    if mokutil --enable-validation 2>/dev/null; then
+        log "Shim Secure Boot validation re-enabled via mokutil"
+    else
+        log_warn "Could not re-enable shim validation — run: mokutil --enable-validation"
+    fi
 }
 
 # _disable_shim_validation — write MokSBState=1 directly to the EFI variable
 # store to disable shim's Secure Boot signature validation without any
-# MokManager prompt. Falls back to mokutil --disable-validation if the
-# direct write fails (will show a MokManager prompt in that case).
+# MokManager prompt. Falls back to mokutil --disable-validation if direct write fails.
 _disable_shim_validation() {
     local mok_sbstate_var="MokSBStateRT-605dab50-e046-4300-abb6-3dd810dd8b23"
     local efivar_path="/sys/firmware/efi/efivars/${mok_sbstate_var}"
@@ -502,7 +544,6 @@ _disable_shim_validation() {
 
     # Write MokSBState = 0x01 directly to the EFI variable file.
     # Format: 4-byte attributes (0x07 = NV|BS|RT) + 1 data byte (0x01 = disable).
-    # chattr -i removes the immutable flag the kernel sets on EFI variable files.
     if [[ -e "$efivar_path" ]]; then
         chattr -i "$efivar_path" 2>/dev/null || true
     fi
@@ -514,7 +555,8 @@ _disable_shim_validation() {
     # Direct write failed — fall back to mokutil --disable-validation (will prompt)
     log_warn "Direct EFI variable write failed — falling back to mokutil --disable-validation"
     local tmp_hash; tmp_hash=$(mktemp)
-    if mokutil --generate-hash=shanios > "$tmp_hash" 2>/dev/null &&        mokutil --disable-validation --hash-file "$tmp_hash" >/dev/null 2>&1; then
+    if mokutil --generate-hash=shanios > "$tmp_hash" 2>/dev/null && \
+       mokutil --disable-validation --hash-file "$tmp_hash" >/dev/null 2>&1; then
         log_warn "Shim validation disable staged — confirm in MokManager on next boot (password: shanios)"
     else
         log_warn "Could not disable shim validation — Secure Boot may block unsigned binaries"

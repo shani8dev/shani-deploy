@@ -331,53 +331,42 @@ _section_os_slots() {
     fi
 
     _head "Slots"
+
+    # Booted — what is actually running right now
+    _row "Booted"   "--  @${booted}"
+
+    # Expected — the slot current-slot points to (what boots next time)
     if [[ "$booted" == "$slot_current" ]]; then
-        _row "Active"    "OK  @${slot_current}  (booted)"
+        _row "Expected"  "OK  @${slot_current}  (matches booted)"
     elif [[ -f "$DATA_REBOOT_NEEDED" ]]; then
-        # Update deployed, waiting for reboot — not a failure
         local rver; rver=$(cat "$DATA_REBOOT_NEEDED" 2>/dev/null | tr -cd '0-9A-Za-z.-' | head -c 32)
-        _row "Active"    "!   @${booted}  (new v${rver} ready — reboot to activate @${slot_current})"
+        _row "Expected"  "!   @${slot_current}  (v${rver} ready — reboot to activate)"
     elif [[ -f "$DATA_BOOT_FAIL" || -f "$DATA_BOOT_HARD_FAIL" ]]; then
-        # Booted slot != current-slot AND failure marker present = fallback boot
-        # Read the actual failed slot from the marker file rather than assuming it's slot_current
         local _failed_slot
-        _failed_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' || \
-                       cat "$DATA_BOOT_HARD_FAIL" 2>/dev/null | tr -d '[:space:]' || \
-                       echo "$slot_current")
+        _failed_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' ||                        cat "$DATA_BOOT_HARD_FAIL" 2>/dev/null | tr -d '[:space:]' ||                        echo "$slot_current")
         [[ -z "$_failed_slot" ]] && _failed_slot="$slot_current"
-        _row "Active"    "!!  @${booted}  (FALLBACK — @${_failed_slot} failed to boot)"
-        _rec "Fallback boot confirmed — run: shani-deploy --rollback"
+        _row "Expected"  "!!  @${slot_current}  (booted @${booted} instead of expected — @${_failed_slot} failed)"
+        _rec "Booted to candidate slot — expected slot failed; run: shani-deploy --rollback"
     else
-        # Mismatch with no reboot-needed and no failure = unexpected
-        _row "Active"    "!!  @${slot_current}  mismatch — booted: @${booted}"
+        _row "Expected"  "!!  @${slot_current}  (mismatch — booted: @${booted})"
         _rec "Slot mismatch with no failure or reboot-needed marker — run: shani-deploy --rollback"
     fi
 
-    # Fallback slot display — distinguish stale failure (other slot is fine) from active problem
+    # Fallback — the slot that is NOT current-slot (the true systemd-boot fallback).
+    # slot_previous tracks last slot switch history, not the fallback target —
+    # derive it directly as the other slot.
+    local _fallback_slot
+    [[ "$slot_current" == "blue" ]] && _fallback_slot="green" || _fallback_slot="blue"
+
     if [[ -f "$DATA_BOOT_FAIL" ]]; then
         local _fail_slot; _fail_slot=$(cat "$DATA_BOOT_FAIL" 2>/dev/null | tr -d '[:space:]' || echo "")
-        # Determine the fallback slot name for display
-        local _fallback_slot="$slot_previous"
-        [[ -z "$_fallback_slot" || "$_fallback_slot" == "unknown" ]] && \
-            _fallback_slot="$_fail_slot"
-
-        if [[ "$booted" == "$slot_current" ]]; then
-            # We are booted into the *current* slot successfully — the failure
-            # marker is for the *other* slot and is a historical record, not
-            # an emergency. Inform the user but don't trigger rollback rec here
-            # (Boot Health section handles the rec).
-            _row "Fallback"  "!   @${_fallback_slot}  (prior boot failure recorded — may need: shani-deploy --rollback)"
-        elif [[ "$_fail_slot" == "$booted" ]]; then
-            # The failing slot IS the one we're currently booted into — it had a
-            # prior failure but succeeded this boot. The previous slot is the fallback.
-            _row "Fallback"  "--  @${slot_previous}  (active slot @${booted} had prior failure — run: shani-health --clear-boot-failure)"
-        elif [[ "$_fail_slot" == "$slot_previous" ]]; then
-            _row "Fallback"  "!   @${slot_previous}  (has recorded boot failure — run: shani-deploy --rollback)"
+        if [[ "$_fail_slot" == "$_fallback_slot" ]]; then
+            _row "Candidate"  "!   @${_fallback_slot}  (has recorded boot failure)"
         else
-            _row "Fallback"  "--  @${slot_previous}"
+            _row "Candidate"  "--  @${_fallback_slot}"
         fi
     else
-        _row "Fallback"  "--  @${slot_previous}"
+        _row "Candidate"  "--  @${_fallback_slot}"
     fi
 }
 
@@ -872,26 +861,34 @@ _section_deployment() {
     fi
 
     # ── Last deploy action ────────────────────────────────────────────────────
-    # Extract most recent DEPLOY/ROLLBACK event from the deploy log using the
-    # same _scan_log_file helper that --history uses.
+    # Scan only the last 200 lines of the log — the most recent event is always
+    # near the end. Avoids reading the entire log file line-by-line.
     if [[ -f "$DEPLOY_LOG" ]]; then
-        local _dep_tmp; _dep_tmp=$(mktemp)
-        _scan_log_file "$DEPLOY_LOG"       "$_dep_tmp"
-        _scan_log_file "${DEPLOY_LOG}.old" "$_dep_tmp"
-        local _last_event
-        _last_event=$(sort "$_dep_tmp" 2>/dev/null | tail -1 || echo "")
-        rm -f "$_dep_tmp"
-        if [[ -n "$_last_event" ]]; then
-            local _ev_ts _ev_type _ev_detail
-            _ev_ts=$(echo "$_last_event" | cut -c1-19)
-            _ev_type=$(echo "$_last_event" | awk '{print $3}')
-            _ev_detail=$(echo "$_last_event" | cut -d' ' -f4-)
-            case "$_ev_type" in
-                DEPLOY)   _row "Last deploy" "OK  ${_ev_ts}  deployed ${_ev_detail}" ;;
-                ROLLBACK) _row "Last deploy" "!   ${_ev_ts}  rollback — ${_ev_detail}" ;;
-                START)    _row "Last deploy" "--  ${_ev_ts}  boot ${_ev_detail}" ;;
-                *)        _row "Last deploy" "--  ${_ev_ts}  ${_ev_type} ${_ev_detail}" ;;
-            esac
+        local _last_line=""
+        # Try current log first, fall back to .old if no match found
+        for _logf in "$DEPLOY_LOG" "${DEPLOY_LOG}.old"; do
+            [[ -f "$_logf" ]] || continue
+            _last_line=$(tail -200 "$_logf" 2>/dev/null \
+                | grep -E "Deployment successful|Emergency rollback complete|Fallback slot ready|Rollback complete|Running system:" \
+                | tail -1 || echo "")
+            [[ -n "$_last_line" ]] && break
+        done
+        if [[ -n "$_last_line" ]]; then
+            local _ev_ts
+            _ev_ts=$(echo "$_last_line" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' || echo "")
+            if echo "$_last_line" | grep -q "Deployment successful"; then
+                local _ver; _ver=$(echo "$_last_line" | grep -oE 'v[0-9]{8}' | head -1 || echo "")
+                _row "Last deploy" "OK  ${_ev_ts}  deployed ${_ver}"
+            elif echo "$_last_line" | grep -q "Emergency rollback complete"; then
+                _row "Last deploy" "!   ${_ev_ts}  rollback (emergency — deploy failed)"
+            elif echo "$_last_line" | grep -q "Fallback slot ready"; then
+                _row "Last deploy" "!   ${_ev_ts}  rollback (no backup — snapshot of booted slot)"
+            elif echo "$_last_line" | grep -q "Rollback complete"; then
+                _row "Last deploy" "!   ${_ev_ts}  rollback (manual)"
+            elif echo "$_last_line" | grep -q "Running system:"; then
+                local _ver; _ver=$(echo "$_last_line" | grep -oE 'v[0-9]+' | head -1 || echo "")
+                _row "Last deploy" "--  ${_ev_ts}  boot ${_ver}"
+            fi
         fi
     fi
 }
@@ -1076,8 +1073,20 @@ _section_secureboot() {
     fi
 
     local sb_state; sb_state=$(mokutil --sb-state 2>/dev/null || echo "")
+
+    # Check shim validation state — reuse sb_state to avoid calling mokutil twice
+    local shim_validation_disabled=0
+    echo "$sb_state" | grep -q "Secure Boot validation is disabled" \
+        && shim_validation_disabled=1
+
     if [[ "$sb_state" == *"SecureBoot enabled"* ]]; then
-        _row "Status"    "OK  enabled"
+        if (( shim_validation_disabled )); then
+            # SB on in firmware but shim is not validating signatures —
+            # boot chain is active but shim bypass is in effect
+            _row "Status"    "--  enabled (shim validation disabled)"
+        else
+            _row "Status"    "OK  enabled"
+        fi
     else
         _row "Status"    "!!  disabled"
         _rec "Enable Secure Boot in BIOS/UEFI for full boot chain protection"
@@ -1086,30 +1095,64 @@ _section_secureboot() {
     local mok_count
     mok_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
     local mok_der_check="/etc/secureboot/keys/MOK.der"
-    if (( mok_count > 0 )); then
-        # Verify the enrolled key actually matches the local MOK.der —
-        # a regenerated keypair would show "enrolled" but the UKIs signed
-        # with the new key would be rejected at boot.
+
+    # Compute local MOK.der fingerprint once — used for enrolled and pending checks
+    local local_fp=""
+    if [[ -f "$mok_der_check" ]] && command -v openssl &>/dev/null; then
+        local_fp=$(openssl x509 -in "$mok_der_check" -inform DER -noout -fingerprint -sha1 \
+            2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+    fi
+
+
+    if (( shim_validation_disabled )); then
+        # Shim validation disabled — check if key is already enrolled.
+        # If enrolled: run gen-efi enroll-mok again to re-enable validation
+        #              (it was only disabled to skip the MokManager prompt).
+        # If not enrolled: this is the expected pending state — key will be
+        #              written to firmware on next boot, then enroll-mok
+        #              re-enables validation automatically.
         local enrolled_match=0
-        if [[ -f "$mok_der_check" ]] && command -v openssl &>/dev/null; then
-            local local_fp
-            local_fp=$(openssl x509 -in "$mok_der_check" -inform DER -noout -fingerprint -sha1 \
-                2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+        if [[ -n "$local_fp" ]] && \
+           mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+           | grep -q "$local_fp"; then
+            enrolled_match=1
+        fi
+        if (( enrolled_match )); then
+            # Key enrolled but validation still disabled — re-enable it
+            _row "MOK enrol" "!   shim validation disabled but key is enrolled — run: gen-efi enroll-mok"
+            _rec "MOK key enrolled but shim validation still disabled — run: gen-efi enroll-mok  [auto]"
+        else
+            # Key pending — normal state after first enroll-mok run, before reboot
+            _row "MOK enrol" "->  enrollment pending, shim validation bypassed — reboot, then run: gen-efi enroll-mok"
+        fi
+    else
+        # Check if local key is pending enrollment
+        local mok_pending=0
+        if [[ -n "$local_fp" ]] && \
+           mokutil --list-new 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+           | grep -q "$local_fp"; then
+            mok_pending=1
+        fi
+
+        if (( mok_pending )); then
+            _row "MOK enrol" "->  enrollment pending — reboot, then run: gen-efi enroll-mok"
+        elif (( mok_count > 0 )); then
+            local enrolled_match=0
             if [[ -n "$local_fp" ]] && \
                mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
                | grep -q "$local_fp"; then
                 enrolled_match=1
             fi
-        fi
-        if (( enrolled_match )); then
-            _row "MOK enrol" "OK  ${mok_count} key(s) enrolled  (local key confirmed)"
+            if (( enrolled_match )); then
+                _row "MOK enrol" "OK  ${mok_count} key(s) enrolled  (local key confirmed)"
+            else
+                _row "MOK enrol" "!   ${mok_count} key(s) enrolled but local MOK.der not matched — key may be stale"
+                _rec "Enrolled MOK key does not match local MOK.der — re-enroll: gen-efi enroll-mok  [auto]"
+            fi
         else
-            _row "MOK enrol" "!   ${mok_count} key(s) enrolled but local MOK.der not matched — key may be stale"
-            _rec "Enrolled MOK key does not match local MOK.der — re-enroll: gen-efi enroll-mok  [auto]"
+            _row "MOK enrol" "!!  no keys enrolled"
+            _rec "Enroll MOK: gen-efi enroll-mok  [auto]"
         fi
-    else
-        _row "MOK enrol" "!!  no keys enrolled"
-        _rec "Enroll MOK: gen-efi enroll-mok  [auto]"
     fi
 
     local mok_key="/etc/secureboot/keys/MOK.key"
@@ -1439,7 +1482,7 @@ _section_security_services() {
         if [[ -n "$_aa_journal" ]]; then
             local _aa_top
             _aa_top=$(echo "$_aa_journal" \
-                | grep -oP 'profile="[^"]+"' \
+                | grep -oP '(?<=profile=")[^"]+' \
                 | sort | uniq -c | sort -rn | head -3 \
                 | awk '{printf "%s (%d denial(s))\n", $2, $1}' || true)
             while IFS= read -r line; do
@@ -2742,9 +2785,13 @@ _section_package_managers() {
         if [[ "$snapd_sock" == "active" ]] && command -v snap &>/dev/null; then
             local snap_updates
             snap_updates=$(timeout 10 snap refresh --list 2>/dev/null | tail -n +2 | wc -l || echo "")
-            if [[ "$snap_updates" =~ ^[0-9]+$ ]] && (( snap_updates > 0 )); then
-                _row "Snap upd"   "!   ${snap_updates} snap(s) with pending updates — run: snap refresh  [auto]"
-                _rec "${snap_updates} snap update(s) available — run: snap refresh  [auto]"
+            if [[ "$snap_updates" =~ ^[0-9]+$ ]]; then
+                if (( snap_updates > 0 )); then
+                    _row "Snap upd"   "--  ${snap_updates} update(s) pending — run: snap refresh  [auto]"
+                    _rec "${snap_updates} snap update(s) available — run: snap refresh  [auto]"
+                else
+                    _row "Snap upd"   "OK  up to date"
+                fi
             fi
         fi
     fi
@@ -2777,6 +2824,23 @@ _section_package_managers() {
         else
             _row "Nix" "!!  @nix mounted but nix-daemon.socket not active"
             _rec "nix-daemon.socket not active — run: systemctl enable --now nix-daemon.socket  [auto]"
+        fi
+        # Nix channel freshness — compare local channel age to detect stale channels.
+        # nix-env --dry-run is too slow for a health check; instead check how old
+        # the local channel manifest is. >7 days without update = suggest nix-channel --update.
+        if [[ -n "$_nix_user" ]] && command -v nix-channel &>/dev/null; then
+            local _nix_channel_dir
+            _nix_channel_dir=$(runuser -u "$_nix_user" -- \
+                sh -c 'echo "${HOME}/.nix-defexpr/channels"' 2>/dev/null || echo "")
+            if [[ -d "$_nix_channel_dir" ]]; then
+                local _nix_age_days
+                _nix_age_days=$(( ( $(date +%s) - $(stat -c %Y "$_nix_channel_dir" 2>/dev/null || echo 0) ) / 86400 ))
+                if (( _nix_age_days > 7 )); then
+                    _row "Nix upd"    "--  channels ${_nix_age_days}d old — run: nix-channel --update"
+                else
+                    _row "Nix upd"    "OK  channels updated ${_nix_age_days}d ago"
+                fi
+            fi
         fi
         # Nix store: warn only when critically large (detail in --storage-info)
         if [[ "$nix_store_mb" =~ ^[0-9]+$ ]] && (( nix_store_mb > 51200 )); then
@@ -3061,9 +3125,12 @@ _section_runtime_health() {
             bt_sec=$(echo "$bt" | grep -oE '^[0-9]+' || echo "0")
             if (( bt_sec >= 30 )); then
                 _row "Boot time"  "!   ${bt}  (slow — run: systemd-analyze blame)"
-                # Inline top 3 slowest units to save the extra command
+                # Inline top 3 slowest units — filter transient/sleep units
+                # that appear in blame but are not boot-critical
                 local _blame
-                _blame=$(systemd-analyze blame 2>/dev/null | head -3 | sed 's/^ *//' || true)
+                _blame=$(systemd-analyze blame 2>/dev/null \
+                    | grep -vE "systemd-(suspend|hibernate|hybrid-sleep|sleep)\.service" \
+                    | head -3 | sed 's/^ *//' || true)
                 while IFS= read -r line; do
                     [[ -n "$line" ]] && _row2 "--  $line"
                 done <<< "$_blame"
@@ -3148,7 +3215,12 @@ security_report() {
 
     local sb_active="no"
     [[ -d /sys/firmware/efi ]] && \
-        [[ "$(mokutil --sb-state 2>/dev/null)" == *"SecureBoot enabled"* ]] && sb_active="yes"
+        local _sb_state_tmp; _sb_state_tmp=$(mokutil --sb-state 2>/dev/null || echo "")
+        # Only treat as fully active if SB enabled AND shim validation not disabled
+        if [[ "$_sb_state_tmp" == *"SecureBoot enabled"* ]] && \
+           ! echo "$_sb_state_tmp" | grep -q "Secure Boot validation is disabled"; then
+            sb_active="yes"
+        fi
 
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
@@ -3204,7 +3276,12 @@ system_info() {
 
     local sb_active="no"
     [[ -d /sys/firmware/efi ]] && \
-        [[ "$(mokutil --sb-state 2>/dev/null)" == *"SecureBoot enabled"* ]] && sb_active="yes"
+        local _sb_state_tmp; _sb_state_tmp=$(mokutil --sb-state 2>/dev/null || echo "")
+        # Only treat as fully active if SB enabled AND shim validation not disabled
+        if [[ "$_sb_state_tmp" == *"SecureBoot enabled"* ]] && \
+           ! echo "$_sb_state_tmp" | grep -q "Secure Boot validation is disabled"; then
+            sb_active="yes"
+        fi
 
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
@@ -3644,10 +3721,10 @@ _fix_boot() {
         fi
     fi
 
-    # MOK enroll — if local MOK.der not matched in firmware, re-enroll via gen-efi
-    # gen-efi configure handles both key generation and reenroll_mok_keys staging
+    # MOK enroll — skip entirely if shim validation is already disabled
     local _mok_der="/etc/secureboot/keys/MOK.der"
-    if [[ -f "$_mok_der" ]] && command -v mokutil &>/dev/null; then
+    if [[ -f "$_mok_der" ]] && command -v mokutil &>/dev/null && \
+       ! mokutil --sb-state 2>/dev/null | grep -q "Secure Boot validation is disabled"; then
         local _mok_enrolled_count
         _mok_enrolled_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
         local _local_fp
@@ -3658,7 +3735,15 @@ _fix_boot() {
             mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
                 | grep -q "$_local_fp" && _enrolled_match=1
         fi
-        if (( _mok_enrolled_count == 0 )) || (( ! _enrolled_match )); then
+        # Check if already pending — if so, nothing to do but reboot
+        local _mok_pending=0
+        if [[ -n "$_local_fp" ]]; then
+            mokutil --list-new 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+                | grep -q "$_local_fp" && _mok_pending=1
+        fi
+        if (( _mok_pending )); then
+            _log "MOK enrollment already pending — reboot and confirm in MokManager"
+        elif (( _mok_enrolled_count == 0 )) || (( ! _enrolled_match )); then
             if [[ "$_fix_booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
                 _log "MOK key not enrolled or stale — running gen-efi enroll-mok..."
                 if "$GENEFI_BIN" enroll-mok 2>&1; then

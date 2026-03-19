@@ -26,7 +26,6 @@ IFS=$'\n\t'
 ### Constants                                                                ###
 ###############################################################################
 
-readonly SCRIPT_VERSION="3.3"
 readonly OS_NAME="shanios"
 readonly ROOTLABEL="shani_root"
 readonly ROOT_DEV="/dev/disk/by-label/shani_root"
@@ -812,7 +811,7 @@ _section_deployment() {
             _row "Downloads"  "!   ${dl_size_mb} MB in /data/downloads — run: shani-deploy --cleanup"
             _rec "Download cache is ${dl_size_mb} MB — free space with: shani-deploy --cleanup"
         elif [[ "$dl_size_mb" =~ ^[0-9]+$ ]] && (( dl_size_mb > 1024 )); then
-            _row "Downloads"  "--  ${dl_size_mb} MB cached (run --cleanup to free space)"
+            _row "Downloads"  "--  ${dl_size_mb} MB cached (run: shani-deploy --cleanup to free space)"
         fi
     fi
 
@@ -1522,6 +1521,102 @@ _section_security_services() {
             fi
         fi
     fi
+
+    # ── Lynis ─────────────────────────────────────────────────────────────────
+    # Security auditing tool — show last scan date and hardening index if available
+    if command -v lynis &>/dev/null; then
+        local lynis_log="/var/log/lynis.log"
+        local lynis_report="/var/log/lynis-report.dat"
+        local lynis_last="" lynis_score=""
+
+        # Check timer status first
+        local lynis_timer_active=0
+        local lynis_next=""
+        if systemctl is-active --quiet lynis.timer 2>/dev/null; then
+            lynis_timer_active=1
+            local lynis_next_raw
+            lynis_next_raw=$(systemctl show lynis.timer \
+                --property=NextElapseUSecRealtime --value 2>/dev/null || echo "")
+            [[ -z "$lynis_next_raw" || "$lynis_next_raw" == "0" ]] && \
+                lynis_next_raw=$(systemctl show lynis.timer \
+                    --property=NextElapseUSecMonotonic --value 2>/dev/null || echo "")
+            if [[ "$lynis_next_raw" =~ ^[0-9]+$ ]] && (( lynis_next_raw > 0 )); then
+                lynis_next=$(date -d "@$(( lynis_next_raw / 1000000 ))" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "")
+            fi
+        fi
+
+        # Last scan date from report
+        if [[ -f "$lynis_report" ]]; then
+            lynis_last=$(grep '^report_datetime_start=' "$lynis_report" 2>/dev/null \
+                | cut -d= -f2 | head -1 || echo "")
+            lynis_score=$(grep '^hardening_index=' "$lynis_report" 2>/dev/null \
+                | cut -d= -f2 | head -1 || echo "")
+        elif [[ -f "$lynis_log" ]]; then
+            lynis_last=$(grep 'Starting Lynis' "$lynis_log" 2>/dev/null \
+                | tail -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || echo "")
+        fi
+
+        local lynis_score_str=""
+        [[ -n "$lynis_score" ]] && lynis_score_str="  (hardening index: ${lynis_score})"
+        local lynis_next_str=""
+        [[ -n "$lynis_next" ]] && lynis_next_str="  (next: ${lynis_next})"
+
+        if [[ -n "$lynis_last" ]]; then
+            local lynis_age_days
+            lynis_age_days=$(( ( $(date +%s) - $(date -d "$lynis_last" +%s 2>/dev/null || echo 0) ) / 86400 ))
+            if (( lynis_timer_active )); then
+                # Timer running — age warning threshold is higher since it runs automatically
+                if (( lynis_age_days > 30 )); then
+                    _row "lynis"     "!   timer active, last scan ${lynis_age_days}d ago${lynis_score_str}${lynis_next_str}"
+                    _rec "Lynis timer active but last scan was ${lynis_age_days} days ago — check timer"
+                else
+                    _row "lynis"     "OK  timer active, last scan ${lynis_age_days}d ago${lynis_score_str}${lynis_next_str}"
+                fi
+            else
+                if (( lynis_age_days > 30 )); then
+                    _row "lynis"     "!   last scan ${lynis_age_days}d ago${lynis_score_str} — run: lynis audit system"
+                    _rec "Lynis last ran ${lynis_age_days} days ago — enable timer: systemctl enable --now lynis.timer  [auto]"
+                else
+                    _row "lynis"     "OK  last scan ${lynis_age_days}d ago${lynis_score_str}"
+                    _row2 "--  timer not active — run: systemctl enable --now lynis.timer  [auto]"
+                fi
+            fi
+        else
+            if (( lynis_timer_active )); then
+                _row "lynis"     "--  timer active, no scan recorded yet${lynis_next_str}"
+            else
+                _row "lynis"     "--  installed, no scan recorded — run: lynis audit system"
+                _rec "Enable lynis timer: systemctl enable --now lynis.timer  [auto]"
+            fi
+        fi
+    fi
+
+    # ── rkhunter ──────────────────────────────────────────────────────────────
+    # Rootkit hunter — show last scan date and any warnings
+    if command -v rkhunter &>/dev/null; then
+        local rkh_log="/var/log/rkhunter.log"
+        local rkh_last="" rkh_warnings=0
+        if [[ -f "$rkh_log" ]]; then
+            rkh_last=$(grep 'Start date' "$rkh_log" 2>/dev/null \
+                | tail -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || echo "")
+            rkh_warnings=$(grep -c 'Warning:' "$rkh_log" 2>/dev/null || echo "0")
+        fi
+        if [[ -n "$rkh_last" ]]; then
+            local rkh_age_days
+            rkh_age_days=$(( ( $(date +%s) - $(date -d "$rkh_last" +%s 2>/dev/null || echo 0) ) / 86400 ))
+            if (( rkh_warnings > 0 )); then
+                _row "rkhunter"  "!!  ${rkh_warnings} warning(s) in last scan (${rkh_last}) — check: cat ${rkh_log}"
+                _rec "rkhunter reported ${rkh_warnings} warning(s) — review: grep Warning ${rkh_log}"
+            elif (( rkh_age_days > 7 )); then
+                _row "rkhunter"  "!   last scan ${rkh_age_days}d ago — run: rkhunter --check"
+                _rec "rkhunter last ran ${rkh_age_days} days ago — run: rkhunter --check"
+            else
+                _row "rkhunter"  "OK  last scan ${rkh_age_days}d ago, no warnings"
+            fi
+        else
+            _row "rkhunter"  "--  installed, no scan recorded — run: rkhunter --check"
+        fi
+    fi
 }
 _section_groups() {
     _head "Groups"
@@ -2187,7 +2282,14 @@ _stor_check_bees() {
         _row "bees"  "--  not configured (run beesd-setup to enable dedup)"
         _rec "bees not configured — run: beesd-setup, then: systemctl enable --now ${bees_unit}"
     elif [[ "$bees_en" == "enabled" ]]; then
-        _row "bees"  "!!  beesd@${bees_short} enabled but not running"
+        # Show when it last ran so user knows if it ever started
+        local bees_last=""
+        bees_last=$(systemctl show "$bees_unit" --property=ExecMainExitTimestamp --value \
+            2>/dev/null | grep -v "^0$\|^$" || echo "")
+        [[ -z "$bees_last" ]] && \
+            bees_last=$(journalctl -u "$bees_unit" -n 1 --no-pager -q \
+                --output=short-iso 2>/dev/null | awk '{print $1}' | head -1 || echo "")
+        _row "bees"  "!!  beesd@${bees_short} enabled but not running${bees_last:+  (last run: ${bees_last})}"
         _rec "bees enabled but not running — run: systemctl start ${bees_unit}  [auto]"
     else
         _row "bees"  "!   beesd@${bees_short} configured but not enabled"
@@ -2877,6 +2979,285 @@ _section_package_managers() {
     fi
 }
 
+_section_virtualization() {
+    # Only show if libvirt or qemu is installed
+    if ! command -v virsh &>/dev/null && \
+       ! command -v qemu-system-x86_64 &>/dev/null && \
+       ! command -v qemu-kvm &>/dev/null && \
+       [[ ! -d /data/varlib/libvirt ]]; then
+        return 0
+    fi
+
+    _head "Virtualization"
+
+    # ── KVM / hardware virt ───────────────────────────────────────────────────
+    if [[ -e /dev/kvm ]]; then
+        local kvm_perms; kvm_perms=$(stat -c '%a' /dev/kvm 2>/dev/null || echo "")
+        _row "KVM"        "OK  /dev/kvm present${kvm_perms:+  (mode ${kvm_perms})}"
+    else
+        _row "KVM"        "!!  /dev/kvm missing — VMs will not start"
+        _rec "KVM device missing — enable AMD-V/VT-x in BIOS and ensure kvm/kvm-amd/kvm-intel module is loaded"
+    fi
+
+    # ── libvirt daemons ───────────────────────────────────────────────────────
+    if command -v virsh &>/dev/null || [[ -d /data/varlib/libvirt ]]; then
+
+        # Detect whether running modular (virtqemud) or monolithic (libvirtd) mode.
+        # Arch libvirt defaults to modular since libvirt 6.0.
+        local libvirt_active=0
+        local libvirt_mode=""
+
+        if systemctl is-active --quiet virtqemud.socket 2>/dev/null || \
+           systemctl is-active --quiet virtqemud.service 2>/dev/null; then
+            libvirt_active=1
+            libvirt_mode="modular"
+        elif systemctl is-active --quiet libvirtd.socket 2>/dev/null || \
+             systemctl is-active --quiet libvirtd.service 2>/dev/null; then
+            libvirt_active=1
+            libvirt_mode="monolithic"
+        fi
+
+        if (( libvirt_active )); then
+            local vm_count="" vm_running=""
+            if command -v virsh &>/dev/null; then
+                vm_count=$(timeout 5 virsh list --all 2>/dev/null \
+                    | awk 'NR>2 && /^[[:space:]]*[0-9-]/' | wc -l || echo "")
+                vm_running=$(timeout 5 virsh list 2>/dev/null \
+                    | awk 'NR>2 && /running/' | wc -l || echo "0")
+            fi
+            _row "libvirtd"  "OK  active (${libvirt_mode})${vm_count:+  (${vm_count} VM(s) defined${vm_running:+, ${vm_running} running})}"
+        elif systemctl is-enabled --quiet virtqemud.service 2>/dev/null || \
+             systemctl is-enabled --quiet libvirtd.service  2>/dev/null; then
+            _row "libvirtd"  "!   enabled but not running"
+            _rec "libvirtd/virtqemud enabled but not active — run: systemctl start virtqemud.socket  [auto]"
+        else
+            _row "libvirtd"  "--  installed but not enabled"
+        fi
+
+        # ── Modular daemon health ─────────────────────────────────────────────
+        # In modular mode, each subsystem is a separate daemon activated via
+        # its .socket unit. Check .socket first (socket activation), then
+        # .service (always-running). Per docs: virtlogd and virtlockd must
+        # NEVER be stopped while VMs are running.
+        if [[ "$libvirt_mode" == "modular" ]]; then
+            # Format: "unit:description:critical"
+            # critical=1 means stopping while VMs run causes data loss/corruption
+            local _virt_daemons=(
+                "virtqemud:QEMU/KVM driver:1"
+                "virtnetworkd:virtual networking:0"
+                "virtstoraged:storage pools:0"
+                "virtlogd:VM console logging (must not stop while VMs run):1"
+                "virtlockd:disk image locking (must not stop while VMs run):1"
+                "virtsecretd:secrets/credentials:0"
+                "virtnodedevd:host device management:0"
+                "virtnwfilterd:network firewall rules:0"
+            )
+            local _virt_failed=() _virt_critical_failed=() _virt_ok=0
+            for _entry in "${_virt_daemons[@]}"; do
+                local _svc="${_entry%%:*}"
+                local _rest="${_entry#*:}"
+                local _desc="${_rest%%:*}"
+                local _crit="${_rest##*:}"
+                # Only check if the unit exists on this system
+                if systemctl cat "${_svc}.socket" &>/dev/null 2>&1 || \
+                   systemctl cat "${_svc}.service" &>/dev/null 2>&1; then
+                    if systemctl is-active --quiet "${_svc}.socket"  2>/dev/null || \
+                       systemctl is-active --quiet "${_svc}.service" 2>/dev/null; then
+                        _virt_ok=$(( _virt_ok + 1 ))
+                    else
+                        if [[ "$_crit" == "1" ]]; then
+                            _virt_critical_failed+=("$_svc")
+                        else
+                            _virt_failed+=("$_svc")
+                        fi
+                    fi
+                fi
+            done
+
+            if [[ ${#_virt_critical_failed[@]} -gt 0 ]]; then
+                _row "virt daemons" "!!  critical not running: $(_join "${_virt_critical_failed[@]}")"
+                for _f in "${_virt_critical_failed[@]}"; do
+                    _rec "${_f} not active — STOP all VMs first, then: systemctl enable --now ${_f}.socket  [auto]"
+                done
+            fi
+            if [[ ${#_virt_failed[@]} -gt 0 ]]; then
+                _row2 "!   not running: $(_join "${_virt_failed[@]}")"
+                for _f in "${_virt_failed[@]}"; do
+                    _rec "${_f} not active — run: systemctl enable --now ${_f}.socket  [auto]"
+                done
+            fi
+            if [[ ${#_virt_critical_failed[@]} -eq 0 && ${#_virt_failed[@]} -eq 0 ]]; then
+                _row "virt daemons" "OK  ${_virt_ok} modular daemon(s) active"
+            fi
+
+            # virtproxyd — only relevant for remote connections; warn if TCP/TLS sockets active
+            if systemctl is-active --quiet virtproxyd-tcp.socket 2>/dev/null || \
+               systemctl is-active --quiet virtproxyd-tls.socket 2>/dev/null; then
+                _row "virtproxyd"   "--  remote access active (TCP/TLS) — ensure auth is configured"
+            fi
+
+            # libvirt-guests — saves/restores VMs on host shutdown
+            if systemctl cat libvirt-guests.service &>/dev/null 2>&1; then
+                local lg_en; lg_en=$(systemctl is-enabled libvirt-guests.service 2>/dev/null || echo "disabled")
+                if [[ "$lg_en" == "enabled" ]]; then
+                    _row "virt-guests" "OK  enabled (VMs saved/restored on host shutdown)"
+                else
+                    _row "virt-guests" "--  disabled (VMs will be killed on host shutdown)"
+                fi
+            fi
+        else
+            # Monolithic mode — virtlogd and virtlockd are helpers, must not stop while VMs run
+            for _vhelper in virtlogd virtlockd; do
+                if systemctl cat "${_vhelper}.socket" &>/dev/null 2>&1; then
+                    if ! systemctl is-active --quiet "${_vhelper}.socket"  2>/dev/null && \
+                       ! systemctl is-active --quiet "${_vhelper}.service" 2>/dev/null; then
+                        _row "$_vhelper"   "!!  not running — STOP all VMs first, then start it"
+                        _rec "${_vhelper} not active — must not stop while VMs run: systemctl enable --now ${_vhelper}.socket  [auto]"
+                    fi
+                fi
+            done
+        fi
+
+        # ── Groups ───────────────────────────────────────────────────────────
+        local _virt_login=()
+        _get_login_users _virt_login
+
+        # kvm group — needed for /dev/kvm access
+        if getent group kvm &>/dev/null; then
+            local _kvm_missing=()
+            for u in "${_virt_login[@]}"; do
+                id -nG "$u" 2>/dev/null | grep -qw kvm || _kvm_missing+=("$u")
+            done
+            if [[ ${#_kvm_missing[@]} -gt 0 ]]; then
+                _row "kvm group"  "!   $(_join "${_kvm_missing[@]}") not in kvm group"
+                _rec "User(s) $(_join "${_kvm_missing[@]}") not in kvm group — run: usermod -aG kvm <user>"
+            else
+                _row "kvm group"  "OK  users have kvm access"
+            fi
+        else
+            _row "kvm group"  "!!  kvm group missing"
+            _rec "kvm group missing — create: groupadd -r kvm  [auto]"
+        fi
+
+        # libvirt group — needed for virsh/virt-manager without sudo
+        if getent group libvirt &>/dev/null; then
+            local _libvirt_missing=()
+            for u in "${_virt_login[@]}"; do
+                id -nG "$u" 2>/dev/null | grep -qw libvirt || _libvirt_missing+=("$u")
+            done
+            if [[ ${#_libvirt_missing[@]} -gt 0 ]]; then
+                _row "libvirt grp" "!   $(_join "${_libvirt_missing[@]}") not in libvirt group"
+                _rec "User(s) $(_join "${_libvirt_missing[@]}") not in libvirt group — run: usermod -aG libvirt <user>"
+            else
+                _row "libvirt grp" "OK  users have libvirt access"
+            fi
+        else
+            _row "libvirt grp" "!!  libvirt group missing"
+            _rec "libvirt group missing — create: groupadd -r libvirt  [auto]"
+        fi
+
+        # ── AppArmor profiles for libvirt ─────────────────────────────────────
+        # libvirt ships AppArmor profiles for qemu/kvm — if AA is enforcing but
+        # the libvirt profile is not loaded, VMs may fail to start
+        if command -v aa-status &>/dev/null && aa-status --enabled >/dev/null 2>&1; then
+            local aa_libvirt=0
+            aa-status 2>/dev/null | grep -q 'libvirt\|qemu' && aa_libvirt=1
+            if (( aa_libvirt )); then
+                _row "AA/libvirt"  "OK  AppArmor profiles loaded for libvirt/qemu"
+            else
+                _row "AA/libvirt"  "--  no AppArmor profiles for libvirt/qemu (may be unconfined)"
+            fi
+        fi
+
+        # ── Default network ───────────────────────────────────────────────────
+        if (( libvirt_active )) && command -v virsh &>/dev/null; then
+            local net_state="" net_autostart=""
+            net_state=$(timeout 5 virsh net-info default 2>/dev/null \
+                | awk '/^Active:/{print $2}' || echo "")
+            net_autostart=$(timeout 5 virsh net-info default 2>/dev/null \
+                | awk '/^Autostart:/{print $2}' || echo "")
+            if [[ "$net_state" == "yes" ]]; then
+                local net_as_str=""
+                [[ "$net_autostart" == "no" ]] && net_as_str="  (autostart off — run: virsh net-autostart default)"
+                _row "Virt net"   "OK  default network active (virbr0)${net_as_str}"
+                [[ "$net_autostart" == "no" ]] && \
+                    _rec "libvirt default network autostart disabled — run: virsh net-autostart default"
+            elif [[ -n "$net_state" ]]; then
+                _row "Virt net"   "!   default network inactive"
+                _rec "libvirt default network inactive — run: virsh net-start default && virsh net-autostart default"
+            fi
+
+            # dnsmasq — libvirt's NAT networking depends on it
+            if ! pgrep -x dnsmasq &>/dev/null; then
+                _row "dnsmasq"    "--  not running (needed for VM NAT networking)"
+            fi
+        fi
+
+        # ── Storage pools ─────────────────────────────────────────────────────
+        if (( libvirt_active )) && command -v virsh &>/dev/null; then
+            local pool_list="" pool_inactive_list=()
+            pool_list=$(timeout 5 virsh pool-list --all 2>/dev/null || echo "")
+            while IFS= read -r line; do
+                # Skip header/separator lines
+                [[ "$line" =~ ^[[:space:]]*Name || "$line" =~ ^[-[:space:]]+$ || -z "$line" ]] && continue
+                local pool_name pool_state
+                pool_name=$(echo "$line" | awk '{print $1}')
+                pool_state=$(echo "$line" | awk '{print $2}')
+                [[ "$pool_state" != "active" && -n "$pool_name" ]] && pool_inactive_list+=("$pool_name")
+            done <<< "$pool_list"
+            if [[ ${#pool_inactive_list[@]} -gt 0 ]]; then
+                _row "Virt pools"  "!   inactive: $(_join "${pool_inactive_list[@]}")"
+                _rec "libvirt storage pool(s) inactive ($(_join "${pool_inactive_list[@]}")) — run: virsh pool-start <pool>"
+            fi
+        fi
+
+        # ── hugepages ─────────────────────────────────────────────────────────
+        # If libvirt VMs are configured with hugepages, check they're available
+        local hugepages_total hugepages_free
+        hugepages_total=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "0")
+        if (( hugepages_total > 0 )); then
+            hugepages_free=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages 2>/dev/null || echo "0")
+            _row "Hugepages"  "--  ${hugepages_free}/${hugepages_total} free  ($(( hugepages_total * 2 )) MB reserved)"
+        fi
+
+        # ── QEMU version ──────────────────────────────────────────────────────
+        local qemu_ver=""
+        for qemu_bin in qemu-system-x86_64 qemu-kvm; do
+            command -v "$qemu_bin" &>/dev/null && \
+                qemu_ver=$("$qemu_bin" --version 2>/dev/null \
+                    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "") && break
+        done
+        [[ -n "$qemu_ver" ]] && _row "QEMU"       "--  v${qemu_ver}"
+
+        # ── @qemu subvolume ───────────────────────────────────────────────────
+        # VM disk images live on @qemu (nodatacow for performance).
+        if findmnt -n /var/lib/qemu &>/dev/null; then
+            local qemu_mb=""
+            qemu_mb=$(du -sm /var/lib/qemu 2>/dev/null | awk '{print $1}' || echo "")
+            _row "@qemu"      "OK  mounted${qemu_mb:+  (${qemu_mb} MB)}"
+        else
+            _row "@qemu"      "!!  /var/lib/qemu not mounted — VM images inaccessible"
+            _rec "@qemu subvolume not mounted at /var/lib/qemu — check fstab"
+        fi
+
+        # ── @libvirt subvolume ────────────────────────────────────────────────
+        if findmnt -n /var/lib/libvirt &>/dev/null || [[ -d /data/varlib/libvirt ]]; then
+            local libvirt_mb=""
+            libvirt_mb=$(du -sm /var/lib/libvirt /data/varlib/libvirt 2>/dev/null \
+                | awk '{s+=$1} END{if(s>0)print s}' || echo "")
+            if findmnt -n /var/lib/libvirt &>/dev/null; then
+                _row "@libvirt"   "OK  mounted${libvirt_mb:+  (${libvirt_mb} MB)}"
+            else
+                _row "@libvirt"   "--  via /data/varlib/libvirt${libvirt_mb:+  (${libvirt_mb} MB)}"
+            fi
+            if [[ "$libvirt_mb" =~ ^[0-9]+$ ]] && (( libvirt_mb > 20480 )); then
+                _row2 "!   ${libvirt_mb} MB — review VM disk images"
+                _rec "libvirt storage is ${libvirt_mb} MB — review VM disk images"
+            fi
+        fi
+    fi
+}
+
 _section_containers() {
     _head "Containers"
 
@@ -3225,7 +3606,7 @@ security_report() {
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
     printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Security Report"
-    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "$(date '+%Y-%m-%d %H:%M')"
     printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
 
     _section_secureboot         "$booted" uki_booted_bad "$hibernate_stale"
@@ -3286,7 +3667,7 @@ system_info() {
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
     printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS System Status"
-    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "$(date '+%Y-%m-%d %H:%M')"
     printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
 
     # ── Identity ──────────────────────────────────────────────────────────────
@@ -3326,6 +3707,7 @@ system_info() {
     _section_units
     _section_package_managers
     _section_containers
+    _section_virtualization
 
     # ── Runtime ───────────────────────────────────────────────────────────────
     _section_runtime_health
@@ -4182,7 +4564,7 @@ show_journal() {
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
     printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Journal — ${level} and above"
-    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "$(date '+%Y-%m-%d %H:%M')"
     printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
 
     # Map level name to journalctl priority number for display
@@ -4392,7 +4774,7 @@ analyze_storage() {
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
     printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Storage Analysis"
-    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "shani-health v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M')"
+    printf "  ${_C_BOLD}│  ${_C_DIM}%-44s${_C_BOLD}│${_C_RESET}\n" "$(date '+%Y-%m-%d %H:%M')"
     printf "  ${_C_BOLD}└──────────────────────────────────────────────┘${_C_RESET}\n"
 
     # ── Part 1: Standard storage section (same as main report) ───────────────
@@ -4717,7 +5099,7 @@ export_logs() {
         > "$staging/journal-systemd-boot.log" 2>/dev/null || true
 
     {
-        echo "=== shani-health ${SCRIPT_VERSION} bug report — $(date) ==="
+        echo "=== shani-health bug report — $(date) ==="
         echo ""
         echo "=== /proc/cmdline ===";         cat /proc/cmdline            2>/dev/null; echo ""
         echo "=== uname -a ===";              uname -a                     2>/dev/null; echo ""

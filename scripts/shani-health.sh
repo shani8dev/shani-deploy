@@ -904,91 +904,6 @@ _section_kernel_security() {
         fi
     fi
 
-    # Sysctl hardening table: key  target  cmp(min|max|eq|info)  label
-    # kernel.unprivileged_userns_clone: required =1 when rootless containers are
-    # present (Podman/Distrobox/LXC); purely advisory when they are not.
-    local _userns_cmp="info"
-    local _userns_label="restrict user namespaces (set to 1 if using rootless containers)"
-    if command -v podman &>/dev/null || command -v distrobox &>/dev/null || \
-       command -v lxc &>/dev/null || command -v lxd &>/dev/null; then
-        _userns_cmp="eq"
-        _userns_label="required for rootless containers (Podman/Distrobox/LXC)"
-    fi
-
-    local sysctl_table=(
-        # ── Kernel info leaks ──────────────────────────────────────────────────
-        "kernel.kptr_restrict"               "1"  "min"  "hide kernel pointers from non-root"
-        "kernel.dmesg_restrict"              "1"  "eq"   "restrict dmesg to root"
-        # ── ASLR ──────────────────────────────────────────────────────────────
-        "kernel.randomize_va_space"          "2"  "eq"   "full ASLR (stack+heap+mmap)"
-        # ── BPF ───────────────────────────────────────────────────────────────
-        "kernel.unprivileged_bpf_disabled"   "1"  "min"  "disable unprivileged BPF"
-        "net.core.bpf_jit_harden"            "2"  "min"  "harden BPF JIT"
-        "net.core.bpf_jit_kallsyms"          "0"  "eq"   "hide BPF JIT addresses from kallsyms"
-        # ── ptrace ────────────────────────────────────────────────────────────
-        "kernel.yama.ptrace_scope"           "1"  "min"  "restrict ptrace to parent processes"
-        # ── perf ──────────────────────────────────────────────────────────────
-        "kernel.perf_event_paranoid"         "2"  "min"  "restrict perf_event access to root"
-        # ── core dumps ────────────────────────────────────────────────────────
-        "fs.suid_dumpable"                   "0"  "eq"   "prevent suid coredumps leaking sensitive memory"
-        # ── filesystem hardening ───────────────────────────────────────────────
-        "fs.protected_hardlinks"             "1"  "eq"   "block hardlink attacks in sticky dirs"
-        "fs.protected_symlinks"              "1"  "eq"   "block symlink TOCTOU attacks in sticky dirs"
-        # ── SysRq (advisory — policy choice on desktop) ───────────────────────
-        "kernel.sysrq"                       "0"  "info" "disable SysRq (allows unauth reboot/kill if console access)"
-        # ── network: ICMP redirects ────────────────────────────────────────────
-        "net.ipv4.conf.all.accept_redirects"     "0"  "max"  "ignore IPv4 ICMP redirects (all)"
-        "net.ipv4.conf.default.accept_redirects" "0"  "max"  "ignore IPv4 ICMP redirects (default)"
-        "net.ipv6.conf.all.accept_redirects"     "0"  "max"  "ignore IPv6 ICMP redirects (all)"
-        "net.ipv6.conf.default.accept_redirects" "0"  "max"  "ignore IPv6 ICMP redirects (default)"
-        "net.ipv4.conf.all.send_redirects"       "0"  "max"  "do not send ICMP redirects (not a router)"
-        "net.ipv4.conf.default.send_redirects"   "0"  "max"  "do not send ICMP redirects (default)"
-        # ── network: source routing ────────────────────────────────────────────
-        "net.ipv4.conf.all.accept_source_route"     "0"  "max"  "ignore IP source routing (obsolete, MITM vector)"
-        "net.ipv4.conf.default.accept_source_route" "0"  "max"  "ignore IP source routing (default)"
-        # ── network: TCP hardening ─────────────────────────────────────────────
-        "net.ipv4.tcp_syncookies"            "1"  "eq"   "TCP SYN cookies (SYN flood mitigation)"
-        "net.ipv4.tcp_rfc1337"               "1"  "eq"   "protect against TCP time-wait assassination"
-        # ── network: advisory ─────────────────────────────────────────────────
-        "net.ipv4.conf.all.rp_filter"        "1"  "info" "reverse path filter (safe on single-homed)"
-        # ── user namespaces ────────────────────────────────────────────────────
-        "kernel.unprivileged_userns_clone"   "1"  "$_userns_cmp"  "$_userns_label"
-    )
-    local sc_ok=0 sc_total=0 sc_warn=() sc_info=()
-    local i=0
-    while (( i < ${#sysctl_table[@]} )); do
-        local key="${sysctl_table[$i]}"       target="${sysctl_table[$((i+1))]}"
-        local cmp="${sysctl_table[$((i+2))]}" label="${sysctl_table[$((i+3))]}"
-        i=$(( i + 4 ))
-        local actual; actual=$(sysctl -n "$key" 2>/dev/null || echo "")
-        [[ -z "$actual" ]] && continue
-        if [[ "$cmp" == "info" ]]; then
-            [[ "$actual" != "$target" ]] && sc_info+=("${key}=${actual}  (recommended ${target} — ${label})")
-            continue
-        fi
-        sc_total=$(( sc_total + 1 ))
-        local pass=0
-        case "$cmp" in
-            min) [[ "$actual" =~ ^[0-9]+$ ]] && (( actual >= target )) && pass=1 ;;
-            max) [[ "$actual" =~ ^[0-9]+$ ]] && (( actual <= target )) && pass=1 ;;
-            eq)  [[ "$actual" == "$target" ]] && pass=1 ;;
-        esac
-        if (( pass )); then
-            sc_ok=$(( sc_ok + 1 ))
-        else
-            sc_warn+=("${key}=${actual}  (want ${cmp} ${target} — ${label})")
-        fi
-    done
-    if [[ ${#sc_warn[@]} -eq 0 ]]; then
-        _row "Sysctl"    "OK  ${sc_ok}/${sc_total} hardening keys correct"
-    else
-        _row "Sysctl"    "!   ${sc_ok}/${sc_total} correct"
-        for w in "${sc_warn[@]}"; do _row2 "!  $w"; done
-        _rec "Sysctl hardening gaps — check /etc/sysctl.d/"
-    fi
-    for info in "${sc_info[@]}"; do _row2 "--  $info"; done
-
-
     local bad_mods=()
     for mod in mei mei_me pcspkr; do
         lsmod 2>/dev/null | grep -qw "$mod" && bad_mods+=("$mod")
@@ -1137,6 +1052,19 @@ _section_security_services() {
     if [[ "$aa_denials" =~ ^[0-9]+$ ]] && (( aa_denials > 0 )); then
         _row "AA denials" "!   ${aa_denials} DENIED event(s) this boot"
         _rec "${aa_denials} AppArmor denial(s) this boot — check: journalctl -k -b 0 | grep 'apparmor.*DENIED'"
+    fi
+
+    # ── Polkit ───────────────────────────────────────────────────────────────
+    # polkitd is required for pkexec-based privilege escalation (used by this
+    # script itself) and for GUI admin actions in GNOME/Plasma.
+    if systemctl is-active --quiet polkit 2>/dev/null; then
+        _row "polkit"     "OK  running"
+    elif systemctl is-enabled --quiet polkit 2>/dev/null; then
+        _row "polkit"     "!!  enabled but not running — pkexec and GUI elevation broken"
+        _rec "polkitd not running — run: systemctl start polkit  [auto]"
+    else
+        _row "polkit"     "!!  not enabled — pkexec and GUI elevation will fail"
+        _rec "polkit not enabled — run: systemctl enable --now polkit  [auto]"
     fi
 
     # ── Audit daemon ──────────────────────────────────────────────────────────
@@ -1925,6 +1853,18 @@ _section_services() {
         _rec "systemd-resolved is active — Shanios uses openresolv; resolvectl will not work"
     fi
 
+    # ── /etc/resolv.conf usability ────────────────────────────────────────────
+    if [[ ! -f /etc/resolv.conf ]]; then
+        _row "resolv.conf" "!!  missing — DNS resolution broken"
+        _rec "/etc/resolv.conf missing — resolvconf or openresolv should generate it"
+    elif [[ ! -s /etc/resolv.conf ]]; then
+        _row "resolv.conf" "!!  empty — DNS resolution broken"
+        _rec "/etc/resolv.conf is empty — check openresolv / resolvconf configuration"
+    elif ! grep -q '^nameserver ' /etc/resolv.conf 2>/dev/null; then
+        _row "resolv.conf" "!!  no nameserver entries — DNS resolution broken"
+        _rec "/etc/resolv.conf has no nameserver lines — check openresolv configuration"
+    fi
+
     # ── Realtime audio ────────────────────────────────────────────────────────
     local rtkit_st; rtkit_st=$(systemctl is-active rtkit-daemon 2>/dev/null || echo "inactive")
     if [[ "$rtkit_st" == "active" ]]; then
@@ -2096,6 +2036,17 @@ _section_packages() {
             _row "Flatpak"    "!   auto-update timer not active  (${flatpak_apps} apps)"
             _rec "Flatpak auto-update timer not active — run: systemctl enable --now flatpak-update-system.timer  [auto]"
         fi
+        # Flatpak storage — runtimes and old app versions accumulate
+        local flatpak_mb
+        flatpak_mb=$(du -sm /var/lib/flatpak 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ "$flatpak_mb" =~ ^[0-9]+$ ]]; then
+            if (( flatpak_mb > 20480 )); then
+                _row "Flatpak sz"  "!   ${flatpak_mb} MB — run: flatpak uninstall --unused"
+                _rec "Flatpak storage is ${flatpak_mb} MB — free space: flatpak uninstall --unused"
+            elif (( flatpak_mb > 8192 )); then
+                _row "Flatpak sz"  "--  ${flatpak_mb} MB (consider: flatpak uninstall --unused)"
+            fi
+        fi
     fi
 
     # ── Snap (snapd) ──────────────────────────────────────────────────────────
@@ -2115,6 +2066,17 @@ _section_packages() {
             _row "Snap"       "!!  @snapd mounted but snapd.socket is ${snapd_sock}"
             _rec "snapd.socket not active — run: systemctl enable --now snapd.socket snapd.apparmor.service  [auto]"
         fi
+        # Snap storage size — old revisions accumulate silently
+        local snap_store_mb
+        snap_store_mb=$(du -sm /var/lib/snapd/snaps 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ "$snap_store_mb" =~ ^[0-9]+$ ]]; then
+            if (( snap_store_mb > 10240 )); then
+                _row "Snap store" "!   ${snap_store_mb} MB — run: snap set system refresh.retain=2"
+                _rec "Snap storage is ${snap_store_mb} MB — limit old revisions: snap set system refresh.retain=2"
+            elif (( snap_store_mb > 3072 )); then
+                _row "Snap store" "--  ${snap_store_mb} MB (consider: snap set system refresh.retain=2)"
+            fi
+        fi
     fi
 
     # ── Nix ───────────────────────────────────────────────────────────────────
@@ -2131,6 +2093,17 @@ _section_packages() {
         else
             _row "Nix"        "!!  @nix mounted but nix-daemon.socket not active"
             _rec "nix-daemon.socket not active — run: systemctl enable --now nix-daemon.socket  [auto]"
+        fi
+        # Nix store size — grows unboundedly without garbage collection
+        local nix_store_mb
+        nix_store_mb=$(du -sm /nix/store 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ "$nix_store_mb" =~ ^[0-9]+$ ]]; then
+            if (( nix_store_mb > 51200 )); then
+                _row "Nix store"  "!   ${nix_store_mb} MB — run: nix-collect-garbage -d"
+                _rec "Nix store is ${nix_store_mb} MB — free space: nix-collect-garbage -d"
+            elif (( nix_store_mb > 20480 )); then
+                _row "Nix store"  "--  ${nix_store_mb} MB (consider: nix-collect-garbage -d)"
+            fi
         fi
     fi
 
@@ -2187,6 +2160,17 @@ _section_packages() {
            [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
             _row2 "!  Distrobox installed but Podman socket not active — containers won't start"
         fi
+        # Image storage size — dangling images silently fill @containers
+        local podman_img_mb
+        podman_img_mb=$(du -sm /var/lib/containers/storage/overlay 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ "$podman_img_mb" =~ ^[0-9]+$ ]]; then
+            if (( podman_img_mb > 20480 )); then
+                _row "Podman img" "!   ${podman_img_mb} MB in image storage — run: podman image prune"
+                _rec "Podman image storage is ${podman_img_mb} MB — free space: podman image prune"
+            elif (( podman_img_mb > 5120 )); then
+                _row "Podman img" "--  ${podman_img_mb} MB in image storage"
+            fi
+        fi
     fi
 
     # ── LXD / lxcfs ──────────────────────────────────────────────────────────
@@ -2214,6 +2198,12 @@ _section_packages() {
                 _row2 "!  lxcfs enabled but not running — containers see host stats"
                 _rec "lxcfs not running — run: systemctl enable --now lxcfs  [auto]"
             fi
+        fi
+        # LXD storage size
+        local lxd_mb
+        lxd_mb=$(du -sm /var/lib/lxd /data/varlib/lxd 2>/dev/null | awk '{s+=$1} END{print s}' || echo "")
+        if [[ "$lxd_mb" =~ ^[0-9]+$ ]] && (( lxd_mb > 20480 )); then
+            _row "LXD store"  "--  ${lxd_mb} MB (review with: lxc storage info default)"
         fi
     fi
 
@@ -2246,6 +2236,12 @@ _section_packages() {
             else
                 _row "nspawn"     "!   machines present but systemd-machined is ${machined_st}"
                 _rec "systemd-machined not active — run: systemctl start systemd-machined  [auto]"
+            fi
+            # nspawn storage size
+            local nspawn_mb
+            nspawn_mb=$(du -sm "$machines_dir" 2>/dev/null | awk '{print $1}' || echo "")
+            if [[ "$nspawn_mb" =~ ^[0-9]+$ ]] && (( nspawn_mb > 10240 )); then
+                _row "nspawn sz"  "--  ${nspawn_mb} MB in ${machines_dir}"
             fi
         fi
     fi
@@ -2447,6 +2443,22 @@ _section_firmware() {
 _section_runtime_health() {
     _head "Runtime Health"
 
+    # ── CPU load ──────────────────────────────────────────────────────────────
+    local load1 ncores load_int
+    load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "")
+    ncores=$(nproc 2>/dev/null || echo "1")
+    if [[ -n "$load1" && "$ncores" =~ ^[0-9]+$ ]]; then
+        load_int=$(awk "BEGIN{printf \"%d\", $load1}" 2>/dev/null || echo "0")
+        if (( load_int >= ncores * 4 )); then
+            _row "CPU load"   "!!  ${load1}  (${ncores} cores) — critically high"
+            _rec "CPU load average ${load1} on ${ncores} cores — check: ps aux --sort=-%cpu | head"
+        elif (( load_int >= ncores * 2 )); then
+            _row "CPU load"   "!   ${load1}  (${ncores} cores) — high"
+        else
+            _row "CPU load"   "OK  ${load1}  (${ncores} cores)"
+        fi
+    fi
+
     # ── Memory pressure ───────────────────────────────────────────────────────
     local mem_available_kb mem_total_kb
     mem_available_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
@@ -2499,7 +2511,6 @@ _section_runtime_health() {
         fi
     fi
 
-
     local running installed
     running=$(uname -r 2>/dev/null || echo "")
     installed=$(find /usr/lib/modules/ -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
@@ -2536,6 +2547,29 @@ _section_runtime_health() {
         _rec "${oom} OOM kill(s) this boot — consider more RAM or swap"
     else
         _row "OOM kills"  "OK  none this boot"
+    fi
+
+    # ── /home usage per user ──────────────────────────────────────────────────
+    if findmnt -n /home &>/dev/null; then
+        local home_warn=() home_crit=()
+        for user_dir in /home/*/; do
+            [[ -d "$user_dir" ]] || continue
+            local uname; uname=$(basename "$user_dir")
+            local used_mb
+            used_mb=$(du -sm "$user_dir" 2>/dev/null | awk '{print $1}' || echo "")
+            [[ "$used_mb" =~ ^[0-9]+$ ]] || continue
+            if (( used_mb > 51200 )); then      # > 50 GB
+                home_crit+=("${uname}:${used_mb}MB")
+            elif (( used_mb > 20480 )); then    # > 20 GB
+                home_warn+=("${uname}:${used_mb}MB")
+            fi
+        done
+        if [[ ${#home_crit[@]} -gt 0 ]]; then
+            _row "Home usage" "!   large: ${home_crit[*]}"
+            _rec "Home directories using significant space (${home_crit[*]}) — review with: du -sh /home/*"
+        elif [[ ${#home_warn[@]} -gt 0 ]]; then
+            _row "Home usage" "--  ${home_warn[*]}"
+        fi
     fi
 
     # ── Journal errors ────────────────────────────────────────────────────────
@@ -2716,13 +2750,59 @@ _section_users() {
     done < /etc/passwd 2>/dev/null || true
     _row "Login"     "--  ${login_users[*]:-none detected}"
 
+    # ── Login user password status ────────────────────────────────────────────
+    local no_pass=()
+    if [[ ${#login_users[@]} -gt 0 ]]; then
+        for u in "${login_users[@]}"; do
+            local pw_st; pw_st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}' || echo "")
+            [[ "$pw_st" == "NP" ]] && no_pass+=("$u")
+        done
+    fi
+    if [[ ${#no_pass[@]} -gt 0 ]]; then
+        _row "Passwords"  "!!  no password set for: ${no_pass[*]}"
+        _rec "User(s) ${no_pass[*]} have no password — set one: passwd <username>"
+    fi
+
     local wheel_line wheel_members=()
     wheel_line=$(getent group wheel 2>/dev/null || grep '^wheel:' /etc/group 2>/dev/null || true)
-    [[ -n "$wheel_line" ]] && IFS=',' read -ra wheel_members <<< "${wheel_line##*:}"
-    if [[ ${#wheel_members[@]} -gt 0 && -n "${wheel_members[0]}" ]]; then
-        _row "Wheel"     "--  ${wheel_members[*]}"
+    local wheel_sudoers
+    wheel_sudoers=$(grep -h '^%wheel' /etc/sudoers.d/wheel 2>/dev/null \
+        | grep -v '^[[:space:]]*#' | head -1 || true)
+    if [[ -z "$wheel_line" ]]; then
+        _row "Wheel"     "!!  group does not exist — sudo access broken"
+        _rec "wheel group missing — create it: groupadd wheel, then add users: usermod -aG wheel <username>"
     else
-        _row "Wheel"     "--  no members"
+        IFS=',' read -ra wheel_members <<< "${wheel_line##*:}"
+        if [[ -z "$wheel_sudoers" ]]; then
+            _row "Wheel"     "!!  group exists but no sudoers rule found for %wheel"
+            _rec "No sudoers rule for wheel — add: %wheel ALL=(ALL:ALL) ALL to /etc/sudoers.d/wheel"
+        elif [[ ${#wheel_members[@]} -gt 0 && -n "${wheel_members[0]}" ]]; then
+            # Check at least one wheel member is a real login user (uid >= 1000)
+            local wheel_has_login=0
+            for m in "${wheel_members[@]}"; do
+                local m_uid; m_uid=$(id -u "$m" 2>/dev/null || echo "")
+                [[ "$m_uid" =~ ^[0-9]+$ ]] && (( m_uid >= 1000 )) && { wheel_has_login=1; break; }
+            done
+            if (( wheel_has_login )); then
+                _row "Wheel"     "OK  ${wheel_members[*]}"
+            else
+                _row "Wheel"     "!!  no regular user (uid≥1000) in wheel — sudo access effectively broken"
+                _rec "wheel group has no regular login users — add one: usermod -aG wheel <username>"
+            fi
+        else
+            _row "Wheel"     "!!  sudoers rule present but group has no members — no user can sudo"
+            _rec "wheel group is empty — add a user: usermod -aG wheel <username>"
+        fi
+    fi
+
+    # ── Duplicate UID 0 accounts ──────────────────────────────────────────────
+    local uid0_accounts=()
+    while IFS=: read -r name _ uid _; do
+        [[ "$uid" -eq 0 && "$name" != "root" ]] && uid0_accounts+=("$name")
+    done < /etc/passwd 2>/dev/null || true
+    if [[ ${#uid0_accounts[@]} -gt 0 ]]; then
+        _row "UID 0"      "!!  non-root accounts with UID 0: ${uid0_accounts[*]}"
+        _rec "Accounts with UID 0 besides root (${uid0_accounts[*]}) — remove or reassign UID"
     fi
 
     local nopasswd=()
@@ -2743,7 +2823,7 @@ _section_users() {
     case "$root_st" in
         L|LK) _row "Root acct"  "OK  locked" ;;
         P)    _row "Root acct"  "!   has a password (locked root recommended)"
-              _rec "Root has a password — lock: passwd -l root  [auto]" ;;
+              _rec "Root has a password — to lock: passwd -l root" ;;
         *)    _row "Root acct"  "--  status unknown" ;;
     esac
 
@@ -3047,6 +3127,12 @@ fix() {
     command -v aa-status &>/dev/null && ! aa-status --enabled >/dev/null 2>&1 && \
         _apply_fix "Enable AppArmor"  systemctl enable --now apparmor
 
+    # Polkit
+    if systemctl cat polkit &>/dev/null 2>&1 && \
+       ! systemctl is-active --quiet polkit 2>/dev/null; then
+        _apply_fix "Enable polkit"  systemctl enable --now polkit
+    fi
+
     # Firewall
     command -v firewall-cmd &>/dev/null && ! systemctl is-active --quiet firewalld 2>/dev/null && \
         _apply_fix "Enable firewalld"  systemctl enable --now firewalld
@@ -3054,10 +3140,6 @@ fix() {
     # fail2ban
     command -v fail2ban-client &>/dev/null && ! systemctl is-active --quiet fail2ban 2>/dev/null && \
         _apply_fix "Enable fail2ban"  systemctl enable --now fail2ban
-
-    # Lock root
-    local root_st; root_st=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "")
-    [[ "$root_st" == "P" ]] && _apply_fix "Lock root account"  passwd -l root
 
     # SSH root login
     if [[ -f /etc/ssh/sshd_config ]]; then

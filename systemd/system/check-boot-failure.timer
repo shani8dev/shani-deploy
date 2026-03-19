@@ -1,6 +1,6 @@
 [Unit]
 Description=Run Boot Failure Check 15 Minutes After Boot
-After=multi-user.target
+DefaultDependencies=no
 
 [Timer]
 OnBootSec=15m
@@ -8,4 +8,4 @@ Unit=check-boot-failure.service
 
 [Install]
 WantedBy=timers.target
-
+WantedBy=emergency.target

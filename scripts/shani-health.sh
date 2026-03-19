@@ -1109,22 +1109,12 @@ _section_secureboot() {
 
     local sb_state; sb_state=$(mokutil --sb-state 2>/dev/null || echo "")
 
-    # Check shim validation state — reuse sb_state to avoid calling mokutil twice
-    local shim_validation_disabled=0
-    echo "$sb_state" | grep -q "Secure Boot validation is disabled" \
-        && shim_validation_disabled=1
-
     if [[ "$sb_state" == *"SecureBoot enabled"* ]]; then
-        if (( shim_validation_disabled )); then
-            # SB on in firmware but shim is not validating signatures —
-            # boot chain is active but shim bypass is in effect
-            _row "Status"    "--  enabled (shim validation disabled)"
-        else
-            _row "Status"    "OK  enabled"
-        fi
+        _row "Status"    "OK  enabled"
     else
-        _row "Status"    "!!  disabled"
-        _rec "Enable Secure Boot in BIOS/UEFI for full boot chain protection"
+        _row "Status"    "--  disabled"
+        # Note only — user may have deliberately left SB off
+        _rec "Secure Boot is disabled — enable in BIOS/UEFI for full boot chain protection (optional)"
     fi
 
     local mok_count
@@ -1138,14 +1128,20 @@ _section_secureboot() {
             2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
     fi
 
+    # Check if local key is pending enrollment (staged via mokutil --import, not yet confirmed)
+    local mok_pending=0
+    if [[ -n "$local_fp" ]] && \
+       mokutil --list-new 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
+       | grep -q "$local_fp"; then
+        mok_pending=1
+    fi
 
-    if (( shim_validation_disabled )); then
-        # Shim validation disabled — check if key is already enrolled.
-        # If enrolled: run gen-efi enroll-mok again to re-enable validation
-        #              (it was only disabled to skip the MokManager prompt).
-        # If not enrolled: this is the expected pending state — key will be
-        #              written to firmware on next boot, then enroll-mok
-        #              re-enables validation automatically.
+    local _sb_enabled=0
+    [[ "$sb_state" == *"SecureBoot enabled"* ]] && _sb_enabled=1
+
+    if (( mok_pending )); then
+        _row "MOK enrol" "->  enrollment pending — reboot and confirm in MokManager"
+    elif (( mok_count > 0 )); then
         local enrolled_match=0
         if [[ -n "$local_fp" ]] && \
            mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
@@ -1153,40 +1149,20 @@ _section_secureboot() {
             enrolled_match=1
         fi
         if (( enrolled_match )); then
-            # Key enrolled but validation still disabled — re-enable it
-            _row "MOK enrol" "!   shim validation disabled but key is enrolled — run: gen-efi enroll-mok"
-            _rec "MOK key enrolled but shim validation still disabled — run: gen-efi enroll-mok  [auto]"
+            _row "MOK enrol" "OK  ${mok_count} key(s) enrolled  (local key confirmed)"
         else
-            # Key pending — normal state after first enroll-mok run, before reboot
-            _row "MOK enrol" "->  enrollment pending, shim validation bypassed — reboot, then run: gen-efi enroll-mok"
+            _row "MOK enrol" "!   ${mok_count} key(s) enrolled but local MOK.der not matched — key may be stale"
+            _rec "Enrolled MOK key does not match local MOK.der — re-enroll: gen-efi enroll-mok  [auto]"
         fi
     else
-        # Check if local key is pending enrollment
-        local mok_pending=0
-        if [[ -n "$local_fp" ]] && \
-           mokutil --list-new 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
-           | grep -q "$local_fp"; then
-            mok_pending=1
-        fi
-
-        if (( mok_pending )); then
-            _row "MOK enrol" "->  enrollment pending — reboot, then run: gen-efi enroll-mok"
-        elif (( mok_count > 0 )); then
-            local enrolled_match=0
-            if [[ -n "$local_fp" ]] && \
-               mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]' \
-               | grep -q "$local_fp"; then
-                enrolled_match=1
-            fi
-            if (( enrolled_match )); then
-                _row "MOK enrol" "OK  ${mok_count} key(s) enrolled  (local key confirmed)"
-            else
-                _row "MOK enrol" "!   ${mok_count} key(s) enrolled but local MOK.der not matched — key may be stale"
-                _rec "Enrolled MOK key does not match local MOK.der — re-enroll: gen-efi enroll-mok  [auto]"
-            fi
+        if (( _sb_enabled )); then
+            # SB is on but no key enrolled — system may not boot after next UKI rebuild
+            _row "MOK enrol" "!!  no keys enrolled — Secure Boot will reject unsigned UKIs"
+            _rec "Enroll MOK key: gen-efi enroll-mok  [auto: stages enrollment, reboot required]"
         else
-            _row "MOK enrol" "!!  no keys enrolled"
-            _rec "Enroll MOK: gen-efi enroll-mok  [auto]"
+            # SB off — enrollment is staged but not yet confirmed, or not yet done
+            _row "MOK enrol" "--  no keys enrolled (Secure Boot is disabled — enroll before enabling SB)"
+            _rec "Enroll MOK key before enabling Secure Boot: gen-efi enroll-mok  [auto: stages enrollment, reboot required]"
         fi
     fi
 
@@ -2779,9 +2755,11 @@ _section_system_services() {
     _head "Servers"
 
     # ── Samba (Windows file sharing) ─────────────────────────────────────────
+    # "configured" means smb.conf exists and has at least one share section.
+    # /data/varlib/samba is created unconditionally at install time so it cannot
+    # be used as a signal that Samba has been configured by the user.
     if command -v smbd &>/dev/null || systemctl cat smb &>/dev/null 2>&1; then
-        if [[ -d /data/varlib/samba ]] || \
-           ( [[ -f /etc/samba/smb.conf ]] && grep -q '^\[' /etc/samba/smb.conf 2>/dev/null ); then
+        if [[ -f /etc/samba/smb.conf ]] && grep -q '^\[' /etc/samba/smb.conf 2>/dev/null; then
             local smbd_st; smbd_st=$(systemctl is-active smb 2>/dev/null || \
                                       systemctl is-active smbd 2>/dev/null || echo "inactive")
             if [[ "$smbd_st" == "active" ]]; then
@@ -2794,7 +2772,7 @@ _section_system_services() {
                 _row "Samba"      "--  configured but not enabled (to enable: systemctl enable --now smb)"
             fi
         else
-            _row "Samba"          "--  installed, not configured (create shares in /etc/samba/smb.conf)"
+            _row "Samba"          "--  installed, not configured or enabled (create shares in /etc/samba/smb.conf, then systemctl enable --now smb)"
         fi
     fi
 
@@ -2813,7 +2791,7 @@ _section_system_services() {
                 _rec "NFS exports defined but service not enabled — run: systemctl enable --now nfs-server  [auto]"
             fi
         else
-            _row "NFS"            "--  installed, not configured (add exports to /etc/exports, then systemctl enable --now nfs-server)"
+            _row "NFS"            "--  installed, not configured or enabled (add exports to /etc/exports, then systemctl enable --now nfs-server)"
         fi
     fi
 
@@ -2873,6 +2851,51 @@ _section_system_services() {
             _rec "cloudflared not running — run: systemctl start cloudflared  [auto]"
         else
             _row "cloudflared" "--  installed, not enabled (to create a tunnel: cloudflared tunnel create <name>)"
+        fi
+    fi
+
+    # ── nginx web server ──────────────────────────────────────────────────────
+    if command -v nginx &>/dev/null || systemctl cat nginx &>/dev/null 2>&1; then
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            local nginx_ver=""
+            nginx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "nginx"      "OK  running${nginx_ver:+  (${nginx_ver})}"
+        elif systemctl is-enabled --quiet nginx 2>/dev/null; then
+            _row "nginx"      "!   enabled but not running"
+            _rec "nginx not running — run: systemctl start nginx  [auto]"
+        else
+            _row "nginx"      "--  installed, not enabled (to serve sites: systemctl enable --now nginx)"
+        fi
+    fi
+
+    # ── Syncthing (file sync) ─────────────────────────────────────────────────
+    if command -v syncthing &>/dev/null || systemctl cat syncthing &>/dev/null 2>&1; then
+        # Syncthing runs as a user service — check for any active user instance
+        local st_active=0
+        if systemctl is-active --quiet syncthing 2>/dev/null ||            systemctl --global is-enabled --quiet syncthing 2>/dev/null; then
+            st_active=1
+        fi
+        if (( st_active )); then
+            _row "Syncthing"  "OK  running"
+        elif systemctl is-enabled --quiet syncthing 2>/dev/null; then
+            _row "Syncthing"  "!   enabled but not running"
+            _rec "syncthing not running — run: systemctl start syncthing  [auto]"
+        else
+            _row "Syncthing"  "--  installed, not enabled (to sync files: systemctl --user enable --now syncthing)"
+        fi
+    fi
+
+    # ── Cockpit (web-based system management) ────────────────────────────────
+    if command -v cockpit-bridge &>/dev/null || systemctl cat cockpit.socket &>/dev/null 2>&1; then
+        if systemctl is-active --quiet cockpit.socket 2>/dev/null; then
+            local cockpit_port=""
+            cockpit_port=$(ss -tlnp 2>/dev/null | awk '/cockpit/{match($4,/:([0-9]+)$/,a); if(a[1]) print a[1]}' | head -1 || echo "9090")
+            _row "Cockpit"    "OK  socket active  (https://localhost:${cockpit_port:-9090})"
+        elif systemctl is-enabled --quiet cockpit.socket 2>/dev/null; then
+            _row "Cockpit"    "!   enabled but not running"
+            _rec "cockpit.socket enabled but not active — run: systemctl start cockpit.socket  [auto]"
+        else
+            _row "Cockpit"    "--  installed, not enabled (to enable: systemctl enable --now cockpit.socket)"
         fi
     fi
 
@@ -5004,10 +5027,9 @@ _fix_boot() {
         fi
     fi
 
-    # MOK enroll — skip entirely if shim validation is already disabled
+    # MOK enroll — stage if not already enrolled or pending
     local _mok_der="/etc/secureboot/keys/MOK.der"
-    if [[ -f "$_mok_der" ]] && command -v mokutil &>/dev/null && \
-       ! mokutil --sb-state 2>/dev/null | grep -q "Secure Boot validation is disabled"; then
+    if [[ -f "$_mok_der" ]] && command -v mokutil &>/dev/null; then
         local _mok_enrolled_count
         _mok_enrolled_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
         local _local_fp
@@ -5030,7 +5052,7 @@ _fix_boot() {
             if [[ "$_fix_booted" != "unknown" && -x "$GENEFI_BIN" ]]; then
                 _log "MOK key not enrolled or stale — running gen-efi enroll-mok..."
                 if "$GENEFI_BIN" enroll-mok 2>&1; then
-                    _log_ok "gen-efi enroll-mok succeeded — reboot and confirm MOK enrollment in MokManager"
+                    _log_ok "gen-efi enroll-mok succeeded — reboot and confirm MOK enrollment in MokManager (one-time prompt)"
                     fixed=$(( fixed + 1 ))
                 else
                     _log_warn "gen-efi enroll-mok failed — check manually"

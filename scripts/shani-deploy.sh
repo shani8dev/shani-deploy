@@ -2476,6 +2476,12 @@ finalize_update() {
     log_section "Finalization"
     [[ "${DRY_RUN}" == "yes" ]] && return 0
 
+    # Arm emergency rollback trap here — deploy_update arms it inside its own
+    # scope, but ERR traps do not propagate across function call boundaries.
+    # Without this, a UKI generation failure (or any die() below) would exit
+    # without restoring @CANDIDATE_SLOT from its backup.
+    trap 'restore_candidate' ERR
+
     verify_and_create_subvolumes || die "Subvolume verification failed"
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
     finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT" || die "Failed to update boot entries — ESP may not be accessible"

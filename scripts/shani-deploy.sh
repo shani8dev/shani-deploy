@@ -92,6 +92,7 @@ declare -g SKIP_SELF_UPDATE="${SKIP_SELF_UPDATE:-no}"
 declare -g SELF_UPDATE_DONE="${SELF_UPDATE_DONE:-}"
 declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
 declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-}"
+declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 # CHROOT_STATIC_DIRS are bind-mounted from the live system into the candidate
@@ -130,7 +131,7 @@ persist_state() {
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE 2>/dev/null || true
-        declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME 2>/dev/null || true
+        declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
@@ -1258,6 +1259,7 @@ cleanup_old_backups() {
                 [[ -n "${BACKUP_NAME:-}" && "$backup" == "@${BACKUP_NAME}" ]] && continue
 
                 [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would delete: ${backup}"; continue; }
+                btrfs property set -f -ts "$MOUNT_DIR/${backup}" ro false 2>/dev/null || true
                 if btrfs subvolume delete "$MOUNT_DIR/${backup}" &>/dev/null; then
                     log_success "Deleted: ${backup}"
                 else
@@ -1615,6 +1617,10 @@ restore_candidate() {
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || \
         log_warn "Failed to mount subvolid=5 — slot file writes may fail"
 
+    # Capture booted slot once — used for safety checks and slot markers below.
+    local rc_booted
+    rc_booted=$(get_booted_subvol 2>/dev/null || echo "")
+
     # If BACKUP_NAME not set, search disk for most recent backup
     if [[ -z "${BACKUP_NAME:-}" ]]; then
         local found
@@ -1629,10 +1635,14 @@ restore_candidate() {
     fi
 
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
-        log "Restoring @${CANDIDATE_SLOT} from backup @${BACKUP_NAME}..."
 
-        local rc_booted
-        rc_booted=$(get_booted_subvol)
+        if [[ "${CANDIDATE_MODIFIED:-no}" != "yes" ]]; then
+            # @CANDIDATE_SLOT was never touched (e.g. extraction failed before delete).
+            # The backup is identical to the current slot — skip the restore entirely
+            # to avoid a pointless delete + re-snapshot cycle.
+            log "Skipping subvolume restore — @${CANDIDATE_SLOT} was not modified (backup is identical)"
+        else
+        log "Restoring @${CANDIDATE_SLOT} from backup @${BACKUP_NAME}..."
 
         if [[ "$CANDIDATE_SLOT" == "$rc_booted" ]]; then
             log_warn "Refusing to touch @${CANDIDATE_SLOT} — it is the currently booted slot"
@@ -1648,14 +1658,13 @@ restore_candidate() {
             btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
         fi
 
-        local _rc_slot="${CURRENT_SLOT:-$(get_booted_subvol)}"
+        local _rc_slot="${CURRENT_SLOT:-${rc_booted}}"
         echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null ||             log_warn "Failed to write current-slot"
         echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null ||             log_warn "Failed to write previous-slot"
+        fi
     else
         log_error "No backup available for @${CANDIDATE_SLOT} — snapshotting @${CURRENT_SLOT} as fallback"
-        local nb_booted
-        nb_booted=$(get_booted_subvol)
-        if [[ -n "${CURRENT_SLOT:-}" && "$CANDIDATE_SLOT" != "$nb_booted" ]] && \
+        if [[ -n "${CURRENT_SLOT:-}" && "$CANDIDATE_SLOT" != "$rc_booted" ]] && \
            btrfs_subvol_exists "$MOUNT_DIR/@${CURRENT_SLOT}"; then
             if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
@@ -1668,7 +1677,7 @@ restore_candidate() {
                     log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
                 fi
 
-            local _rc_slot="${CURRENT_SLOT:-$(get_booted_subvol)}"
+            local _rc_slot="${CURRENT_SLOT:-${rc_booted}}"
             echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
                 log_warn "Failed to write current-slot"
             echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
@@ -1693,6 +1702,16 @@ restore_candidate() {
     btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
 
+    # If @CANDIDATE_SLOT was never modified the backup snapshot is identical to
+    # the live slot — delete it now rather than leaving it for cleanup_old_backups.
+    if [[ "${CANDIDATE_MODIFIED:-no}" != "yes" ]] && \
+       [[ -n "${BACKUP_NAME:-}" ]] && \
+       btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
+        btrfs property set -f -ts "$MOUNT_DIR/@${BACKUP_NAME}" ro false 2>/dev/null || true
+        btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" 2>/dev/null && \
+            log "Deleted unused backup @${BACKUP_NAME} (candidate was not modified)"
+    fi
+
     umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
     # Clear the reboot-needed marker — the deployment that wrote it was just
@@ -1703,10 +1722,10 @@ restore_candidate() {
     # _handle_fallback_boot) or by a direct shani-deploy --rollback invocation.
     rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
 
-    finalize_boot_entries "${CURRENT_SLOT:-$(get_booted_subvol)}" "$CANDIDATE_SLOT" "no-tries" || \
+    finalize_boot_entries "${CURRENT_SLOT:-${rc_booted}}" "$CANDIDATE_SLOT" "no-tries" || \
         log_warn "Could not update boot entries — you may need to set the default boot slot manually"
 
-    log_error "Emergency rollback complete — system remains on @${CURRENT_SLOT:-$(get_booted_subvol)}"
+    log_error "Emergency rollback complete — system remains on @${CURRENT_SLOT:-${rc_booted}}"
     log_error "Please reboot to ensure a clean system state"
     exit 1
 }
@@ -1871,7 +1890,7 @@ rollback_system() {
     log "  Restored slot:     @${failed_slot} (ready for next deploy)"
     log "  Please reboot — the system will boot into @${booted}"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    trap 'restore_candidate' ERR
+    trap - ERR
 }
 
 #####################################
@@ -2457,12 +2476,14 @@ deploy_update() {
 
     # Extraction succeeded — now safe to replace candidate.
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
+        CANDIDATE_MODIFIED="yes"
         run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
         run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
     fi
 
     log_verbose "Replacing @${CANDIDATE_SLOT} with extracted snapshot..."
     run_cmd btrfs subvolume snapshot "$temp/shanios_base" "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+    CANDIDATE_MODIFIED="yes"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
 
     btrfs_subvol_exists "$temp/shanios_base" && run_cmd btrfs subvolume delete "$temp/shanios_base"

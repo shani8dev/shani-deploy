@@ -1544,15 +1544,14 @@ title   ${OS_NAME}-${candidate_slot} (Candidate)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
 EOF
 
-    # Use the exact entry filename as the default — systemd-boot glob matching
-    # with '+' in the pattern is unreliable in practice (glob does not match
-    # tries-suffixed filenames correctly on some builds). This is safe because
-    # loader.conf default only needs to match on the very first boot after deploy:
-    # once systemd-boot boots the entry it takes over tries counting autonomously,
-    # renaming the file each boot regardless of what loader.conf says.
-    # On subsequent failed boots systemd-boot falls back to the candidate slot
-    # via the tries exhaustion mechanism, not via loader.conf.
-    local loader_default="${active_filename}"
+    # Use the base entry ID (without tries suffix) as the loader.conf default.
+    # systemd-boot matches the "default" value against entry IDs, not filenames.
+    # The entry ID is always the plain .conf name with tries suffix stripped —
+    # i.e. shanios-blue+3-0.conf has ID shanios-blue.conf. Using the exact
+    # filename (shanios-blue+3-0.conf) or a glob (shanios-blue+*.conf) will not
+    # match because neither equals the ID. The base ID always resolves correctly
+    # to the tries-suffixed file on disk regardless of how many boots have elapsed.
+    local loader_default="${OS_NAME}-${active_slot}.conf"
     local loader_conf="$ESP/loader/loader.conf"
     if [[ -f "$loader_conf" ]]; then
         grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
@@ -1564,6 +1563,12 @@ EOF
     fi
     log_verbose "loader.conf default set to ${loader_default}"
     log "Boot default set to: @${active_slot} (${loader_default}) | Fallback: @${candidate_slot}"
+
+    # Best-effort: also set the EFI variable so systemd-boot has two sources of
+    # truth for the default entry. Suppressed entirely — failure is non-fatal and
+    # must not affect the deployment result (EFI vars may be read-only, or the
+    # ESP may not be writable via bootctl on all firmware).
+    bootctl set-default "${loader_default}" &>/dev/null || true
 
     if [[ $esp_mounted -eq 1 ]]; then
         umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"

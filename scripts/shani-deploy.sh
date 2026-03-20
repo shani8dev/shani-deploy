@@ -220,6 +220,20 @@ format_bytes() {
     numfmt --to=iec "$1" 2>/dev/null || echo "${1}B"
 }
 
+format_duration() {
+    local secs="$1"
+    local h=$(( secs / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    local s=$(( secs % 60 ))
+    if (( h > 0 )); then
+        printf '%dh %dm %ds' "$h" "$m" "$s"
+    elif (( m > 0 )); then
+        printf '%dm %ds' "$m" "$s"
+    else
+        printf '%ds' "$s"
+    fi
+}
+
 get_file_size() {
     stat -c%s "$1" 2>/dev/null || echo 0
 }
@@ -685,7 +699,7 @@ validate_download() {
     fi
 
     if (( size < min_size )); then
-        log_error "File too small: $(basename "$file") is $(format_bytes "size"), expected at least $(format_bytes "min_size")"
+        log_error "File too small: $(basename "$file") is $(format_bytes "$size"), expected at least $(format_bytes "$min_size")"
         return 1
     fi
 
@@ -696,7 +710,7 @@ validate_download() {
     if (( disk_usage > 0 && size > 0 )); then
         local usage_ratio
         usage_ratio=$((disk_usage * 100 / size))
-        log_verbose "Disk usage: $(format_bytes "disk_usage") / $(format_bytes "size") (${usage_ratio}%)"
+        log_verbose "Disk usage: $(format_bytes "$disk_usage") / $(format_bytes "$size") (${usage_ratio}%)"
 
         # ONLY check for sparse files if this is a final validation
         # (i.e., download tool claims to be done)
@@ -704,7 +718,7 @@ validate_download() {
             # Only flag as preallocated if disk usage is extremely low (< 5%)
             # — btrfs transparent compression can legitimately yield 40-60% ratios
             if (( expected_size > 0 && size == expected_size && usage_ratio < 5 )); then
-                log_error "File appears preallocated but incomplete: $(format_bytes "disk_usage") actual vs $(format_bytes "size") apparent"
+                log_error "File appears preallocated but incomplete: $(format_bytes "$disk_usage") actual vs $(format_bytes "$size") apparent"
                 return 1
             fi
         fi
@@ -736,7 +750,7 @@ validate_download() {
         fi
     fi
 
-    log_verbose "Validation passed: $(format_bytes "size")"
+    log_verbose "Validation passed: $(format_bytes "$size")"
     return 0
 }
 
@@ -903,7 +917,7 @@ download_file() {
                 elif (( current_size > 0 )); then
                     local usage_ratio
                     usage_ratio=$((disk_usage * 100 / current_size))
-                    log_verbose "Found partial: $(format_bytes "disk_usage") actual / $(format_bytes "current_size") apparent (${usage_ratio}%)"
+                    log_verbose "Found partial: $(format_bytes "$disk_usage") actual / $(format_bytes "$current_size") apparent (${usage_ratio}%)"
 
                     # ANY real data is worth keeping for resume
                     # Don't delete partial downloads just because they're sparse
@@ -948,7 +962,7 @@ download_file() {
                 new_usage=$(du -b "$output" 2>/dev/null | awk '{print $1}')
 
                 if (( new_usage > 0 )); then
-                    log_verbose "Progress: $(format_bytes "new_usage") actual data written"
+                    log_verbose "Progress: $(format_bytes "$new_usage") actual data written"
                     # If we have real partial data, retry with same tool
                     if (( attempt < max_tool_attempts )); then
                         log_verbose "Retrying with $tool to resume..."
@@ -1357,7 +1371,7 @@ optimize_storage() {
 
     echo ""
     if [[ $dedupe_status -eq 0 ]]; then
-        log_success "Deduplication completed in ${dedupe_duration}s"
+        log_success "Deduplication completed in $(format_duration "$dedupe_duration")"
     else
         log_warn "Deduplication completed with warnings (exit: $dedupe_status)"
     fi
@@ -2171,7 +2185,7 @@ download_update() {
         local existing_size
         existing_size=$(get_file_size "$image")
         if (( existing_size > 0 )); then
-            log_success "Using verified cached image: ${IMAGE_NAME} ($(format_bytes "existing_size"))"
+            log_success "Using verified cached image: ${IMAGE_NAME} ($(format_bytes "$existing_size"))"
             return 0
         fi
         rm -f "$marker" "$image" "$sha" "$asc" "${image}.aria2"
@@ -2197,7 +2211,7 @@ download_update() {
         local r2_size
         r2_size=$(get_remote_file_size "$r2_image_url")
         if (( r2_size > MIN_FILE_SIZE )); then
-            log_success "Primary server available — image size: $(format_bytes "r2_size")"
+            log_success "Primary server available — image size: $(format_bytes "$r2_size")"
             use_r2=1
         else
             log_verbose "Primary server unavailable or returned unexpected size, falling back to SourceForge mirror"
@@ -2223,19 +2237,19 @@ download_update() {
         active_url="$mirror_url"
     fi
     expected_size=$(get_remote_file_size "$active_url")
-    (( expected_size > 0 )) && log "Expected: $(format_bytes "expected_size")"
+    (( expected_size > 0 )) && log "Expected: $(format_bytes "$expected_size")"
 
     # Check for existing partial download
     if [[ -f "$image" ]]; then
         local current_size
         current_size=$(get_file_size "$image")
         if (( current_size > 0 )); then
-            log "Found partial download: $(format_bytes "current_size")"
+            log "Found partial download: $(format_bytes "$current_size")"
             if (( expected_size > 0 )); then
                 if (( current_size >= expected_size )); then
                     log "Existing file matches expected size — skipping download, will verify integrity"
                 elif (( current_size < expected_size )); then
-                    log "Will resume from $(format_bytes "current_size")"
+                    log "Will resume from $(format_bytes "$current_size")"
                 fi
             else
                 log_warn "Cannot determine expected image size from server — will attempt resume and validate after"
@@ -2273,17 +2287,17 @@ download_update() {
 
             local current_size
             current_size=$(get_file_size "$image")
-            log_verbose "Downloaded: $(format_bytes "current_size")"
+            log_verbose "Downloaded: $(format_bytes "$current_size")"
 
             # Check if download is complete
             if (( expected_size > 0 )); then
                 if (( current_size < expected_size )); then
-                    log_warn "Download incomplete: $(format_bytes "current_size") / $(format_bytes "expected_size")"
+                    log_warn "Download incomplete: $(format_bytes "$current_size") / $(format_bytes "$expected_size")"
                     log "Will retry to resume..."
                     sleep 5
                     continue
                 elif (( current_size > expected_size )); then
-                    log_error "Download too large: $(format_bytes "current_size") > $(format_bytes "expected_size")"
+                    log_error "Download too large: $(format_bytes "$current_size") > $(format_bytes "$expected_size")"
                     rm -f "$image" "${image}.aria2"
                     sleep 5
                     continue
@@ -2291,7 +2305,7 @@ download_update() {
             fi
 
             download_success=1
-            log_success "Downloaded: $(format_bytes "current_size")"
+            log_success "Downloaded: $(format_bytes "$current_size")"
             break
         fi
 
@@ -2527,7 +2541,7 @@ finalize_update() {
     log "  Deployment successful!"
     log "  Next boot will load: @${CANDIDATE_SLOT} (v${REMOTE_VERSION})"
     log "  Current slot:        @${CURRENT_SLOT} (still running)"
-    log "  Total time:          ${total_time}s"
+    log "  Total time:          $(format_duration "$total_time")"
     log "  Please reboot to switch to the updated slot"
     log "  Tip: run with --optimize to reclaim disk space via deduplication"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

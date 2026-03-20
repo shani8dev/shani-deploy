@@ -99,6 +99,8 @@ _SYM_OK="✓"
 _SYM_ERR="✗"
 _SYM_WARN="⚠"
 _SYM_INFO="—"
+_SYM_IDLE="○"
+_SYM_READY="◉"
 _SYM_SPIN="↻"
 
 _ts()        { date '+%Y-%m-%d %H:%M:%S'; }
@@ -132,6 +134,8 @@ _row() {
         !!)   coloured="${_C_RED}${_SYM_ERR}${_C_RESET}  ${rest}" ;;
         "!")  coloured="${_C_YELLOW}${_SYM_WARN}${_C_RESET}  ${rest}" ;;
         "--") coloured="${_C_DIM}${_SYM_INFO}${_C_RESET}  ${rest}" ;;
+        "~~") coloured="${_C_CYAN}${_SYM_IDLE}${_C_RESET}  ${rest}" ;;
+        ">>") coloured="${_C_GREEN}${_C_DIM}${_SYM_READY}${_C_RESET}  ${rest}" ;;
         "->") coloured="${_C_CYAN}${_SYM_SPIN}${_C_RESET}  ${rest}" ;;
         "N/A") coloured="${_C_DIM}${val}${_C_RESET}" ;;
         *)    coloured="$val" ;;  # no prefix recognised — pass through verbatim
@@ -150,6 +154,8 @@ _row2() {
         "!!")  coloured="${_C_RED}${_SYM_ERR}${_C_RESET}  ${rest}" ;;
         "!")   coloured="${_C_YELLOW}${_SYM_WARN}${_C_RESET}  ${rest}" ;;
         "--")  coloured="${_C_DIM}${_SYM_INFO}${_C_RESET}  ${rest}" ;;
+        "~~")  coloured="${_C_CYAN}${_SYM_IDLE}${_C_RESET}  ${rest}" ;;
+        ">>")  coloured="${_C_GREEN}${_C_DIM}${_SYM_READY}${_C_RESET}  ${rest}" ;;
         "->")  coloured="${_C_CYAN}${_SYM_SPIN}${_C_RESET}  ${rest}" ;;
         *)     coloured="$text" ;;
     esac
@@ -160,6 +166,83 @@ _row2() {
 _head() {
     printf "\n  ${_C_BOLD}${_C_CYAN}%-40s${_C_RESET}\n" "$1"
     printf "  ${_C_DIM}%s${_C_RESET}\n" "----------------------------------------"
+}
+
+# Lightweight subsection divider — used for "Optional" group at bottom of sections
+_subhead() {
+    printf "  ${_C_DIM}— %s —${_C_RESET}\n" "${1,,}"
+}
+
+# ── Optional-block buffering ──────────────────────────────────────────────────
+# Usage:
+#   _optional_begin          # start buffering all _row/_row2 output
+#   ... checks ...
+#   _optional_end            # flush: prints "— optional —" + buffer only if non-empty
+#
+# Implementation: redirect stdout to a temp file; _optional_end flushes it.
+_OPT_BUF=""          # temp file path, set by _optional_begin
+_OPT_STDOUT=""       # saved fd 1
+
+_optional_begin() {
+    _OPT_BUF=$(mktemp /tmp/.shani-opt.XXXXXX)
+    # Redirect fd 1 to the temp file, save original fd 1 as fd 9
+    exec 9>&1 >"$_OPT_BUF"
+}
+
+_optional_end() {
+    # Restore stdout
+    exec 1>&9 9>&-
+    if [[ -s "$_OPT_BUF" ]]; then
+        _subhead "Optional"
+        cat "$_OPT_BUF"
+    fi
+    rm -f "$_OPT_BUF"
+    _OPT_BUF=""
+}
+
+# ── Per-service optional buffering ───────────────────────────────────────────
+# Used in _section_servers so "installed but not enabled" rows collect at the
+# bottom under "— optional —" while active/enabled services show immediately.
+#
+# Usage around any service block:
+#   _srv_is_notable <unit> [<unit2>…]  → returns 0 if any unit is active/enabled
+#   Wrap the "installed only" output branch:
+#     if _srv_is_notable sshd sshd.socket; then
+#         <normal checks>
+#     else
+#         _srv_opt_begin; <installed-only _row calls>; _srv_opt_end
+#     fi
+#   At the end of the section: _srv_opt_flush
+#
+# _SRV_OPT_BUF accumulates across multiple calls.
+_SRV_OPT_BUF=""
+
+_srv_is_notable() {
+    # Returns 0 (true) if any of the given units is active or enabled
+    local u
+    for u in "$@"; do
+        systemctl is-active  --quiet "$u" 2>/dev/null && return 0
+        systemctl is-enabled --quiet "$u" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+_srv_opt_begin() {
+    [[ -z "$_SRV_OPT_BUF" ]] && _SRV_OPT_BUF=$(mktemp /tmp/.shani-srv-opt.XXXXXX)
+    exec 9>&1 >>"$_SRV_OPT_BUF"
+}
+
+_srv_opt_end() {
+    exec 1>&9 9>&-
+}
+
+_srv_opt_flush() {
+    if [[ -n "$_SRV_OPT_BUF" && -s "$_SRV_OPT_BUF" ]]; then
+        _subhead "Optional"
+        cat "$_SRV_OPT_BUF"
+    fi
+    rm -f "$_SRV_OPT_BUF"
+    _SRV_OPT_BUF=""
 }
 
 ###############################################################################
@@ -297,7 +380,7 @@ _section_os_slots() {
 
     # /etc/hosts — hostname must resolve locally
     if [[ -f /etc/hosts && -n "$hostname" && "$hostname" != "localhost" ]]; then
-        if ! grep -qE "^(127\.0\.0\.1|::1)[[:space:]].*\b${hostname}\b" /etc/hosts 2>/dev/null; then
+        if ! grep -qE "^(127\.0\.0\.1|127\.0\.1\.1|::1)[[:space:]].*\b${hostname}\b" /etc/hosts 2>/dev/null; then
             _row "hosts"     "!   ${hostname} not in /etc/hosts — local hostname won't resolve"
             _rec "Add '127.0.1.1 ${hostname}' to /etc/hosts for local hostname resolution  [auto]"
         fi
@@ -305,10 +388,16 @@ _section_os_slots() {
 
     # Timezone
     if [[ -L /etc/localtime ]]; then
-        local tz; tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || echo "")
+        local tz=""
+        # timedatectl gives the effective timezone even when /etc/localtime is a copy not a symlink
+        if command -v timedatectl &>/dev/null; then
+            tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "")
+        fi
+        [[ -z "$tz" ]] && \
+            tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || echo "")
         if [[ -z "$tz" || ! -f /etc/localtime ]]; then
-            _row "Timezone"  "!!  /etc/localtime symlink broken"
-            _rec "Fix timezone: ln -sf /usr/share/zoneinfo/UTC /etc/localtime"
+            _row "Timezone"  "!!  /etc/localtime missing or broken"
+            _rec "Fix timezone: timedatectl set-timezone UTC (or your region)"
         else
             _row "Timezone"  "--  ${tz}"
         fi
@@ -358,34 +447,32 @@ _section_os_slots() {
 
     # Locale — /etc/locale.conf must exist and set LANG
     local sys_lang=""
-    if [[ -f /etc/locale.conf ]]; then
+    # localectl reads /etc/locale.conf and kernel cmdline — use it for the effective value
+    if command -v localectl &>/dev/null; then
+        sys_lang=$(localectl status 2>/dev/null \
+            | awk -F'=' '/System Locale:/{gsub(/.*LANG=/,"",$0); print $1}' \
+            | awk '{print $1}' | tr -d '"' || echo "")
+    fi
+    [[ -z "$sys_lang" ]] && [[ -f /etc/locale.conf ]] && \
         sys_lang=$(grep -E '^LANG=' /etc/locale.conf 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "")
-        if [[ -z "$sys_lang" ]]; then
-            _row "Locale"     "!   /etc/locale.conf exists but LANG not set"
-            _rec "Set LANG in /etc/locale.conf (e.g. LANG=en_US.UTF-8)"
-        else
-            # Check locale is actually generated — only warn if locale -a explicitly
-            # lists NO locales at all (not just this one), to avoid false positives
-            # on systems where locale binary behaves differently
-            local locale_ok=1  # assume OK unless we can definitively confirm it's missing
-            if command -v locale &>/dev/null; then
-                local _locale_list; _locale_list=$(locale -a 2>/dev/null || echo "")
-                if [[ -n "$_locale_list" ]]; then
-                    # locale -a works — check if our locale (or its base, e.g. en_US) appears
-                    echo "$_locale_list" | grep -qi "${sys_lang%%.*}" || locale_ok=0
-                fi
-                # If locale -a returned nothing, we can't determine — keep locale_ok=1
-            fi
-            if (( locale_ok )); then
-                _row "Locale"     "OK  ${sys_lang}"
-            else
-                _row "Locale"     "!   ${sys_lang}  (not generated — run: locale-gen)"
-                _rec "Locale '${sys_lang}' set but not generated — run: locale-gen"
+    if [[ -z "$sys_lang" ]]; then
+        _row "Locale"     "!   LANG not set — locale not configured"
+        _rec "Set LANG in /etc/locale.conf (e.g. LANG=en_US.UTF-8)"
+    else
+        # Check locale is actually generated
+        local locale_ok=1
+        if command -v locale &>/dev/null; then
+            local _locale_list; _locale_list=$(locale -a 2>/dev/null || echo "")
+            if [[ -n "$_locale_list" ]]; then
+                echo "$_locale_list" | grep -qi "${sys_lang%%.*}" || locale_ok=0
             fi
         fi
-    else
-        _row "Locale"     "!   /etc/locale.conf missing — locale may fall back to C"
-        _rec "Create /etc/locale.conf with LANG=en_US.UTF-8 (or your preferred locale)"
+        if (( locale_ok )); then
+            _row "Locale"     "OK  ${sys_lang}"
+        else
+            _row "Locale"     "!   ${sys_lang}  (not generated — run: locale-gen)"
+            _rec "Locale '${sys_lang}' set but not generated — run: locale-gen"
+        fi
     fi
 
     # Live keymap (what localectl reports as currently active, not just the UKI param)
@@ -396,8 +483,14 @@ _section_os_slots() {
     fi
     # Also check vconsole.conf for consistency
     local vconsole_km=""
-    vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
-        | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+    # localectl reads vconsole.conf and gives effective VC keymap
+    if command -v localectl &>/dev/null; then
+        vconsole_km=$(localectl status 2>/dev/null \
+            | awk -F': +' '/VC Keymap:/{print $2}' | tr -d '[:space:]' || echo "")
+    fi
+    [[ -z "$vconsole_km" ]] && \
+        vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+            | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
     if [[ -n "$live_keymap" && -n "$vconsole_km" && "$live_keymap" != "$vconsole_km" ]]; then
         _row "Keymap"      "!   live='${live_keymap}' but vconsole.conf='${vconsole_km}' — run: localectl set-keymap ${vconsole_km}"
         _rec "Live keymap '${live_keymap}' differs from vconsole.conf '${vconsole_km}' — run: localectl set-keymap ${vconsole_km}  [auto]"
@@ -687,8 +780,13 @@ _section_boot_entries() {
         _row "Keymap"     "!   /etc/vconsole.conf missing — UKI will have no keymap"
         _rec "Create /etc/vconsole.conf with KEYMAP= set (e.g. KEYMAP=us) and regenerate UKI"
     else
-        vconsole_keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
-            | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+        if command -v localectl &>/dev/null; then
+            vconsole_keymap=$(localectl status 2>/dev/null \
+                | awk -F': +' '/VC Keymap:/{print $2}' | tr -d '[:space:]' || echo "")
+        fi
+        [[ -z "$vconsole_keymap" ]] && \
+            vconsole_keymap=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+                | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
         if [[ -z "$vconsole_keymap" ]]; then
             _row "Keymap"     "!   KEYMAP not set in /etc/vconsole.conf — UKI will have no keymap"
             _rec "Set KEYMAP= in /etc/vconsole.conf (e.g. KEYMAP=us) and regenerate UKI: gen-efi configure <slot>"
@@ -891,6 +989,19 @@ _section_deployment() {
 _section_update_tools() {
     _head "Update Tools"
 
+    # ── GPG signing key ───────────────────────────────────────────────────────
+    # Key must be imported for image verification.
+    # Ships locally at GPG_SIGNING_KEY_FILE — no network required.
+    if gpg --batch --list-keys "$GPG_SIGNING_KEY" &>/dev/null 2>&1; then
+        _row "GPG key"    "OK  signing key imported"
+    elif [[ -f "$GPG_SIGNING_KEY_FILE" ]]; then
+        _row "GPG key"    "!!  signing key not in keyring — image verification will fail"
+        _rec "GPG signing key not imported — run: gpg --import ${GPG_SIGNING_KEY_FILE}  [auto]"
+    else
+        _row "GPG key"    "!!  signing key not in keyring — image verification will fail"
+        _rec "GPG signing key not imported — run: gpg --keyserver keys.openpgp.org --recv-keys ${GPG_SIGNING_KEY}  [auto]"
+    fi
+
     # ── Shani signing key file ────────────────────────────────────────────────
     # /etc/shani-keys/signing.asc ships with the OS and is the offline source
     # for importing the GPG key used to verify OS image downloads.
@@ -942,19 +1053,6 @@ _section_update_tools() {
                 _rec "Stale shani-update lock — remove: rm ${_lock}"
             fi
         fi
-    fi
-
-    # ── GPG signing key ───────────────────────────────────────────────────────
-    # Key must be imported for image verification.
-    # Ships locally at GPG_SIGNING_KEY_FILE — no network required.
-    if gpg --batch --list-keys "$GPG_SIGNING_KEY" &>/dev/null 2>&1; then
-        _row "GPG key"    "OK  signing key imported"
-    elif [[ -f "$GPG_SIGNING_KEY_FILE" ]]; then
-        _row "GPG key"    "!!  signing key not in keyring — image verification will fail"
-        _rec "GPG signing key not imported — run: gpg --import ${GPG_SIGNING_KEY_FILE}  [auto]"
-    else
-        _row "GPG key"    "!!  signing key not in keyring — image verification will fail"
-        _rec "GPG signing key not imported — run: gpg --keyserver keys.openpgp.org --recv-keys ${GPG_SIGNING_KEY}  [auto]"
     fi
 
     # ── Download tools ────────────────────────────────────────────────────────
@@ -1537,6 +1635,7 @@ _section_tpm2() {
 _section_security_services() {
     _head "Security Services"
 
+    # ── Enforcement: AppArmor + Firewall + fail2ban ───────────────────────────
     if command -v aa-status &>/dev/null; then
         if aa-status --enabled >/dev/null 2>&1; then
             local n; n=$(aa-status 2>/dev/null | awk '/enforce mode/{print $1}' | tr -d '[:space:]' || echo "?")
@@ -1547,40 +1646,6 @@ _section_security_services() {
         fi
     else
         _row "AppArmor"   "--  aa-status not found"
-    fi
-
-    if command -v firewall-cmd &>/dev/null; then
-        if systemctl is-active --quiet firewalld 2>/dev/null; then
-            local zone; zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "unknown")
-            _row "Firewall"   "OK  active (zone: ${zone})"
-        else
-            _row "Firewall"   "!!  firewalld not running"
-            _rec "Firewall not active — run: systemctl enable --now firewalld  [auto]"
-        fi
-    else
-        _row "Firewall"   "!!  not installed — system has no firewall"
-    fi
-
-    if command -v fail2ban-client &>/dev/null; then
-        if systemctl is-active --quiet fail2ban 2>/dev/null; then
-            local jails
-            jails=$(fail2ban-client status 2>/dev/null                 | awk -F'Jail list:' '/Jail list:/{
-                    gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2)
-                    if($2==""){print 0}
-                    else{n=split($2,a,/,[[:space:]]*/); print n}
-                  }' || echo "?")
-            if [[ "$jails" == "0" ]]; then
-                _row "fail2ban"   "!   running but 0 jails configured — no protection active"
-                _rec "fail2ban has no jails — create /etc/fail2ban/jail.local with at least [sshd] enabled"
-            else
-                _row "fail2ban"   "OK  ${jails} jail(s) active"
-            fi
-        else
-            _row "fail2ban"   "!!  not running"
-            _rec "fail2ban not active — run: systemctl enable --now fail2ban  [auto]"
-        fi
-    else
-        _row "fail2ban"   "--  not installed"
     fi
 
     # AppArmor denial count this boot — non-zero means a process is being blocked
@@ -1605,7 +1670,91 @@ _section_security_services() {
         _rec "${aa_denials} AppArmor denial(s) this boot — check: journalctl -k -b 0 | grep 'apparmor.*DENIED'"
     fi
 
-    # ── Polkit ───────────────────────────────────────────────────────────────
+    if command -v firewall-cmd &>/dev/null; then
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+            local zone; zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "unknown")
+            _row "Firewall"   "OK  active (zone: ${zone})"
+        else
+            _row "Firewall"   "!!  firewalld not running"
+            _rec "Firewall not active — run: systemctl enable --now firewalld  [auto]"
+        fi
+    elif systemctl is-active --quiet ufw 2>/dev/null || \
+         { command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; }; then
+        _row "Firewall"   "OK  active (ufw)"
+    elif systemctl is-active --quiet nftables 2>/dev/null; then
+        local _nft_rules=""
+        _nft_rules=$(nft list ruleset 2>/dev/null | grep -c 'chain' || echo "")
+        _row "Firewall"   "OK  active (nftables${_nft_rules:+, ${_nft_rules} chain(s)})"
+    elif command -v ufw &>/dev/null; then
+        _row "Firewall"   "!!  ufw installed but not active"
+        _rec "Firewall not active — run: systemctl enable --now ufw && ufw enable  [auto]"
+    else
+        _row "Firewall"   "!!  not installed — system has no firewall"
+    fi
+
+    if command -v fail2ban-client &>/dev/null; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            local jails
+            jails=$(fail2ban-client status 2>/dev/null                 | awk -F'Jail list:' '/Jail list:/{
+                    gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2)
+                    if($2==""){print 0}
+                    else{n=split($2,a,/,[[:space:]]*/); print n}
+                  }' || echo "?")
+            if [[ "$jails" == "0" ]]; then
+                _row "fail2ban"   "!   running but 0 jails configured — no protection active"
+                # Suggest the most relevant jail based on what's enabled
+                local _f2b_rec="fail2ban has no jails — create /etc/fail2ban/jail.local"
+                if systemctl is-enabled --quiet sshd 2>/dev/null || \
+                   systemctl is-active  --quiet sshd 2>/dev/null; then
+                    _f2b_rec+=" with at least [sshd] enabled"
+                else
+                    _f2b_rec+=" with a jail matching your enabled services"
+                fi
+                _rec "$_f2b_rec"
+            else
+                _row "fail2ban"   "OK  ${jails} jail(s) active"
+            fi
+        else
+            _row "fail2ban"   "!!  not running"
+            _rec "fail2ban not active — run: systemctl enable --now fail2ban  [auto]"
+        fi
+    else
+        _row "fail2ban"   "--  not installed"
+    fi
+
+    # ── sshguard ─────────────────────────────────────────────────────────────
+    if command -v sshguard &>/dev/null || systemctl cat sshguard &>/dev/null 2>&1; then
+        if systemctl is-active --quiet sshguard 2>/dev/null; then
+            _row "sshguard"    "OK  running"
+            if command -v fail2ban-client &>/dev/null && \
+               systemctl is-active --quiet fail2ban 2>/dev/null; then
+                _row2 "!   fail2ban also active — duplicate SSH protection, disable one"
+            fi
+        elif systemctl is-enabled --quiet sshguard 2>/dev/null; then
+            if command -v fail2ban-client &>/dev/null && \
+               systemctl is-active --quiet fail2ban 2>/dev/null; then
+                _row "sshguard"    "!!  enabled but fail2ban already active — duplicate SSH protection; disable one: systemctl disable --now sshguard"
+                _rec "sshguard enabled but fail2ban already active — disable one: systemctl disable --now sshguard"
+            else
+                _row "sshguard"    "!   enabled but not running"
+                _rec "sshguard not running — run: systemctl start sshguard  [auto]"
+            fi
+        else
+            _row "sshguard"    "~~  not enabled — to enable: systemctl enable --now sshguard"
+        fi
+    fi
+
+    # ── firewall front-end conflicts ──────────────────────────────────────────
+    local _fw_active=()
+    systemctl is-active --quiet firewalld 2>/dev/null && _fw_active+=("firewalld")
+    systemctl is-active --quiet nftables  2>/dev/null && _fw_active+=("nftables")
+    { command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; } && _fw_active+=("ufw")
+    if (( ${#_fw_active[@]} > 1 )); then
+        _row "Firewall"    "!!  multiple firewall front-ends active: ${_fw_active[*]} — rule sets may conflict"
+        _rec "Multiple firewall front-ends active (${_fw_active[*]}) — disable all but one"
+    fi
+
+    # ── Privilege / authentication ────────────────────────────────────────────
     # polkitd is required for pkexec-based privilege escalation (used by this
     # script itself) and for GUI admin actions in GNOME/Plasma.
     if systemctl is-active --quiet polkit 2>/dev/null; then
@@ -1614,13 +1763,11 @@ _section_security_services() {
         _row "polkit"     "!!  enabled but not running — pkexec and GUI elevation broken"
         _rec "polkitd not running — run: systemctl start polkit  [auto]"
     else
-        _row "polkit"     "!!  not enabled — pkexec and GUI elevation will fail"
+        _row "polkit"     "!   not enabled — pkexec and GUI elevation will fail"
         _rec "polkit not enabled — run: systemctl enable --now polkit  [auto]"
     fi
 
-    # ── Audit daemon ──────────────────────────────────────────────────────────
     # auditd logs kernel security events (syscall auditing, file access, etc.)
-    # Wiki confirms 'audit' is installed as part of the security stack
     if command -v auditctl &>/dev/null; then
         if systemctl is-active --quiet auditd 2>/dev/null; then
             local audit_rules; audit_rules=$(auditctl -l 2>/dev/null | grep -c '^-' || true)
@@ -1630,13 +1777,106 @@ _section_security_services() {
             local audit_en; audit_en=$(systemctl is-enabled auditd 2>/dev/null || echo "disabled")
             if [[ "$audit_en" == "enabled" ]]; then
                 _row "auditd"    "!   enabled but not running"
-                _rec "auditd enabled but not active — run: systemctl start auditd  [auto]"
+                _rec "auditd not running — run: systemctl start auditd  [auto]"
             else
-                _row "auditd"    "--  installed but not enabled"
+                _row "auditd"    "~~  not enabled"
             fi
         fi
     fi
 
+
+    # ── Legacy cleartext servers ──────────────────────────────────────────────
+    # ── inetutils legacy servers (ftpd / telnetd / rsh / rlogin) ─────────────
+    # These transmit credentials in cleartext and should not be enabled on any
+    # machine reachable from untrusted networks. Report each that is enabled or
+    # active as a security warning; stay silent when all are disabled (normal).
+    if command -v ftpd &>/dev/null || command -v telnetd &>/dev/null || \
+       command -v rshd  &>/dev/null || command -v rlogind &>/dev/null; then
+        local _inet_warn=()
+        # ftpd — runs as a plain service (not socket-activated on Arch)
+        if systemctl is-active --quiet ftpd 2>/dev/null; then
+            _inet_warn+=("ftpd:ACTIVE")
+        elif systemctl is-enabled --quiet ftpd 2>/dev/null; then
+            _inet_warn+=("ftpd:enabled")
+        fi
+        # telnetd — socket-activated via telnet.socket
+        if systemctl is-active --quiet telnet.socket 2>/dev/null || \
+           systemctl is-active --quiet telnetd 2>/dev/null; then
+            _inet_warn+=("telnetd:ACTIVE")
+        elif systemctl is-enabled --quiet telnet.socket 2>/dev/null; then
+            _inet_warn+=("telnetd:enabled")
+        fi
+        # rshd — socket-activated via rsh.socket
+        if systemctl is-active --quiet rsh.socket 2>/dev/null; then
+            _inet_warn+=("rshd:ACTIVE")
+        elif systemctl is-enabled --quiet rsh.socket 2>/dev/null; then
+            _inet_warn+=("rshd:enabled")
+        fi
+        # rlogind — socket-activated via rlogin.socket
+        if systemctl is-active --quiet rlogin.socket 2>/dev/null; then
+            _inet_warn+=("rlogind:ACTIVE")
+        elif systemctl is-enabled --quiet rlogin.socket 2>/dev/null; then
+            _inet_warn+=("rlogind:enabled")
+        fi
+        if [[ ${#_inet_warn[@]} -gt 0 ]]; then
+            local _inet_list; _inet_list=$(IFS=', '; echo "${_inet_warn[*]}")
+            _row "inetutils"   "!!  legacy cleartext server(s) enabled: ${_inet_list}"
+            _rec "Cleartext network servers active — disable unless on a fully trusted isolated network: systemctl disable --now ftpd telnet.socket rsh.socket rlogin.socket"
+        fi
+        # Silent when all disabled — no noise for normal installs
+    fi
+
+    _optional_begin
+    # gpg-agent / dirmngr / keyboxd: socket-activated user services.
+    # Idle between gpg operations is normal — only warn on hard failure state.
+    if command -v gpg &>/dev/null || command -v gpg2 &>/dev/null; then
+        for _gpg_unit in gpg-agent dirmngr keyboxd; do
+            if _sysd_user cat "${_gpg_unit}.service" &>/dev/null 2>&1 || \
+               _sysd_user cat "${_gpg_unit}.socket"  &>/dev/null 2>&1; then
+                if _sysd_user is-failed --quiet "${_gpg_unit}.service" 2>/dev/null; then
+                    _row "gpg/${_gpg_unit}" "!   failed — gpg operations may hang"
+                    _rec "gpg ${_gpg_unit} in failed state — run: systemctl --user reset-failed ${_gpg_unit}  [auto]"
+                fi
+                # Silent when idle or active — socket-activated, idle is normal
+            fi
+        done
+    fi
+
+    # ── Entropy ───────────────────────────────────────────────────────────────
+    # haveged: Redundant on Linux 5.6+ which has getrandom().
+    if command -v haveged &>/dev/null || systemctl cat haveged &>/dev/null 2>&1; then
+        if systemctl is-active --quiet haveged 2>/dev/null; then
+            local _kver_maj; _kver_maj=$(uname -r | cut -d. -f1 || echo "0")
+            local _kver_min; _kver_min=$(uname -r | cut -d. -f2 | cut -d- -f1 || echo "0")
+            if (( _kver_maj > 5 || ( _kver_maj == 5 && _kver_min >= 6 ) )); then
+                _row "haveged"     "!   running but redundant on kernel $(uname -r) — getrandom() handles entropy"
+                _rec "haveged is unnecessary on Linux 5.6+ — disable: systemctl disable --now haveged  [auto]"
+            else
+                _row "haveged"     "OK  running"
+            fi
+        elif systemctl is-enabled --quiet haveged 2>/dev/null; then
+            _row "haveged"     "!   enabled but not running"
+            _rec "haveged not running — run: systemctl start haveged  [auto]"
+        fi
+    fi
+
+    # rngd: feeds hardware RNG output into the kernel entropy pool.
+    if command -v rngd &>/dev/null || systemctl cat rngd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet rngd 2>/dev/null; then
+            _row "rngd"         "OK  running"
+            if systemctl is-active --quiet haveged 2>/dev/null; then
+                _row2 "!   haveged also active — duplicate entropy sources"
+                _rec  "Both rngd and haveged active — disable one"
+            fi
+        elif systemctl is-enabled --quiet rngd 2>/dev/null; then
+            _row "rngd"         "!   enabled but not running"
+            _rec "rngd not running — run: systemctl start rngd  [auto]"
+        fi
+    fi
+
+
+
+    _optional_end
 }
 
 _section_security_audit() {
@@ -1695,7 +1935,7 @@ _section_security_audit() {
             else
                 if (( lynis_age_days > 30 )); then
                     _row "lynis"     "!   last scan ${lynis_age_days}d ago${lynis_score_str} — run: lynis audit system"
-                    _rec "Lynis last ran ${lynis_age_days} days ago — enable timer: systemctl enable --now lynis.timer"
+                    _rec "Lynis last ran ${lynis_age_days} days ago — enable timer: systemctl enable --now lynis.timer  [auto]"
                 else
                     _row "lynis"     "OK  last scan ${lynis_age_days}d ago${lynis_score_str}"
                     _row2 "--  timer not active — run: systemctl enable --now lynis.timer"
@@ -1705,8 +1945,8 @@ _section_security_audit() {
             if (( lynis_timer_active )); then
                 _row "lynis"     "--  timer active, no scan recorded yet${lynis_next_str}"
             else
-                _row "lynis"     "--  installed, no scan recorded — run: lynis audit system"
-                _rec "Enable lynis timer: systemctl enable --now lynis.timer"
+                _row "lynis"     "~~  no scan recorded — run: lynis audit system"
+                _rec "Enable lynis timer: systemctl enable --now lynis.timer  [auto]"
             fi
         fi
     fi
@@ -1734,7 +1974,7 @@ _section_security_audit() {
                 _row "rkhunter"  "OK  last scan ${rkh_age_days}d ago, no warnings"
             fi
         else
-            _row "rkhunter"  "--  installed, no scan recorded — run: rkhunter --check"
+            _row "rkhunter"  "!   no scan recorded — run: rkhunter --check"
         fi
     fi
 
@@ -1793,14 +2033,170 @@ _section_security_audit() {
                 _rec "Enable fprintd for fingerprint login: systemctl enable --now fprintd  [auto]"
             fi
         else
-            if systemctl is-enabled --quiet fprintd 2>/dev/null && \
-               ! systemctl is-active --quiet fprintd 2>/dev/null; then
-                _row "fprintd"  "--  enabled but no fingerprint hardware detected"
+            local _fpr_svc_en=0 _fpr_sock_en=0
+            systemctl is-enabled --quiet fprintd 2>/dev/null        && _fpr_svc_en=1
+            systemctl is-enabled --quiet fprintd.socket 2>/dev/null && _fpr_sock_en=1
+            if (( _fpr_svc_en || _fpr_sock_en )); then
+                _row "fprintd"  ">>  enabled (idle — no fingerprint hardware detected; will activate when connected)"
             else
-                _row "fprintd"  "--  installed, no fingerprint hardware detected (enroll a finger once hardware is connected: fprintd-enroll)"
+                _row "fprintd"  "~~  no fingerprint hardware detected — enroll a finger once hardware is connected: fprintd-enroll"
             fi
         fi
     fi
+}
+
+_section_users() {
+    _head "Users & Access Control"
+
+    # ── Login users ───────────────────────────────────────────────────────────
+    local login_users=()
+    _get_login_users login_users
+    local _login_str; _login_str=$(IFS=' '; echo "${login_users[*]:-none detected}")
+    _row "Login"     "--  ${_login_str}"
+
+    # ── Login user password status ────────────────────────────────────────────
+    local no_pass=()
+    if [[ ${#login_users[@]} -gt 0 ]]; then
+        for u in "${login_users[@]}"; do
+            local pw_st; pw_st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}' || echo "")
+            [[ "$pw_st" == "NP" ]] && no_pass+=("$u")
+        done
+    fi
+    if [[ ${#no_pass[@]} -gt 0 ]]; then
+        _row "Passwords"  "!!  no password set for: $(_join "${no_pass[@]}")"
+        _rec "User(s) $(_join "${no_pass[@]}") have no password — set one: passwd <username>"
+    fi
+
+    # ── Password expiry ───────────────────────────────────────────────────────
+    if command -v chage &>/dev/null; then
+        local _no_expiry=()
+        for _u in "${login_users[@]}"; do
+            local _pw_st; _pw_st=$(passwd -S "$_u" 2>/dev/null | awk '{print $2}' || echo "")
+            [[ "$_pw_st" != "P" ]] && continue
+            local _max_days
+            _max_days=$(chage -l "$_u" 2>/dev/null \
+                | awk -F": " '/Maximum number of days/{print $2}' | tr -d '[:space:]' || echo "")
+            if [[ "$_max_days" == "99999" || "$_max_days" == "-1" ]]; then
+                _no_expiry+=("$_u")
+            fi
+        done
+        if [[ ${#_no_expiry[@]} -gt 0 ]]; then
+            _row "Pw expiry"   "--  no expiry: $(_join "${_no_expiry[@]}") (to set: chage -M 365 <user>)"
+        fi
+    fi
+
+    local wheel_line wheel_members=()
+    wheel_line=$(getent group wheel 2>/dev/null || grep '^wheel:' /etc/group 2>/dev/null || true)
+    local wheel_sudoers
+    wheel_sudoers=$(grep -h '^%wheel' /etc/sudoers.d/wheel 2>/dev/null \
+        | grep -v '^[[:space:]]*#' | head -1 || true)
+    if [[ -z "$wheel_line" ]]; then
+        _row "Wheel"     "!!  group does not exist — sudo access broken"
+        _rec "wheel group missing — create it: groupadd wheel, then add users: usermod -aG wheel <username>"
+    else
+        IFS=',' read -ra wheel_members <<< "${wheel_line##*:}"
+        if [[ -z "$wheel_sudoers" ]]; then
+            _row "Wheel"     "!!  group exists but no sudoers rule found for %wheel"
+            _rec "No sudoers rule for wheel — add: %wheel ALL=(ALL:ALL) ALL to /etc/sudoers.d/wheel"
+        elif [[ ${#wheel_members[@]} -gt 0 && -n "${wheel_members[0]}" ]]; then
+            # Check at least one wheel member is a real login user (uid >= 1000)
+            local wheel_has_login=0
+            for m in "${wheel_members[@]}"; do
+                local m_uid; m_uid=$(id -u "$m" 2>/dev/null || echo "")
+                [[ "$m_uid" =~ ^[0-9]+$ ]] && (( m_uid >= 1000 )) && { wheel_has_login=1; break; }
+            done
+            if (( wheel_has_login )); then
+                local _wheel_str; _wheel_str=$(IFS=' '; echo "${wheel_members[*]}")
+                _row "Wheel"     "OK  ${_wheel_str}"
+            else
+                _row "Wheel"     "!!  no regular user (uid≥1000) in wheel — sudo access effectively broken"
+                _rec "wheel group has no regular login users — add one: usermod -aG wheel <username>"
+            fi
+        else
+            _row "Wheel"     "!!  sudoers rule present but group has no members — no user can sudo"
+            _rec "wheel group is empty — add a user: usermod -aG wheel <username>"
+        fi
+    fi
+
+    # ── Duplicate UID 0 accounts ──────────────────────────────────────────────
+    local uid0_accounts=()
+    while IFS=: read -r name _ uid _; do
+        [[ "$uid" -eq 0 && "$name" != "root" ]] && uid0_accounts+=("$name")
+    done < /etc/passwd 2>/dev/null || true
+    if [[ ${#uid0_accounts[@]} -gt 0 ]]; then
+        local _uid0_str; _uid0_str=$(_join "${uid0_accounts[@]}")
+        _row "UID 0"      "!!  non-root accounts with UID 0: ${_uid0_str}"
+        _rec "Accounts with UID 0 besides root (${_uid0_str}) — remove or reassign UID"
+    fi
+
+    local nopasswd=()
+    while IFS= read -r line; do
+        echo "$line" | grep -qE 'NOPASSWD.*ALL\s*$|NOPASSWD.*ALL\)' && nopasswd+=("$line")
+    done < <(grep -rh NOPASSWD /etc/sudoers /etc/sudoers.d/ 2>/dev/null \
+        | grep -v '^[[:space:]]*#' || true)
+    if [[ ${#nopasswd[@]} -gt 0 ]]; then
+        _row "NOPASSWD"  "!   passwordless sudo entries found:"
+        for e in "${nopasswd[@]}"; do _row2 "$(echo "$e" | xargs)"; done
+        _rec "Passwordless sudo (NOPASSWD ALL) found — review /etc/sudoers.d/"
+    else
+        _row "NOPASSWD"  "OK  no unrestricted passwordless sudo"
+    fi
+
+    # ── Root account ──────────────────────────────────────────────────────────
+    local root_st; root_st=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
+    case "$root_st" in
+        L|LK) _row "Root acct"  "OK  locked" ;;
+        P)    _row "Root acct"  "!   has a password (locked root recommended)"
+              _rec "Root has a password — to lock: passwd -l root  [auto]" ;;
+        *)    _row "Root acct"  "--  status unknown" ;;
+    esac
+
+    # ── Rootless container namespaces (subuid/subgid) ─────────────────────────
+    # /etc/subuid and /etc/subgid must have entries for every login user so
+    # Podman and Distrobox can create rootless containers. This is a per-user
+    # access control setting, not a service config.
+    if command -v podman &>/dev/null || command -v distrobox &>/dev/null; then
+        local sub_missing=()
+        local _sub_login_users=()
+        _get_login_users _sub_login_users
+        for u in "${_sub_login_users[@]}"; do
+            if ! grep -q "^${u}:" /etc/subuid 2>/dev/null || \
+               ! grep -q "^${u}:" /etc/subgid 2>/dev/null; then
+                sub_missing+=("$u")
+            fi
+        done
+        if [[ ${#sub_missing[@]} -gt 0 ]]; then
+            _row "subuid"   "!!  missing for: $(_join "${sub_missing[@]}") — rootless Podman/Distrobox will fail"
+            _rec "subuid/subgid missing for $(_join "${sub_missing[@]}") — run: usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <user>"
+        else
+            _row "subuid"   "OK  configured for all users"
+        fi
+    fi
+    # Pre-check: homed enabled-but-broken must always show
+    if systemctl cat systemd-homed &>/dev/null 2>&1 && \
+       systemctl is-enabled --quiet systemd-homed 2>/dev/null && \
+       ! systemctl is-active --quiet systemd-homed 2>/dev/null; then
+        _row "homed"       "!!  enabled but not running — homed users cannot log in"
+        _rec "systemd-homed not running — run: systemctl start systemd-homed  [auto]"
+    fi
+    _optional_begin
+    # ── systemd-homed (portable encrypted home directories) ──────────────────
+    # Manages LUKS-encrypted, self-contained home directories. Only surface when
+    # active or enabled — most systems don't use homed.
+    if systemctl cat systemd-homed &>/dev/null 2>&1; then
+        if systemctl is-active --quiet systemd-homed 2>/dev/null; then
+            local _homed_users=""
+            _homed_users=$(homectl list 2>/dev/null | grep -c '^' || echo "")
+            _row "homed"       "OK  running${_homed_users:+  (${_homed_users} user(s))}"
+        elif systemctl is-enabled --quiet systemd-homed 2>/dev/null; then
+            _row "homed"       "!!  enabled but not running — homed users cannot log in"
+            _rec "systemd-homed not running — run: systemctl start systemd-homed  [auto]"
+        else
+            _row "homed"       "~~  not enabled — portable encrypted home directories"
+        fi
+    fi
+
+    _optional_end
 }
 
 _section_groups() {
@@ -1972,117 +2368,9 @@ _section_groups() {
             _row "realtime"  "OK  ${rt_display}"
         fi
     fi
-}
 
-_section_users() {
-    _head "Users & Access Control"
 
-    # ── Login users ───────────────────────────────────────────────────────────
-    local login_users=()
-    _get_login_users login_users
-    local _login_str; _login_str=$(IFS=' '; echo "${login_users[*]:-none detected}")
-    _row "Login"     "--  ${_login_str}"
 
-    # ── Login user password status ────────────────────────────────────────────
-    local no_pass=()
-    if [[ ${#login_users[@]} -gt 0 ]]; then
-        for u in "${login_users[@]}"; do
-            local pw_st; pw_st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}' || echo "")
-            [[ "$pw_st" == "NP" ]] && no_pass+=("$u")
-        done
-    fi
-    if [[ ${#no_pass[@]} -gt 0 ]]; then
-        _row "Passwords"  "!!  no password set for: $(_join "${no_pass[@]}")"
-        _rec "User(s) $(_join "${no_pass[@]}") have no password — set one: passwd <username>"
-    fi
-
-    local wheel_line wheel_members=()
-    wheel_line=$(getent group wheel 2>/dev/null || grep '^wheel:' /etc/group 2>/dev/null || true)
-    local wheel_sudoers
-    wheel_sudoers=$(grep -h '^%wheel' /etc/sudoers.d/wheel 2>/dev/null \
-        | grep -v '^[[:space:]]*#' | head -1 || true)
-    if [[ -z "$wheel_line" ]]; then
-        _row "Wheel"     "!!  group does not exist — sudo access broken"
-        _rec "wheel group missing — create it: groupadd wheel, then add users: usermod -aG wheel <username>"
-    else
-        IFS=',' read -ra wheel_members <<< "${wheel_line##*:}"
-        if [[ -z "$wheel_sudoers" ]]; then
-            _row "Wheel"     "!!  group exists but no sudoers rule found for %wheel"
-            _rec "No sudoers rule for wheel — add: %wheel ALL=(ALL:ALL) ALL to /etc/sudoers.d/wheel"
-        elif [[ ${#wheel_members[@]} -gt 0 && -n "${wheel_members[0]}" ]]; then
-            # Check at least one wheel member is a real login user (uid >= 1000)
-            local wheel_has_login=0
-            for m in "${wheel_members[@]}"; do
-                local m_uid; m_uid=$(id -u "$m" 2>/dev/null || echo "")
-                [[ "$m_uid" =~ ^[0-9]+$ ]] && (( m_uid >= 1000 )) && { wheel_has_login=1; break; }
-            done
-            if (( wheel_has_login )); then
-                local _wheel_str; _wheel_str=$(IFS=' '; echo "${wheel_members[*]}")
-                _row "Wheel"     "OK  ${_wheel_str}"
-            else
-                _row "Wheel"     "!!  no regular user (uid≥1000) in wheel — sudo access effectively broken"
-                _rec "wheel group has no regular login users — add one: usermod -aG wheel <username>"
-            fi
-        else
-            _row "Wheel"     "!!  sudoers rule present but group has no members — no user can sudo"
-            _rec "wheel group is empty — add a user: usermod -aG wheel <username>"
-        fi
-    fi
-
-    # ── Duplicate UID 0 accounts ──────────────────────────────────────────────
-    local uid0_accounts=()
-    while IFS=: read -r name _ uid _; do
-        [[ "$uid" -eq 0 && "$name" != "root" ]] && uid0_accounts+=("$name")
-    done < /etc/passwd 2>/dev/null || true
-    if [[ ${#uid0_accounts[@]} -gt 0 ]]; then
-        local _uid0_str; _uid0_str=$(_join "${uid0_accounts[@]}")
-        _row "UID 0"      "!!  non-root accounts with UID 0: ${_uid0_str}"
-        _rec "Accounts with UID 0 besides root (${_uid0_str}) — remove or reassign UID"
-    fi
-
-    local nopasswd=()
-    while IFS= read -r line; do
-        echo "$line" | grep -qE 'NOPASSWD.*ALL\s*$|NOPASSWD.*ALL\)' && nopasswd+=("$line")
-    done < <(grep -rh NOPASSWD /etc/sudoers /etc/sudoers.d/ 2>/dev/null \
-        | grep -v '^[[:space:]]*#' || true)
-    if [[ ${#nopasswd[@]} -gt 0 ]]; then
-        _row "NOPASSWD"  "!   passwordless sudo entries found:"
-        for e in "${nopasswd[@]}"; do _row2 "$(echo "$e" | xargs)"; done
-        _rec "Passwordless sudo (NOPASSWD ALL) found — review /etc/sudoers.d/"
-    else
-        _row "NOPASSWD"  "OK  no unrestricted passwordless sudo"
-    fi
-
-    # ── Root account ──────────────────────────────────────────────────────────
-    local root_st; root_st=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
-    case "$root_st" in
-        L|LK) _row "Root acct"  "OK  locked" ;;
-        P)    _row "Root acct"  "!   has a password (locked root recommended)"
-              _rec "Root has a password — to lock: passwd -l root  [auto]" ;;
-        *)    _row "Root acct"  "--  status unknown" ;;
-    esac
-
-    # ── Rootless container namespaces (subuid/subgid) ─────────────────────────
-    # /etc/subuid and /etc/subgid must have entries for every login user so
-    # Podman and Distrobox can create rootless containers. This is a per-user
-    # access control setting, not a service config.
-    if command -v podman &>/dev/null || command -v distrobox &>/dev/null; then
-        local sub_missing=()
-        local _sub_login_users=()
-        _get_login_users _sub_login_users
-        for u in "${_sub_login_users[@]}"; do
-            if ! grep -q "^${u}:" /etc/subuid 2>/dev/null || \
-               ! grep -q "^${u}:" /etc/subgid 2>/dev/null; then
-                sub_missing+=("$u")
-            fi
-        done
-        if [[ ${#sub_missing[@]} -gt 0 ]]; then
-            _row "subuid"   "!!  missing for: $(_join "${sub_missing[@]}") — rootless Podman/Distrobox will fail"
-            _rec "subuid/subgid missing for $(_join "${sub_missing[@]}") — run: usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <user>"
-        else
-            _row "subuid"   "OK  configured for all users"
-        fi
-    fi
 }
 
 
@@ -2094,6 +2382,7 @@ _section_users() {
 _section_hardware() {
     _head "Hardware"
 
+    # ── CPU & RAM ───────────────────────────────────────────────────────────
     # ── CPU ───────────────────────────────────────────────────────────────────
     local cpu_model cpu_cores cpu_arch cpu_flags
     cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null \
@@ -2127,6 +2416,106 @@ _section_hardware() {
         _row "CPU flags"  "--  ${flags_ok_str}${flags_miss_str}"
     fi
 
+    # ── CPU microcode revision ────────────────────────────────────────────────
+    # Outdated microcode leaves CPU vulnerability mitigations partially ineffective.
+    local _ucode_rev=""
+    _ucode_rev=$(grep -m1 "microcode" /proc/cpuinfo 2>/dev/null \
+        | awk -F": " '{print $2}' | tr -d '[:space:]' || echo "")
+    if [[ -n "$_ucode_rev" ]]; then
+        _row "Microcode"   "--  revision ${_ucode_rev} (verify against vendor errata)"
+    fi
+
+    # ── RAM ───────────────────────────────────────────────────────────────────
+    local mem_total_kb mem_total_gb
+    mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    if [[ "$mem_total_kb" =~ ^[0-9]+$ ]] && (( mem_total_kb > 0 )); then
+        mem_total_gb=$(awk "BEGIN{printf \"%.1f\", $mem_total_kb/1048576}")
+        _row "RAM"       "--  ${mem_total_gb} GB"
+    fi
+
+    # ── GPU ─────────────────────────────────────────────────────────────────
+    # ── GPU ───────────────────────────────────────────────────────────────────
+    if command -v lspci &>/dev/null; then
+        local gpu_lines=()
+        mapfile -t gpu_lines < <(lspci 2>/dev/null \
+            | grep -iE 'VGA compatible|3D controller|Display controller' \
+            | sed 's/^[^ ]* //' \
+            | sed 's/.*: //' \
+            | sed 's/ (rev [0-9a-f]*)//' \
+            | sed 's/Advanced Micro Devices, Inc\. \[AMD\/ATI\] /AMD /' \
+            | sed 's/NVIDIA Corporation /NVIDIA /' \
+            | sed 's/Intel Corporation /Intel /' \
+            | sed 's/  */ /g' || true)
+        if [[ ${#gpu_lines[@]} -gt 0 ]]; then
+            for gpu in "${gpu_lines[@]}"; do
+                # Identify driver via /sys/bus/pci — match on original lspci output
+                local pci_addr; pci_addr=$(lspci 2>/dev/null \
+                    | grep -iE 'VGA compatible|3D controller|Display controller' \
+                    | grep -i "${gpu%%[*}" \
+                    | awk '{print $1}' | head -1 || echo "")
+                local drv=""
+                if [[ -n "$pci_addr" ]]; then
+                    drv=$(readlink "/sys/bus/pci/devices/0000:${pci_addr}/driver" 2>/dev/null \
+                        | xargs basename 2>/dev/null || echo "")
+                fi
+                _row "GPU"      "--  ${gpu}${drv:+ [${drv}]}"
+            done
+        fi
+    fi
+
+    # ── switcheroo-control (hybrid GPU) ───────────────────────────────────────
+    # Only relevant when multiple GPUs are present (discrete + integrated)
+    if command -v switcherooctl &>/dev/null; then
+        local gpu_count; gpu_count=$(switcherooctl list 2>/dev/null | grep -c '^GPU' || echo "0")
+        if [[ "$gpu_count" =~ ^[0-9]+$ ]] && (( gpu_count >= 2 )); then
+            if systemctl is-active --quiet switcheroo-control 2>/dev/null; then
+                _row "GPU switch"  "OK  switcheroo-control active (${gpu_count} GPUs)"
+            else
+                _row "GPU switch"  "!   ${gpu_count} GPUs found but switcheroo-control not running — PRIME offload unavailable"
+                _rec "switcheroo-control not active — run: systemctl enable --now switcheroo-control  [auto]"
+            fi
+        fi
+    fi
+
+    # ── nvidia-persistenced (NVIDIA GPU persistence daemon) ───────────────────
+    # Keeps GPU context loaded between jobs — reduces latency for CUDA/compute.
+    # Only relevant on NVIDIA hardware.
+    if command -v nvidia-persistenced &>/dev/null || \
+       systemctl cat nvidia-persistenced &>/dev/null 2>&1; then
+        local _has_nvidia=0
+        lspci 2>/dev/null | grep -qi 'NVIDIA' && _has_nvidia=1
+        if (( _has_nvidia )); then
+            if systemctl is-active --quiet nvidia-persistenced 2>/dev/null; then
+                _row "nvidia-pd"   "OK  nvidia-persistenced running"
+            elif systemctl is-enabled --quiet nvidia-persistenced 2>/dev/null; then
+                _row "nvidia-pd"   "!   enabled but not running"
+                _rec "nvidia-persistenced not running — run: systemctl start nvidia-persistenced  [auto]"
+            else
+                _row "nvidia-pd"   "~~  not enabled — to enable: systemctl enable --now nvidia-persistenced"
+            fi
+        fi
+        # Silent on non-NVIDIA systems
+    fi
+
+    # ── CPU frequency governor ───────────────────────────────────────────────
+    # Shows the scaling governor when power-profiles-daemon is NOT active.
+    if ! systemctl is-active --quiet power-profiles-daemon 2>/dev/null; then
+        local _gov_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        if [[ -r "$_gov_file" ]]; then
+            local _gov; _gov=$(cat "$_gov_file" 2>/dev/null | tr -d '[:space:]' || echo "")
+            if [[ -n "$_gov" ]]; then
+                case "$_gov" in
+                    performance)  _row "CPU gov" "--  ${_gov} (max speed, high power)" ;;
+                    powersave)    _row "CPU gov" "--  ${_gov} (low power, may throttle)" ;;
+                    schedutil|ondemand|conservative)
+                                  _row "CPU gov" "OK  ${_gov} (dynamic scaling)" ;;
+                    *)            _row "CPU gov" "--  ${_gov}" ;;
+                esac
+            fi
+        fi
+    fi
+
+    # ── Thermals ────────────────────────────────────────────────────────────
     # ── CPU temperature ───────────────────────────────────────────────────────
     local cpu_temp=""
     # Try /sys/class/thermal first (most reliable, no extra tools)
@@ -2183,14 +2572,7 @@ _section_hardware() {
         fi
     fi
 
-    # ── RAM ───────────────────────────────────────────────────────────────────
-    local mem_total_kb mem_total_gb
-    mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
-    if [[ "$mem_total_kb" =~ ^[0-9]+$ ]] && (( mem_total_kb > 0 )); then
-        mem_total_gb=$(awk "BEGIN{printf \"%.1f\", $mem_total_kb/1048576}")
-        _row "RAM"       "--  ${mem_total_gb} GB"
-    fi
-
+    # ── Virtualisation ──────────────────────────────────────────────────────
     # ── Virtualisation ────────────────────────────────────────────────────────
     # Strategy:
     #   vmx/svm in /proc/cpuinfo flags → BIOS has it enabled → check /dev/kvm
@@ -2258,50 +2640,7 @@ _section_hardware() {
                 _row "IOMMU"     "!   enabled in cmdline but no groups visible"
                 _rec "IOMMU enabled in cmdline but not active — check BIOS VT-d/AMD-Vi setting"
             else
-                _row "IOMMU"     "--  not enabled (add intel_iommu=on or amd_iommu=on for PCI passthrough)"
-            fi
-        fi
-    fi
-
-    # ── GPU ───────────────────────────────────────────────────────────────────
-    if command -v lspci &>/dev/null; then
-        local gpu_lines=()
-        mapfile -t gpu_lines < <(lspci 2>/dev/null \
-            | grep -iE 'VGA compatible|3D controller|Display controller' \
-            | sed 's/^[^ ]* //' \
-            | sed 's/.*: //' \
-            | sed 's/ (rev [0-9a-f]*)//' \
-            | sed 's/Advanced Micro Devices, Inc\. \[AMD\/ATI\] /AMD /' \
-            | sed 's/NVIDIA Corporation /NVIDIA /' \
-            | sed 's/Intel Corporation /Intel /' \
-            | sed 's/  */ /g' || true)
-        if [[ ${#gpu_lines[@]} -gt 0 ]]; then
-            for gpu in "${gpu_lines[@]}"; do
-                # Identify driver via /sys/bus/pci — match on original lspci output
-                local pci_addr; pci_addr=$(lspci 2>/dev/null \
-                    | grep -iE 'VGA compatible|3D controller|Display controller' \
-                    | grep -i "${gpu%%[*}" \
-                    | awk '{print $1}' | head -1 || echo "")
-                local drv=""
-                if [[ -n "$pci_addr" ]]; then
-                    drv=$(readlink "/sys/bus/pci/devices/0000:${pci_addr}/driver" 2>/dev/null \
-                        | xargs basename 2>/dev/null || echo "")
-                fi
-                _row "GPU"      "--  ${gpu}${drv:+ [${drv}]}"
-            done
-        fi
-    fi
-
-    # ── switcheroo-control (hybrid GPU) ───────────────────────────────────────
-    # Only relevant when multiple GPUs are present (discrete + integrated)
-    if command -v switcherooctl &>/dev/null; then
-        local gpu_count; gpu_count=$(switcherooctl list 2>/dev/null | grep -c '^GPU' || echo "0")
-        if [[ "$gpu_count" =~ ^[0-9]+$ ]] && (( gpu_count >= 2 )); then
-            if systemctl is-active --quiet switcheroo-control 2>/dev/null; then
-                _row "GPU switch"  "OK  switcheroo-control active (${gpu_count} GPUs)"
-            else
-                _row "GPU switch"  "!   ${gpu_count} GPUs found but switcheroo-control not running — PRIME offload unavailable"
-                _rec "switcheroo-control not active — run: systemctl enable --now switcheroo-control  [auto]"
+                _row "IOMMU"     "~~  not enabled — add intel_iommu=on or amd_iommu=on for PCI passthrough"
             fi
         fi
     fi
@@ -2315,25 +2654,189 @@ _section_hardware() {
             _row "Bluetooth"  "OK  bluetooth.service active"
         elif [[ "$bt_en" == "enabled" ]]; then
             _row "Bluetooth"  "!   enabled but not running (${bt_st})"
-            _rec "bluetooth.service enabled but not active — run: systemctl start bluetooth  [auto]"
+            _rec "bluetooth.service not running — run: systemctl start bluetooth  [auto]"
         elif (( bt_hw )); then
             _row "Bluetooth"  "!   hardware present but bluetooth.service not enabled"
             _rec "Enable bluetooth: systemctl enable --now bluetooth  [auto]"
         else
-            _row "Bluetooth"  "--  installed, not enabled"
+            _row "Bluetooth"  "~~  not enabled — to enable: systemctl enable --now bluetooth"
         fi
     fi
 
+    # geoclue: D-Bus-activated location service. Idle is normal.
+    if systemctl cat geoclue &>/dev/null 2>&1; then
+        if systemctl is-active --quiet geoclue 2>/dev/null; then
+            _row "geoclue"      "OK  running"
+        elif systemctl is-enabled --quiet geoclue 2>/dev/null; then
+            _row "geoclue"      ">>  enabled (idle — starts on demand via D-Bus)"
+        else
+            _row "geoclue"      "~~  not enabled — location services inactive: systemctl enable --now geoclue"
+        fi
+    fi
+
+    # ── usbmuxd (iOS device multiplexer) ─────────────────────────────────────
+    if command -v usbmuxd &>/dev/null || systemctl cat usbmuxd &>/dev/null 2>&1; then
+        local _ios_present=0
+        grep -rql '05ac' /sys/bus/usb/devices/*/idVendor 2>/dev/null && _ios_present=1
+        if systemctl is-active --quiet usbmuxd 2>/dev/null; then
+            _row "usbmuxd"     "OK  running (iOS device access active)"
+        elif (( _ios_present )); then
+            if systemctl is-enabled --quiet usbmuxd 2>/dev/null || \
+               systemctl is-enabled --quiet usbmuxd.socket 2>/dev/null; then
+                _row "usbmuxd"     "!   Apple device detected but usbmuxd not responding — run: systemctl start usbmuxd  [auto]"
+                _rec "usbmuxd not running but Apple device present — run: systemctl start usbmuxd  [auto]"
+            else
+                _row "usbmuxd"     "!   Apple device detected but usbmuxd not enabled — iOS access unavailable"
+                _rec "Enable usbmuxd for iOS device access: systemctl enable --now usbmuxd  [auto]"
+            fi
+        elif systemctl is-enabled --quiet usbmuxd 2>/dev/null || \
+             systemctl is-enabled --quiet usbmuxd.socket 2>/dev/null; then
+            _row "usbmuxd"     ">>  enabled (idle — activates when Apple device is connected)"
+        fi
+        # Silent when not enabled and no iOS device present
+    fi
+
+    # ── ratbagd (gaming mouse / input device daemon) ──────────────────────────
+    if command -v ratbagctl &>/dev/null || systemctl cat ratbagd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet ratbagd 2>/dev/null; then
+            local _rb_devs=""
+            _rb_devs=$(ratbagctl list 2>/dev/null | grep -c '.' || echo "")
+            _row "ratbagd"     "OK  running${_rb_devs:+  (${_rb_devs} supported device(s))}"
+        elif systemctl is-enabled --quiet ratbagd 2>/dev/null; then
+            _row "ratbagd"     ">>  enabled (idle — activates on supported device connect)"
+        else
+            _row "ratbagd"     "~~  not enabled — gaming mouse daemon; activates on supported device"
+        fi
+    fi
+
+    # ── lircd (Linux Infrared Remote Control daemon) ──────────────────────────
+    if command -v lircd &>/dev/null || systemctl cat lircd &>/dev/null 2>&1; then
+        local _lirc_cfg=0
+        _lirc_has_remote() {
+            grep -qlE '^[[:space:]]*begin[[:space:]]+remote' "$1" 2>/dev/null
+        }
+        if [[ -f /etc/lirc/lircd.conf ]] && _lirc_has_remote /etc/lirc/lircd.conf; then
+            _lirc_cfg=1
+        elif ls /etc/lirc/lircd.conf.d/*.conf &>/dev/null 2>&1; then
+            for _lf in /etc/lirc/lircd.conf.d/*.conf; do
+                _lirc_has_remote "$_lf" && { _lirc_cfg=1; break; }
+            done
+        fi
+        if systemctl is-active --quiet lircd 2>/dev/null; then
+            local _lirc_remotes=""
+            _lirc_remotes=$(irsend LIST "" "" 2>/dev/null | grep -c '.' || echo "")
+            _row "lircd"        "OK  running${_lirc_remotes:+  (${_lirc_remotes} remote(s))}"
+        elif systemctl is-enabled --quiet lircd 2>/dev/null; then
+            _row "lircd"        "!   enabled but not running"
+            _rec "lircd not running — run: systemctl start lircd  [auto]"
+        elif (( _lirc_cfg )); then
+            _row "lircd"        "~~  configured, not enabled — to enable: systemctl enable --now lircd"
+        fi
+        # Silent when not configured and not enabled
+    fi
+
+    # ── speech-dispatcher (TTS backend) ───────────────────────────────────────
+    if command -v speech-dispatcher &>/dev/null || \
+       _sysd_user cat speech-dispatcher &>/dev/null 2>&1; then
+        local _orca_active=0
+        pgrep -x orca &>/dev/null && _orca_active=1
+        if _sysd_user is-active --quiet speech-dispatcher 2>/dev/null; then
+            _row "speech-disp"  "OK  speech-dispatcher running"
+        elif _sysd_user is-enabled --quiet speech-dispatcher 2>/dev/null; then
+            _row "speech-disp"  ">>  enabled (idle — starts on demand)"
+        elif (( _orca_active )); then
+            _row "speech-disp"  "!   Orca is running but speech-dispatcher not enabled — TTS may fail"
+            _rec "Enable speech-dispatcher for Orca TTS: systemctl --user enable --now speech-dispatcher  [auto]"
+        fi
+        # Silent when neither enabled nor Orca active
+    fi
+
+    # ── Orca (screen reader) ──────────────────────────────────────────────────
+    if command -v orca &>/dev/null; then
+        if pgrep -x orca &>/dev/null; then
+            _row "Orca"         "OK  running"
+        fi
+        # Silent when not running
+    fi
+
+    # ── gpsd (GPS daemon) ─────────────────────────────────────────────────────
+    if command -v gpsd &>/dev/null || systemctl cat gpsd &>/dev/null 2>&1; then
+        local gpsd_socket_active=0 gpsd_active=0
+        systemctl is-active --quiet gpsd.socket 2>/dev/null && gpsd_socket_active=1
+        systemctl is-active --quiet gpsd        2>/dev/null && gpsd_active=1
+        if (( gpsd_active )) || (( gpsd_socket_active )); then
+            local gpsd_dev=""
+            gpsd_dev=$(grep -oP '(?<=^DEVICES=")[^"]+' /etc/conf.d/gpsd 2>/dev/null \
+                | head -1 || echo "")
+            [[ -z "$gpsd_dev" ]] && \
+                gpsd_dev=$(grep -oP '(?<=^DEVICES=")[^"]+' /etc/default/gpsd 2>/dev/null \
+                | head -1 || echo "")
+            [[ -z "$gpsd_dev" ]] && \
+                gpsd_dev=$(grep -oP '(?<=^DEVICES=)[^ ]+' /etc/gpsd.conf 2>/dev/null \
+                | head -1 || echo "")
+            if (( gpsd_socket_active )); then
+                _row "gpsd"        "OK  socket active${gpsd_dev:+  (${gpsd_dev})}"
+            else
+                _row "gpsd"        "OK  running${gpsd_dev:+  (${gpsd_dev})}"
+            fi
+        elif systemctl is-enabled --quiet gpsd 2>/dev/null || \
+             systemctl is-enabled --quiet gpsd.socket 2>/dev/null; then
+            local _gpsd_dev=""
+            _gpsd_dev=$(grep -oP '(?<=^DEVICES=")[^"]+' /etc/conf.d/gpsd 2>/dev/null | head -1 || \
+                        grep -oP '(?<=^DEVICES=")[^"]+' /etc/default/gpsd 2>/dev/null | head -1 || echo "")
+            if [[ -z "$_gpsd_dev" ]]; then
+                _row "gpsd"            "!   enabled but not configured — set DEVICES= in /etc/conf.d/gpsd"
+                _rec "gpsd enabled but DEVICES not set in /etc/conf.d/gpsd — add your GPS device path"
+            else
+                _row "gpsd"            "!   enabled but not running"
+                _rec "gpsd not running — run: systemctl start gpsd.socket  [auto]"
+            fi
+        else
+            _row "gpsd"            "~~  not enabled — GPS inactive; set DEVICES in /etc/conf.d/gpsd then: systemctl enable --now gpsd.socket"
+        fi
+    fi
+
+    _optional_begin
+    # ── apcupsd (APC UPS monitoring daemon) ──────────────────────────────────
+    if command -v apcupsd &>/dev/null || systemctl cat apcupsd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet apcupsd 2>/dev/null; then
+            local ups_status="" ups_bcharge="" ups_timeleft=""
+            if command -v apcaccess &>/dev/null; then
+                local _apc_out; _apc_out=$(apcaccess status 2>/dev/null || echo "")
+                ups_status=$(awk  -F': +' '/^STATUS/{gsub(/ /,"",$2); print $2}' <<< "$_apc_out" | head -1)
+                ups_bcharge=$(awk -F': +' '/^BCHARGE/{print $2}'              <<< "$_apc_out" | head -1)
+                ups_timeleft=$(awk -F': +' '/^TIMELEFT/{print $2}'            <<< "$_apc_out" | head -1)
+            fi
+            local ups_info=""
+            [[ -n "$ups_status"   ]] && ups_info+="status: ${ups_status}"
+            [[ -n "$ups_bcharge"  ]] && ups_info+="${ups_info:+  }battery: ${ups_bcharge}"
+            [[ -n "$ups_timeleft" ]] && ups_info+="${ups_info:+  }runtime: ${ups_timeleft}"
+            _row "apcupsd"     "OK  running${ups_info:+  (${ups_info})}"
+        elif systemctl is-enabled --quiet apcupsd 2>/dev/null; then
+            local _apc_upstype=""
+            _apc_upstype=$(grep -oP '(?<=^UPSTYPE\s)\S+' /etc/apcupsd/apcupsd.conf 2>/dev/null | head -1 || echo "")
+            local _apc_device=""
+            _apc_device=$(grep -oP '(?<=^DEVICE\s)\S+' /etc/apcupsd/apcupsd.conf 2>/dev/null | head -1 || echo "")
+            if [[ -z "$_apc_upstype" || "$_apc_upstype" == "dumb" ]]; then
+                _row "apcupsd"     "!   enabled but not configured — set UPSTYPE and DEVICE in /etc/apcupsd/apcupsd.conf"
+                _rec "apcupsd enabled but UPSTYPE/DEVICE not configured — edit /etc/apcupsd/apcupsd.conf"
+            else
+                _row "apcupsd"     "!   enabled but not running"
+                _rec "apcupsd not running — run: systemctl start apcupsd  [auto]"
+            fi
+        else
+            _row "apcupsd"     "~~  not configured — edit /etc/apcupsd/apcupsd.conf, set UPSTYPE/DEVICE, then systemctl enable --now apcupsd"
+        fi
+    fi
+
+    # ── Connectivity & peripherals ──────────────────────────────────────────
     # ── Thunderbolt (bolt) ────────────────────────────────────────────────────
-    # bolt manages Thunderbolt 3/4 device authorization and security.
-    # Only check when Thunderbolt hardware is present — detected via sysfs.
     if [[ -d /sys/bus/thunderbolt ]] && \
        [[ $(ls /sys/bus/thunderbolt/devices/ 2>/dev/null | wc -l) -gt 0 ]]; then
         if command -v boltctl &>/dev/null || systemctl cat bolt &>/dev/null 2>&1; then
             local bolt_st; bolt_st=$(systemctl is-active bolt 2>/dev/null || echo "inactive")
             local bolt_en; bolt_en=$(systemctl is-enabled bolt 2>/dev/null || echo "disabled")
             if [[ "$bolt_st" == "active" ]]; then
-                # Show count of enrolled vs connected devices
                 local bolt_enrolled="" bolt_connected=""
                 if command -v boltctl &>/dev/null; then
                     bolt_enrolled=$(timeout 5 boltctl list 2>/dev/null | grep -c 'status:' || echo "")
@@ -2352,6 +2855,112 @@ _section_hardware() {
         fi
     fi
 
+    # ── iio-sensor-proxy (accelerometer / ambient light) ──────────────────────
+    if command -v monitor-sensor &>/dev/null || \
+       systemctl cat iio-sensor-proxy &>/dev/null 2>&1; then
+        local _iio_devs=0
+        [[ -d /sys/bus/iio/devices ]] && \
+            _iio_devs=$(ls /sys/bus/iio/devices/ 2>/dev/null | wc -l || echo 0)
+        if (( _iio_devs > 0 )); then
+            if systemctl is-active --quiet iio-sensor-proxy 2>/dev/null; then
+                _row "IIO sensors"  "OK  iio-sensor-proxy active (${_iio_devs} device(s))"
+            elif systemctl is-enabled --quiet iio-sensor-proxy 2>/dev/null; then
+                _row "IIO sensors"  "!   enabled but not running — auto-rotate/brightness unavailable"
+                _rec "iio-sensor-proxy not running — run: systemctl start iio-sensor-proxy  [auto]"
+            else
+                _row "IIO sensors"  "!   IIO hardware present but iio-sensor-proxy not enabled — auto-rotate/brightness unavailable"
+                _rec "Enable iio-sensor-proxy: systemctl enable --now iio-sensor-proxy  [auto]"
+            fi
+        fi
+        # Silent when no IIO devices present (most desktops)
+    fi
+
+    # ── tablet-mode-switch ────────────────────────────────────────────────────
+    if command -v tablet-mode-switch &>/dev/null || \
+       systemctl cat tablet-mode-switch &>/dev/null 2>&1; then
+        if systemctl is-active --quiet tablet-mode-switch 2>/dev/null; then
+            _row "tablet-mode"  "OK  running"
+        elif systemctl is-enabled --quiet tablet-mode-switch 2>/dev/null; then
+            _row "tablet-mode"  "!   enabled but not running"
+            _rec "tablet-mode-switch not running — run: systemctl start tablet-mode-switch  [auto]"
+        fi
+        # Silent when not enabled
+    fi
+
+    # ── acpid ─────────────────────────────────────────────────────────────────
+    if command -v acpid &>/dev/null || systemctl cat acpid &>/dev/null 2>&1; then
+        if systemctl is-active --quiet acpid 2>/dev/null; then
+            local _acpi_handlers=""
+            _acpi_handlers=$(find /etc/acpi/events/ -type f 2>/dev/null | wc -l || echo "")
+            _row "acpid"        "OK  running${_acpi_handlers:+  (${_acpi_handlers} event handler(s))}"
+        elif systemctl is-enabled --quiet acpid 2>/dev/null; then
+            _row "acpid"        "!   enabled but not running"
+            _rec "acpid not running — run: systemctl start acpid  [auto]"
+        else
+            _row "acpid"        "~~  not enabled — ACPI event scripts beyond logind; to enable: systemctl enable --now acpid"
+        fi
+    fi
+
+    # ── keyd ──────────────────────────────────────────────────────────────────
+    if command -v keyd &>/dev/null || systemctl cat keyd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet keyd 2>/dev/null; then
+            _row "keyd"        "OK  running"
+        elif systemctl is-enabled --quiet keyd 2>/dev/null; then
+            _row "keyd"        "!   enabled but not running — key remapping inactive"
+            _rec "keyd not running — run: systemctl start keyd  [auto]"
+        else
+            _row "keyd"        "~~  not enabled — key remapping inactive; to enable: systemctl enable --now keyd"
+        fi
+    fi
+
+    # ── kanata ────────────────────────────────────────────────────────────────
+    if command -v kanata &>/dev/null || systemctl cat kanata &>/dev/null 2>&1; then
+        if systemctl is-active --quiet kanata 2>/dev/null || \
+           _sysd_user is-active --quiet kanata 2>/dev/null; then
+            _row "kanata"      "OK  running"
+        elif systemctl is-enabled --quiet kanata 2>/dev/null || \
+             _sysd_user is-enabled --quiet kanata 2>/dev/null; then
+            _row "kanata"      "!   enabled but not running"
+            _rec "kanata not running — run: systemctl start kanata  [auto]"
+        else
+            _row "kanata"      "~~  not enabled — key remapping inactive; to enable: systemctl --user enable --now kanata"
+        fi
+    fi
+
+    # ── inputattach ───────────────────────────────────────────────────────────
+    if command -v inputattach &>/dev/null || systemctl cat inputattach &>/dev/null 2>&1; then
+        local _ia_cfg=0
+        [[ -f /etc/conf.d/inputattach ]] && \
+            grep -qE '^[[:space:]]*DEVICE=[^"'"'"'\s][^"'"'"'\s]*|^[[:space:]]*DEVICE=["'"'"'][^"'"'"']+["'"'"']' \
+            /etc/conf.d/inputattach 2>/dev/null \
+            && _ia_cfg=1
+        if systemctl is-active --quiet inputattach 2>/dev/null; then
+            local _ia_dev=""
+            _ia_dev=$(grep -oP '(?<=^DEVICE=)[^ ]+' /etc/conf.d/inputattach 2>/dev/null \
+                | head -1 || echo "")
+            _row "inputattach"  "OK  running${_ia_dev:+  (${_ia_dev})}"
+        elif systemctl is-enabled --quiet inputattach 2>/dev/null; then
+            _row "inputattach"  "!   enabled but not running"
+            _rec "inputattach not running — run: systemctl start inputattach  [auto]"
+        elif (( _ia_cfg )); then
+            _row "inputattach"  "~~  configured, not enabled — to enable: systemctl enable --now inputattach"
+        fi
+        # Silent when not configured and not enabled
+    fi
+
+    # ── brltty (Braille display daemon) ───────────────────────────────────────
+    if command -v brltty &>/dev/null || systemctl cat brltty &>/dev/null 2>&1; then
+        if systemctl is-active --quiet brltty 2>/dev/null; then
+            _row "brltty"       "OK  running"
+        elif systemctl is-enabled --quiet brltty 2>/dev/null; then
+            _row "brltty"       "!   enabled but not running"
+            _rec "brltty not running — run: systemctl start brltty  [auto]"
+        else
+            _row "brltty"       "~~  not enabled — Braille display daemon; to enable: systemctl enable --now brltty"
+        fi
+    fi
+
+    _optional_end
 }
 
 _section_disk() {
@@ -2375,6 +2984,18 @@ _section_disk() {
         disk_type=$(lsblk -dno ROTA  "/dev/${root_disk}" 2>/dev/null || echo "1")
         [[ "$disk_type" == "0" ]] && disk_type="SSD/NVMe" || disk_type="HDD"
         _row "Device"    "--  /dev/${root_disk}  ${disk_model}  (${disk_size}, ${disk_type})"
+        # ── Partition table ───────────────────────────────────────────────────
+        local _pt_type=""
+        _pt_type=$(lsblk -dno PTTYPE "/dev/${root_disk}" 2>/dev/null | tr -d '[:space:]' || echo "")
+        if [[ -n "$_pt_type" ]]; then
+            case "$_pt_type" in
+                gpt)  _row "Part table"  "OK  GPT" ;;
+                dos)  _row "Part table"  "!   MBR/DOS — UEFI systems should use GPT"
+                      _rec "Root disk uses MBR — consider converting to GPT for full UEFI support" ;;
+                *)    _row "Part table"  "--  ${_pt_type}" ;;
+            esac
+        fi
+
 
         if command -v smartctl &>/dev/null; then
             local smart
@@ -2506,6 +3127,165 @@ _section_disk() {
         fi
     fi
 
+    # ── mdadm / mdmonitor (software RAID) ────────────────────────────────────
+    # Only relevant when /proc/mdstat shows active arrays.
+    if [[ -f /proc/mdstat ]] && grep -q '^md[0-9]' /proc/mdstat 2>/dev/null; then
+        local _md_arrays
+        _md_arrays=$(grep -c '^md[0-9]' /proc/mdstat 2>/dev/null || echo "0")
+        if systemctl is-active --quiet mdmonitor 2>/dev/null; then
+            _row "mdmonitor"   "OK  running  (${_md_arrays} array(s))"
+        elif systemctl is-enabled --quiet mdmonitor 2>/dev/null; then
+            _row "mdmonitor"   "!   enabled but not running — RAID events will not be reported"
+            _rec "mdmonitor not running — run: systemctl start mdmonitor  [auto]"
+        else
+            _row "mdmonitor"   "!   ${_md_arrays} RAID array(s) present but mdmonitor not enabled — failures will go unreported"
+            _rec "Enable RAID monitoring: systemctl enable --now mdmonitor  [auto]"
+        fi
+    fi
+
+    # ── lvm2-monitor / dmeventd (LVM event daemon) ───────────────────────────
+    # Monitors thin pools, mirrors and snapshots — alerts before they fill up.
+    # Only relevant when LVM volume groups exist.
+    if command -v vgs &>/dev/null; then
+        local _vg_count
+        _vg_count=$(vgs --noheadings 2>/dev/null | wc -l || echo "0")
+        if (( _vg_count > 0 )); then
+            if systemctl is-active --quiet lvm2-monitor 2>/dev/null || \
+               systemctl is-active --quiet dmeventd    2>/dev/null; then
+                _row "lvm2-monitor" "OK  running  (${_vg_count} VG(s))"
+            elif systemctl is-enabled --quiet lvm2-monitor 2>/dev/null || \
+                 systemctl is-enabled --quiet dmeventd    2>/dev/null; then
+                _row "lvm2-monitor" "!   enabled but not running — thin pool/mirror events missed"
+                _rec "lvm2-monitor not running — run: systemctl start lvm2-monitor  [auto]"
+            else
+                _row "lvm2-monitor" "!   LVM VGs present but lvm2-monitor not enabled — thin pool overflows will go undetected"
+                _rec "Enable LVM monitoring: systemctl enable --now lvm2-monitor  [auto]"
+            fi
+
+            # ── lvm2-lvmpolld (pvmove / lvconvert progress polling) ───────────
+            # Socket-activated; only meaningful when VGs exist.
+            # Idle (not running) between operations is normal — warn only if failed.
+            if systemctl cat lvm2-lvmpolld.socket &>/dev/null 2>&1; then
+                if systemctl is-failed --quiet lvm2-lvmpolld.service 2>/dev/null; then
+                    _row "lvmpolld"    "!   lvm2-lvmpolld.service failed — pvmove/lvconvert may stall"
+                    _rec "lvm2-lvmpolld failed — run: systemctl reset-failed lvm2-lvmpolld  [auto]"
+                elif ! systemctl is-enabled --quiet lvm2-lvmpolld.socket 2>/dev/null && \
+                     ! systemctl is-active  --quiet lvm2-lvmpolld.socket 2>/dev/null; then
+                    _row "lvmpolld"    "--  lvm2-lvmpolld.socket not enabled — pvmove/lvconvert polling unavailable"
+                    _rec "Enable LVM polling daemon: systemctl enable lvm2-lvmpolld.socket  [auto]"
+                fi
+                # Silent when socket enabled/active and service idle — that is normal
+            fi
+        fi
+    fi
+
+    # ── e2scrub_all (ext4-on-LVM filesystem integrity timer) ─────────────────
+    # e2scrub_all.timer runs a read-only fsck on ext4 filesystems hosted on LVM
+    # logical volumes (snapshots safely; does not unmount). Only relevant when
+    # LVM VGs and ext4 volumes coexist — silent otherwise.
+    if systemctl cat e2scrub_all.timer &>/dev/null 2>&1; then
+        local _has_ext4_lvm=0
+        # Check for ext4 mounts that sit on an LVM device (dm- prefix)
+        while IFS= read -r _src _tgt _fstype _rest; do
+            if [[ "$_fstype" == "ext4" ]] && \
+               [[ "$_src" == /dev/mapper/* || "$_src" == /dev/dm-* ]]; then
+                _has_ext4_lvm=1; break
+            fi
+        done < <(findmnt --list -n -o SOURCE,TARGET,FSTYPE 2>/dev/null || true)
+        if (( _has_ext4_lvm )); then
+            if systemctl is-active --quiet e2scrub_all.timer 2>/dev/null; then
+                _row "e2scrub"     "OK  timer active (ext4-on-LVM integrity checks scheduled)"
+            elif systemctl is-enabled --quiet e2scrub_all.timer 2>/dev/null; then
+                _row "e2scrub"     "!   timer enabled but not active"
+                _rec "e2scrub_all.timer not active — run: systemctl start e2scrub_all.timer  [auto]"
+            else
+                _row "e2scrub"     "!   ext4-on-LVM volumes present but e2scrub_all.timer not enabled"
+                _rec "Enable ext4 integrity checks: systemctl enable --now e2scrub_all.timer  [auto]"
+            fi
+        fi
+        # Silent when no ext4-on-LVM volumes detected
+    fi
+
+    _optional_begin
+    # ── smartd (continuous SMART monitoring daemon) ───────────────────────────
+    # Distinct from the one-shot smartctl check above — smartd runs permanently,
+    # polls all drives on a schedule, and can email on failures.
+    # Only surface when at least one disk is present.
+    if command -v smartd &>/dev/null || systemctl cat smartd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet smartd 2>/dev/null; then
+            local _smartd_devs=""
+            _smartd_devs=$(smartctl --scan 2>/dev/null | wc -l || echo "")
+            _row "smartd"      "OK  running${_smartd_devs:+  (${_smartd_devs} device(s) monitored)}"
+        elif systemctl is-enabled --quiet smartd 2>/dev/null; then
+            _row "smartd"      "!   enabled but not running — disk failure alerts inactive"
+            _rec "smartd not running — run: systemctl start smartd  [auto]"
+        else
+            _row "smartd"      "~~  not enabled — continuous disk monitoring inactive: systemctl enable --now smartd"
+        fi
+    fi
+
+    # ── ndctl-monitor (NVDIMM / persistent memory health monitoring) ──────────
+    # Monitors NVDIMM health events (media errors, unsafe shutdowns) via kernel
+    # notifications. Only relevant when NVDIMM namespaces are present.
+    if command -v ndctl &>/dev/null || systemctl cat ndctl-monitor &>/dev/null 2>&1; then
+        local _ndctl_ns=""
+        _ndctl_ns=$(ndctl list -N 2>/dev/null | grep -c '"dev"' || echo "0")
+        if [[ "$_ndctl_ns" =~ ^[0-9]+$ ]] && (( _ndctl_ns > 0 )); then
+            if systemctl is-active --quiet ndctl-monitor 2>/dev/null; then
+                _row "ndctl-mon"   "OK  running  (${_ndctl_ns} namespace(s))"
+            elif systemctl is-enabled --quiet ndctl-monitor 2>/dev/null; then
+                _row "ndctl-mon"   "!   enabled but not running — NVDIMM health events not monitored"
+                _rec "ndctl-monitor not running — run: systemctl start ndctl-monitor  [auto]"
+            else
+                _row "ndctl-mon"   "!   NVDIMM namespaces present but ndctl-monitor not enabled"
+                _rec "Enable NVDIMM monitoring: systemctl enable --now ndctl-monitor  [auto]"
+            fi
+        fi
+        # Silent when no NVDIMM namespaces detected
+    fi
+
+    # ── cxl-monitor (CXL memory device health monitoring) ────────────────────
+    # Monitors CXL (Compute Express Link) memory device events. Only relevant
+    # when CXL devices are present.
+    if command -v cxl &>/dev/null || systemctl cat cxl-monitor &>/dev/null 2>&1; then
+        local _cxl_devs=""
+        _cxl_devs=$(cxl list -M 2>/dev/null | grep -c '"memdev"' || echo "0")
+        if [[ "$_cxl_devs" =~ ^[0-9]+$ ]] && (( _cxl_devs > 0 )); then
+            if systemctl is-active --quiet cxl-monitor 2>/dev/null; then
+                _row "cxl-monitor"  "OK  running  (${_cxl_devs} CXL device(s))"
+            elif systemctl is-enabled --quiet cxl-monitor 2>/dev/null; then
+                _row "cxl-monitor"  "!   enabled but not running — CXL health events not monitored"
+                _rec "cxl-monitor not running — run: systemctl start cxl-monitor  [auto]"
+            else
+                _row "cxl-monitor"  "!   CXL device(s) present but cxl-monitor not enabled"
+                _rec "Enable CXL monitoring: systemctl enable --now cxl-monitor  [auto]"
+            fi
+        fi
+        # Silent when no CXL devices detected
+    fi
+
+    # ── quota_nld (disk quota netlink daemon) ─────────────────────────────────
+    # Sends quota warning messages to users via netlink. Only relevant when
+    # disk quotas are enabled in /etc/fstab (usrquota/grpquota/prjquota).
+    if command -v quota_nld &>/dev/null || systemctl cat quota_nld &>/dev/null 2>&1; then
+        local _quota_enabled=0
+        grep -qE '\busrquota\b|\bgrpquota\b|\bprjquota\b' /etc/fstab 2>/dev/null \
+            && _quota_enabled=1
+        if (( _quota_enabled )); then
+            if systemctl is-active --quiet quota_nld 2>/dev/null; then
+                _row "quota_nld"   "OK  running"
+            elif systemctl is-enabled --quiet quota_nld 2>/dev/null; then
+                _row "quota_nld"   "!   enabled but not running"
+                _rec "quota_nld not running — run: systemctl start quota_nld  [auto]"
+            else
+                _row "quota_nld"   "!   quotas in fstab but quota_nld not enabled — quota warnings won't be delivered"
+                _rec "Enable quota daemon: systemctl enable --now quota_nld  [auto]"
+            fi
+        fi
+        # Silent when no quotas configured
+    fi
+
+    _optional_end
 }
 
 ###############################################################################
@@ -2579,7 +3359,7 @@ _stor_check_bees() {
             bees_last=$(journalctl -u "$bees_unit" -n 1 --no-pager -q \
                 --output=short-iso 2>/dev/null | awk '{print $1}' | head -1 || echo "")
         _row "bees"  "!   beesd@${bees_short} enabled but not running${bees_last:+  (last run: ${bees_last})}"
-        _rec "bees enabled but not running — run: systemctl start ${bees_unit}  [auto]"
+        _rec "bees not running — run: systemctl start ${bees_unit}  [auto]"
     else
         _row "bees"  "!   beesd@${bees_short} configured but not enabled"
         _rec "bees not running — run: systemctl enable --now ${bees_unit}  [auto]"
@@ -2688,8 +3468,58 @@ _section_storage() {
         _rec "Btrfs timers inactive (${t_bad_str}) — run: systemctl enable --now ${units% }  [auto]"
     fi
 
+    # ── Btrfs balance ────────────────────────────────────────────────────────
+    local _bal_last=""
+    _bal_last=$(systemctl show btrfs-balance.timer \
+        --property=LastTriggerUSecRealtime --value 2>/dev/null \
+        | grep -v "^0$\|^$" | head -1 || echo "")
+    if [[ -n "$_bal_last" && "$_bal_last" =~ ^[0-9]+$ ]]; then
+        _bal_last=$(date -d "@$(( _bal_last / 1000000 ))" '+%Y-%m-%d' 2>/dev/null || echo "")
+    fi
+    if [[ -n "$_bal_last" ]]; then
+        _row "Balance"     "--  last run: ${_bal_last}"
+    else
+        _row "Balance"     "--  no balance recorded (run: btrfs balance start -dusage=5 / )"
+    fi
+
+    # ── fstrim (periodic SSD TRIM) ────────────────────────────────────────────
+    # fstrim.timer runs fstrim.service weekly on all mounted filesystems that
+    # support TRIM. Shipped by util-linux as a static unit (enabled via
+    # timers.target.wants/ symlink — systemctl is-enabled returns "static").
+    # Check is-active only; if missing entirely, TRIM won't run periodically.
+    if systemctl cat fstrim.timer &>/dev/null 2>&1; then
+        if systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+            local _ft_next=""
+            _ft_next=$(systemctl show fstrim.timer --property=NextElapseUSecRealtime \
+                --value 2>/dev/null || echo "")
+            [[ -z "$_ft_next" || "$_ft_next" == "0" ]] && \
+                _ft_next=$(systemctl show fstrim.timer --property=NextElapseUSecMonotonic \
+                    --value 2>/dev/null || echo "")
+            local _ft_fmt=""
+            [[ "$_ft_next" =~ ^[0-9]+$ ]] && (( _ft_next > 0 )) && \
+                _ft_fmt=$(date -d "@$(( _ft_next / 1000000 ))" '+%Y-%m-%d' 2>/dev/null || echo "")
+            _row "fstrim"      "OK  timer active${_ft_fmt:+  (next: ${_ft_fmt})}"
+        else
+            local _ft_en
+            _ft_en=$(systemctl is-enabled fstrim.timer 2>/dev/null || echo "disabled")
+            if [[ "$_ft_en" == "enabled" ]]; then
+                _row "fstrim"  "!   timer enabled but not active"
+                _rec "fstrim.timer not active — run: systemctl start fstrim.timer  [auto]"
+            else
+                # Check if btrfs-trim.timer covers this (Btrfs-specific TRIM, different from fstrim.timer)
+                local _btrfs_trim_active=0
+                systemctl is-active --quiet btrfs-trim.timer 2>/dev/null && _btrfs_trim_active=1
+                if (( _btrfs_trim_active )); then
+                    _row "fstrim"  "--  fstrim.timer inactive (btrfs-trim.timer active — Btrfs TRIM covered)"
+                else
+                    _row "fstrim"  "!   fstrim.timer not active — SSD TRIM not running periodically"
+                    _rec "Enable periodic TRIM: systemctl start fstrim.timer  [auto]"
+                fi
+            fi
+        fi
+    fi
+
     # ── Btrfs subvolume size breakdown ────────────────────────────────────────
-    # Enumerate mounted Btrfs subvolumes by matching findmnt subvol options
     # against btrfs subvolume list. This reliably catches /data, /nix, /home, etc.
     local _svol_sizes=()
     while IFS=$'\t' read -r mp opts; do
@@ -2717,6 +3547,26 @@ _section_storage() {
             _row "compsize"  "--  not installed"
         fi
     fi
+    # ── Storage device management ────────────────────────────────────────────
+    # ── Desktop & accessibility services ────────────────────────────────────
+    # ── udisks2 (storage device management daemon) ────────────────────────────
+    # D-Bus-activated — provides automount, format, and SMART info to desktop
+    # file managers and KDE/GNOME settings. Starts on demand; idle is normal.
+    if command -v udisksctl &>/dev/null || systemctl cat udisks2 &>/dev/null 2>&1; then
+        if systemctl is-active --quiet udisks2 2>/dev/null; then
+            _row "udisks2"     "OK  running"
+        elif systemctl is-enabled --quiet udisks2 2>/dev/null; then
+            _row "udisks2"     ">>  enabled (idle — starts on demand via D-Bus)"
+        else
+            _row "udisks2"     "!   not enabled — removable storage and automount will not work"
+            _rec "Enable udisks2: systemctl enable udisks2  [auto]"
+        fi
+    fi
+
+
+
+    _optional_begin
+    _optional_end
 }
 
 _section_battery() {
@@ -2826,7 +3676,7 @@ _section_printing() {
             _row "CUPS"      "!   enabled but cups.socket is ${cups_st}"
             _rec "CUPS enabled but socket not active — run: systemctl enable --now cups.socket  [auto]"
         else
-            _row "CUPS"      "--  not enabled (to enable printing: systemctl enable --now cups.socket)"
+            _row "CUPS"      "~~  not enabled — printing inactive; to enable: systemctl enable --now cups.socket"
         fi
     fi
 
@@ -2838,7 +3688,7 @@ _section_printing() {
             _row "cups-browsed" "!   enabled but not running"
             _rec "cups-browsed not running — run: systemctl start cups-browsed  [auto]"
         else
-            _row "cups-browsed" "--  not enabled (to enable network printer discovery: systemctl enable --now cups-browsed)"
+            _row "cups-browsed" "~~  not enabled — network printer discovery inactive; to enable: systemctl enable --now cups-browsed"
         fi
     fi
 
@@ -2862,7 +3712,7 @@ _section_printing() {
                 _rec "ipp-usb not running — run: systemctl start ipp-usb  [auto]"
             fi
         else
-            _row "ipp-usb"    "--  not enabled (driverless USB printing/scanning unavailable)"
+            _row "ipp-usb"    "~~  not enabled — driverless USB printing/scanning inactive; to enable: systemctl enable --now ipp-usb"
             _rec "Enable ipp-usb for driverless USB printers/scanners: systemctl enable --now ipp-usb  [auto]"
         fi
     fi
@@ -2876,167 +3726,53 @@ _section_printing() {
             _row "SANE"       "OK  saned.socket enabled"
         else
             _row "SANE"       "--  saned.socket not enabled (network scanning unavailable; local USB scanning still works)"
-            _rec "Enable saned.socket for network scanning access: systemctl enable saned.socket"
+            _rec "Enable saned.socket for network scanning access: systemctl enable saned.socket  [auto]"
         fi
     fi
 
 }
 
-_section_system_services() {
+
+
+_section_servers() {
+    # Only show if at least one server package is present
+    local _any=0
+    for _bin in smbd rpcbind exportfs gssproxy nbd-server \
+                sshd rsync named unbound stubby kresd rec_control dnsmasq \
+                snmpd vnstat \
+                caddy nginx httpd php-fpm haproxy squid stunnel cockpit \
+                mysqld mariadbd postgres redis-server memcached slapd \
+                postfix dovecot minidlnad jellyfin rygel \
+                transmission-daemon aria2c syncthing; do
+        command -v "$_bin" &>/dev/null && { _any=1; break; }
+    done
+    _srv_opt_begin
+    if (( ! _any )); then
+        for _unit in smb nfs-server rpcbind gssproxy nbd-server \
+                     sshd rsyncd named unbound stubby knot-resolver pdns-recursor dnsmasq \
+                     snmpd vnstatd \
+                     caddy nginx httpd php-fpm haproxy squid stunnel cockpit \
+                     mariadb postgresql redis memcached slapd \
+                     postfix dovecot minidlna jellyfin rygel \
+                     transmission aria2 syncthing; do
+            systemctl cat "$_unit" &>/dev/null 2>&1 && { _any=1; break; }
+        done
+    fi
+    _srv_opt_end
+    (( _any )) || return 0
+
     _head "Servers"
 
-    # ── Samba (Windows file sharing) ─────────────────────────────────────────
-    # "configured" means smb.conf exists and has at least one share section.
-    # /data/varlib/samba is created unconditionally at install time so it cannot
-    # be used as a signal that Samba has been configured by the user.
-    if command -v smbd &>/dev/null || systemctl cat smb &>/dev/null 2>&1; then
-        if [[ -f /etc/samba/smb.conf ]] && grep -q '^\[' /etc/samba/smb.conf 2>/dev/null; then
-            local smbd_st; smbd_st=$(systemctl is-active smb 2>/dev/null || \
-                                      systemctl is-active smbd 2>/dev/null || echo "inactive")
-            if [[ "$smbd_st" == "active" ]]; then
-                _row "Samba"      "OK  smbd running"
-            elif systemctl is-enabled --quiet smb 2>/dev/null || \
-                 systemctl is-enabled --quiet smbd 2>/dev/null; then
-                _row "Samba"      "!   enabled but not running"
-                _rec "smbd not running — run: systemctl start smb  [auto]"
-            else
-                _row "Samba"      "--  configured but not enabled (to enable: systemctl enable --now smb)"
-            fi
-        else
-            _row "Samba"          "--  installed, not configured or enabled (create shares in /etc/samba/smb.conf, then systemctl enable --now smb)"
-        fi
-    fi
-
-    # ── NFS (network file sharing) ────────────────────────────────────────────
-    if command -v exportfs &>/dev/null || systemctl cat nfs-server &>/dev/null 2>&1; then
-        if [[ -f /etc/exports ]] && grep -qv '^[[:space:]]*#' /etc/exports 2>/dev/null; then
-            if systemctl is-active --quiet nfs-server 2>/dev/null; then
-                local export_count
-                export_count=$(grep -cv '^[[:space:]]*#\|^[[:space:]]*$' /etc/exports 2>/dev/null || echo "?")
-                _row "NFS"        "OK  nfs-server running  (${export_count} export(s))"
-            elif systemctl is-enabled --quiet nfs-server 2>/dev/null; then
-                _row "NFS"        "!   enabled but not running"
-                _rec "nfs-server not running — run: systemctl start nfs-server  [auto]"
-            else
-                _row "NFS"        "--  /etc/exports has entries but nfs-server not enabled"
-                _rec "NFS exports defined but service not enabled — run: systemctl enable --now nfs-server  [auto]"
-            fi
-        else
-            _row "NFS"            "--  installed, not configured or enabled (add exports to /etc/exports, then systemctl enable --now nfs-server)"
-        fi
-    fi
-
-    # ── Caddy web server ──────────────────────────────────────────────────────
-    if command -v caddy &>/dev/null || systemctl cat caddy.service &>/dev/null 2>&1; then
-        if systemctl is-active --quiet caddy 2>/dev/null; then
-            local caddy_ver caddy_cfg_ok=0
-            caddy_ver=$(caddy version 2>/dev/null | awk '{print $1}' | head -1 || echo "")
-            [[ -f /etc/caddy/Caddyfile ]] && caddy_cfg_ok=1
-            if (( caddy_cfg_ok )); then
-                _row "Caddy"     "OK  running${caddy_ver:+  (${caddy_ver})}"
-            else
-                _row "Caddy"     "OK  running${caddy_ver:+  (${caddy_ver})} — no Caddyfile found"
-                _row2 "--  create /etc/caddy/Caddyfile to configure sites"
-            fi
-        elif systemctl is-enabled --quiet caddy 2>/dev/null; then
-            _row "Caddy"     "!   enabled but not running"
-            _rec "Caddy not running — run: systemctl start caddy  [auto]"
-        else
-            _row "Caddy"     "--  installed, not configured or enabled (to serve sites: create /etc/caddy/Caddyfile, then systemctl enable --now caddy)"
-        fi
-    fi
-
-    # ── Tailscale connectivity ────────────────────────────────────────────────
-    if command -v tailscale &>/dev/null || systemctl cat tailscaled &>/dev/null 2>&1; then
-        if systemctl is-active --quiet tailscaled 2>/dev/null; then
-            local ts_out; ts_out=$(timeout 5 tailscale status 2>/dev/null || echo "")
-            local ts_ip;  ts_ip=$(timeout 5 tailscale ip -4 2>/dev/null || echo "")
-            if echo "$ts_out" | grep -qiE 'logged out|not logged in|stopped'; then
-                _row "Tailscale"  "!   daemon running but not authenticated — run: tailscale up"
-            elif [[ -n "$ts_ip" ]]; then
-                _row "Tailscale"  "OK  connected  (${ts_ip})"
-            else
-                _row "Tailscale"  "--  daemon active (status unclear)"
-            fi
-        elif systemctl is-enabled --quiet tailscaled 2>/dev/null; then
-            _row "Tailscale"  "!   enabled but not running"
-            _rec "tailscaled not running — run: systemctl start tailscaled  [auto]"
-        else
-            _row "Tailscale"  "--  installed, not enabled (to join a tailnet: systemctl enable --now tailscaled && tailscale up)"
-        fi
-    fi
-
-    # ── cloudflared (Cloudflare Zero Trust tunnels) ───────────────────────────
-    if command -v cloudflared &>/dev/null || systemctl cat cloudflared &>/dev/null 2>&1; then
-        if systemctl is-active --quiet cloudflared 2>/dev/null; then
-            local cf_tunnel=""
-            cf_tunnel=$(cloudflared tunnel list 2>/dev/null \
-                | awk 'NR==2{print $2}' || echo "")
-            if [[ -n "$cf_tunnel" ]]; then
-                _row "cloudflared" "OK  running, tunnel: ${cf_tunnel}"
-            else
-                _row "cloudflared" "OK  running (no tunnel configured)"
-            fi
-        elif systemctl is-enabled --quiet cloudflared 2>/dev/null; then
-            _row "cloudflared" "!   enabled but not running"
-            _rec "cloudflared not running — run: systemctl start cloudflared  [auto]"
-        else
-            _row "cloudflared" "--  installed, not enabled (to create a tunnel: cloudflared tunnel create <name>)"
-        fi
-    fi
-
-    # ── nginx web server ──────────────────────────────────────────────────────
-    if command -v nginx &>/dev/null || systemctl cat nginx &>/dev/null 2>&1; then
-        if systemctl is-active --quiet nginx 2>/dev/null; then
-            local nginx_ver=""
-            nginx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
-            _row "nginx"      "OK  running${nginx_ver:+  (${nginx_ver})}"
-        elif systemctl is-enabled --quiet nginx 2>/dev/null; then
-            _row "nginx"      "!   enabled but not running"
-            _rec "nginx not running — run: systemctl start nginx  [auto]"
-        else
-            _row "nginx"      "--  installed, not enabled (to serve sites: systemctl enable --now nginx)"
-        fi
-    fi
-
-    # ── Syncthing (file sync) ─────────────────────────────────────────────────
-    if command -v syncthing &>/dev/null || systemctl cat syncthing &>/dev/null 2>&1; then
-        # Syncthing runs as a user service — check for any active user instance
-        local st_active=0
-        if systemctl is-active --quiet syncthing 2>/dev/null ||            systemctl --global is-enabled --quiet syncthing 2>/dev/null; then
-            st_active=1
-        fi
-        if (( st_active )); then
-            _row "Syncthing"  "OK  running"
-        elif systemctl is-enabled --quiet syncthing 2>/dev/null; then
-            _row "Syncthing"  "!   enabled but not running"
-            _rec "syncthing not running — run: systemctl start syncthing  [auto]"
-        else
-            _row "Syncthing"  "--  installed, not enabled (to sync files: systemctl --user enable --now syncthing)"
-        fi
-    fi
-
-    # ── Cockpit (web-based system management) ────────────────────────────────
-    if command -v cockpit-bridge &>/dev/null || systemctl cat cockpit.socket &>/dev/null 2>&1; then
-        if systemctl is-active --quiet cockpit.socket 2>/dev/null; then
-            local cockpit_port=""
-            cockpit_port=$(ss -tlnp 2>/dev/null | awk '/cockpit/{match($4,/:([0-9]+)$/,a); if(a[1]) print a[1]}' | head -1 || echo "9090")
-            _row "Cockpit"    "OK  socket active  (https://localhost:${cockpit_port:-9090})"
-        elif systemctl is-enabled --quiet cockpit.socket 2>/dev/null; then
-            _row "Cockpit"    "!   enabled but not running"
-            _rec "cockpit.socket enabled but not active — run: systemctl start cockpit.socket  [auto]"
-        else
-            _row "Cockpit"    "--  installed, not enabled (to enable: systemctl enable --now cockpit.socket)"
-        fi
-    fi
-
+    # ── Remote access ──────────────────────────────────────────────────────
     # ── OpenSSH ───────────────────────────────────────────────────────────────
     if [[ -f /etc/ssh/sshd_config ]] || [[ -d /etc/ssh/sshd_config.d ]] || \
        command -v sshd &>/dev/null; then
 
-        local sshd_enabled=0 sshd_active=0
-        systemctl is-enabled --quiet sshd 2>/dev/null && sshd_enabled=1
-        systemctl is-active  --quiet sshd 2>/dev/null && sshd_active=1
+        local sshd_enabled=0 sshd_active=0 sshd_socket=0
+        systemctl is-enabled --quiet sshd        2>/dev/null && sshd_enabled=1
+        systemctl is-enabled --quiet sshd.socket 2>/dev/null && sshd_enabled=1
+        systemctl is-active  --quiet sshd        2>/dev/null && sshd_active=1
+        systemctl is-active  --quiet sshd.socket 2>/dev/null && sshd_socket=1
 
         # ── Service state ────────────────────────────────────────────────────
         if (( sshd_active )); then
@@ -3046,16 +3782,20 @@ _section_system_services() {
                 | head -1 || echo "22")
             ssh_ver=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | head -1 || echo "")
             _row "sshd"      "OK  running${ssh_ver:+  (${ssh_ver})}${ssh_port:+  port ${ssh_port}}"
+        elif (( sshd_socket )); then
+            _row "sshd"      ">>  enabled (idle — socket-activated)"
         elif (( sshd_enabled )); then
             if systemctl is-failed --quiet sshd 2>/dev/null; then
                 _row "sshd"  "!!  failed — run: systemctl status sshd"
                 _rec "sshd in failed state — run: systemctl reset-failed sshd && systemctl start sshd  [auto]"
             else
                 _row "sshd"  "!!  enabled but not running"
-                _rec "sshd enabled but not active — run: systemctl start sshd  [auto]"
+                _rec "sshd not running — run: systemctl start sshd  [auto]"
             fi
         else
-            _row "sshd"      "--  installed, not enabled (to allow remote login: systemctl enable --now sshd)"
+            _srv_opt_begin
+            _row "sshd"      "~~  not enabled — to allow remote login: systemctl enable --now sshd"
+            _srv_opt_end
         fi
 
         # ── Host key integrity — only relevant when sshd is enabled ──────────
@@ -3076,12 +3816,19 @@ _section_system_services() {
         if (( sshd_enabled )) && \
            { [[ -f /etc/ssh/sshd_config ]] || [[ -d /etc/ssh/sshd_config.d ]]; }; then
             local ssh_root ssh_pw_auth
-            ssh_root=$(grep -rh '^PermitRootLogin' \
-                /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ \
-                2>/dev/null | tail -1 | awk '{print $2}' || echo "")
-            ssh_pw_auth=$(grep -rh '^PasswordAuthentication' \
-                /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ \
-                2>/dev/null | tail -1 | awk '{print $2}' || echo "")
+            # sshd -T dumps the fully merged effective config including all Include directives
+            local _sshd_T; _sshd_T=$(sshd -T 2>/dev/null || echo "")
+            if [[ -n "$_sshd_T" ]]; then
+                ssh_root=$(echo "$_sshd_T" | awk '/^permitrootlogin /{print $2}' | head -1 || echo "")
+                ssh_pw_auth=$(echo "$_sshd_T" | awk '/^passwordauthentication /{print $2}' | head -1 || echo "")
+            else
+                ssh_root=$(grep -rsh '^PermitRootLogin' \
+                    /usr/lib/ssh/sshd_config.d/ /etc/ssh/sshd_config.d/ /etc/ssh/sshd_config \
+                    2>/dev/null | tail -1 | awk '{print $2}' || echo "")
+                ssh_pw_auth=$(grep -rsh '^PasswordAuthentication' \
+                    /usr/lib/ssh/sshd_config.d/ /etc/ssh/sshd_config.d/ /etc/ssh/sshd_config \
+                    2>/dev/null | tail -1 | awk '{print $2}' || echo "")
+            fi
 
             if [[ -z "$ssh_root" ]]; then
                 local _ssh_ver_maj
@@ -3110,7 +3857,1165 @@ _section_system_services() {
             fi
         fi
     fi
+
+    # ── rsyncd (rsync daemon — file transfer server) ──────────────────────────
+    # rsync ships its own daemon mode; no separate package needed.
+    # "configured" means /etc/rsyncd.conf has a real [module] with a path= directive.
+    # [global] is the default header; example configs may have named sections without path=.
+    if command -v rsync &>/dev/null || systemctl cat rsyncd &>/dev/null 2>&1; then
+        local _rsyncd_cfg=0
+        if [[ -f /etc/rsyncd.conf ]]; then
+            local _in_module=0
+            while IFS= read -r _rl; do
+                if [[ "$_rl" =~ ^\[[[:space:]]*([^][:space:]]+)[[:space:]]*\] ]]; then
+                    [[ "${BASH_REMATCH[1]}" != "global" ]] && _in_module=1 || _in_module=0
+                elif (( _in_module )) && [[ "$_rl" =~ ^[[:space:]]*path[[:space:]]*= ]]; then
+                    _rsyncd_cfg=1; break
+                fi
+            done < /etc/rsyncd.conf
+        fi
+        if (( _rsyncd_cfg )); then
+            local rsyncd_st; rsyncd_st=$(systemctl is-active rsyncd 2>/dev/null || echo "inactive")
+            if [[ "$rsyncd_st" == "active" ]]; then
+                local mod_count
+                mod_count=$(grep -c '^\[' /etc/rsyncd.conf 2>/dev/null || echo "?")
+                _row "rsyncd"      "OK  running  (${mod_count} module(s))"
+                # Warn if any module allows anonymous writes (grep whole file — no -A needed)
+                if grep -q 'read only *= *\(false\|no\)' /etc/rsyncd.conf 2>/dev/null; then
+                    if ! grep -q 'auth users' /etc/rsyncd.conf 2>/dev/null; then
+                        _row2 "!!  read only = false with no auth users — anonymous write access"
+                        _rec  "rsyncd has writable module(s) with no auth — set 'auth users' and 'secrets file' in /etc/rsyncd.conf"
+                    fi
+                fi
+            elif systemctl is-enabled --quiet rsyncd 2>/dev/null; then
+                _row "rsyncd"      "!   enabled but not running"
+                _rec "rsyncd not running — run: systemctl start rsyncd  [auto]"
+            else
+                _srv_opt_begin
+                _row "rsyncd"      "~~  configured, not enabled — to enable: systemctl enable --now rsyncd"
+                _srv_opt_end
+            fi
+        else
+            _srv_opt_begin
+            _row "rsyncd"          "~~  not configured — create /etc/rsyncd.conf with [module] sections, then systemctl enable --now rsyncd"
+            _srv_opt_end
+        fi
+    fi
+
+
+    # ── DNS servers ──────────────────────────────────────────────────────────
+    # ── dnsmasq (local DNS/DHCP server) ──────────────────────────────────────
+    # The libvirt check elsewhere only covers dnsmasq-as-libvirt-dependency.
+    # This covers dnsmasq running as a standalone DNS/DHCP server.
+    # Skip if the only running dnsmasq is owned by libvirt (virbr0 only).
+    if command -v dnsmasq &>/dev/null || systemctl cat dnsmasq &>/dev/null 2>&1; then
+        local _dm_standalone=0
+        # Standalone config: require at least one real directive, not just non-comment content
+        # Default dnsmasq.conf ships with commented-out examples
+        if [[ -f /etc/dnsmasq.conf ]] && \
+           grep -qE '^[[:space:]]*(server|address|listen-address|interface|port|domain|dhcp-range)=' \
+           /etc/dnsmasq.conf 2>/dev/null; then
+            _dm_standalone=1
+        elif ls /etc/dnsmasq.d/*.conf &>/dev/null 2>&1; then
+            if grep -rlE '^[[:space:]]*(server|address|listen-address|interface|port|domain|dhcp-range)=' \
+               /etc/dnsmasq.d/*.conf &>/dev/null 2>&1; then
+                _dm_standalone=1
+            fi
+        fi
+        if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+            local _dm_upstream
+            _dm_upstream=$(grep -rh '^server=' /etc/dnsmasq.conf /etc/dnsmasq.d/ \
+                2>/dev/null | wc -l || echo "0")
+            _row "dnsmasq"     "OK  running${_dm_upstream:+  (${_dm_upstream} upstream server(s))}"
+            # Warn if systemd-resolved stub listener conflicts on port 53
+            if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+                local _stub
+                _stub=$(grep -rshiE '^DNSStubListener=' \
+                    /usr/lib/systemd/resolved.conf.d/ \
+                    /etc/systemd/resolved.conf.d/ \
+                    /etc/systemd/resolved.conf 2>/dev/null \
+                    | tail -1 | cut -d= -f2 | tr -d '[:space:]' || echo "")
+                if [[ "$_stub" != "no" && "$_stub" != "No" ]]; then
+                    _row2 "!   systemd-resolved stub listener may conflict on port 53"
+                    _rec  "Set DNSStubListener=no in /etc/systemd/resolved.conf to avoid port 53 conflict"
+                fi
+            fi
+        elif systemctl is-enabled --quiet dnsmasq 2>/dev/null; then
+            local _nm_dns_dm
+            _nm_dns_dm=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_dm" ]] && _nm_dns_dm="default"
+            if [[ "$_nm_dns_dm" == "dnsmasq" ]]; then
+                _row "dnsmasq"     "!   enabled but not running"
+                _rec "dnsmasq not running — run: systemctl start dnsmasq  [auto]"
+            else
+                _row "dnsmasq"     "!!  enabled standalone — conflicts with NM dns=${_nm_dns_dm}; disable: systemctl disable --now dnsmasq  or set dns=dnsmasq in NetworkManager.conf"
+                _rec "dnsmasq enabled standalone conflicts with NM dns=${_nm_dns_dm} — disable: systemctl disable --now dnsmasq  or set NM dns=dnsmasq"
+            fi
+        fi
+    fi
+
+    # ── bind / named (authoritative DNS server) ───────────────────────────────
+    if command -v named &>/dev/null || systemctl cat named &>/dev/null 2>&1; then
+        local _named_cfg=0
+        # Require a user-defined zone — default named.conf only has ".", "localhost",
+        # and reverse-lookup zones for 127/0/255 which ship with the package.
+        _named_has_user_zone() {
+            local _f="$1"
+            [[ -f "$_f" ]] || return 1
+            grep -E '^[[:space:]]*zone[[:space:]]+"[^"]+"' "$_f" 2>/dev/null | \
+                grep -qvE '"\."|"localhost"|"localhost\.localdomain"|"0\.0\.127\.in-addr\.arpa"|"1\.0\.0\.127\.in-addr\.arpa"|"255\.in-addr\.arpa"|"0\.in-addr\.arpa"|"\.ip6\.arpa"'
+        }
+        if command -v named-checkconf &>/dev/null && [[ -f /etc/named.conf ]]; then
+            if named-checkconf /etc/named.conf &>/dev/null 2>&1; then
+                _named_has_user_zone /etc/named.conf && _named_cfg=1
+                # Also check any include files for user zones
+                if (( ! _named_cfg )); then
+                    while IFS= read -r _inc; do
+                        _named_has_user_zone "$_inc" && { _named_cfg=1; break; }
+                    done < <(grep -E '^[[:space:]]*include[[:space:]]+"' /etc/named.conf 2>/dev/null \
+                        | grep -oE '"[^"]+"' | tr -d '"' || true)
+                fi
+            fi
+        fi
+        # Fallback: file check if named-checkconf not available
+        if (( ! _named_cfg )); then
+            _named_has_user_zone /etc/named.conf && _named_cfg=1
+        fi
+        if systemctl is-active --quiet named 2>/dev/null; then
+            local _named_zones=""
+            _named_zones=$(rndc status 2>/dev/null \
+                | awk '/number of zones/{print $NF}' | head -1 || echo "")
+            _row "named"       "OK  running${_named_zones:+  (${_named_zones} zone(s))}"
+        elif systemctl is-enabled --quiet named 2>/dev/null; then
+            local _nm_dns_nd
+            _nm_dns_nd=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_nd" ]] && _nm_dns_nd="default"
+            if [[ "$_nm_dns_nd" == "none" ]]; then
+                _row "named"       "!   enabled but not running"
+                _rec "named not running — run: systemctl start named  [auto]"
+            else
+                _row "named"       "!!  enabled standalone — conflicts with NM dns=${_nm_dns_nd}; disable: systemctl disable --now named  or set NM dns=none first"
+                _rec "named enabled standalone conflicts with NM dns=${_nm_dns_nd} — disable: systemctl disable --now named  or set NM dns=none and point resolv.conf to 127.0.0.1"
+            fi
+        fi
+    fi
+
+    # ── unbound (validating/caching DNS resolver) ─────────────────────────────
+    # Unbound is a full DNSSEC-validating caching resolver. It conflicts with NM
+    # dns=default (which writes resolv.conf directly). Coexists correctly only
+    # when NM dns=none and resolv.conf points to 127.0.0.1.
+    if command -v unbound &>/dev/null || systemctl cat unbound &>/dev/null 2>&1; then
+        local _ub_cfg=0
+        # Require a real server: directive (interface: or access-control:) not just defaults
+        if [[ -f /etc/unbound/unbound.conf ]] && \
+           grep -qE '^[[:space:]]*(interface|access-control|forward-zone|stub-zone|auth-zone):' \
+           /etc/unbound/unbound.conf 2>/dev/null; then
+            _ub_cfg=1
+        elif ls /etc/unbound/unbound.conf.d/*.conf &>/dev/null 2>&1; then
+            grep -rlE '^[[:space:]]*(interface|access-control|forward-zone|stub-zone):' \
+                /etc/unbound/unbound.conf.d/ &>/dev/null 2>&1 && _ub_cfg=1
+        fi
+        if systemctl is-active --quiet unbound 2>/dev/null; then
+            local _ub_stats=""
+            _ub_stats=$(unbound-control stats_noreset 2>/dev/null \
+                | awk -F= '/^total.num.queries=/{print $2}' | head -1 || echo "")
+            _row "unbound"     "OK  running${_ub_stats:+  (${_ub_stats} queries)}"
+            # Warn if NM is not configured to use unbound
+            local _nm_dns_ub
+            _nm_dns_ub=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_ub" ]] && _nm_dns_ub="default"
+            if [[ "$_nm_dns_ub" != "none" ]]; then
+                _row2 "!   NM dns=${_nm_dns_ub} — set dns=none so unbound owns /etc/resolv.conf"
+                _rec "unbound running but NM dns!=none — add dns=none under [main] in /etc/NetworkManager/NetworkManager.conf"
+            fi
+        elif systemctl is-enabled --quiet unbound 2>/dev/null; then
+            local _nm_dns_ub2
+            _nm_dns_ub2=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_ub2" ]] && _nm_dns_ub2="default"
+            if [[ "$_nm_dns_ub2" == "none" ]]; then
+                _row "unbound"     "!   enabled but not running"
+                _rec "unbound not running — run: systemctl start unbound  [auto]"
+            else
+                _row "unbound"     "!!  enabled standalone — conflicts with NM dns=${_nm_dns_ub2}; disable: systemctl disable --now unbound  or set NM dns=none first"
+                _rec "unbound enabled standalone conflicts with NM dns=${_nm_dns_ub2} — disable: systemctl disable --now unbound  or set NM dns=none and point resolv.conf to 127.0.0.1"
+            fi
+        fi
+    fi
+
+    # ── stubby (DNS-over-TLS stub resolver) ───────────────────────────────────
+    # Stubby forwards all queries over TLS to upstream resolvers. Typically
+    # runs on 127.0.0.1:5300 and is used as an upstream for dnsmasq or unbound.
+    # Conflicts with NM dns=default if pointed at port 53 directly.
+    if command -v stubby &>/dev/null || systemctl cat stubby &>/dev/null 2>&1; then
+        local _stubby_cfg=0
+        if [[ -f /etc/stubby/stubby.yml ]] && \
+           grep -qE '^[[:space:]]*(upstream_recursive_servers|listen_addresses):' \
+           /etc/stubby/stubby.yml 2>/dev/null; then
+            _stubby_cfg=1
+        fi
+        if systemctl is-active --quiet stubby 2>/dev/null; then
+            local _stubby_listen=""
+            _stubby_listen=$(grep -oP "(?<=address_data: )[^\s]+" \
+                /etc/stubby/stubby.yml 2>/dev/null | head -1 || echo "")
+            _row "stubby"      "OK  running${_stubby_listen:+  (${_stubby_listen})}"
+        elif systemctl is-enabled --quiet stubby 2>/dev/null; then
+            _row "stubby"      "!   enabled but not running"
+            _rec "stubby not running — run: systemctl start stubby  [auto]"
+        elif (( _stubby_cfg )); then
+            _srv_opt_begin
+            _row "stubby"      "~~  configured, not enabled — typically used as upstream for dnsmasq/unbound; to enable: systemctl enable --now stubby"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "stubby"      "~~  not configured — configure /etc/stubby/stubby.yml with upstream TLS servers"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── knot-resolver / kresd (full DNS resolver) ─────────────────────────────
+    # Knot Resolver is a modern DNSSEC-validating caching resolver.
+    # Conflicts with NM dns=default — requires dns=none to own resolv.conf.
+    if command -v kresctl &>/dev/null || command -v kresd &>/dev/null || \
+       systemctl cat knot-resolver &>/dev/null 2>&1 || \
+       systemctl cat kresd@1 &>/dev/null 2>&1; then
+        local _kresd_unit="knot-resolver"
+        systemctl cat kresd@1 &>/dev/null 2>&1 && _kresd_unit="kresd@1"
+        if systemctl is-active --quiet "$_kresd_unit" 2>/dev/null; then
+            _row "knot-res"    "OK  running"
+            local _nm_dns_kr
+            _nm_dns_kr=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_kr" ]] && _nm_dns_kr="default"
+            if [[ "$_nm_dns_kr" != "none" ]]; then
+                _row2 "!   NM dns=${_nm_dns_kr} — set dns=none so knot-resolver owns /etc/resolv.conf"
+                _rec "knot-resolver running but NM dns!=none — add dns=none in /etc/NetworkManager/NetworkManager.conf"
+            fi
+        elif systemctl is-enabled --quiet "$_kresd_unit" 2>/dev/null; then
+            local _nm_dns_kr2
+            _nm_dns_kr2=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_kr2" ]] && _nm_dns_kr2="default"
+            if [[ "$_nm_dns_kr2" == "none" ]]; then
+                _row "knot-res"    "!   enabled but not running"
+                _rec "knot-resolver not running — run: systemctl start ${_kresd_unit}  [auto]"
+            else
+                _row "knot-res"    "!!  enabled standalone — conflicts with NM dns=${_nm_dns_kr2}; disable: systemctl disable --now ${_kresd_unit}  or set NM dns=none first"
+                _rec "knot-resolver enabled standalone conflicts with NM dns=${_nm_dns_kr2} — disable: systemctl disable --now ${_kresd_unit}  or set NM dns=none"
+            fi
+        fi
+    fi
+
+    # ── pdns-recursor (PowerDNS recursor) ────────────────────────────────────
+    # PowerDNS Recursor is a high-performance DNS resolver.
+    # Conflicts with NM dns=default — requires dns=none to own resolv.conf.
+    if command -v rec_control &>/dev/null || systemctl cat pdns-recursor &>/dev/null 2>&1; then
+        local _pdns_cfg=0
+        [[ -f /etc/powerdns/recursor.conf ]] && \
+            grep -qvE '^[[:space:]]*#|^[[:space:]]*$' /etc/powerdns/recursor.conf 2>/dev/null && \
+            _pdns_cfg=1
+        if systemctl is-active --quiet pdns-recursor 2>/dev/null; then
+            local _pdns_queries=""
+            _pdns_queries=$(rec_control get all-outqueries 2>/dev/null | head -1 || echo "")
+            _row "pdns-rec"    "OK  running${_pdns_queries:+  (${_pdns_queries} outqueries)}"
+            local _nm_dns_pd
+            _nm_dns_pd=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_pd" ]] && _nm_dns_pd="default"
+            if [[ "$_nm_dns_pd" != "none" ]]; then
+                _row2 "!   NM dns=${_nm_dns_pd} — set dns=none so pdns-recursor owns /etc/resolv.conf"
+                _rec "pdns-recursor running but NM dns!=none — add dns=none in /etc/NetworkManager/NetworkManager.conf"
+            fi
+        elif systemctl is-enabled --quiet pdns-recursor 2>/dev/null; then
+            local _nm_dns_pd2
+            _nm_dns_pd2=$(grep -rshE '^dns\s*=' /usr/lib/NetworkManager/conf.d/ /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            [[ -z "$_nm_dns_pd2" ]] && _nm_dns_pd2="default"
+            if [[ "$_nm_dns_pd2" == "none" ]]; then
+                _row "pdns-rec"    "!   enabled but not running"
+                _rec "pdns-recursor not running — run: systemctl start pdns-recursor  [auto]"
+            else
+                _row "pdns-rec"    "!!  enabled standalone — conflicts with NM dns=${_nm_dns_pd2}; disable: systemctl disable --now pdns-recursor  or set NM dns=none first"
+                _rec "pdns-recursor enabled standalone conflicts with NM dns=${_nm_dns_pd2} — disable: systemctl disable --now pdns-recursor  or set NM dns=none"
+            fi
+        fi
+    fi
+
+
+    # ── Monitoring ───────────────────────────────────────────────────────────
+    # ── snmpd (SNMP monitoring daemon) ───────────────────────────────────────
+    # Exposes system metrics over SNMP — used by monitoring systems (Nagios,
+    # Zabbix, LibreNMS etc.). Key security concern: default 'community public'
+    # exposes full system info to anyone on the network.
+    if command -v snmpd &>/dev/null || systemctl cat snmpd &>/dev/null 2>&1; then
+        local _snmp_cfg=0
+        local _snmp_conf="/etc/snmp/snmpd.conf"
+        # Require a non-default community/user — default snmpd.conf has example content
+        if [[ -f "$_snmp_conf" ]]; then
+            if grep -qE '^[[:space:]]*(rocommunity|rwcommunity|rouser|rwuser)[[:space:]]+' "$_snmp_conf" 2>/dev/null && \
+               ! grep -qE '^[[:space:]]*(rocommunity|rwcommunity)[[:space:]]+public[[:space:]]*$' "$_snmp_conf" 2>/dev/null; then
+                _snmp_cfg=1
+            fi
+        fi
+        if systemctl is-active --quiet snmpd 2>/dev/null; then
+            _row "snmpd"       "OK  running"
+            # Warn on default insecure community string
+            if grep -qE '^[[:space:]]*rocommunity[[:space:]]+public' \
+               /etc/snmp/snmpd.conf 2>/dev/null; then
+                _row2 "!!  rocommunity public — exposes system info to all hosts"
+                _rec  "snmpd uses default 'public' community — restrict in /etc/snmp/snmpd.conf"
+            fi
+        elif systemctl is-enabled --quiet snmpd 2>/dev/null; then
+            if (( ! _snmp_cfg )); then
+                _row "snmpd"       "!   enabled but not configured — edit /etc/snmp/snmpd.conf"
+                _rec "snmpd enabled but /etc/snmp/snmpd.conf is empty or missing — configure communities/access before starting"
+            else
+                _row "snmpd"       "!   enabled but not running"
+                _rec "snmpd not running — run: systemctl start snmpd  [auto]"
+            fi
+        elif (( _snmp_cfg )); then
+            _srv_opt_begin
+            _row "snmpd"       "~~  configured, not enabled — to enable: systemctl enable --now snmpd"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "snmpd"       "~~  not enabled — SNMP monitoring inactive; to enable: systemctl enable --now snmpd"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── vnstatd (network traffic monitor daemon) ──────────────────────────────
+    if command -v vnstat &>/dev/null || systemctl cat vnstatd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet vnstatd 2>/dev/null; then
+            local vn_ifaces=""
+            vn_ifaces=$(vnstat --json 2>/dev/null \
+                | python3 -c \
+                  "import sys,json; d=json.load(sys.stdin); print(', '.join(i['name'] for i in d.get('interfaces',[])))" \
+                2>/dev/null || echo "")
+            _row "vnstatd"     "OK  running${vn_ifaces:+  (${vn_ifaces})}"
+        elif systemctl is-enabled --quiet vnstatd 2>/dev/null; then
+            _row "vnstatd"     "!   enabled but not running"
+            _rec "vnstatd not running — run: systemctl start vnstatd  [auto]"
+        else
+            _srv_opt_begin
+            _row "vnstatd"     "~~  not enabled — traffic monitoring inactive; to enable: systemctl enable --now vnstatd"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Remote Desktop ────────────────────────────────────────────────────────
+    # Profile-aware: Plasma uses krdp (RDP) + krfb (VNC); GNOME uses
+    # gnome-remote-desktop (RDP+VNC via pipewire).  spice-vdagent is VM-only.
+    # All run as user services — silent when not enabled (opt-in feature).
+    local _rd_profile; _rd_profile=$(cat /etc/shani-profile 2>/dev/null | tr -d '[:space:]' || echo "")
+
+    # ── KDE: krdp (RDP server, Plasma 6) ─────────────────────────────────────
+    if [[ "$_rd_profile" == "plasma" ]] || command -v krdp &>/dev/null; then
+        if _sysd_user is-active --quiet plasma-krdp_server 2>/dev/null || \
+           _sysd_user is-active --quiet krdp             2>/dev/null; then
+            local _krdp_port=""
+            _krdp_port=$(ss -tlnp 2>/dev/null \
+                | awk '/krdp/{match($4,/:([0-9]+)$/,a); if(a[1]) print a[1]}' | head -1 || echo "")
+            _row "krdp"        "OK  KDE RDP server active${_krdp_port:+  (port ${_krdp_port})}"
+        elif _sysd_user is-enabled --quiet plasma-krdp_server 2>/dev/null || \
+             _sysd_user is-enabled --quiet krdp            2>/dev/null; then
+            _row "krdp"        "!   enabled but not running"
+            _rec "krdp not running — run: systemctl --user start plasma-krdp_server  [auto]"
+        elif command -v krdp &>/dev/null; then
+            _srv_opt_begin
+            _row "krdp"        "~~  not enabled — to enable KDE RDP: systemctl --user enable --now plasma-krdp_server"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── KDE: krfb (VNC server) ────────────────────────────────────────────────
+    if [[ "$_rd_profile" == "plasma" ]] || command -v krfb &>/dev/null; then
+        if _sysd_user is-active --quiet krfb 2>/dev/null || \
+           pgrep -x krfb &>/dev/null; then
+            _row "krfb"        "OK  KDE VNC server active"
+        elif _sysd_user is-enabled --quiet krfb 2>/dev/null; then
+            _row "krfb"        "!   enabled but not running"
+            _rec "krfb not running — run: systemctl --user start krfb  [auto]"
+        elif command -v krfb &>/dev/null; then
+            _srv_opt_begin
+            _row "krfb"        "~~  not enabled — to enable KDE VNC: enable via System Settings → Sharing → Remote Desktop"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── GNOME: gnome-remote-desktop (RDP + VNC) ───────────────────────────────
+    if [[ "$_rd_profile" == "gnome" ]] || \
+       command -v grdctl &>/dev/null || \
+       _sysd_user cat gnome-remote-desktop &>/dev/null 2>&1; then
+        if _sysd_user is-active --quiet gnome-remote-desktop 2>/dev/null; then
+            # Detect which protocols are enabled via gsettings
+            local _grd_rdp="" _grd_vnc=""
+            if command -v gsettings &>/dev/null; then
+                _grd_rdp=$(gsettings get org.gnome.desktop.remote-desktop.rdp enable \
+                    2>/dev/null | tr -d "'" || echo "")
+                _grd_vnc=$(gsettings get org.gnome.desktop.remote-desktop.vnc enable \
+                    2>/dev/null | tr -d "'" || echo "")
+            fi
+            local _grd_proto=""
+            [[ "$_grd_rdp" == "true"  ]] && _grd_proto+="RDP"
+            [[ "$_grd_vnc" == "true"  ]] && _grd_proto+="${_grd_proto:+, }VNC"
+            [[ -z "$_grd_proto"       ]] && _grd_proto="no protocol enabled"
+            _row "GRD"         "OK  gnome-remote-desktop active  (${_grd_proto})"
+        elif _sysd_user is-enabled --quiet gnome-remote-desktop 2>/dev/null; then
+            _row "GRD"         "!   enabled but not running"
+            _rec "gnome-remote-desktop not running — run: systemctl --user start gnome-remote-desktop  [auto]"
+        elif [[ "$_rd_profile" == "gnome" ]] && command -v grdctl &>/dev/null; then
+            _srv_opt_begin
+            _row "GRD"         "~~  not enabled — to enable: Settings → Sharing → Remote Desktop"
+            _srv_opt_end
+        fi
+    fi
+
+
+    # ── File sharing: Samba ───────────────────────────────────────────────────
+    if command -v smbd &>/dev/null || systemctl cat smb &>/dev/null 2>&1; then
+        if [[ -f /etc/samba/smb.conf ]] && \
+           grep -E '^\[' /etc/samba/smb.conf 2>/dev/null | grep -qvE '^\[(global|homes|printers|print\$)\]'; then
+            local smbd_st; smbd_st=$(systemctl is-active smb 2>/dev/null || \
+                                      systemctl is-active smbd 2>/dev/null || echo "inactive")
+            if [[ "$smbd_st" == "active" ]]; then
+                _row "Samba"      "OK  smbd running"
+            elif systemctl is-enabled --quiet smb 2>/dev/null || \
+                 systemctl is-enabled --quiet smbd 2>/dev/null; then
+                _row "Samba"      "!   enabled but not running"
+                _rec "smbd not running — run: systemctl start smb  [auto]"
+            else
+                _srv_opt_begin
+                _row "Samba"      "~~  configured, not enabled — to enable: systemctl enable --now smb"
+                _srv_opt_end
+            fi
+            if systemctl cat nmb &>/dev/null 2>&1 || command -v nmbd &>/dev/null; then
+                if systemctl is-active --quiet nmb 2>/dev/null; then
+                    _row "nmbd"       "OK  NetBIOS name resolution active"
+                elif systemctl is-enabled --quiet nmb 2>/dev/null; then
+                    _row "nmbd"       "!   enabled but not running"
+                    _rec "nmbd not running — run: systemctl start nmb  [auto]"
+                else
+                    _srv_opt_begin
+                    _row "nmbd"       "~~  not enabled — NetBIOS browsing inactive: systemctl enable --now nmb"
+                    _srv_opt_end
+                fi
+            fi
+            if systemctl cat winbind &>/dev/null 2>&1 || command -v winbindd &>/dev/null; then
+                local _smb_security=""
+                _smb_security=$(grep -i '^\s*security\s*=' /etc/samba/smb.conf 2>/dev/null \
+                    | awk -F= '{print $2}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | head -1 || echo "")
+                if [[ "$_smb_security" == "ads" || "$_smb_security" == "domain" ]]; then
+                    if systemctl is-active --quiet winbind 2>/dev/null; then
+                        _row "winbind"    "OK  running (AD/domain auth active)"
+                    elif systemctl is-enabled --quiet winbind 2>/dev/null; then
+                        _row "winbind"    "!   enabled but not running — domain auth broken"
+                        _rec "winbind not running — run: systemctl start winbind  [auto]"
+                    else
+                        _row "winbind"    "!   security=ads/domain set but winbind not enabled"
+                        _rec "Enable winbind for AD/domain auth: systemctl enable --now winbind  [auto]"
+                    fi
+                fi
+            fi
+        else
+            _srv_opt_begin
+            _row "Samba"          "~~  not configured — create shares in /etc/samba/smb.conf, then systemctl enable --now smb"
+            _srv_opt_end
+        fi
+    fi
+    if command -v wsdd &>/dev/null || systemctl cat wsdd &>/dev/null 2>&1; then
+        local _smb_cfg=0
+        [[ -f /etc/samba/smb.conf ]] && grep -q '^\[' /etc/samba/smb.conf 2>/dev/null && _smb_cfg=1
+        if systemctl is-active --quiet wsdd 2>/dev/null; then
+            _row "wsdd"        "OK  running (WS-Discovery active)"
+        elif systemctl is-enabled --quiet wsdd 2>/dev/null; then
+            _row "wsdd"        "!   enabled but not running"
+            _rec "wsdd not running — run: systemctl start wsdd  [auto]"
+        elif (( _smb_cfg )); then
+            _row "wsdd"        "--  Samba configured but wsdd not enabled (Windows network discovery will not work: systemctl enable --now wsdd)"
+        fi
+    fi
+
+    # ── File sharing: NFS ─────────────────────────────────────────────────────
+    if command -v rpcbind &>/dev/null || systemctl cat rpcbind &>/dev/null 2>&1; then
+        if systemctl is-active --quiet rpcbind 2>/dev/null || \
+           systemctl is-active --quiet rpcbind.socket 2>/dev/null; then
+            _row "rpcbind"     "OK  running"
+        elif systemctl is-enabled --quiet rpcbind 2>/dev/null || \
+             systemctl is-enabled --quiet rpcbind.socket 2>/dev/null; then
+            if systemctl is-active --quiet rpcbind.socket 2>/dev/null || \
+               systemctl is-enabled --quiet rpcbind.socket 2>/dev/null; then
+                _row "rpcbind"     ">>  enabled (idle — socket-activated)"
+            else
+                _row "rpcbind"     "!   enabled but not running"
+                _rec "rpcbind not running — run: systemctl start rpcbind  [auto]"
+            fi
+        else
+            _srv_opt_begin
+            _row "rpcbind"     "~~  not enabled — required if using NFS: systemctl enable --now rpcbind"
+            _srv_opt_end
+        fi
+    fi
+    if command -v exportfs &>/dev/null || systemctl cat nfs-server &>/dev/null 2>&1; then
+        if [[ -f /etc/exports ]] && grep -qv '^[[:space:]]*#' /etc/exports 2>/dev/null; then
+            if systemctl is-active --quiet nfs-server 2>/dev/null; then
+                local export_count
+                export_count=$(grep -cv '^[[:space:]]*#\|^[[:space:]]*$' /etc/exports 2>/dev/null || echo "?")
+                _row "NFS"        "OK  nfs-server running  (${export_count} export(s))"
+                if command -v rpcbind &>/dev/null && \
+                   ! systemctl is-active --quiet rpcbind 2>/dev/null; then
+                    _row2 "!!  rpcbind not running — NFS clients will fail to mount"
+                    _rec  "NFS active but rpcbind is down — run: systemctl enable --now rpcbind  [auto]"
+                fi
+                if systemctl cat nfs-idmapd &>/dev/null 2>&1; then
+                    if ! systemctl is-active --quiet nfs-idmapd 2>/dev/null; then
+                        _row2 "!   nfs-idmapd not running — NFSv4 ownership may show as 'nobody'"
+                        _rec "nfs-idmapd not running — run: systemctl start nfs-idmapd  [auto]"
+                    fi
+                fi
+                if systemctl cat rpc-statd &>/dev/null 2>&1; then
+                    if systemctl is-enabled --quiet rpc-statd 2>/dev/null && \
+                       ! systemctl is-active --quiet rpc-statd 2>/dev/null; then
+                        _row2 "!   rpc-statd enabled but not running — NFSv3 lock recovery broken"
+                        _rec "rpc-statd not running — run: systemctl start rpc-statd  [auto]"
+                    fi
+                fi
+                if systemctl cat rpc-gssd &>/dev/null 2>&1; then
+                    if systemctl is-enabled --quiet rpc-gssd 2>/dev/null && \
+                       ! systemctl is-active --quiet rpc-gssd 2>/dev/null; then
+                        _row2 "!   rpc-gssd enabled but not running — Kerberos NFS mounts will fail"
+                        _rec "rpc-gssd not running — run: systemctl start rpc-gssd  [auto]"
+                    fi
+                fi
+            elif systemctl is-enabled --quiet nfs-server 2>/dev/null; then
+                _row "NFS"        "!   enabled but not running"
+                _rec "nfs-server not running — run: systemctl start nfs-server  [auto]"
+            else
+                _row "NFS"        "--  /etc/exports has entries but nfs-server not enabled"
+                _rec "NFS exports defined but service not enabled — run: systemctl enable --now nfs-server  [auto]"
+            fi
+        else
+            _srv_opt_begin
+            _row "NFS"            "~~  not configured — add exports to /etc/exports, then systemctl enable --now nfs-server"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── gssproxy (Kerberos/GSSAPI proxy) ─────────────────────────────────────
+    if command -v gssproxy &>/dev/null || systemctl cat gssproxy &>/dev/null 2>&1; then
+        if systemctl is-active --quiet gssproxy 2>/dev/null; then
+            _row "gssproxy"     "OK  running"
+        elif systemctl is-enabled --quiet gssproxy 2>/dev/null; then
+            _row "gssproxy"     "!   enabled but not running — Kerberos auth will fail"
+            _rec "gssproxy not running — run: systemctl start gssproxy  [auto]"
+        else
+            _srv_opt_begin
+            _row "gssproxy"     "~~  not enabled — Kerberos/NFS GSSAPI proxy; to enable: systemctl enable --now gssproxy"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── nbd-server (network block device server) ──────────────────────────────
+    if command -v nbd-server &>/dev/null || systemctl cat nbd-server &>/dev/null 2>&1; then
+        if [[ -f /etc/nbd-server/config ]] && \
+           grep -E '^\[' /etc/nbd-server/config 2>/dev/null | grep -qvE '^\[generic\]'; then
+            local nbd_st; nbd_st=$(systemctl is-active nbd-server 2>/dev/null || echo "inactive")
+            if [[ "$nbd_st" == "active" ]]; then
+                local nbd_exports
+                nbd_exports=$(grep -c '^\[' /etc/nbd-server/config 2>/dev/null || echo "?")
+                _row "nbd-server"  "OK  running  (${nbd_exports} export(s))"
+            elif systemctl is-enabled --quiet nbd-server 2>/dev/null; then
+                _row "nbd-server"  "!   enabled but not running"
+                _rec "nbd-server not running — run: systemctl start nbd-server  [auto]"
+            else
+                _srv_opt_begin
+                _row "nbd-server"  "~~  configured, not enabled — to enable: systemctl enable --now nbd-server"
+                _srv_opt_end
+            fi
+        else
+            _srv_opt_begin
+            _row "nbd-server"      "~~  not configured — create /etc/nbd-server/config with [export] sections, then systemctl enable --now nbd-server"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Web & proxy ─────────────────────────────────────────────────────────
+    # ── Caddy web server ──────────────────────────────────────────────────────
+    if command -v caddy &>/dev/null || systemctl cat caddy.service &>/dev/null 2>&1; then
+        if systemctl is-active --quiet caddy 2>/dev/null; then
+            local caddy_ver caddy_cfg_ok=0
+            caddy_ver=$(caddy version 2>/dev/null | awk '{print $1}' | head -1 || echo "")
+            [[ -f /etc/caddy/Caddyfile ]] && caddy_cfg_ok=1
+            if (( caddy_cfg_ok )); then
+                _row "Caddy"     "OK  running${caddy_ver:+  (${caddy_ver})}"
+            else
+                _row "Caddy"     "OK  running${caddy_ver:+  (${caddy_ver})} — no Caddyfile found"
+                _row2 "--  create /etc/caddy/Caddyfile to configure sites"
+            fi
+        elif systemctl is-enabled --quiet caddy 2>/dev/null; then
+            _row "Caddy"     "!   enabled but not running"
+            _rec "Caddy not running — run: systemctl start caddy  [auto]"
+        else
+            _srv_opt_begin
+            _row "Caddy"     "~~  not configured — to serve sites: create /etc/caddy/Caddyfile, then systemctl enable --now caddy"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── nginx web server ──────────────────────────────────────────────────────
+    if command -v nginx &>/dev/null || systemctl cat nginx &>/dev/null 2>&1; then
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            local nginx_ver=""
+            nginx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "nginx"      "OK  running${nginx_ver:+  (${nginx_ver})}"
+        elif systemctl is-enabled --quiet nginx 2>/dev/null; then
+            _row "nginx"      "!   enabled but not running"
+            _rec "nginx not running — run: systemctl start nginx  [auto]"
+        else
+            _srv_opt_begin
+            _row "nginx"      "~~  not enabled — to serve sites: systemctl enable --now nginx"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Apache httpd web server ───────────────────────────────────────────────
+    if command -v httpd &>/dev/null || systemctl cat httpd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet httpd 2>/dev/null; then
+            local _apache_ver=""
+            _apache_ver=$(httpd -v 2>/dev/null | grep -oE 'Apache/[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "Apache"     "OK  running${_apache_ver:+  (${_apache_ver})}"
+        elif systemctl is-enabled --quiet httpd 2>/dev/null; then
+            _row "Apache"     "!   enabled but not running"
+            _rec "httpd not running — run: systemctl start httpd  [auto]"
+        else
+            _srv_opt_begin
+            _row "Apache"     "~~  not enabled — to serve sites: systemctl enable --now httpd"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── php-fpm (PHP FastCGI Process Manager) ─────────────────────────────────
+    # Required for nginx/Apache to serve PHP applications. Multiple versioned
+    # units may exist (php-fpm, php83-fpm, etc.) — check any that are installed.
+    local _php_fpm_found=0
+    for _phpfpm_unit in php-fpm php83-fpm php82-fpm php81-fpm; do
+        if command -v "${_phpfpm_unit}" &>/dev/null || \
+           systemctl cat "${_phpfpm_unit}" &>/dev/null 2>&1; then
+            _php_fpm_found=1
+            if systemctl is-active --quiet "${_phpfpm_unit}" 2>/dev/null; then
+                local _php_ver=""
+                _php_ver=$(php --version 2>/dev/null | grep -oE '^PHP [0-9]+\.[0-9]+' | head -1 || echo "")
+                _row "php-fpm"     "OK  ${_phpfpm_unit} running${_php_ver:+  (${_php_ver})}"
+            elif systemctl is-enabled --quiet "${_phpfpm_unit}" 2>/dev/null; then
+                _row "php-fpm"     "!   ${_phpfpm_unit} enabled but not running"
+                _rec "${_phpfpm_unit} not running — run: systemctl start ${_phpfpm_unit}  [auto]"
+            else
+                _row "php-fpm"     "--  ${_phpfpm_unit} installed, not enabled (to serve PHP: systemctl enable --now ${_phpfpm_unit})"
+            fi
+            break
+        fi
+    done
+
+    # ── HAProxy (TCP/HTTP load balancer and proxy) ─────────────────────────────
+    if command -v haproxy &>/dev/null || systemctl cat haproxy &>/dev/null 2>&1; then
+        local _hap_cfg=0
+        local _hap_conf="${HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
+        # Require a real frontend/backend/listen block — default config only has global+defaults
+        if [[ -f "$_hap_conf" ]] && \
+           grep -qE '^[[:space:]]*(frontend|backend|listen)[[:space:]]+\S' "$_hap_conf" 2>/dev/null; then
+            # CLI: validate it's not just example content by confirming haproxy accepts it
+            if command -v haproxy &>/dev/null; then
+                haproxy -c -f "$_hap_conf" &>/dev/null 2>&1 && _hap_cfg=1
+            else
+                _hap_cfg=1
+            fi
+        fi
+        if systemctl is-active --quiet haproxy 2>/dev/null; then
+            local _hap_ver=""
+            _hap_ver=$(haproxy -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "HAProxy"     "OK  running${_hap_ver:+  (v${_hap_ver})}"
+        elif systemctl is-enabled --quiet haproxy 2>/dev/null; then
+            if (( ! _hap_cfg )); then
+                _row "HAProxy"     "!   enabled but not configured — add frontend/backend to /etc/haproxy/haproxy.cfg"
+                _rec "HAProxy enabled but no frontend/backend in /etc/haproxy/haproxy.cfg — configure before starting"
+            else
+                _row "HAProxy"     "!   enabled but not running"
+                _rec "haproxy not running — run: systemctl start haproxy  [auto]"
+            fi
+        elif (( _hap_cfg )); then
+            _srv_opt_begin
+            _row "HAProxy"     "~~  configured, not enabled — to enable: systemctl enable --now haproxy"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "HAProxy"     "~~  not enabled — to enable: systemctl enable --now haproxy"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── squid (HTTP caching proxy) ────────────────────────────────────────────
+    if command -v squid &>/dev/null || systemctl cat squid &>/dev/null 2>&1; then
+        local _squid_cfg=0
+        [[ -f /etc/squid/squid.conf ]] &&             grep -qE '^http_access allow' /etc/squid/squid.conf 2>/dev/null &&             ! grep -qE '^http_access allow all' /etc/squid/squid.conf 2>/dev/null &&             _squid_cfg=1
+        # Also accept if config has a custom acl definition
+        [[ -f /etc/squid/squid.conf ]] &&             grep -qE '^acl\s+localnet\s+src\s+[0-9]' /etc/squid/squid.conf 2>/dev/null &&             _squid_cfg=1
+        if systemctl is-active --quiet squid 2>/dev/null; then
+            _row "squid"       "OK  running"
+        elif systemctl is-enabled --quiet squid 2>/dev/null; then
+            if (( ! _squid_cfg )); then
+                _row "squid"       "!   enabled but not configured — define acl/http_access in /etc/squid/squid.conf"
+                _rec "Squid enabled but no custom acl/http_access in /etc/squid/squid.conf — configure before starting"
+            else
+                _row "squid"       "!   enabled but not running"
+                _rec "squid not running — run: systemctl start squid  [auto]"
+            fi
+        elif (( _squid_cfg )); then
+            _srv_opt_begin
+            _row "squid"       "~~  configured, not enabled — to enable: systemctl enable --now squid"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "squid"       "~~  not enabled — proxy inactive; configure /etc/squid/squid.conf then: systemctl enable --now squid"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── stunnel (TLS tunneling wrapper) ──────────────────────────────────────
+    if command -v stunnel &>/dev/null || systemctl cat stunnel &>/dev/null 2>&1; then
+        local _stunnel_cfg=0
+        for _sf in /etc/stunnel/*.conf; do
+            [[ -f "$_sf" ]] || continue
+            # Require a named [service] block with a connect= directive — not just a global conf
+            if grep -qE '^\[[^[:space:]]+\]' "$_sf" 2>/dev/null && \
+               grep -qE '^[[:space:]]*connect[[:space:]]*=' "$_sf" 2>/dev/null; then
+                _stunnel_cfg=1; break
+            fi
+        done
+        if systemctl is-active --quiet stunnel 2>/dev/null; then
+            _row "stunnel"     "OK  running"
+        elif systemctl is-enabled --quiet stunnel 2>/dev/null; then
+            if (( ! _stunnel_cfg )); then
+                _row "stunnel"     "!   enabled but not configured — create /etc/stunnel/<name>.conf with cert and connect settings"
+                _rec "stunnel enabled but no .conf found in /etc/stunnel/ — create a tunnel config before starting"
+            else
+                _row "stunnel"     "!   enabled but not running"
+                _rec "stunnel not running — run: systemctl start stunnel  [auto]"
+            fi
+        elif (( _stunnel_cfg )); then
+            _srv_opt_begin
+            _row "stunnel"     "~~  configured, not enabled — to enable: systemctl enable --now stunnel"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "stunnel"     "~~  not enabled — TLS tunnel inactive; create /etc/stunnel/<n>.conf then: systemctl enable --now stunnel"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Cockpit (web-based system administration) ─────────────────────────────
+    if command -v cockpit-bridge &>/dev/null || systemctl cat cockpit.socket &>/dev/null 2>&1; then
+        if systemctl is-active --quiet cockpit.socket 2>/dev/null; then
+            local cockpit_port=""
+            cockpit_port=$(ss -tlnp 2>/dev/null | awk '/cockpit/{match($4,/:([0-9]+)$/,a); if(a[1]) print a[1]}' | head -1 || echo "9090")
+            _row "Cockpit"    "OK  socket active  (https://localhost:${cockpit_port:-9090})"
+        elif systemctl is-enabled --quiet cockpit.socket 2>/dev/null; then
+            _row "Cockpit"    "!   enabled but not running"
+            _rec "cockpit.socket not running — run: systemctl start cockpit.socket  [auto]"
+        else
+            _srv_opt_begin
+            _row "Cockpit"    "~~  not enabled — to enable: systemctl enable --now cockpit.socket"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Databases ───────────────────────────────────────────────────────────
+    # ── MariaDB (MySQL-compatible relational database) ────────────────────────
+    if command -v mariadbd &>/dev/null || command -v mysqld &>/dev/null || \
+       systemctl cat mariadb &>/dev/null 2>&1 || systemctl cat mysqld &>/dev/null 2>&1; then
+        local _db_unit="mariadb"
+        systemctl cat mysqld &>/dev/null 2>&1 && ! systemctl cat mariadb &>/dev/null 2>&1 \
+            && _db_unit="mysqld"
+        if systemctl is-active --quiet "$_db_unit" 2>/dev/null; then
+            local _db_ver=""
+            _db_ver=$(mariadb --version 2>/dev/null | grep -oE 'Distrib [0-9]+\.[0-9]+\.[0-9]+' \
+                | awk '{print $2}' | head -1 || \
+                mysql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "MariaDB"     "OK  running${_db_ver:+  (v${_db_ver})}"
+        elif systemctl is-enabled --quiet "$_db_unit" 2>/dev/null; then
+            _row "MariaDB"     "!   enabled but not running"
+            _rec "${_db_unit} not running — run: systemctl start ${_db_unit}  [auto]"
+        else
+            _srv_opt_begin
+            _row "MariaDB"     "~~  not enabled — to enable: systemctl enable --now mariadb"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── PostgreSQL (relational database) ─────────────────────────────────────
+    if command -v psql &>/dev/null || systemctl cat postgresql &>/dev/null 2>&1; then
+        if systemctl is-active --quiet postgresql 2>/dev/null; then
+            local _pg_ver=""
+            _pg_ver=$(psql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "PostgreSQL"  "OK  running${_pg_ver:+  (v${_pg_ver})}"
+        elif systemctl is-enabled --quiet postgresql 2>/dev/null; then
+            _row "PostgreSQL"  "!   enabled but not running"
+            _rec "postgresql not running — run: systemctl start postgresql  [auto]"
+        else
+            _srv_opt_begin
+            _row "PostgreSQL"  "~~  not enabled — to enable: systemctl enable --now postgresql"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Redis (in-memory key-value store) ─────────────────────────────────────
+    if command -v redis-cli &>/dev/null || systemctl cat redis &>/dev/null 2>&1; then
+        local _redis_unit="redis"
+        systemctl cat redis.service &>/dev/null 2>&1 || _redis_unit="redis-server"
+        if systemctl is-active --quiet "$_redis_unit" 2>/dev/null; then
+            local _redis_ver=""
+            _redis_ver=$(redis-cli --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            _row "Redis"       "OK  running${_redis_ver:+  (v${_redis_ver})}"
+        elif systemctl is-enabled --quiet "$_redis_unit" 2>/dev/null; then
+            _row "Redis"       "!   enabled but not running"
+            _rec "${_redis_unit} not running — run: systemctl start ${_redis_unit}  [auto]"
+        else
+            _srv_opt_begin
+            _row "Redis"       "~~  not enabled — to enable: systemctl enable --now redis"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Memcached (memory object caching) ─────────────────────────────────────
+    if command -v memcached &>/dev/null || systemctl cat memcached &>/dev/null 2>&1; then
+        if systemctl is-active --quiet memcached 2>/dev/null; then
+            _row "Memcached"   "OK  running"
+        elif systemctl is-enabled --quiet memcached 2>/dev/null; then
+            _row "Memcached"   "!   enabled but not running"
+            _rec "memcached not running — run: systemctl start memcached  [auto]"
+        else
+            _srv_opt_begin
+            _row "Memcached"   "~~  not enabled — to enable: systemctl enable --now memcached"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── slapd (OpenLDAP server) ───────────────────────────────────────────────
+    if command -v slapd &>/dev/null || systemctl cat slapd &>/dev/null 2>&1; then
+        local _ldap_cfg=0
+        # CLI: check for a real user database beyond the default {-1}frontend / {0}config
+        if command -v slaptest &>/dev/null; then
+            if slaptest -Q -u 2>/dev/null | grep -qE 'config file testing succeeded' \
+               || slaptest -Q -u &>/dev/null 2>&1; then
+                # slaptest passes even on default install — check for non-default database
+                # with a non-placeholder suffix (default ships dc=my-domain,dc=com)
+                if [[ -d /etc/openldap/slapd.d ]]; then
+                    local _mdb_file
+                    _mdb_file=$(grep -rl '^olcDatabase:[[:space:]]*(mdb|hdb|bdb|ldif|sql)' \
+                        /etc/openldap/slapd.d/ 2>/dev/null | head -1 || echo "")
+                    if [[ -n "$_mdb_file" ]] && \
+                       grep -q '^olcSuffix:' "$_mdb_file" 2>/dev/null && \
+                       ! grep -qE '^olcSuffix:[[:space:]]*(dc=my-domain,dc=com|dc=example,dc=com|dc=nodomain)' \
+                           "$_mdb_file" 2>/dev/null; then
+                        _ldap_cfg=1
+                    fi
+                fi
+            fi
+        fi
+        # Fallback: file check — require a real backend database with non-placeholder suffix
+        if (( ! _ldap_cfg )); then
+            if [[ -f /etc/openldap/slapd.conf ]] && \
+               grep -qE '^[[:space:]]*database[[:space:]]+(mdb|hdb|bdb|ldif|sql)' \
+               /etc/openldap/slapd.conf 2>/dev/null && \
+               ! grep -qE '^[[:space:]]*suffix[[:space:]]+"(dc=my-domain,dc=com|dc=example,dc=com|dc=nodomain)"' \
+               /etc/openldap/slapd.conf 2>/dev/null; then
+                _ldap_cfg=1
+            fi
+            if [[ -d /etc/openldap/slapd.d ]]; then
+                local _mdb_file2
+                _mdb_file2=$(grep -rl '^olcDatabase:[[:space:]]*(mdb|hdb|bdb|ldif|sql)' \
+                    /etc/openldap/slapd.d/ 2>/dev/null | head -1 || echo "")
+                if [[ -n "$_mdb_file2" ]] && \
+                   grep -q '^olcSuffix:' "$_mdb_file2" 2>/dev/null && \
+                   ! grep -qE '^olcSuffix:[[:space:]]*(dc=my-domain,dc=com|dc=example,dc=com|dc=nodomain)' \
+                       "$_mdb_file2" 2>/dev/null; then
+                    _ldap_cfg=1
+                fi
+            fi
+        fi
+        if systemctl is-active --quiet slapd 2>/dev/null; then
+            _row "slapd"         "OK  OpenLDAP running"
+        elif systemctl is-enabled --quiet slapd 2>/dev/null; then
+            _row "slapd"         "!   enabled but not running"
+            _rec "slapd not running — run: systemctl start slapd  [auto]"
+        elif (( _ldap_cfg )); then
+            _srv_opt_begin
+            _row "slapd"         "~~  configured, not enabled — to enable: systemctl enable --now slapd"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "slapd"         "~~  not configured — configure /etc/openldap/slapd.conf, then systemctl enable --now slapd"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Mail ────────────────────────────────────────────────────────────────
+    # ── Postfix (mail transfer agent) ─────────────────────────────────────────
+    # Commonly used for sending system mail (cron output, logwatch alerts).
+    if command -v postfix &>/dev/null || systemctl cat postfix &>/dev/null 2>&1; then
+        local _pf_cfg=0
+        # CLI: postconf reads compiled config including $config_directory includes
+        if command -v postconf &>/dev/null; then
+            local _pf_relay _pf_dest _pf_ifaces
+            _pf_relay=$(postconf -h relayhost 2>/dev/null | tr -d '[:space:]')
+            _pf_dest=$(postconf -h mydestination 2>/dev/null | tr -d '[:space:]')
+            _pf_ifaces=$(postconf -h inet_interfaces 2>/dev/null | tr -d '[:space:]')
+            # relayhost set → sending to a smarthost: clearly configured
+            [[ -n "$_pf_relay" ]] && _pf_cfg=1
+            # inet_interfaces != loopback-only → listening externally: clearly configured
+            [[ "$_pf_ifaces" != "loopback-only" && "$_pf_ifaces" != "localhost" ]] && _pf_cfg=1
+            # mydestination: only count as configured if it differs from all known defaults
+            # Default installs ship one of these values:
+            if (( ! _pf_cfg )) && [[ -n "$_pf_dest" ]]; then
+                case "$_pf_dest" in
+                    '$myhostname,localhost.$mydomain,localhost' | \
+                    '$myhostname,localhost.$mydomain,localhost,$mydomain' | \
+                    'localhost')
+                        : ;; # default — not configured
+                    *)
+                        _pf_cfg=1 ;;
+                esac
+            fi
+        fi
+        # Fallback: file check — only relayhost or non-loopback inet_interfaces signal real config
+        if (( ! _pf_cfg )); then
+            [[ -f /etc/postfix/main.cf ]] && \
+                grep -qE '^(relayhost|inet_interfaces)\s*=\s*\S' /etc/postfix/main.cf 2>/dev/null && \
+                ! grep -qE '^inet_interfaces\s*=\s*(loopback-only|localhost)\s*$' /etc/postfix/main.cf 2>/dev/null && \
+                _pf_cfg=1
+        fi
+        if systemctl is-active --quiet postfix 2>/dev/null; then
+            local _pf_queue=""
+            _pf_queue=$(postqueue -p 2>/dev/null | tail -1 | grep -oE '[0-9]+' | head -1 || echo "")
+            _row "Postfix"     "OK  running${_pf_queue:+  (${_pf_queue} message(s) queued)}"
+        elif systemctl is-enabled --quiet postfix 2>/dev/null; then
+            if (( ! _pf_cfg )); then
+                _row "Postfix"     "!   enabled but not configured — set relayhost/mydestination in /etc/postfix/main.cf"
+                _rec "Postfix enabled but /etc/postfix/main.cf has no relayhost or mydestination — configure before starting"
+            else
+                _row "Postfix"     "!   enabled but not running — system mail delivery broken"
+                _rec "postfix not running — run: systemctl start postfix  [auto]"
+            fi
+        elif (( _pf_cfg )); then
+            _srv_opt_begin
+            _row "Postfix"     "~~  configured, not enabled — to enable: systemctl enable --now postfix"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "Postfix"     "~~  not enabled — to send system mail: systemctl enable --now postfix"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Dovecot (IMAP/POP3 mail server) ──────────────────────────────────────
+    if command -v dovecot &>/dev/null || systemctl cat dovecot &>/dev/null 2>&1; then
+        local _dv_cfg=0
+        # CLI: doveconf reads all conf.d/ includes and returns the compiled value
+        if command -v doveconf &>/dev/null; then
+            local _dv_mailloc
+            _dv_mailloc=$(doveconf mail_location 2>/dev/null | awk -F'=' '{print $2}' | tr -d '[:space:]')
+            [[ -n "$_dv_mailloc" && "$_dv_mailloc" != "" ]] && _dv_cfg=1
+        fi
+        # Fallback: file check if doveconf not available
+        if (( ! _dv_cfg )); then
+            { [[ -f /etc/dovecot/dovecot.conf ]] &&                 grep -qE '^mail_location\s*=' /etc/dovecot/dovecot.conf 2>/dev/null; } && _dv_cfg=1
+            { [[ -f /etc/dovecot/conf.d/10-mail.conf ]] &&                 grep -qE '^mail_location\s*=' /etc/dovecot/conf.d/10-mail.conf 2>/dev/null; } && _dv_cfg=1
+        fi
+        if systemctl is-active --quiet dovecot 2>/dev/null; then
+            _row "Dovecot"     "OK  running"
+        elif systemctl is-enabled --quiet dovecot 2>/dev/null; then
+            if (( ! _dv_cfg )); then
+                _row "Dovecot"     "!   enabled but not configured — set mail_location in /etc/dovecot/conf.d/10-mail.conf"
+                _rec "Dovecot enabled but mail_location not set — configure /etc/dovecot/conf.d/10-mail.conf before starting"
+            else
+                _row "Dovecot"     "!   enabled but not running — IMAP/POP3 unavailable"
+                _rec "dovecot not running — run: systemctl start dovecot  [auto]"
+            fi
+        elif (( _dv_cfg )); then
+            _srv_opt_begin
+            _row "Dovecot"     "~~  configured, not enabled — to enable: systemctl enable --now dovecot"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "Dovecot"     "~~  not enabled — to serve IMAP/POP3: systemctl enable --now dovecot"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Media ───────────────────────────────────────────────────────────────
+    # ── minidlna / ReadyMedia (UPnP/DLNA media server) ───────────────────────
+    if command -v minidlnad &>/dev/null || systemctl cat minidlna &>/dev/null 2>&1; then
+        local _dlna_cfg=0
+        [[ -f /etc/minidlna.conf ]] &&             grep -qE '^media_dir=' /etc/minidlna.conf 2>/dev/null &&             _dlna_cfg=1
+        if systemctl is-active --quiet minidlna 2>/dev/null; then
+            _row "minidlna"    "OK  running"
+        elif systemctl is-enabled --quiet minidlna 2>/dev/null; then
+            if (( ! _dlna_cfg )); then
+                _row "minidlna"    "!   enabled but not configured — set media_dir= in /etc/minidlna.conf"
+                _rec "minidlna enabled but media_dir not set in /etc/minidlna.conf — configure before starting"
+            else
+                _row "minidlna"    "!   enabled but not running"
+                _rec "minidlna not running — run: systemctl start minidlna  [auto]"
+            fi
+        elif (( _dlna_cfg )); then
+            _srv_opt_begin
+            _row "minidlna"    "~~  configured, not enabled — to enable: systemctl enable --now minidlna"
+            _srv_opt_end
+        else
+            _srv_opt_begin
+            _row "minidlna"    "~~  not enabled — to serve DLNA: systemctl enable --now minidlna"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Jellyfin (media server) ───────────────────────────────────────────────
+    if command -v jellyfin &>/dev/null || systemctl cat jellyfin &>/dev/null 2>&1; then
+        if systemctl is-active --quiet jellyfin 2>/dev/null; then
+            _row "Jellyfin"    "OK  running"
+        elif systemctl is-enabled --quiet jellyfin 2>/dev/null; then
+            _row "Jellyfin"    "!   enabled but not running"
+            _rec "jellyfin not running — run: systemctl start jellyfin  [auto]"
+        else
+            _srv_opt_begin
+            _row "Jellyfin"    "~~  not enabled — to stream media: systemctl enable --now jellyfin"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Rygel (UPnP/DLNA media server) ───────────────────────────────────────
+    # GNOME-profile only; runs as a user service launched from GNOME Settings →
+    # Sharing → Media Sharing.  Silent on Plasma.
+    if [[ "$_rd_profile" == "gnome" ]] || command -v rygel &>/dev/null; then
+        if _sysd_user is-active --quiet rygel 2>/dev/null || \
+           pgrep -x rygel &>/dev/null; then
+            _row "Rygel"       "OK  DLNA/UPnP media server active"
+        elif _sysd_user is-enabled --quiet rygel 2>/dev/null; then
+            _row "Rygel"       "!   enabled but not running"
+            _rec "rygel not running — run: systemctl --user start rygel  [auto]"
+        elif command -v rygel &>/dev/null; then
+            _srv_opt_begin
+            _row "Rygel"       "~~  not enabled — to share media: Settings → Sharing → Media Sharing"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── GNOME sharing stack ───────────────────────────────────────────────────
+
+    # ── gnome-user-share (WebDAV / personal file sharing) ────────────────────
+    # Provides WebDAV sharing via Apache mod_dnssd; enabled per-user from
+    # GNOME Settings → Sharing → Personal File Sharing.
+    if [[ "$_rd_profile" == "gnome" ]] || command -v gnome-user-share &>/dev/null; then
+        if _sysd_user is-active --quiet gnome-user-share 2>/dev/null || \
+           pgrep -x gnome-user-share &>/dev/null; then
+            _row "User share"  "OK  GNOME personal file sharing active (WebDAV)"
+        elif _sysd_user is-enabled --quiet gnome-user-share 2>/dev/null; then
+            _row "User share"  "!   enabled but not running"
+            _rec "gnome-user-share not running — run: systemctl --user start gnome-user-share  [auto]"
+        elif command -v gnome-user-share &>/dev/null; then
+            _srv_opt_begin
+            _row "User share"  "~~  not enabled — to share files: Settings → Sharing → Personal File Sharing"
+            _srv_opt_end
+        fi
+    fi
+
+    # ── Legacy & utilities ────────────────────────────────────────────────────
+    # ── transmission (BitTorrent daemon) ─────────────────────────────────────
+    # transmission-cli ships transmission.service. Only relevant when the daemon
+    # is intentionally enabled — not enabled by default.
+    if command -v transmission-daemon &>/dev/null || \
+       systemctl cat transmission.service &>/dev/null 2>&1; then
+        local _trans_cfg=0
+        { [[ -f /var/lib/transmission/.config/transmission-daemon/settings.json ]] ||           [[ -f /etc/transmission-daemon/settings.json ]]; } && _trans_cfg=1
+        if systemctl is-active --quiet transmission 2>/dev/null; then
+            local _tr_port=""
+            _tr_port=$(ss -tlnp 2>/dev/null \
+                | awk '/transmission/{match($4,/:([0-9]+)$/,a); if(a[1]) print a[1]}' \
+                | head -1 || echo "")
+            _row "Transmission" "OK  running${_tr_port:+  (RPC port ${_tr_port})}"
+        elif systemctl is-enabled --quiet transmission 2>/dev/null; then
+            if (( ! _trans_cfg )); then
+                _row "Transmission" "!   enabled but not configured — start once to initialise: systemctl start transmission"
+                _rec "Transmission enabled but settings.json not found — start once to initialise config"
+            else
+                _row "Transmission" "!   enabled but not running"
+                _rec "transmission not running — run: systemctl start transmission  [auto]"
+            fi
+        else
+            _srv_opt_begin
+            _row "Transmission" "~~  not enabled — to run daemon: systemctl enable --now transmission"
+            _srv_opt_end
+        fi
+    fi
+
+
+    # ── System search & indexing ─────────────────────────────────────────────
+    # ── localsearch / tinysparql (file indexer) ───────────────────────────────
+    # Tracker 3 fork — indexes files for GNOME Files search, GNOME Music, etc.
+    # Runs as user services. Surface when active or enabled.
+    local _ls_svc=""
+    systemctl --user cat localsearch-3   &>/dev/null 2>&1 && _ls_svc="localsearch-3"
+    systemctl --user cat tinysparql-3    &>/dev/null 2>&1 && [[ -z "$_ls_svc" ]] \
+        && _ls_svc="tinysparql-3"
+    if [[ -n "$_ls_svc" ]] || command -v localsearch &>/dev/null || \
+       command -v tinysparql &>/dev/null; then
+        if _sysd_user is-active --quiet "${_ls_svc:-localsearch-3}" 2>/dev/null; then
+            _row "Indexer"      "OK  ${_ls_svc:-localsearch} running"
+        elif _sysd_user is-enabled --quiet "${_ls_svc:-localsearch-3}" 2>/dev/null; then
+            _row "Indexer"      "!   enabled but not running"
+            _rec "File indexer not running — run: systemctl --user start ${_ls_svc:-localsearch-3}  [auto]"
+        fi
+        # Silent when not enabled
+    fi
+
+
+    # ── Downloads ───────────────────────────────────────────────────────────────
+    # ── aria2 (download daemon / RPC server) ──────────────────────────────────
+    # aria2c --enable-rpc runs as a JSON-RPC download daemon used by front-ends
+    # like Motrix or web UIs. Only surface when a systemd unit is present.
+    if systemctl cat aria2 &>/dev/null 2>&1 || \
+       systemctl cat aria2c &>/dev/null 2>&1; then
+        local _aria2_svc="aria2"
+        systemctl cat aria2c &>/dev/null 2>&1 && _aria2_svc="aria2c"
+        if systemctl is-active --quiet "$_aria2_svc" 2>/dev/null; then
+            _row "aria2"         "OK  running (RPC download daemon)"
+        elif systemctl is-enabled --quiet "$_aria2_svc" 2>/dev/null; then
+            _row "aria2"         "!   enabled but not running"
+            _rec "aria2 not running — run: systemctl start ${_aria2_svc}  [auto]"
+        else
+            _row "aria2"         "--  unit present but not enabled (to enable: systemctl enable --now ${_aria2_svc})"
+        fi
+    fi
+
+
+    # ── File Sync ────────────────────────────────────────────────────────────────
+    # ── Syncthing (peer-to-peer file synchronisation) ────────────────────────────
+    if command -v syncthing &>/dev/null || systemctl cat syncthing &>/dev/null 2>&1; then
+        # Syncthing runs as a user service — check for any active user instance
+        local st_active=0
+        if systemctl is-active --quiet syncthing 2>/dev/null ||            systemctl --global is-enabled --quiet syncthing 2>/dev/null; then
+            st_active=1
+        fi
+        if (( st_active )); then
+            _row "Syncthing"  "OK  running"
+        elif systemctl is-enabled --quiet syncthing 2>/dev/null; then
+            _row "Syncthing"  "!   enabled but not running"
+            _rec "syncthing not running — run: systemctl start syncthing  [auto]"
+        else
+            _srv_opt_begin
+            _row "Syncthing"  "~~  not enabled — to sync files: systemctl --user enable --now syncthing"
+            _srv_opt_end
+        fi
+    fi
+
+
+
+    _srv_opt_flush
 }
+
 _section_performance() {
     _head "Performance"
 
@@ -3165,7 +5070,7 @@ _section_performance() {
             _rec "Enable irqbalance: systemctl enable --now irqbalance  [auto]"
         fi
     else
-        _row "irqbalance"  "!!  not installed — all IRQs handled by one core"
+        _row "irqbalance"  "!   not installed — all IRQs handled by one core"
     fi
 
     # ── ananicy-cpp ───────────────────────────────────────────────────────────
@@ -3201,6 +5106,21 @@ _section_performance() {
         fi
     fi
 
+    # ── Transparent Huge Pages ───────────────────────────────────────────────
+    # THP=always causes latency spikes in Redis, databases, and games.
+    local _thp_file="/sys/kernel/mm/transparent_hugepage/enabled"
+    if [[ -f "$_thp_file" ]]; then
+        local _thp
+        _thp=$(cat "$_thp_file" 2>/dev/null | grep -oP '\[\K[^\]]+' || echo "")
+        case "$_thp" in
+            always)  _row "THP"  "!   always — may cause latency spikes in Redis/databases"
+                     _rec "Set THP to madvise: echo madvise > /sys/kernel/mm/transparent_hugepage/enabled (persist via tmpfiles.d)" ;;
+            madvise) _row "THP"  "OK  madvise (apps opt in)" ;;
+            never)   _row "THP"  "--  disabled" ;;
+            *)       [[ -n "$_thp" ]] && _row "THP"  "--  ${_thp}" ;;
+        esac
+    fi
+
     # ── Profile Sync Daemon ──────────────────────────────────────────────────
     # Syncs browser profiles to tmpfs for faster access and reduced SSD wear.
     if command -v psd &>/dev/null || _sysd_user cat psd.service &>/dev/null 2>&1; then
@@ -3208,20 +5128,382 @@ _section_performance() {
             _row "PSD"        "OK  browser profiles synced to RAM"
         elif _sysd_user is-enabled --quiet psd 2>/dev/null; then
             _row "PSD"        "!   enabled but not running"
-            _rec "Profile Sync Daemon enabled but not active — run: systemctl --user start psd  [auto]"
+            _rec "Profile Sync Daemon not running — run: systemctl --user start psd  [auto]"
         else
-            _row "PSD"        "--  installed, not enabled"
+            _row "PSD"        "~~  not enabled — to sync browser profiles: systemctl --user enable --now psd"
         fi
     fi
+
+    _optional_begin
+    # ── thermald (Intel thermal management daemon) ────────────────────────────
+    # Only relevant on Intel CPUs — gates on vendor check.
+    if command -v thermald &>/dev/null || systemctl cat thermald &>/dev/null 2>&1; then
+        local _is_intel=0
+        grep -qi 'GenuineIntel' /proc/cpuinfo 2>/dev/null && _is_intel=1
+        if (( _is_intel )); then
+            if systemctl is-active --quiet thermald 2>/dev/null; then
+                _row "thermald"   "OK  running (Intel thermal management active)"
+            elif systemctl is-enabled --quiet thermald 2>/dev/null; then
+                _row "thermald"   "!   enabled but not running"
+                _rec "thermald not running — run: systemctl start thermald  [auto]"
+            else
+                _row "thermald"   "~~  not enabled — Intel CPU detected: systemctl enable --now thermald"
+            fi
+        fi
+        # Silent on AMD/ARM
+    fi
+
+    # ── tuned (system performance tuning daemon) ──────────────────────────────
+    # Applies performance/power profiles via tuned-profiles. Conflicts with
+    # power-profiles-daemon (ppd) which is the preferred stack for GNOME/Plasma.
+    if command -v tuned &>/dev/null || systemctl cat tuned &>/dev/null 2>&1; then
+        if systemctl is-active --quiet tuned 2>/dev/null; then
+            local _tuned_profile=""
+            _tuned_profile=$(tuned-adm active 2>/dev/null \
+                | awk -F': ' '/Current active profile/{print $2}' || echo "")
+            _row "tuned"       "OK  running${_tuned_profile:+  (${_tuned_profile})}"
+            if systemctl is-active --quiet power-profiles-daemon 2>/dev/null; then
+                _row2 "!   power-profiles-daemon also active — may conflict"
+                _rec  "Both tuned and power-profiles-daemon active — disable one"
+            fi
+        elif systemctl is-enabled --quiet tuned 2>/dev/null; then
+            _row "tuned"       "!   enabled but not running"
+            _rec "tuned not running — run: systemctl start tuned  [auto]"
+        else
+            _row "tuned"       "~~  not enabled — to enable: systemctl enable --now tuned"
+        fi
+    fi
+
+    # ── preload (adaptive readahead daemon) ───────────────────────────────────
+    # Monitors app usage and preloads frequently-used binaries into page cache.
+    if command -v preload &>/dev/null || systemctl cat preload &>/dev/null 2>&1; then
+        if systemctl is-active --quiet preload 2>/dev/null; then
+            _row "preload"     "OK  running"
+        elif systemctl is-enabled --quiet preload 2>/dev/null; then
+            _row "preload"     "!   enabled but not running"
+            _rec "preload not running — run: systemctl start preload  [auto]"
+        else
+            _row "preload"     "~~  not enabled — to enable: systemctl enable --now preload"
+        fi
+    fi
+    _optional_end
 }
 
 _section_network() {
     _head "Network"
 
+    # ── Connectivity ────────────────────────────────────────────────────────
     # ── Network manager ───────────────────────────────────────────────────────
-    systemctl is-active --quiet NetworkManager 2>/dev/null \
-        && _row "Network"  "OK  NetworkManager active" \
-        || _row "Network"  "!   NetworkManager not running"
+    if ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        _row "Network"  "!   NetworkManager not running"
+        _rec "NetworkManager not running — run: systemctl enable --now NetworkManager  [auto]"
+    fi
+
+
+    # ── NetworkManager conflicts ──────────────────────────────────────────────
+    # Services that take over interface/DHCP management and conflict with NM.
+    # Only warn when NM is actually active — if NM isn't running these are fine.
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+
+        # Read NM DHCP backend early — used in dhcpcd conflict check below
+        local _nm_dhcp=""
+        _nm_dhcp=$(grep -rshE '^dhcp\s*=' \
+            /usr/lib/NetworkManager/conf.d/ \
+            /etc/NetworkManager/conf.d/ \
+            /etc/NetworkManager/NetworkManager.conf 2>/dev/null \
+            | tail -1 | awk -F'=' '{print $2}' | tr -d '[:space:]' || echo "")
+        [[ -z "$_nm_dhcp" ]] && _nm_dhcp="internal"
+
+        # systemd-networkd — direct conflict: both manage interfaces via udev rules
+        if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+            _row "networkd"    "!!  systemd-networkd active alongside NetworkManager — interfaces may fight"
+            _rec "Both NetworkManager and systemd-networkd are active — disable one: systemctl disable --now systemd-networkd"
+        fi
+
+        # connman — direct conflict: its own DHCP, DNS, and interface manager
+        if systemctl is-active --quiet connman 2>/dev/null; then
+            _row "connman"     "!!  connman active alongside NetworkManager — network conflict"
+            _rec "Both NetworkManager and connman active — disable one: systemctl disable --now connman"
+        fi
+
+          # dhcpcd — standalone DHCP client conflicts with NM's built-in DHCP
+        # Exception: dhcpcd on an interface NM isn't managing (e.g. a bridge) is fine.
+        # Only warn when dhcpcd is on an interface NM has claimed. If NM dhcp=dhcpcd,
+        # NM itself invoked dhcpcd — not a conflict.
+        if systemctl is-active --quiet dhcpcd 2>/dev/null; then
+            if [[ "$_nm_dhcp" == "dhcpcd" ]]; then
+                : # NM is using dhcpcd as its DHCP backend — expected, not a conflict
+            else
+                local _dhcpcd_ifaces=""
+                _dhcpcd_ifaces=$(ps -C dhcpcd -o args= 2>/dev/null \
+                    | grep -oP '(?<=\s)\w+$' | sort -u | paste -sd ',' || echo "")
+                local _nm_managed=""
+                _nm_managed=$(nmcli -t -f DEVICE,STATE d 2>/dev/null \
+                    | awk -F: '$2 != "unmanaged" {print $1}' | paste -sd ',' || echo "")
+                local _overlap=0
+                if [[ -n "$_dhcpcd_ifaces" && -n "$_nm_managed" ]]; then
+                    while IFS=',' read -ra _dif; do
+                        for _di in "${_dif[@]}"; do
+                            [[ ",$_nm_managed," == *",${_di},"* ]] && { _overlap=1; break 2; }
+                        done
+                    done <<< "$_dhcpcd_ifaces"
+                elif [[ -z "$_dhcpcd_ifaces" ]]; then
+                    _overlap=1
+                fi
+                if (( _overlap )); then
+                    _row "dhcpcd"  "!!  dhcpcd running on NM-managed interface(s) — DHCP conflict${_dhcpcd_ifaces:+  (${_dhcpcd_ifaces})}"
+                    _rec "dhcpcd and NetworkManager both managing DHCP — disable: systemctl disable --now dhcpcd"
+                else
+                    _row "dhcpcd"  "!   dhcpcd running alongside NM (unmanaged interface${_dhcpcd_ifaces:+: ${_dhcpcd_ifaces}}) — monitor for conflicts"
+                fi
+            fi
+        fi
+
+        # netctl — profile-based network manager, mutually exclusive with NM
+        if systemctl is-active --quiet netctl 2>/dev/null; then
+            _row "netctl"      "!!  netctl active alongside NetworkManager — network conflict"
+            _rec "Both NetworkManager and netctl active — disable one: systemctl disable --now netctl"
+        fi
+
+        # wicd — legacy wireless/wired manager, mutually exclusive with NM
+        if systemctl is-active --quiet wicd 2>/dev/null; then
+            _row "wicd"        "!!  wicd active alongside NetworkManager — network conflict"
+            _rec "Both NetworkManager and wicd active — disable one: systemctl disable --now wicd"
+        fi
+
+        # networking.service (Debian/Ubuntu ifupdown) — manages interfaces via /etc/network/interfaces
+        if systemctl is-active --quiet networking 2>/dev/null; then
+            _row "networking"  "!!  networking.service (ifupdown) active alongside NetworkManager — interface conflict"
+            _rec "ifupdown networking.service and NetworkManager both active — disable one to avoid interface conflicts"
+        fi
+
+    fi
+
+
+    # ── NetworkManager configuration & plugins ────────────────────────────────
+    # Only check when NM is active — these are meaningless otherwise.
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        local _nm_conf="/etc/NetworkManager/NetworkManager.conf"
+        local _nm_conf_dir="/etc/NetworkManager/conf.d"
+        local _nm_lib_conf_dir="/usr/lib/NetworkManager/conf.d"
+
+
+        # ── DNS backend consistency ───────────────────────────────────────────
+        # NM's dns= setting must match what's actually installed.
+        # On ShaniOS dns=none or dns=resolvconf is expected (openresolv manages resolv.conf).
+        local _nm_dns=""
+        _nm_dns=$(grep -rshE '^dns\s*=' "$_nm_lib_conf_dir"/ "$_nm_conf_dir"/ "$_nm_conf" 2>/dev/null             | tail -1 | awk -F'=' '{print $2}' | tr -d '[:space:]' || echo "")
+        # Fallback: default (NM writes resolv.conf directly) when no dns= is set
+        [[ -z "$_nm_dns" ]] && _nm_dns="default"
+
+        case "$_nm_dns" in
+            resolvconf|openresolv)
+                # Needs resolvconf binary and openresolv dispatcher script
+                if ! command -v resolvconf &>/dev/null; then
+                    _row "NM dns"     "!!  dns=resolvconf but resolvconf not installed — DNS updates will fail"
+                    _rec "NetworkManager dns=resolvconf but resolvconf binary missing — install openresolv"
+                else
+                    # Check dispatcher script exists
+                    if [[ ! -f /etc/NetworkManager/dispatcher.d/09-openresolv ]] &&                        [[ ! -f /etc/NetworkManager/dispatcher.d/99-openresolv ]]; then
+                        _row "NM dns"     "!   dns=resolvconf but NM dispatcher script missing"
+                        _rec "NetworkManager openresolv dispatcher script not found in /etc/NetworkManager/dispatcher.d/ — DNS may not update on connect"
+                    else
+                        _row "NM dns"     "OK  dns=resolvconf (openresolv dispatcher present)"
+                    fi
+                fi
+                ;;
+            systemd-resolved)
+                if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+                    _row "NM dns"     "!!  dns=systemd-resolved but systemd-resolved not running"
+                    _rec "NetworkManager dns=systemd-resolved but systemd-resolved is not active — DNS updates will fail"
+                else
+                    _row "NM dns"     "OK  dns=systemd-resolved"
+                fi
+                ;;
+            dnsmasq)
+                # NM spawns its own dnsmasq instance — dnsmasq must be installed
+                if ! command -v dnsmasq &>/dev/null; then
+                    _row "NM dns"     "!!  dns=dnsmasq but dnsmasq not installed"
+                    _rec "NetworkManager dns=dnsmasq but dnsmasq binary missing — install dnsmasq"
+                else
+                    _row "NM dns"     "OK  dns=dnsmasq"
+                fi
+                ;;
+            none|"")
+                _row "NM dns"     "--  dns=none (resolv.conf managed externally)"
+                ;;
+            default|*)
+                # Silent — default behaviour, NM writes resolv.conf directly
+                ;;
+        esac
+
+        # ── DHCP backend consistency ──────────────────────────────────────────
+
+        case "$_nm_dhcp" in
+            dhclient)
+                if ! command -v dhclient &>/dev/null; then
+                    _row "NM dhcp"    "!!  dhcp=dhclient but dhclient not installed — DHCP will fail"
+                    _rec "NetworkManager dhcp=dhclient but dhclient binary missing — install dhclient or change to dhcp=internal"
+                else
+                    _row "NM dhcp"    "--  dhcp=dhclient"
+                fi
+                ;;
+            dhcpcd)
+                if ! command -v dhcpcd &>/dev/null; then
+                    _row "NM dhcp"    "!!  dhcp=dhcpcd but dhcpcd not installed — DHCP will fail"
+                    _rec "NetworkManager dhcp=dhcpcd but dhcpcd binary missing — install dhcpcd or change to dhcp=internal"
+                else
+                    _row "NM dhcp"    "--  dhcp=dhcpcd"
+                fi
+                ;;
+            internal|*)
+                # internal is the default — no extra binary needed, silent
+                ;;
+        esac
+
+        # ── Wi-Fi backend consistency ─────────────────────────────────────────
+        local _nm_wifi_backend=""
+        _nm_wifi_backend=$(grep -rshE '^wifi\.backend\s*=' "$_nm_lib_conf_dir"/ "$_nm_conf_dir"/ "$_nm_conf" 2>/dev/null             | tail -1 | awk -F'=' '{print $2}' | tr -d '[:space:]' || echo "")
+        [[ -z "$_nm_wifi_backend" ]] && _nm_wifi_backend="wpa_supplicant"
+
+        case "$_nm_wifi_backend" in
+            iwd)
+                if ! command -v iwctl &>/dev/null; then
+                    _row "NM wifi"    "!!  wifi.backend=iwd but iwd not installed — Wi-Fi unavailable"
+                    _rec "NetworkManager wifi.backend=iwd but iwd not installed — install iwd or change backend to wpa_supplicant"
+                elif ! systemctl is-active --quiet iwd 2>/dev/null; then
+                    _row "NM wifi"    "!!  wifi.backend=iwd but iwd not running — Wi-Fi unavailable"
+                    _rec "NetworkManager uses iwd as Wi-Fi backend but iwd is not active — run: systemctl enable --now iwd  [auto]"
+                else
+                    _row "NM wifi"    "OK  wifi.backend=iwd (iwd running)"
+                fi
+                ;;
+            wpa_supplicant|*)
+                # wpa_supplicant is default — NM manages it internally, silent unless broken
+                ;;
+        esac
+
+        # ── VPN plugin availability ───────────────────────────────────────────
+        # Check if any saved VPN connections require plugins that aren't installed.
+        # NM stores connections in /etc/NetworkManager/system-connections/ and
+        # /run/NetworkManager/system-connections/.
+        local _nm_vpn_types=""
+        _nm_vpn_types=$(grep -rsh '^type\s*='             /etc/NetworkManager/system-connections/             /run/NetworkManager/system-connections/ 2>/dev/null             | awk -F'=' '/vpn/{print $2}' | sort -u | tr -d '[:space:]' | tr '
+' ','             || echo "")
+        # Also read vpn service-type lines
+        local _nm_vpn_plugins=""
+        _nm_vpn_plugins=$(grep -rsh '^service-type\s*='             /etc/NetworkManager/system-connections/             /run/NetworkManager/system-connections/ 2>/dev/null             | awk -F'=' '{print $2}' | sed 's|.*org\.freedesktop\.NetworkManager\.||'             | tr -d '[:space:]' | sort -u | tr '
+' ' '             || echo "")
+
+        # Map vpn service-type to the plugin binary NM invokes
+        declare -A _nm_vpn_bins=(
+            ["openvpn"]="nm-openvpn-service"
+            ["vpnc"]="nm-vpnc-service"
+            ["openconnect"]="nm-openconnect-service"
+            ["wireguard"]="nm-wireguard-service"
+            ["strongswan"]="nm-strongswan-service"
+            ["l2tp"]="nm-l2tp-service"
+            ["pptp"]="nm-pptp-service"
+            ["ssh"]="nm-ssh-service"
+            ["fortisslvpn"]="nm-fortisslvpn-service"
+        )
+
+        local _vpn_missing=()
+        for _vpn_type in "${!_nm_vpn_bins[@]}"; do
+            # Check if any saved connection uses this VPN type
+            if grep -rqs "service-type.*${_vpn_type}"                /etc/NetworkManager/system-connections/                /run/NetworkManager/system-connections/ 2>/dev/null; then
+                local _plugin_bin="${_nm_vpn_bins[$_vpn_type]}"
+                if ! command -v "$_plugin_bin" &>/dev/null &&                    [[ ! -f "/usr/lib/NetworkManager/${_plugin_bin}" ]] &&                    [[ ! -f "/usr/libexec/${_plugin_bin}" ]]; then
+                    _vpn_missing+=("${_vpn_type}")
+                fi
+            fi
+        done
+
+        if [[ ${#_vpn_missing[@]} -gt 0 ]]; then
+            local _vm_str; _vm_str=$(IFS=', '; echo "${_vpn_missing[*]}")
+            _row "NM VPN"      "!!  saved VPN connection(s) missing plugin: ${_vm_str}"
+            _rec "NM VPN plugin(s) missing for: ${_vm_str} — install networkmanager-${_vpn_missing[0]} (and others)"
+        fi
+
+
+
+    fi
+
+    # ── wpa_supplicant (Wi-Fi authentication backend) ─────────────────────────
+    # NetworkManager uses wpa_supplicant internally; the D-Bus unit
+    # wpa_supplicant.service is managed by NM automatically. Only surface when
+    # it is independently enabled (used without NM) or has failed.
+    if command -v wpa_supplicant &>/dev/null || \
+       systemctl cat wpa_supplicant.service &>/dev/null 2>&1; then
+        local _nm_active=0
+        systemctl is-active --quiet NetworkManager 2>/dev/null && _nm_active=1
+        if systemctl is-failed --quiet wpa_supplicant.service 2>/dev/null; then
+            _row "wpa_supp"    "!   wpa_supplicant.service failed — Wi-Fi auth broken"
+            _rec "wpa_supplicant failed — run: systemctl reset-failed wpa_supplicant && systemctl start wpa_supplicant  [auto]"
+        elif (( ! _nm_active )); then
+            # NM not managing Wi-Fi — check if wpa_supplicant is running directly
+            if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
+                _row "wpa_supp"    "OK  running (standalone mode)"
+            elif systemctl is-enabled --quiet wpa_supplicant 2>/dev/null; then
+                _row "wpa_supp"    "!   enabled but not running — Wi-Fi auth unavailable"
+                _rec "wpa_supplicant not running — run: systemctl start wpa_supplicant  [auto]"
+            fi
+        fi
+        # Silent when NM is active and wpa_supplicant is healthy — NM manages it
+    fi
+
+    # ── iwd (Intel Wi-Fi daemon — alternative to wpa_supplicant) ─────────────
+    # Can be used standalone or as the Wi-Fi backend for NetworkManager.
+    # If both iwd and wpa_supplicant are active, they may conflict.
+    if command -v iwctl &>/dev/null || systemctl cat iwd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet iwd 2>/dev/null; then
+            local _iwd_nets=""
+            _iwd_nets=$(iwctl station list 2>/dev/null | grep -c 'connected' || echo "")
+            _row "iwd"         "OK  running${_iwd_nets:+  (${_iwd_nets} connected)}"
+            # Warn if wpa_supplicant is also active — they conflict
+            if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
+                _row2 "!   wpa_supplicant also active — iwd and wpa_supplicant conflict"
+                _rec "Both iwd and wpa_supplicant active — disable one to avoid Wi-Fi conflicts"
+            fi
+        elif systemctl is-enabled --quiet iwd 2>/dev/null; then
+            # Check if NM is configured to use iwd as its backend
+            local _nm_wifi_be_iwd=""
+            _nm_wifi_be_iwd=$(grep -rshE '^wifi\.backend\s*=' \
+                /usr/lib/NetworkManager/conf.d/ \
+                /etc/NetworkManager/conf.d/ \
+                /etc/NetworkManager/NetworkManager.conf 2>/dev/null \
+                | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+            if [[ "$_nm_wifi_be_iwd" == "iwd" ]]; then
+                _row "iwd"     "!   enabled but not running — NM wifi.backend=iwd requires it"
+                _rec "iwd not running but NM wifi.backend=iwd — run: systemctl start iwd  [auto]"
+            else
+                _row "iwd"     "!!  enabled standalone — conflicts with NM/wpa_supplicant; disable: systemctl disable --now iwd"
+                _rec "iwd enabled standalone conflicts with NM wpa_supplicant backend — disable: systemctl disable --now iwd  or switch NM to wifi.backend=iwd"
+            fi
+        fi
+        # Silent when not installed/enabled and NM+wpa_supplicant is handling Wi-Fi
+    fi
+
+    # ── ModemManager (mobile broadband) ──────────────────────────────────────
+    if command -v mmcli &>/dev/null; then
+        if systemctl is-active --quiet ModemManager 2>/dev/null; then
+            # Show modem info if any modems are present
+            local _mm_modems=""
+            _mm_modems=$(timeout 5 mmcli -L 2>/dev/null \
+                | grep -oE '/org/freedesktop/ModemManager[^ ]+' | wc -l || echo "0")
+            if [[ "$_mm_modems" =~ ^[0-9]+$ ]] && (( _mm_modems > 0 )); then
+                local _mm_info=""
+                _mm_info=$(timeout 5 mmcli -L 2>/dev/null \
+                    | grep -oE '\(.*\)' | head -1 | tr -d '()' || echo "")
+                _row "ModemMgr"   "OK  running  (${_mm_modems} modem(s)${_mm_info:+: ${_mm_info}})"
+            fi
+            # Silent when running but no modem plugged in — NM activates on demand
+        elif systemctl is-enabled --quiet ModemManager 2>/dev/null; then
+            _row "ModemMgr"   "!   enabled but not running — mobile broadband unavailable"
+            _rec "ModemManager not running — run: systemctl start ModemManager  [auto]"
+        fi
+        # Silent when not enabled — NM activates it on demand when a modem is present
+    fi
 
     # ── Active connection + IP ────────────────────────────────────────────────
     local _nm_conn _nm_type _nm_ip4
@@ -3274,14 +5556,14 @@ _section_network() {
             _row2 "--  IPv6 reachable${_ipv6_addr:+  (${_ipv6_addr})}"
         elif [[ -n "$_ipv6_addr" ]]; then
             _row2 "--  IPv6 address present but unreachable (${_ipv6_addr})"
-        else
-            _row2 "--  IPv6 not configured"
         fi
+        # Silent when IPv6 not configured — IPv4-only is normal
     else
         _row "Internet"   "!!  no internet connectivity"
         _rec "Cannot reach internet — check default route and upstream connection"
     fi
 
+    # ── DNS ─────────────────────────────────────────────────────────────────
     # openresolv (resolvconf) — Shanios uses this, NOT systemd-resolved
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         _row "DNS"        "!!  systemd-resolved active — not supported on Shanios"
@@ -3289,6 +5571,15 @@ _section_network() {
     fi
 
     # ── openresolv ────────────────────────────────────────────────────────────
+    # Determine who is expected to own resolv.conf based on NM dns= setting
+    local _nm_dns_resolv=""
+    _nm_dns_resolv=$(grep -rshE '^dns\s*=' \
+        /usr/lib/NetworkManager/conf.d/ \
+        /etc/NetworkManager/conf.d/ \
+        /etc/NetworkManager/NetworkManager.conf 2>/dev/null \
+        | tail -1 | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+    [[ -z "$_nm_dns_resolv" ]] && _nm_dns_resolv="default"
+
     if command -v resolvconf &>/dev/null; then
         local _resolv_managed=0
         if [[ -L /etc/resolv.conf ]]; then
@@ -3297,27 +5588,57 @@ _section_network() {
         if [[ "$_resolv_managed" -eq 0 && -f /etc/resolv.conf ]]; then
             grep -q 'Generated by resolvconf\|openresolv' /etc/resolv.conf 2>/dev/null && _resolv_managed=1
         fi
-        if (( _resolv_managed )); then
-            _row "openresolv" "OK  resolvconf present (manages /etc/resolv.conf)"
-        else
-            _row "openresolv" "OK  resolvconf installed"
-        fi
+        case "$_nm_dns_resolv" in
+            resolvconf|openresolv)
+                # openresolv should be actively managing resolv.conf
+                if (( _resolv_managed )); then
+                    _row "openresolv" "OK  resolvconf managing /etc/resolv.conf"
+                else
+                    _row "openresolv" "!   installed but not managing /etc/resolv.conf — NM dns=resolvconf expects it to"
+                    _rec "openresolv installed but /etc/resolv.conf not generated by resolvconf — check NM dispatcher script"
+                fi
+                ;;
+            default|none|*)
+                # NM writes resolv.conf directly — openresolv is present but not in the path
+                if (( _resolv_managed )); then
+                    _row "openresolv" "!   managing /etc/resolv.conf but NM dns=${_nm_dns_resolv} — NM may overwrite it"
+                    _rec "openresolv is managing /etc/resolv.conf but NM dns=${_nm_dns_resolv} writes it directly — set NM dns=resolvconf or dns=none"
+                fi
+                # Silent when installed but idle — NM owns resolv.conf, nothing to say
+                ;;
+        esac
     else
-        _row "openresolv" "!!  resolvconf not found — DNS management broken"
+        case "$_nm_dns_resolv" in
+            resolvconf|openresolv)
+                _row "openresolv" "!!  resolvconf not found — NM dns=resolvconf requires it"
+                _rec "NetworkManager dns=resolvconf but resolvconf binary missing — install openresolv"
+                ;;
+            *)
+                # NM manages resolv.conf directly — openresolv not needed
+                ;;
+        esac
     fi
 
     # ── /etc/resolv.conf usability ────────────────────────────────────────────
     if [[ ! -f /etc/resolv.conf ]]; then
         _row "resolv.conf" "!!  missing — DNS resolution broken"
-        _rec "/etc/resolv.conf missing — resolvconf or openresolv should generate it"
+        _rec "/etc/resolv.conf missing — check NM dns=${_nm_dns_resolv} configuration"
     elif [[ ! -s /etc/resolv.conf ]]; then
         _row "resolv.conf" "!!  empty — DNS resolution broken"
-        _rec "/etc/resolv.conf is empty — check openresolv / resolvconf configuration"
+        _rec "/etc/resolv.conf is empty — check NM dns=${_nm_dns_resolv} configuration"
     elif ! grep -q '^nameserver ' /etc/resolv.conf 2>/dev/null; then
         _row "resolv.conf" "!!  no nameserver entries — DNS resolution broken"
-        _rec "/etc/resolv.conf has no nameserver lines — check openresolv configuration"
+        _rec "/etc/resolv.conf has no nameserver lines — check NM dns=${_nm_dns_resolv} configuration"
     else
-        _row "resolv.conf" "OK  present"
+        # Identify who wrote it — only surface non-default ownership
+        local _resolv_owner=""
+        if [[ -L /etc/resolv.conf ]]; then
+            _resolv_owner=$(readlink /etc/resolv.conf 2>/dev/null || echo "")
+            _row "resolv.conf" "--  symlink → ${_resolv_owner}"
+        elif grep -q 'Generated by resolvconf\|openresolv' /etc/resolv.conf 2>/dev/null; then
+            _row "resolv.conf" "--  managed by openresolv"
+        fi
+        # Silent when managed by NM or unknown — DNS server row below shows what matters
     fi
 
     # ── Active DNS servers ────────────────────────────────────────────────────
@@ -3343,13 +5664,13 @@ _section_network() {
     elif command -v getent &>/dev/null; then
         _dns_resolved=$(getent hosts "$_dns_probe" 2>/dev/null | awk '{print $1}' | head -1 || echo "")
     fi
-    if [[ -n "$_dns_resolved" ]]; then
-        _row "DNS probe"  "OK  ${_dns_probe} → ${_dns_resolved}"
-    else
+    if [[ -z "$_dns_resolved" ]]; then
         _row "DNS probe"  "!!  failed to resolve ${_dns_probe} — DNS broken or no internet"
         _rec "DNS probe failed — check nameservers in /etc/resolv.conf and network connectivity"
     fi
+    # Silent when DNS resolves — Internet row already confirms connectivity
 
+    # ── VPN ─────────────────────────────────────────────────────────────────
     # ── VPN (OpenVPN / WireGuard) ─────────────────────────────────────────────
     # OpenVPN — check for active tun/tap interfaces or running openvpn processes
     local _ovpn_iface _ovpn_active=0
@@ -3361,13 +5682,6 @@ _section_network() {
         _ovpn_ip=$(ip -o -4 addr show "$_ovpn_iface" 2>/dev/null \
             | awk '{print $4}' | cut -d/ -f1 | head -1 || echo "")
         _row "OpenVPN"   "OK  tunnel active${_ovpn_iface:+  (${_ovpn_iface})}${_ovpn_ip:+  ${_ovpn_ip}}"
-    elif [[ -d /etc/openvpn/client ]] && \
-         ls /etc/openvpn/client/*.conf &>/dev/null 2>&1; then
-        local _ovpn_count
-        _ovpn_count=$(ls /etc/openvpn/client/*.conf 2>/dev/null | wc -l)
-        _row "OpenVPN"   "--  ${_ovpn_count} profile(s) configured, not connected"
-    elif command -v openvpn &>/dev/null; then
-        _row "OpenVPN"   "--  installed, no profiles configured"
     fi
 
     # WireGuard — check for wg interfaces
@@ -3380,82 +5694,174 @@ _section_network() {
     fi
     if [[ -n "$_wg_ifaces" ]]; then
         _row "WireGuard"  "OK  tunnel(s) active  (${_wg_ifaces})"
-    elif command -v wg &>/dev/null || ls /etc/wireguard/*.conf &>/dev/null 2>&1; then
-        _row "WireGuard"  "--  installed, not connected"
+    fi
+
+    # ── strongSwan (IKEv2/IPsec VPN) ─────────────────────────────────────────
+    # strongSwan is used as the IKEv2/IPsec backend for L2TP/IPsec (xl2tpd) and
+    # direct IKEv2 connections via the NM strongswan plugin.
+    # It is only relevant when explicitly configured — stay silent otherwise.
+    if command -v swanctl &>/dev/null || command -v ipsec &>/dev/null || \
+       systemctl cat strongswan         &>/dev/null 2>&1 || \
+       systemctl cat strongswan-starter &>/dev/null 2>&1; then
+        # strongswan.service (swanctl/modern) preferred over strongswan-starter (ipsec/legacy)
+        local _swan_unit=""
+        systemctl cat strongswan         &>/dev/null 2>&1 && _swan_unit="strongswan"
+        systemctl cat strongswan-starter &>/dev/null 2>&1 && [[ -z "$_swan_unit" ]] \
+            && _swan_unit="strongswan-starter"
+        local _swan_active=0
+        [[ -n "$_swan_unit" ]] && systemctl is-active --quiet "$_swan_unit" 2>/dev/null \
+            && _swan_active=1
+        # "configured" = swanctl.conf or conf.d has a real named connection definition
+        # Require a named block inside connections { } — avoids false positives from
+        # default package files that only mention "connections" in comments/examples
+        local _swan_cfg=0
+        _check_swan_cfg() {
+            local _sf="$1"
+            [[ -f "$_sf" ]] || return 1
+            awk '
+                /^[[:space:]]*#/ { next }
+                /connections[[:space:]]*\{/ { in_conn=1 }
+                in_conn && /^[[:space:]]*[a-zA-Z0-9_-]+[[:space:]]*\{/ { found=1 }
+                END { exit !found }
+            ' "$_sf" 2>/dev/null
+        }
+        if _check_swan_cfg /etc/swanctl/swanctl.conf; then
+            _swan_cfg=1
+        elif ls /etc/swanctl/conf.d/*.conf &>/dev/null 2>&1; then
+            for _swf in /etc/swanctl/conf.d/*.conf; do
+                _check_swan_cfg "$_swf" && { _swan_cfg=1; break; }
+            done
+        fi
+        if (( _swan_active )); then
+            local _swan_conns=""
+            _swan_conns=$(swanctl --list-conns 2>/dev/null | grep -c ':' || echo "")
+            _row "strongSwan" "OK  running${_swan_conns:+  (${_swan_conns} connection(s))}"
+        elif [[ -n "$_swan_unit" ]] && systemctl is-enabled --quiet "$_swan_unit" 2>/dev/null; then
+            _row "strongSwan" "!!  enabled standalone — conflicts with NM; disable: systemctl disable --now ${_swan_unit}"
+            _rec "strongSwan enabled standalone — conflicts with NM-strongswan plugin; disable: systemctl disable --now ${_swan_unit}"
+        fi
+    fi
+
+    # ── xl2tpd (L2TP daemon) ──────────────────────────────────────────────────
+    # L2TP/IPsec VPN backend — pairs with strongSwan for NM L2TP connections.
+    # Only surface when configured or enabled; NM manages the lifecycle normally.
+    if command -v xl2tpd &>/dev/null || systemctl cat xl2tpd &>/dev/null 2>&1; then
+        if systemctl is-active --quiet xl2tpd 2>/dev/null; then
+            _row "xl2tpd"      "OK  running"
+        elif systemctl is-enabled --quiet xl2tpd 2>/dev/null; then
+            _row "xl2tpd"      "!!  enabled standalone — conflicts with NM; disable: systemctl disable --now xl2tpd"
+            _rec "xl2tpd enabled standalone — conflicts with NM-l2tp plugin; disable: systemctl disable --now xl2tpd"
+        fi
     fi
 
     # ── Avahi mDNS ────────────────────────────────────────────────────────────
     if command -v avahi-daemon &>/dev/null; then
         if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
             _row "Avahi"      "OK  mDNS/DNS-SD active"
+        elif systemctl is-active  --quiet avahi-daemon.socket 2>/dev/null || \
+             systemctl is-enabled --quiet avahi-daemon.socket 2>/dev/null; then
+            _row "Avahi"      ">>  enabled (idle — socket-activated)"
         elif systemctl is-enabled --quiet avahi-daemon 2>/dev/null; then
             _row "Avahi"      "!   enabled but not running"
             _rec "avahi-daemon not running — run: systemctl start avahi-daemon  [auto]"
         else
-            _row "Avahi"      "--  not enabled (to enable mDNS/.local resolution: systemctl enable --now avahi-daemon)"
+            _row "Avahi"      "~~  not enabled — to enable mDNS/.local resolution: systemctl enable --now avahi-daemon"
         fi
-    else
-        _row "Avahi"          "--  not installed"
     fi
+    # Silent when Avahi not installed — mDNS is optional
 
-    # ── Time sync ─────────────────────────────────────────────────────────────
-    if command -v timedatectl &>/dev/null; then
-        local td_out ntp_active ntp_synced tsync
-        td_out=$(timedatectl show 2>/dev/null || true)
-        ntp_active=$(echo "$td_out" | awk -F= '/^NTP=/{print $2}'             | tr -d '[:space:]')
-        ntp_synced=$(echo "$td_out" | awk -F= '/^NTPSynchronized=/{print $2}' | tr -d '[:space:]')
-        tsync=$(systemctl is-active systemd-timesyncd 2>/dev/null || echo "inactive")
-        if [[ "$ntp_synced" == "yes" && "$tsync" == "active" ]]; then
-            # Show which NTP server is actually being used
-            local _ntp_server="" _ntp_offset=""
-            _ntp_server=$(timedatectl timesync-status 2>/dev/null \
-                | awk '/^[[:space:]]*Server:/{print $2}' | head -1 || echo "")
-            [[ -z "$_ntp_server" ]] && \
-                _ntp_server=$(journalctl -u systemd-timesyncd -n 50 --no-pager 2>/dev/null \
-                    | grep -oP '(?<=synchronized to )\S+' | tail -1 || echo "")
-            # Clock offset — flag if large (indicates stale hardware clock or poor NTP)
-            _ntp_offset=$(timedatectl timesync-status 2>/dev/null \
-                | awk '/^[[:space:]]*Offset:/{print $2,$3}' | head -1 || echo "")
-            _row "timesyncd"  "OK  synchronised${_ntp_server:+  (${_ntp_server})}"
-            if [[ -n "$_ntp_offset" ]]; then
-                # Extract numeric value — flag if offset > 1s (1000ms)
-                local _off_ms; _off_ms=$(echo "$_ntp_offset" | grep -oE '[0-9]+' | head -1 || echo "0")
-                local _off_unit; _off_unit=$(echo "$_ntp_offset" | grep -oE '[a-z]+' | head -1 || echo "")
-                local _off_large=0
-                [[ "$_off_unit" == "s" || "$_off_unit" == "min" ]] && _off_large=1
-                [[ "$_off_unit" == "ms" && "$_off_ms" =~ ^[0-9]+$ ]] && (( _off_ms > 1000 )) && _off_large=1
-                if (( _off_large )); then
-                    _row2 "!   offset ${_ntp_offset} — large clock drift, check hardware clock"
-                    _rec "NTP clock offset is ${_ntp_offset} — large drift; check: hwclock --systohc"
-                else
-                    _row2 "--  offset ${_ntp_offset}"
-                fi
+    # Pre-check: pppd standalone conflict must always show
+    if command -v pppd &>/dev/null || systemctl cat 'ppp@*' &>/dev/null 2>&1; then
+        local _ppp_en_pre=""
+        _ppp_en_pre=$(systemctl list-unit-files 'ppp@*.service' \
+            --state=enabled --no-legend --no-pager 2>/dev/null \
+            | awk '{print $1}' | paste -sd ',' || echo "")
+        if [[ -n "$_ppp_en_pre" ]]; then
+            _row "pppd" "!!  enabled standalone — conflicts with NM; disable: systemctl disable --now ${_ppp_en_pre%%,*}"
+            _rec "pppd enabled standalone — NM manages PPP natively; disable: systemctl disable --now ${_ppp_en_pre%%,*}"
+        fi
+    fi
+    _optional_begin
+    # ── Monitoring & network tools ────────────────────────────────────────────
+    # ── Tailscale connectivity ────────────────────────────────────────────────
+    if command -v tailscale &>/dev/null || systemctl cat tailscaled &>/dev/null 2>&1; then
+        if systemctl is-active --quiet tailscaled 2>/dev/null; then
+            local ts_out; ts_out=$(timeout 5 tailscale status 2>/dev/null || echo "")
+            local ts_ip;  ts_ip=$(timeout 5 tailscale ip -4 2>/dev/null || echo "")
+            if echo "$ts_out" | grep -qiE 'logged out|not logged in|stopped'; then
+                _row "Tailscale"  "!   daemon running but not authenticated — run: tailscale up"
+            elif [[ -n "$ts_ip" ]]; then
+                _row "Tailscale"  "OK  connected  (${ts_ip})"
+            else
+                _row "Tailscale"  "--  daemon active (status unclear)"
             fi
-        elif [[ "$ntp_active" == "yes" && "$tsync" == "active" ]]; then
-            _row "timesyncd"  "!   running but not yet synchronised"
-        elif [[ "$ntp_active" == "yes" ]]; then
-            _row "timesyncd"  "!!  NTP enabled but service is ${tsync}"
-            _rec "systemd-timesyncd not running — run: systemctl enable --now systemd-timesyncd  [auto]"
+        elif systemctl is-enabled --quiet tailscaled 2>/dev/null; then
+            _row "Tailscale"  "!   enabled but not running"
+            _rec "tailscaled not running — run: systemctl start tailscaled  [auto]"
         else
-            _row "timesyncd"  "!!  disabled"
-            _rec "NTP disabled — run: systemctl enable --now systemd-timesyncd && timedatectl set-ntp true  [auto]"
-        fi
-    else
-        _row "timesyncd"  "--  timedatectl not available"
-    fi
-
-    # ── ModemManager (mobile broadband) ──────────────────────────────────────
-    if command -v mmcli &>/dev/null; then
-        if systemctl is-active --quiet ModemManager 2>/dev/null; then
-            _row "ModemMgr"   "OK  running"
-        elif systemctl is-enabled --quiet ModemManager 2>/dev/null; then
-            _row "ModemMgr"   "!   enabled but not running — mobile broadband unavailable"
-            _rec "ModemManager not running — run: systemctl start ModemManager  [auto]"
-        else
-            _row "ModemMgr"   "--  installed but not enabled"
+            _row "Tailscale"  "~~  not enabled — to join a tailnet: systemctl enable --now tailscaled && tailscale up"
         fi
     fi
 
+    # ── cloudflared (Cloudflare Zero Trust tunnels) ───────────────────────────
+    if command -v cloudflared &>/dev/null || systemctl cat cloudflared &>/dev/null 2>&1; then
+        local _cf_cfg=0
+        # CLI: cloudflared tunnel list queries local credential store
+        if command -v cloudflared &>/dev/null; then
+            local _cf_tunnels
+            _cf_tunnels=$(cloudflared tunnel list --output json 2>/dev/null \
+                | grep -c '"id"' 2>/dev/null || true)
+            [[ "$_cf_tunnels" =~ ^[0-9]+$ ]] || _cf_tunnels=0
+            (( _cf_tunnels > 0 )) && _cf_cfg=1
+        fi
+        # Fallback: credential file check
+        if (( ! _cf_cfg )); then
+            { ls /etc/cloudflared/*.json &>/dev/null 2>&1 || \
+              ls /root/.cloudflared/*.json &>/dev/null 2>&1 || \
+              ls /home/*/.cloudflared/*.json &>/dev/null 2>&1; } && _cf_cfg=1
+        fi
+        if systemctl is-active --quiet cloudflared 2>/dev/null; then
+            local cf_tunnel=""
+            cf_tunnel=$(cloudflared tunnel list 2>/dev/null                 | awk 'NR==2{print $2}' || echo "")
+            if [[ -n "$cf_tunnel" ]]; then
+                _row "cloudflared" "OK  running, tunnel: ${cf_tunnel}"
+            else
+                _row "cloudflared" "OK  running (no tunnel configured)"
+            fi
+        elif systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+            if (( ! _cf_cfg )); then
+                _row "cloudflared" "!   enabled but not configured — run: cloudflared tunnel create <n>"
+                _rec "cloudflared enabled but no tunnel credentials found — run: cloudflared tunnel create <n>"
+            else
+                _row "cloudflared" "!   enabled but not running"
+                _rec "cloudflared not running — run: systemctl start cloudflared  [auto]"
+            fi
+        elif (( _cf_cfg )); then
+            _row "cloudflared" "~~  configured, not enabled — to enable: systemctl enable --now cloudflared"
+        else
+            _row "cloudflared" "~~  not enabled — to create a tunnel: cloudflared tunnel create <n>"
+        fi
+    fi
+    # ── pppd (PPP daemon) ─────────────────────────────────────────────────────
+    # Point-to-Point Protocol daemon for DSL/dial-up/mobile broadband links
+    # not managed by ModemManager. Surface when a ppp@ instance is enabled.
+    if command -v pppd &>/dev/null || systemctl cat 'ppp@*' &>/dev/null 2>&1; then
+        local _ppp_active=""
+        _ppp_active=$(systemctl list-units 'ppp@*.service' \
+            --state=active --no-legend --no-pager 2>/dev/null \
+            | awk '{print $1}' | paste -sd ',' || echo "")
+        local _ppp_enabled=""
+        _ppp_enabled=$(systemctl list-unit-files 'ppp@*.service' \
+            --state=enabled --no-legend --no-pager 2>/dev/null \
+            | awk '{print $1}' | paste -sd ',' || echo "")
+        if [[ -n "$_ppp_active" ]]; then
+            _row "pppd"          "OK  running  (${_ppp_active})"
+        elif [[ -n "$_ppp_enabled" ]]; then
+            _row "pppd"          "!!  enabled standalone — conflicts with NM; disable: systemctl disable --now ${_ppp_enabled%%,*}"
+            _rec "pppd enabled standalone — NM manages PPP natively; disable: systemctl disable --now ${_ppp_enabled%%,*}"
+        fi
+    fi
+    _optional_end
 }
 
 _section_audio_display() {
@@ -3481,7 +5887,7 @@ _section_audio_display() {
             _row "PipeWire"  "OK  pipewire + wireplumber active"
         elif [[ "$pw_st" == "active" && "$wp_st" != "active" ]]; then
             _row "PipeWire"  "!   pipewire active but wireplumber is ${wp_st}"
-            _rec "WirePlumber not running — audio routing broken: systemctl --user enable --now wireplumber"
+            _rec "WirePlumber not running — audio routing broken: systemctl --user enable --now wireplumber  [auto]"
         else
             # Both inactive — only flag if user has an active graphical (x11/wayland) session
             # Under sudo without a session, user services legitimately appear inactive
@@ -3490,11 +5896,34 @@ _section_audio_display() {
                 | awk '{print $3}' | grep -qx "$_CALLER_USER" && _has_session=1
             if (( _has_session )); then
                 _row "PipeWire"  "!   not running for ${_CALLER_USER} — audio will be silent"
-                _rec "PipeWire not running — systemctl --user enable --now pipewire wireplumber"
+                _rec "PipeWire not running — run: systemctl --user enable --now pipewire wireplumber  [auto]"
             fi
             # Silent if no active session — running health at boot/tty before login is normal
         fi
     fi
+
+    # ── sof-firmware (Intel HDA audio) ───────────────────────────────────────
+    local _cpu_vau
+    _cpu_vau=$(grep -m1 "vendor_id" /proc/cpuinfo 2>/dev/null | awk '{print $3}' || echo "")
+    if [[ "$_cpu_vau" == "GenuineIntel" ]]; then
+        if [[ -d /lib/firmware/intel/sof ]] || [[ -d /usr/lib/firmware/intel/sof ]] || \
+           pacman -Q sof-firmware &>/dev/null 2>&1; then
+            _row "sof-fw"     "OK  sof-firmware present"
+        else
+            # Only warn if an HDA DSP device is present
+            if find /sys/class/sound/ -name "hwC*D*" 2>/dev/null | head -1 | \
+               xargs -r sh -c 'cat "$1/chip_name" 2>/dev/null' _ | grep -qi "sof\|hda-dsp"; then
+                _row "sof-fw"     "!   SOF audio device present but sof-firmware not installed"
+                _rec "Install sof-firmware for Intel audio: pacman -S sof-firmware"
+            fi
+        fi
+    fi
+
+    # ── Session type ──────────────────────────────────────────────────────────
+    local _sess_type=""
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] && _sess_type="wayland"
+    [[ -z "$_sess_type" && -n "${DISPLAY:-}" ]] && _sess_type="x11"
+    [[ -n "$_sess_type" ]] && _row "Session" "--  ${_sess_type}"
 
     # ── Display manager ───────────────────────────────────────────────────────
     local profile_dm; profile_dm=$(cat /etc/shani-profile 2>/dev/null | tr -d '[:space:]' || echo "")
@@ -3506,22 +5935,35 @@ _section_audio_display() {
             _row "Display mgr" "OK  ${dm_svc} active"
         elif systemctl is-enabled --quiet "${dm_svc}" 2>/dev/null; then
             _row "Display mgr" "!   ${dm_svc} enabled but not running"
-            _rec "${dm_svc} enabled but not active — run: systemctl start ${dm_svc}  [auto]"
+            _rec "${dm_svc} not running — run: systemctl start ${dm_svc}  [auto]"
         else
             _row "Display mgr" "!!  ${dm_svc} not enabled"
             _rec "${dm_svc} not enabled — run: systemctl enable --now ${dm_svc}  [auto]"
         fi
     fi
 
+    # ── plymouth (boot splash) ────────────────────────────────────────────────
+    if command -v plymouth &>/dev/null || systemctl cat plymouth-start &>/dev/null 2>&1; then
+        local _ply_theme=""
+        _ply_theme=$(plymouth-set-default-theme 2>/dev/null | tr -d '[:space:]' || echo "")
+        if [[ -z "$_ply_theme" || "$_ply_theme" == "text" ]]; then
+            _row "Plymouth"    "~~  no graphical theme set — plymouth-set-default-theme <theme>"
+        else
+            if [[ -d "/usr/share/plymouth/themes/${_ply_theme}" ]]; then
+                _row "Plymouth"    "OK  theme: ${_ply_theme}"
+            else
+                _row "Plymouth"    "!   theme '${_ply_theme}' set but not found in /usr/share/plymouth/themes/"
+                _rec "Plymouth theme missing — reinstall theme or choose another: plymouth-set-default-theme <theme>"
+            fi
+        fi
+    fi
+
     # ── xdg-desktop-portal ────────────────────────────────────────────────────
-    # Required for Flatpak sandboxing, file pickers, screen sharing, and
-    # camera/location access on Wayland. The backend must match the DE profile.
     if command -v xdg-desktop-portal &>/dev/null || \
        systemctl --user cat xdg-desktop-portal.service &>/dev/null 2>&1 || \
        _sysd_user cat xdg-desktop-portal.service &>/dev/null 2>&1; then
         local _xdp_st; _xdp_st=$(_sysd_user is-active xdg-desktop-portal 2>/dev/null | tr -d '[:space:]' || echo "inactive")
         local _xdp_backend=""
-        # Detect the active backend (plasma or gnome)
         if _sysd_user is-active plasma-xdg-desktop-portal-kde &>/dev/null 2>&1; then
             _xdp_backend="kde"
         elif _sysd_user is-active xdg-desktop-portal-gnome &>/dev/null 2>&1; then
@@ -3531,8 +5973,6 @@ _section_audio_display() {
         fi
         if [[ "$_xdp_st" == "active" ]]; then
             _row "XDG portal"  "OK  active${_xdp_backend:+  (${_xdp_backend} backend)}"
-            # Warn if backend doesn't match DE profile — gtk fallback on Plasma
-            # means file pickers, screen share, and camera may not work correctly
             local _xdp_profile; _xdp_profile=$(cat /etc/shani-profile 2>/dev/null | tr -d '[:space:]' || echo "")
             if [[ "$_xdp_profile" == "plasma" && "$_xdp_backend" != "kde" ]]; then
                 _row2 "!   expected kde backend for Plasma — xdg-desktop-portal-kde may not be running"
@@ -3549,7 +5989,38 @@ _section_audio_display() {
         fi
     fi
 
+    # ── colord (colour management daemon) ─────────────────────────────────────
+    if command -v colormgr &>/dev/null || systemctl cat colord &>/dev/null 2>&1; then
+        if systemctl is-active --quiet colord 2>/dev/null; then
+            local _icc_count=""
+            _icc_count=$(colormgr get-profiles 2>/dev/null | grep -c 'Profile ID' || echo "")
+            _row "colord"       "OK  running${_icc_count:+  (${_icc_count} profile(s))}"
+        elif systemctl is-enabled --quiet colord 2>/dev/null; then
+            _row "colord"       ">>  enabled (idle — starts on demand via D-Bus)"
+        else
+            _row "colord"       "~~  not enabled — colour profiles inactive: systemctl enable --now colord"
+        fi
+    fi
+
+    _optional_begin
+    # ── ddcutil-service (DDC/CI monitor control service) ─────────────────────
+    if command -v ddcutil &>/dev/null || systemctl cat ddcutil-service &>/dev/null 2>&1; then
+        if systemctl is-active --quiet ddcutil-service 2>/dev/null; then
+            local _ddc_monitors=""
+            _ddc_monitors=$(ddcutil detect --brief 2>/dev/null | grep -c '^Display' || echo "")
+            _row "ddcutil"     "OK  ddcutil-service running${_ddc_monitors:+  (${_ddc_monitors} monitor(s))}"
+        elif systemctl is-enabled --quiet ddcutil-service 2>/dev/null; then
+            _row "ddcutil"     "!   enabled but not running"
+            _rec "ddcutil-service not running — run: systemctl start ddcutil-service  [auto]"
+        fi
+        # Silent when not enabled
+    fi
+
+
+
+    _optional_end
 }
+
 
 _section_units() {
     _head "Units"
@@ -3563,6 +6034,7 @@ _section_units() {
         systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
             | awk '{print $2}' | grep -v '^$' | grep '\.' \
             | grep -vE "^(${_transient_ok})$" || true)
+
     if [[ ${#failed_units[@]} -eq 0 ]]; then
         _row "Units"     "OK  no failed systemd units"
     else
@@ -3654,7 +6126,7 @@ _section_package_managers() {
         local flatpak_updates
         flatpak_updates=$(timeout 15 flatpak remote-ls --updates 2>/dev/null | wc -l || echo "")
         if [[ "$flatpak_updates" =~ ^[0-9]+$ ]] && (( flatpak_updates > 0 )); then
-            _row "Flatpak upd" "--  ${flatpak_updates} update(s) pending (timer will apply automatically)"
+            _row "Flatpak upd" "--  ${flatpak_updates} update(s) pending"
         fi
     fi
 
@@ -3703,7 +6175,7 @@ _section_package_managers() {
             fi
         fi
     elif command -v snap &>/dev/null || systemctl cat snapd &>/dev/null 2>&1; then
-        _row "Snap"       "--  installed but @snapd subvolume not mounted"
+        _row "Snap"       "~~  @snapd subvolume not mounted"
     fi
 
     # ── Nix ───────────────────────────────────────────────────────────────────
@@ -3750,7 +6222,10 @@ _section_package_managers() {
             if [[ -d "$_nix_channel_dir" ]]; then
                 local _nix_age_days
                 _nix_age_days=$(( ( $(date +%s) - $(stat -c %Y "$_nix_channel_dir" 2>/dev/null || echo 0) ) / 86400 ))
-                if (( _nix_age_days > 7 )); then
+                if (( _nix_age_days > 30 )); then
+                    _row "Nix upd"    "!   channels ${_nix_age_days}d old — run: nix-channel --update"
+                    _rec "Nix channels are ${_nix_age_days} days old — update: nix-channel --update"
+                elif (( _nix_age_days > 7 )); then
                     _row "Nix upd"    "--  channels ${_nix_age_days}d old — run: nix-channel --update"
                 else
                     _row "Nix upd"    "OK  channels updated ${_nix_age_days}d ago"
@@ -3776,8 +6251,40 @@ _section_package_managers() {
         else
             _row "AppImage"   "!!  .AppImage files found but FUSE not loaded — they will not run"
             fi
-    elif command -v fusermount3 &>/dev/null || lsmod 2>/dev/null | grep -qw 'fuse'; then
-        _row "AppImage"   "--  FUSE available (no .AppImage files found)"
+    fi
+    # Silent when FUSE present but no AppImages found — nothing actionable
+
+    # ── man-db (man page cache rebuild timer) ────────────────────────────────
+    # man-db.timer fires man-db.service daily to rebuild the whatis database.
+    # Without it, apropos and whatis return stale or empty results after package
+    # installs. On Arch, pacman hooks also trigger rebuilds — the timer is a
+    # safety net for manual installs and non-pacman changes.
+    if command -v mandb &>/dev/null || systemctl cat man-db.timer &>/dev/null 2>&1; then
+        if systemctl is-active --quiet man-db.timer 2>/dev/null; then
+            _row "man-db"      "OK  cache rebuild timer active"
+        elif systemctl is-enabled --quiet man-db.timer 2>/dev/null; then
+            _row "man-db"      "!   timer enabled but not active"
+            _rec "man-db.timer not active — run: systemctl start man-db.timer  [auto]"
+        else
+            _row "man-db"      "--  timer not enabled (apropos/whatis cache won't auto-update: systemctl enable --now man-db.timer)"
+        fi
+    fi
+
+    # ── plocate (file index update timer) ────────────────────────────────────
+    # plocate-updatedb.timer is statically enabled via timers.target.wants/ —
+    # systemctl enable will fail on it. Check is-active only; if the timer is
+    # missing entirely, plocate's index is stale and locate returns old results.
+    if command -v plocate &>/dev/null || systemctl cat plocate-updatedb.timer &>/dev/null 2>&1; then
+        if systemctl is-active --quiet plocate-updatedb.timer 2>/dev/null; then
+            local _pl_last=""
+            _pl_last=$(systemctl show plocate-updatedb.service \
+                --property=ExecMainExitTimestamp --value 2>/dev/null \
+                | grep -v '^n/a\|^$' | head -1 || echo "")
+            _row "plocate"     "OK  index update timer active${_pl_last:+  (last: ${_pl_last})}"
+        else
+            _row "plocate"     "!   plocate-updatedb.timer not active — locate results will be stale"
+            _rec "Start plocate index timer: systemctl start plocate-updatedb.timer  [auto]"
+        fi
     fi
 
     # ── shani-update ─────────────────────────────────────────────────────────
@@ -3789,6 +6296,359 @@ _section_package_managers() {
         _row "shani-upd"  "!   shani-update.timer not enabled — OS updates won't be auto-checked"
         _rec "shani-update.timer not enabled — run: systemctl --user enable --now shani-update.timer  [auto]"
     fi
+
+    # Pre-check: PackageKit failure must always show
+    if systemctl cat packagekit &>/dev/null 2>&1 && \
+       systemctl is-failed --quiet packagekit 2>/dev/null; then
+        _row "PackageKit"  "!   packagekit.service failed — KDE Discover / GNOME Software may not work"
+        _rec "packagekit.service failed — run: systemctl reset-failed packagekit && systemctl start packagekit  [auto]"
+    fi
+    _optional_begin
+    # ── reflector (Arch mirror ranking) ──────────────────────────────────────
+    # reflector.timer runs reflector.service periodically to keep /etc/pacman.d/
+    # mirrorlist updated with the fastest mirrors. Only relevant on Arch-based
+    # systems (ShaniOS). Silent if not installed.
+    if command -v reflector &>/dev/null || systemctl cat reflector.timer &>/dev/null 2>&1; then
+        if systemctl is-active --quiet reflector.timer 2>/dev/null; then
+            _row "reflector"   "OK  mirror update timer active"
+        elif systemctl is-enabled --quiet reflector.timer 2>/dev/null; then
+            _row "reflector"   "!   timer enabled but not active"
+            _rec "reflector.timer not active — run: systemctl start reflector.timer  [auto]"
+        else
+            _row "reflector"   "~~  not enabled — to auto-update mirrors: systemctl enable --now reflector.timer"
+        fi
+    fi
+
+    # ── PackageKit (D-Bus package management abstraction) ────────────────────
+    # D-Bus-activated static unit used by KDE Discover and GNOME Software to
+    # install/update packages without direct pacman access. Idle between GUI
+    # package operations is normal — only warn on a failed state.
+    if command -v pkcon &>/dev/null || systemctl cat packagekit.service &>/dev/null 2>&1; then
+        if systemctl is-failed --quiet packagekit.service 2>/dev/null; then
+            _row "PackageKit"  "!   packagekit.service failed — KDE Discover / GNOME Software may not work"
+            _rec "PackageKit failed — run: systemctl reset-failed packagekit  [auto]"
+        elif systemctl is-active --quiet packagekit.service 2>/dev/null; then
+            _row "PackageKit"  "OK  running"
+        fi
+        # Silent when idle — D-Bus-activated, not running between GUI operations is normal
+    fi
+    _optional_end
+}
+
+_section_containers() {
+    _head "Containers"
+
+    # ── Podman ────────────────────────────────────────────────────────────────
+    if command -v podman &>/dev/null; then
+        local podman_sys_st podman_usr_st podman_ver=""
+        podman_sys_st=$(systemctl is-active podman.socket 2>/dev/null || echo "inactive")
+        podman_usr_st=$(_sysd_user is-active podman.socket 2>/dev/null || echo "inactive")
+        podman_ver=$(podman --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+        # Rootless capable: needs unprivileged userns + subuid
+        local rootless_ok=1
+        local _rl_user="$_CALLER_USER"
+        [[ -n "$_rl_user" ]] && { grep -q "^${_rl_user}:" /etc/subuid 2>/dev/null || rootless_ok=0; }
+        local userns_val; userns_val=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "1")
+        [[ "$userns_val" == "0" ]] && rootless_ok=0
+        local rl_str=""
+        (( rootless_ok )) && rl_str=", rootless-capable" || rl_str=", rootless BROKEN (check subuid/userns)"
+        # Running containers — fetch before main row so count can be inlined
+        local podman_running=""
+        podman_running=$(podman ps -q 2>/dev/null | wc -l | tr -d '[:space:]' || echo "")
+        if [[ "$podman_sys_st" == "active" ]]; then
+            _row "Podman"     "OK  socket active (system)${podman_ver:+  v${podman_ver}}${podman_running:+, ${podman_running} running}${rl_str}"
+        elif [[ "$podman_usr_st" == "active" ]]; then
+            _row "Podman"     "OK  socket active (user)${podman_ver:+  v${podman_ver}}${podman_running:+, ${podman_running} running}${rl_str}"
+        else
+            _row "Podman"     "--  installed${podman_ver:+  v${podman_ver}}  socket inactive${rl_str}"
+        fi
+        # Distrobox: depends on Podman — flag if installed but Podman socket is down
+        if command -v distrobox &>/dev/null && \
+           [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
+            _row2 "!  Distrobox installed but Podman socket not active — containers won't start"
+        fi
+        # System image/volume storage — always show size
+        local podman_img_mb podman_vol_mb
+        podman_img_mb=$(du -sm /var/lib/containers/storage 2>/dev/null | awk '{print $1}' || echo "")
+        podman_vol_mb=$(du -sm /var/lib/containers/volumes 2>/dev/null | awk '{print $1}' || echo "")
+        local _pdm_sz_parts=()
+        [[ "$podman_img_mb" =~ ^[0-9]+$ ]] && _pdm_sz_parts+=("images/layers: ${podman_img_mb} MB")
+        [[ "$podman_vol_mb" =~ ^[0-9]+$ ]] && (( podman_vol_mb > 0 )) && _pdm_sz_parts+=("volumes: ${podman_vol_mb} MB")
+        if [[ ${#_pdm_sz_parts[@]} -gt 0 ]]; then
+            local _pdm_sz_str; _pdm_sz_str=$(IFS=', '; echo "${_pdm_sz_parts[*]}")
+            if [[ "$podman_img_mb" =~ ^[0-9]+$ ]] && (( podman_img_mb > 20480 )); then
+                _row2 "!   system storage: ${_pdm_sz_str} — run: podman image prune"
+                _rec "Podman system image storage is ${podman_img_mb} MB — free space: podman image prune"
+            else
+                _row2 "--  system storage: ${_pdm_sz_str}"
+            fi
+        fi
+        # User-level Podman storage (rootless)
+        local _rl_user="$_CALLER_USER"
+        if [[ -n "$_rl_user" ]]; then
+            local _user_home; _user_home=$(getent passwd "$_rl_user" 2>/dev/null | cut -d: -f6 || echo "")
+            if [[ -n "$_user_home" ]]; then
+                local _user_img_mb _user_vol_mb
+                _user_img_mb=$(du -sm "${_user_home}/.local/share/containers/storage" 2>/dev/null | awk '{print $1}' || echo "")
+                _user_vol_mb=$(du -sm "${_user_home}/.local/share/containers/volumes" 2>/dev/null | awk '{print $1}' || echo "")
+                local _usr_sz_parts=()
+                [[ "$_user_img_mb" =~ ^[0-9]+$ ]] && (( _user_img_mb > 0 )) && _usr_sz_parts+=("images/layers: ${_user_img_mb} MB")
+                [[ "$_user_vol_mb" =~ ^[0-9]+$ ]] && (( _user_vol_mb > 0 )) && _usr_sz_parts+=("volumes: ${_user_vol_mb} MB")
+                if [[ ${#_usr_sz_parts[@]} -gt 0 ]]; then
+                    local _usr_sz_str; _usr_sz_str=$(IFS=', '; echo "${_usr_sz_parts[*]}")
+                    if [[ "$_user_img_mb" =~ ^[0-9]+$ ]] && (( _user_img_mb > 10240 )); then
+                        _row2 "!   user storage (${_rl_user}): ${_usr_sz_str} — run: podman image prune"
+                        _rec "Podman user image storage for ${_rl_user} is ${_user_img_mb} MB — free space: podman image prune"
+                    else
+                        _row2 "--  user storage (${_rl_user}): ${_usr_sz_str}"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # ── Podman storage driver ────────────────────────────────────────────────
+    if command -v podman &>/dev/null; then
+        local _pdm_drv=""
+        _pdm_drv=$(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null \
+            | tr -d '[:space:]' || echo "")
+        if [[ -n "$_pdm_drv" ]]; then
+            case "$_pdm_drv" in
+                vfs)           _row "Podman drv"  "!   storage=vfs — very slow and space-inefficient"
+                               _rec "Switch Podman to overlay: set driver=overlay in ~/.config/containers/storage.conf" ;;
+                overlay|btrfs|zfs) _row "Podman drv"  "OK  storage=${_pdm_drv}" ;;
+                *)             _row "Podman drv"  "--  storage=${_pdm_drv}" ;;
+            esac
+        fi
+    fi
+
+    # ── LXD / lxcfs ──────────────────────────────────────────────────────────
+    if { findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]]; }; then
+        if systemctl is-active --quiet lxd.socket 2>/dev/null; then
+            local lxd_count=""
+            # Only call lxc list if LXD has been initialised (preseed/init already run).
+            # An active socket on an uninitialised LXD will hang indefinitely.
+            local lxd_initialised=0
+            [[ -f /var/lib/lxd/server.crt || -f /var/snap/lxd/common/lxd/server.crt || \
+               -d /var/lib/lxd/networks || -d /data/varlib/lxd/networks ]] && lxd_initialised=1
+            if (( lxd_initialised )); then
+                lxd_count=$(timeout 5 lxc list --format=csv 2>/dev/null | wc -l || echo "")
+                _row "LXD"        "OK  lxd.socket active${lxd_count:+  (${lxd_count} container(s))}"
+            else
+                _row "LXD"        "--  lxd.socket active but LXD not yet initialised (run: lxd init)"
+            fi
+        else
+            _row "LXD"        "!   @lxd data present but lxd.socket not active"
+            _rec "LXD socket not active — run: systemctl enable --now lxd.socket  [auto]"
+        fi
+        # lxcfs: provides container-aware /proc stats — silent when working
+        if command -v lxcfs &>/dev/null && systemctl is-enabled --quiet lxcfs 2>/dev/null; then
+            if ! systemctl is-active --quiet lxcfs 2>/dev/null; then
+                _row2 "!  lxcfs enabled but not running — containers see host stats"
+                _rec "lxcfs not running — run: systemctl enable --now lxcfs  [auto]"
+            fi
+        fi
+        # LXD storage — always show size
+        local lxd_mb
+        lxd_mb=$(du -sm /var/lib/lxd /data/varlib/lxd 2>/dev/null | awk '{s+=$1} END{print s}' || echo "")
+        if [[ "$lxd_mb" =~ ^[0-9]+$ ]]; then
+            if (( lxd_mb > 20480 )); then
+                _row2 "!   ${lxd_mb} MB — review with: lxc storage info default"
+                _rec "LXD storage is ${lxd_mb} MB — review: lxc storage info default"
+            else
+                _row2 "--  ${lxd_mb} MB"
+            fi
+        fi
+    fi
+
+    # ── Docker ────────────────────────────────────────────────────────────────
+    # Skip if 'docker' is provided by podman-docker (a shim — real engine is Podman above).
+    local _is_podman_docker=0
+    if command -v docker &>/dev/null; then
+        docker --version 2>/dev/null | grep -qi 'podman' && _is_podman_docker=1
+        # Also check via package ownership if available
+        if (( ! _is_podman_docker )) && command -v pacman &>/dev/null; then
+            pacman -Qo "$(command -v docker)" 2>/dev/null | grep -qi 'podman-docker' && _is_podman_docker=1
+        fi
+    fi
+    if (( ! _is_podman_docker )) && { command -v docker &>/dev/null || systemctl cat docker &>/dev/null 2>&1; }; then
+        local docker_st; docker_st=$(systemctl is-active docker 2>/dev/null || echo "inactive")
+        local docker_ver; docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+        if [[ "$docker_st" == "active" ]]; then
+            local docker_running=""
+            docker_running=$(docker ps -q 2>/dev/null | wc -l | tr -d '[:space:]' || echo "")
+            _row "Docker"     "OK  running${docker_ver:+  v${docker_ver}}${docker_running:+  (${docker_running} container(s))}"
+        elif systemctl is-enabled --quiet docker 2>/dev/null; then
+            _row "Docker"     "!   enabled but not running"
+            _rec "Docker not running — run: systemctl start docker  [auto]"
+        else
+            _row "Docker"     "~~  not enabled — to enable: systemctl enable --now docker"
+        fi
+        # Docker image/volume/build cache storage
+        local docker_root; docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+        local docker_img_mb docker_vol_mb docker_build_mb
+        docker_img_mb=$(du -sm "${docker_root}/overlay2" 2>/dev/null | awk '{print $1}' || echo "")
+        docker_vol_mb=$(du -sm "${docker_root}/volumes"  2>/dev/null | awk '{print $1}' || echo "")
+        docker_build_mb=$(du -sm "${docker_root}/buildkit" 2>/dev/null | awk '{print $1}' || echo "")
+        local _dk_sz_parts=()
+        [[ "$docker_img_mb"   =~ ^[0-9]+$ ]] && (( docker_img_mb   > 0 )) && _dk_sz_parts+=("images/layers: ${docker_img_mb} MB")
+        [[ "$docker_vol_mb"   =~ ^[0-9]+$ ]] && (( docker_vol_mb   > 0 )) && _dk_sz_parts+=("volumes: ${docker_vol_mb} MB")
+        [[ "$docker_build_mb" =~ ^[0-9]+$ ]] && (( docker_build_mb > 0 )) && _dk_sz_parts+=("build cache: ${docker_build_mb} MB")
+        if [[ ${#_dk_sz_parts[@]} -gt 0 ]]; then
+            local _dk_sz_str; _dk_sz_str=$(IFS=', '; echo "${_dk_sz_parts[*]}")
+            if [[ "$docker_img_mb" =~ ^[0-9]+$ ]] && (( docker_img_mb > 20480 )); then
+                _row2 "!   storage: ${_dk_sz_str} — run: docker system prune"
+                _rec "Docker image storage is ${docker_img_mb} MB — free space: docker system prune"
+            else
+                _row2 "--  storage: ${_dk_sz_str}"
+            fi
+        fi
+    fi
+
+
+    # ── Waydroid ─────────────────────────────────────────────────────────────
+    if findmnt -n /var/lib/waydroid &>/dev/null; then
+        local waydroid_st; waydroid_st=$(systemctl is-active waydroid-container 2>/dev/null || echo "inactive")
+        local waydroid_mb
+        waydroid_mb=$(du -sm /var/lib/waydroid 2>/dev/null | awk '{print $1}' || echo "")
+        local wd_sz_str=""
+        [[ "$waydroid_mb" =~ ^[0-9]+$ ]] && wd_sz_str="  (${waydroid_mb} MB)"
+        if [[ "$waydroid_st" == "active" ]]; then
+            _row "Waydroid"   "OK  Android container active${wd_sz_str}"
+        else
+            _row "Waydroid"   "!   @waydroid mounted but container service is ${waydroid_st}${wd_sz_str}"
+            _rec "Waydroid container not running — run: systemctl enable --now waydroid-container  [auto]"
+        fi
+    elif command -v waydroid &>/dev/null; then
+        _row "Waydroid"   "~~  not initialised"
+    fi
+
+    # ── systemd-nspawn (systemd-machined) ─────────────────────────────────────
+    # Surface when machines dir has content, machined is running, or any
+    # nspawn@ unit is active/enabled. Shows per-machine state and disk usage.
+    if command -v machinectl &>/dev/null; then
+        local machines_dir="/var/lib/machines"
+        local has_machines=0
+        { [[ -d "$machines_dir" ]] && [[ $(ls "$machines_dir" 2>/dev/null | wc -l) -gt 0 ]]; } \
+            && has_machines=1
+        systemctl is-active --quiet systemd-machined 2>/dev/null && has_machines=1
+        # Also surface if any nspawn@ unit is enabled/active
+        systemctl list-units 'systemd-nspawn@*.service' --no-legend --no-pager 2>/dev/null \
+            | grep -q . && has_machines=1
+        if (( has_machines )); then
+            local machined_st; machined_st=$(systemctl is-active systemd-machined 2>/dev/null || echo "inactive")
+            if [[ "$machined_st" == "active" ]]; then
+                # Gather per-machine info: name, state, IP, OS
+                local _mc_raw=""
+                _mc_raw=$(timeout 5 machinectl list --no-legend 2>/dev/null || echo "")
+                local _mc_count=0
+                [[ -n "$_mc_raw" ]] && _mc_count=$(echo "$_mc_raw" | grep -c . || echo 0)
+                local _mc_running=0
+                _mc_running=$(echo "$_mc_raw" | grep -c running 2>/dev/null || echo 0)
+                # Total disk usage of machines dir
+                local nspawn_mb=""
+                nspawn_mb=$(du -sm "$machines_dir" 2>/dev/null | awk '{print $1}' || echo "")
+                _row "nspawn" "OK  machined active  (${_mc_count} machine(s)${_mc_running:+, ${_mc_running} running}${nspawn_mb:+, ${nspawn_mb} MB})"
+                # Per-machine rows
+                if [[ -n "$_mc_raw" ]]; then
+                    while IFS= read -r _mc_line; do
+                        [[ -z "$_mc_line" ]] && continue
+                        local _mc_name _mc_class _mc_service _mc_os _mc_addr
+                        _mc_name=$(echo "$_mc_line" | awk '{print $1}')
+                        _mc_class=$(echo "$_mc_line" | awk '{print $2}')
+                        _mc_service=$(echo "$_mc_line" | awk '{print $3}')
+                        # Get address and OS from machinectl status
+                        _mc_addr=$(timeout 3 machinectl status "$_mc_name" 2>/dev/null \
+                            | awk '/Address:/{print $2}' | head -1 || echo "")
+                        _mc_os=$(timeout 3 machinectl status "$_mc_name" 2>/dev/null \
+                            | awk '/OS:/{$1=""; print $0}' | head -1 | xargs || echo "")
+                        local _mc_disk=""
+                        _mc_disk=$(du -sm "${machines_dir}/${_mc_name}" 2>/dev/null \
+                            | awk '{print $1}' || echo "")
+                        local _mc_detail=""
+                        [[ -n "$_mc_os"   ]] && _mc_detail+="${_mc_os}"
+                        [[ -n "$_mc_addr" ]] && _mc_detail+="${_mc_detail:+  }${_mc_addr}"
+                        [[ -n "$_mc_disk" ]] && _mc_detail+="${_mc_detail:+  }${_mc_disk} MB"
+                        _row2 "--  ${_mc_name}  (${_mc_service:-${_mc_class}})${_mc_detail:+  ${_mc_detail}}"
+                    done <<< "$_mc_raw"
+                fi
+                # Enabled-but-stopped machines (in /etc/systemd/nspawn/ or unit files)
+                local _nspawn_enabled=""
+                _nspawn_enabled=$(systemctl list-unit-files 'systemd-nspawn@*.service' \
+                    --state=enabled --no-legend --no-pager 2>/dev/null \
+                    | awk '{gsub(/systemd-nspawn@|\.service/,"",$1); print $1}' | paste -sd ',' || echo "")
+                if [[ -n "$_nspawn_enabled" ]]; then
+                    local _nspawn_inactive=""
+                    _nspawn_inactive=$(systemctl list-units 'systemd-nspawn@*.service' \
+                        --state=inactive --no-legend --no-pager 2>/dev/null \
+                        | awk '{gsub(/systemd-nspawn@|\.service/,"",$1); print $1}' | paste -sd ',' || echo "")
+                    [[ -n "$_nspawn_inactive" ]] && \
+                        _row2 "--  enabled but not running: ${_nspawn_inactive} — run: machinectl start <name>"
+                fi
+            else
+                _row "nspawn" "!   machines present but systemd-machined is ${machined_st}"
+                _rec "systemd-machined not active — run: systemctl start systemd-machined  [auto]"
+                local nspawn_mb=""
+                nspawn_mb=$(du -sm "$machines_dir" 2>/dev/null | awk '{print $1}' || echo "")
+                [[ "$nspawn_mb" =~ ^[0-9]+$ ]] && (( nspawn_mb > 0 )) && \
+                    _row2 "--  ${nspawn_mb} MB in ${machines_dir}"
+            fi
+        fi
+    fi
+
+    # Pre-check: Apptainer userns disabled must always show
+    if command -v apptainer &>/dev/null || command -v singularity &>/dev/null; then
+        local _unp
+        _unp=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "1")
+        if [[ "$_unp" == "0" ]]; then
+            _row "Apptainer"  "!!  installed but unprivileged_userns_clone=0 — rootless containers disabled"
+            _rec "Apptainer rootless containers disabled — run: sysctl -w kernel.unprivileged_userns_clone=1"
+        fi
+    fi
+    _optional_begin
+
+    # ── Apptainer ────────────────────────────────────────────────────────────
+    # Rootless HPC container runtime. No daemon — just needs userns support.
+    if command -v apptainer &>/dev/null || command -v singularity &>/dev/null; then
+        local apt_bin="apptainer"; command -v apptainer &>/dev/null || apt_bin="singularity"
+        local apt_ver; apt_ver=$("$apt_bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+        local userns_val; userns_val=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "1")
+        if [[ "$userns_val" == "0" ]]; then
+            _row "Apptainer"  "!!  installed but unprivileged_userns_clone=0 — rootless containers disabled"
+            _rec "kernel.unprivileged_userns_clone must be 1 for rootless Apptainer"
+        else
+            _row "Apptainer"  "OK  ${apt_bin}${apt_ver:+  v${apt_ver}}  (rootless-capable)"
+        fi
+        # Cache storage
+        local _rl_user="$_CALLER_USER"
+        if [[ -n "$_rl_user" ]]; then
+            local _user_home; _user_home=$(getent passwd "$_rl_user" 2>/dev/null | cut -d: -f6 || echo "")
+            if [[ -n "$_user_home" ]]; then
+                local apt_cache_mb
+                apt_cache_mb=$(du -sm "${_user_home}/.apptainer/cache" "${_user_home}/.singularity/cache" 2>/dev/null | awk '{s+=$1} END{print s}' || echo "")
+                [[ "$apt_cache_mb" =~ ^[0-9]+$ ]] && (( apt_cache_mb > 0 )) && _row2 "--  cache: ${apt_cache_mb} MB (${_rl_user})"
+            fi
+        fi
+    fi
+
+    # ── Incus (system container and VM manager) ───────────────────────────────
+    # Fork of LXD; manages containers and VMs via the incus daemon.
+    if command -v incus &>/dev/null || systemctl cat incus &>/dev/null 2>&1; then
+        if systemctl is-active --quiet incus 2>/dev/null; then
+            local _incus_inst=""
+            _incus_inst=$(incus list --format csv 2>/dev/null | wc -l | tr -d '[:space:]' || echo "")
+            _row "Incus"       "OK  running${_incus_inst:+  (${_incus_inst} instance(s))}"
+        elif systemctl is-enabled --quiet incus 2>/dev/null; then
+            _row "Incus"       "!   enabled but not running"
+            _rec "incus not running — run: systemctl start incus  [auto]"
+        else
+            _row "Incus"       "~~  not enabled — to manage containers: systemctl enable --now incus"
+        fi
+        local incus_mb
+        incus_mb=$(du -sm /var/lib/incus 2>/dev/null | awk '{print $1}' || echo "")
+        [[ "$incus_mb" =~ ^[0-9]+$ ]] && (( incus_mb > 0 )) && _row2 "--  ${incus_mb} MB"
+    fi
+    _optional_end
 }
 
 _section_virtualization() {
@@ -3811,6 +6671,15 @@ _section_virtualization() {
         _rec "KVM device missing — enable AMD-V/VT-x in BIOS and ensure kvm/kvm-amd/kvm-intel module is loaded"
     fi
 
+    # ── vhost_net kernel module ──────────────────────────────────────────────
+    if [[ -e /dev/kvm ]]; then
+        if lsmod 2>/dev/null | grep -q "^vhost_net"; then
+            _row "vhost_net"   "OK  loaded (VM network acceleration active)"
+        elif modinfo vhost_net &>/dev/null 2>&1; then
+            _row "vhost_net"   "--  available, auto-loads when VM starts"
+        fi
+    fi
+
     # ── libvirt daemons ───────────────────────────────────────────────────────
     if command -v virsh &>/dev/null || [[ -d /data/varlib/libvirt ]]; then
 
@@ -3831,19 +6700,47 @@ _section_virtualization() {
 
         if (( libvirt_active )); then
             local vm_count="" vm_running=""
+            # QEMU version inline
+            local _qemu_ver=""
+            for _qbin in qemu-system-x86_64 qemu-kvm; do
+                command -v "$_qbin" &>/dev/null && \
+                    _qemu_ver=$("$_qbin" --version 2>/dev/null \
+                        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "") && break
+            done
+            # @qemu storage inline
+            local _qemu_mb=""
+            findmnt -n /var/lib/qemu &>/dev/null && \
+                _qemu_mb=$(du -sm /var/lib/qemu 2>/dev/null | awk '{print $1}' || echo "")
             if command -v virsh &>/dev/null; then
                 vm_count=$(timeout 5 virsh list --all 2>/dev/null \
                     | awk 'NR>2 && /^[[:space:]]*[0-9-]/' | wc -l || echo "")
                 vm_running=$(timeout 5 virsh list 2>/dev/null \
                     | awk 'NR>2 && /running/' | wc -l || echo "0")
             fi
-            _row "libvirtd"  "OK  active (${libvirt_mode})${vm_count:+  (${vm_count} VM(s) defined${vm_running:+, ${vm_running} running})}"
+            _row "libvirtd"  "OK  active (${libvirt_mode})${_qemu_ver:+  QEMU v${_qemu_ver}}${vm_count:+  (${vm_count} VM(s) defined${vm_running:+, ${vm_running} running})${_qemu_mb:+, ${_qemu_mb} MB}}"
+            # Per-VM rows: name, state, vCPUs, memory
+            if command -v virsh &>/dev/null && [[ "$vm_count" =~ ^[0-9]+$ ]] && (( vm_count > 0 )); then
+                while IFS= read -r _vl; do
+                    [[ -z "$_vl" ]] && continue
+                    local _vid _vname _vstate
+                    _vid=$(echo "$_vl" | awk '{print $1}')
+                    _vname=$(echo "$_vl" | awk '{print $2}')
+                    _vstate=$(echo "$_vl" | awk '{$1=$2=""; print $0}' | xargs)
+                    # Get vCPU and memory from dominfo (quick, no XML needed)
+                    local _vcpus="" _vmem=""
+                    local _dominfo=""
+                    _dominfo=$(timeout 3 virsh dominfo "$_vname" 2>/dev/null || echo "")
+                    _vcpus=$(echo "$_dominfo" | awk '/^CPU\(s\):/{print $2}' | head -1)
+                    _vmem=$(echo "$_dominfo" | awk '/^Used memory:/{printf "%.0f MB", $3/1024}' | head -1)
+                    _row2 "--  ${_vname}  (${_vstate}${_vcpus:+, ${_vcpus} vCPU}${_vmem:+, ${_vmem}})"
+                done < <(timeout 5 virsh list --all 2>/dev/null | awk 'NR>2 && /^[[:space:]]*[0-9-]/')
+            fi
         elif systemctl is-enabled --quiet virtqemud.service 2>/dev/null || \
              systemctl is-enabled --quiet libvirtd.service  2>/dev/null; then
             _row "libvirtd"  "!   enabled but not running"
-            _rec "libvirtd/virtqemud enabled but not active — run: systemctl start virtqemud.socket  [auto]"
+            _rec "libvirtd/virtqemud not running — run: systemctl start virtqemud.socket  [auto]"
         else
-            _row "libvirtd"  "--  installed but not enabled"
+            _row "libvirtd"  "~~  not enabled"
         fi
 
         # ── Modular daemon health ─────────────────────────────────────────────
@@ -4032,22 +6929,12 @@ _section_virtualization() {
             _row "Hugepages"  "--  ${hugepages_free}/${hugepages_total} free  ($(( hugepages_total * 2 )) MB reserved)"
         fi
 
-        # ── QEMU version ──────────────────────────────────────────────────────
-        local qemu_ver=""
-        for qemu_bin in qemu-system-x86_64 qemu-kvm; do
-            command -v "$qemu_bin" &>/dev/null && \
-                qemu_ver=$("$qemu_bin" --version 2>/dev/null \
-                    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "") && break
-        done
-        [[ -n "$qemu_ver" ]] && _row "QEMU"       "--  v${qemu_ver}"
+
 
         # ── @qemu subvolume ───────────────────────────────────────────────────
         # VM disk images live on @qemu (nodatacow for performance).
-        if findmnt -n /var/lib/qemu &>/dev/null; then
-            local qemu_mb=""
-            qemu_mb=$(du -sm /var/lib/qemu 2>/dev/null | awk '{print $1}' || echo "")
-            _row "@qemu"      "OK  mounted${qemu_mb:+  (${qemu_mb} MB)}"
-        else
+        # When mounted: size shown inline on the libvirtd row.
+        if ! findmnt -n /var/lib/qemu &>/dev/null; then
             _row "@qemu"      "!!  /var/lib/qemu not mounted — VM images inaccessible"
             _rec "@qemu subvolume not mounted at /var/lib/qemu — check fstab"
         fi
@@ -4068,147 +6955,155 @@ _section_virtualization() {
             fi
         fi
     fi
-}
 
-_section_containers() {
-    _head "Containers"
+    # Profile used by both the GNOME sharing stack and Remote Desktop blocks
 
-    # ── Podman ────────────────────────────────────────────────────────────────
-    if command -v podman &>/dev/null; then
-        local podman_sys_st podman_usr_st podman_ver=""
-        podman_sys_st=$(systemctl is-active podman.socket 2>/dev/null || echo "inactive")
-        podman_usr_st=$(_sysd_user is-active podman.socket 2>/dev/null || echo "inactive")
-        podman_ver=$(podman --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
-        # Rootless capable: needs unprivileged userns + subuid
-        local rootless_ok=1
-        local _rl_user="$_CALLER_USER"
-        [[ -n "$_rl_user" ]] && { grep -q "^${_rl_user}:" /etc/subuid 2>/dev/null || rootless_ok=0; }
-        local userns_val; userns_val=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "1")
-        [[ "$userns_val" == "0" ]] && rootless_ok=0
-        local rl_str=""
-        (( rootless_ok )) && rl_str=", rootless-capable" || rl_str=", rootless BROKEN (check subuid/userns)"
-        if [[ "$podman_sys_st" == "active" ]]; then
-            _row "Podman"     "OK  socket active (system)${podman_ver:+  v${podman_ver}}${rl_str}"
-        elif [[ "$podman_usr_st" == "active" ]]; then
-            _row "Podman"     "OK  socket active (user)${podman_ver:+  v${podman_ver}}${rl_str}"
-        else
-            _row "Podman"     "--  installed${podman_ver:+  v${podman_ver}}  socket inactive${rl_str}"
-        fi
-        # Running containers
-        local podman_running=""
-        podman_running=$(podman ps -q 2>/dev/null | wc -l | tr -d '[:space:]' || echo "")
-        if [[ "$podman_running" =~ ^[0-9]+$ ]] && (( podman_running > 0 )); then
-            _row2 "--  ${podman_running} container(s) running"
-        fi
-        # Distrobox: depends on Podman — flag if installed but Podman socket is down
-        if command -v distrobox &>/dev/null && \
-           [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
-            _row2 "!  Distrobox installed but Podman socket not active — containers won't start"
-        fi
-        # Image storage — warn only when critically large (detail in --storage-info)
-        local podman_img_mb
-        podman_img_mb=$(du -sm /var/lib/containers/storage/overlay 2>/dev/null | awk '{print $1}' || echo "")
-        if [[ "$podman_img_mb" =~ ^[0-9]+$ ]] && (( podman_img_mb > 20480 )); then
-            _row2 "!   ${podman_img_mb} MB in image storage — run: podman image prune"
-            _rec "Podman image storage is ${podman_img_mb} MB — free space: podman image prune"
-        fi
-    fi
 
-    # ── LXD / lxcfs ──────────────────────────────────────────────────────────
-    if { findmnt -n /var/lib/lxd &>/dev/null || [[ -d /data/varlib/lxd ]]; }; then
-        if systemctl is-active --quiet lxd.socket 2>/dev/null; then
-            local lxd_count=""
-            # Only call lxc list if LXD has been initialised (preseed/init already run).
-            # An active socket on an uninitialised LXD will hang indefinitely.
-            local lxd_initialised=0
-            [[ -f /var/lib/lxd/server.crt || -f /var/snap/lxd/common/lxd/server.crt || \
-               -d /var/lib/lxd/networks || -d /data/varlib/lxd/networks ]] && lxd_initialised=1
-            if (( lxd_initialised )); then
-                lxd_count=$(timeout 5 lxc list --format=csv 2>/dev/null | wc -l || echo "")
-                _row "LXD"        "OK  lxd.socket active${lxd_count:+  (${lxd_count} container(s))}"
+    # ── VM guest agents ─────────────────────────────────────────────────────
+    # ── spice-vdagent (SPICE VM guest agent) ─────────────────────────────────
+    # Only relevant inside a SPICE virtual machine — skip on bare metal.
+    if systemctl cat spice-vdagentd &>/dev/null 2>&1; then
+        local _in_vm=0
+        grep -qiE 'qemu|kvm|vmware|virtualbox|xen|hyperv' \
+            /sys/class/dmi/id/sys_vendor \
+            /sys/class/dmi/id/product_name 2>/dev/null && _in_vm=1
+        if (( _in_vm )); then
+            if systemctl is-active --quiet spice-vdagentd 2>/dev/null; then
+                _row "SPICE"       "OK  spice-vdagentd running (VM guest features active)"
+            elif systemctl is-enabled --quiet spice-vdagentd 2>/dev/null; then
+                _row "SPICE"       "!   enabled but not running"
+                _rec "spice-vdagentd not running — run: systemctl start spice-vdagentd  [auto]"
             else
-                _row "LXD"        "--  lxd.socket active but LXD not yet initialised (run: lxd init)"
-            fi
-        else
-            _row "LXD"        "!   @lxd data present but lxd.socket not active"
-            _rec "LXD socket not active — run: systemctl enable --now lxd.socket  [auto]"
-        fi
-        # lxcfs: provides container-aware /proc stats — silent when working
-        if command -v lxcfs &>/dev/null && systemctl is-enabled --quiet lxcfs 2>/dev/null; then
-            if ! systemctl is-active --quiet lxcfs 2>/dev/null; then
-                _row2 "!  lxcfs enabled but not running — containers see host stats"
-                _rec "lxcfs not running — run: systemctl enable --now lxcfs  [auto]"
+                _row "SPICE"       "!   running in SPICE VM but spice-vdagentd not enabled (clipboard/resize will not work)"
+                _rec "Enable SPICE guest agent: systemctl enable --now spice-vdagentd  [auto]"
             fi
         fi
-        # LXD storage — warn only when large (detail in --storage-info)
-        local lxd_mb
-        lxd_mb=$(du -sm /var/lib/lxd /data/varlib/lxd 2>/dev/null | awk '{s+=$1} END{print s}' || echo "")
-        if [[ "$lxd_mb" =~ ^[0-9]+$ ]] && (( lxd_mb > 20480 )); then
-            _row2 "!   ${lxd_mb} MB — review with: lxc storage info default"
-            _rec "LXD storage is ${lxd_mb} MB — review: lxc storage info default"
-        fi
+        # Silent on bare metal — not relevant
     fi
 
-    # ── Waydroid ─────────────────────────────────────────────────────────────
-    if findmnt -n /var/lib/waydroid &>/dev/null; then
-        local waydroid_st; waydroid_st=$(systemctl is-active waydroid-container 2>/dev/null || echo "inactive")
-        # Storage size — Android images can be several GB
-        local waydroid_mb
-        waydroid_mb=$(du -sm /var/lib/waydroid 2>/dev/null | awk '{print $1}' || echo "")
-        local wd_sz_str=""
-        [[ "$waydroid_mb" =~ ^[0-9]+$ ]] && wd_sz_str="  (${waydroid_mb} MB)"
-        if [[ "$waydroid_st" == "active" ]]; then
-            _row "Waydroid"   "OK  Android container active${wd_sz_str}"
-        else
-            _row "Waydroid"   "!   @waydroid mounted but container service is ${waydroid_st}${wd_sz_str}"
-            _rec "Waydroid container not running — run: systemctl enable --now waydroid-container  [auto]"
-        fi
-    elif command -v waydroid &>/dev/null; then
-        _row "Waydroid"   "--  installed, not initialised"
-    fi
-
-    # ── systemd-nspawn (systemd-machined) ─────────────────────────────────────
-    # machinectl manages nspawn containers and VMs. Only check when machines dir
-    # has content or machined is already running.
-    if command -v machinectl &>/dev/null; then
-        local machines_dir="/var/lib/machines"
-        local has_machines=0
-        { [[ -d "$machines_dir" ]] && [[ $(ls "$machines_dir" 2>/dev/null | wc -l) -gt 0 ]]; } \
-            && has_machines=1
-        systemctl is-active --quiet systemd-machined 2>/dev/null && has_machines=1
-        if (( has_machines )); then
-            local machined_st; machined_st=$(systemctl is-active systemd-machined 2>/dev/null || echo "inactive")
-            local machine_count=""
-            machine_count=$(timeout 5 machinectl list --no-legend 2>/dev/null | wc -l || echo "")
-            if [[ "$machined_st" == "active" ]]; then
-                _row "nspawn"     "OK  systemd-machined active${machine_count:+  (${machine_count} machine(s))}"
+    # ── open-vm-tools (VMware guest agent) ────────────────────────────────────
+    if command -v vmtoolsd &>/dev/null || systemctl cat vmtoolsd &>/dev/null 2>&1; then
+        local _in_vmware=0
+        grep -qiE 'vmware' \
+            /sys/class/dmi/id/sys_vendor \
+            /sys/class/dmi/id/product_name 2>/dev/null && _in_vmware=1
+        if (( _in_vmware )); then
+            if systemctl is-active --quiet vmtoolsd 2>/dev/null; then
+                _row "VMware"      "OK  vmtoolsd running (VMware guest features active)"
+            elif systemctl is-enabled --quiet vmtoolsd 2>/dev/null; then
+                _row "VMware"      "!   enabled but not running"
+                _rec "vmtoolsd not running — run: systemctl start vmtoolsd  [auto]"
             else
-                _row "nspawn"     "!   machines present but systemd-machined is ${machined_st}"
-                _rec "systemd-machined not active — run: systemctl start systemd-machined  [auto]"
+                _row "VMware"      "!   running in VMware but vmtoolsd not enabled (clipboard/resize will not work)"
+                _rec "Enable VMware guest agent: systemctl enable --now vmtoolsd  [auto]"
             fi
-            # nspawn storage detail in --storage-info
         fi
+        # Silent on bare metal
     fi
 
-    # ── Apptainer ────────────────────────────────────────────────────────────
-    # Rootless HPC container runtime. No daemon — just needs userns support.
-    if command -v apptainer &>/dev/null || command -v singularity &>/dev/null; then
-        local apt_bin="apptainer"; command -v apptainer &>/dev/null || apt_bin="singularity"
-        local apt_ver; apt_ver=$("$apt_bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
-        local userns_val; userns_val=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "1")
-        if [[ "$userns_val" == "0" ]]; then
-            _row "Apptainer"  "!!  installed but unprivileged_userns_clone=0 — rootless containers disabled"
-            _rec "kernel.unprivileged_userns_clone must be 1 for rootless Apptainer"
-        else
-            _row "Apptainer"  "OK  ${apt_bin}${apt_ver:+  v${apt_ver}}  (rootless-capable)"
+    # ── virtualbox-guest-utils (VirtualBox guest agent) ───────────────────────
+    if command -v VBoxService &>/dev/null || systemctl cat vboxservice &>/dev/null 2>&1; then
+        local _in_vbox=0
+        grep -qiE 'virtualbox|vbox' \
+            /sys/class/dmi/id/sys_vendor \
+            /sys/class/dmi/id/product_name 2>/dev/null && _in_vbox=1
+        if (( _in_vbox )); then
+            if systemctl is-active --quiet vboxservice 2>/dev/null; then
+                _row "VirtualBox"  "OK  VBoxService running (VBox guest features active)"
+            elif systemctl is-enabled --quiet vboxservice 2>/dev/null; then
+                _row "VirtualBox"  "!   enabled but not running"
+                _rec "vboxservice not running — run: systemctl start vboxservice  [auto]"
+            else
+                _row "VirtualBox"  "!   running in VirtualBox but vboxservice not enabled (clipboard/shared folders will not work)"
+                _rec "Enable VirtualBox guest agent: systemctl enable --now vboxservice  [auto]"
+            fi
         fi
-        # Apptainer cache detail in --storage-info
+        # Silent on bare metal
     fi
+
+    # ── qemu-guest-agent (QEMU/KVM VM guest agent) ────────────────────────────
+    # Enables host-initiated shutdown, file system freeze for snapshots,
+    # and guest info reporting inside KVM/QEMU VMs.
+    if command -v qemu-ga &>/dev/null || systemctl cat qemu-guest-agent &>/dev/null 2>&1; then
+        local _in_kvm=0
+        grep -qiE 'qemu|kvm' \
+            /sys/class/dmi/id/sys_vendor \
+            /sys/class/dmi/id/product_name 2>/dev/null && _in_kvm=1
+        # Also check for virtio devices as a fallback indicator
+        [[ $_in_kvm -eq 0 ]] && \
+            ls /sys/bus/virtio/devices/ 2>/dev/null | grep -q '.' && _in_kvm=1
+        if (( _in_kvm )); then
+            if systemctl is-active --quiet qemu-guest-agent 2>/dev/null; then
+                _row "QEMU agent"  "OK  qemu-guest-agent running"
+            elif systemctl is-enabled --quiet qemu-guest-agent 2>/dev/null; then
+                _row "QEMU agent"  "!   enabled but not running"
+                _rec "qemu-guest-agent not running — run: systemctl start qemu-guest-agent  [auto]"
+            else
+                _row "QEMU agent"  "!   running in QEMU/KVM but qemu-guest-agent not enabled (snapshots/shutdown coordination unavailable)"
+                _rec "Enable QEMU guest agent: systemctl enable --now qemu-guest-agent  [auto]"
+            fi
+        fi
+        # Silent on bare metal
+    fi
+
+    # ── Hyper-V guest services ────────────────────────────────────────────────
+    # hv_kvp_daemon (key-value pair), hv_vss_daemon (volume shadow copy),
+    # hv_fcopy_daemon (file copy) — enable host↔guest integration.
+    if systemctl cat hv_kvp_daemon &>/dev/null 2>&1 || \
+       systemctl cat hyperv-daemons.hv-kvp-daemon &>/dev/null 2>&1; then
+        local _in_hyperv=0
+        grep -qiE 'microsoft|hyper-v|hyperv' \
+            /sys/class/dmi/id/sys_vendor \
+            /sys/class/dmi/id/product_name 2>/dev/null && _in_hyperv=1
+        if (( _in_hyperv )); then
+            local _hv_ok=0 _hv_fail=()
+            for _hvsvc in hv_kvp_daemon hv_vss_daemon hv_fcopy_daemon; do
+                if systemctl is-active --quiet "$_hvsvc" 2>/dev/null; then
+                    _hv_ok=$(( _hv_ok + 1 ))
+                elif systemctl cat "$_hvsvc" &>/dev/null 2>&1; then
+                    _hv_fail+=("$_hvsvc")
+                fi
+            done
+            if [[ ${#_hv_fail[@]} -eq 0 && $_hv_ok -gt 0 ]]; then
+                _row "Hyper-V"    "OK  guest daemons running (${_hv_ok})"
+            elif [[ ${#_hv_fail[@]} -gt 0 ]]; then
+                _row "Hyper-V"    "!   some guest daemons not running: $(_join "${_hv_fail[@]}")"
+                _rec "Hyper-V daemons not running — run: systemctl enable --now ${_hv_fail[*]}  [auto]"
+            else
+                _row "Hyper-V"    "!   running in Hyper-V but guest daemons not enabled"
+                _rec "Enable Hyper-V guest services: systemctl enable --now hv_kvp_daemon hv_vss_daemon hv_fcopy_daemon  [auto]"
+            fi
+        fi
+        # Silent on bare metal
+    fi
+
+
 }
-
 
 _section_firmware() {
     _head "Firmware"
+
+    # ── CPU microcode package ─────────────────────────────────────────────────
+    local _cpu_vfw
+    _cpu_vfw=$(grep -m1 "vendor_id" /proc/cpuinfo 2>/dev/null | awk '{print $3}' || echo "")
+    case "$_cpu_vfw" in
+        AuthenticAMD)
+            if [[ -f /boot/amd-ucode.img ]] || pacman -Q amd-ucode &>/dev/null 2>&1; then
+                local _uv; _uv=$(grep -m1 "microcode" /proc/cpuinfo 2>/dev/null | awk '{print $3}' || echo "")
+                _row "CPU ucode"   "OK  amd-ucode present${_uv:+  (rev ${_uv})}"
+            else
+                _row "CPU ucode"   "!   amd-ucode not installed — CPU mitigations may be incomplete"
+                _rec "Install amd-ucode: pacman -S amd-ucode, then regenerate UKI"
+            fi ;;
+        GenuineIntel)
+            if [[ -f /boot/intel-ucode.img ]] || pacman -Q intel-ucode &>/dev/null 2>&1; then
+                local _uv; _uv=$(grep -m1 "microcode" /proc/cpuinfo 2>/dev/null | awk '{print $3}' || echo "")
+                _row "CPU ucode"   "OK  intel-ucode present${_uv:+  (rev ${_uv})}"
+            else
+                _row "CPU ucode"   "!   intel-ucode not installed — CPU mitigations may be incomplete"
+                _rec "Install intel-ucode: pacman -S intel-ucode, then regenerate UKI"
+            fi ;;
+    esac
 
     if ! command -v fwupdmgr &>/dev/null; then
         _row "fwupd"     "--  not available"
@@ -4246,6 +7141,27 @@ _section_firmware() {
         _row "Updates"   "OK  up to date (cached)"
     fi
 
+    _optional_begin
+    # ── passim (local update caching daemon) ──────────────────────────────────
+    # Caches downloaded packages/updates locally and shares them via mDNS,
+    # reducing bandwidth on LANs with multiple machines. ShaniOS ships it.
+    # The unit is static (activated by fwupd on demand) — idle is normal.
+    if command -v passim &>/dev/null || systemctl cat passim &>/dev/null 2>&1; then
+        local _passim_en
+        _passim_en=$(systemctl is-enabled passim 2>/dev/null || echo "disabled")
+        if systemctl is-active --quiet passim 2>/dev/null; then
+            _row "passim"      "OK  running (local update cache active)"
+        elif [[ "$_passim_en" == "static" ]]; then
+            _row "passim"      ">>  enabled (idle — activated by fwupd on demand)"
+        elif [[ "$_passim_en" == "enabled" ]]; then
+            _row "passim"      "!   enabled but not running"
+            _rec "passim not running — run: systemctl start passim  [auto]"
+        else
+            _row "passim"      "~~  not enabled — local LAN update cache: systemctl enable --now passim"
+        fi
+    fi
+
+    _optional_end
 }
 
 _section_runtime_health() {
@@ -4276,6 +7192,19 @@ _section_runtime_health() {
             if (( psi_cpu_int >= 50 )); then
                 _row "CPU PSI"    "!   some=${psi_cpu}% — high CPU contention"
                 _rec "CPU pressure (PSI some) is ${psi_cpu}% — system is CPU-starved; check: ps aux --sort=-%cpu | head"
+            fi
+        fi
+    fi
+
+    # ── I/O pressure ─────────────────────────────────────────────────────────
+    if [[ -f /proc/pressure/io ]]; then
+        local psi_io=""
+        psi_io=$(awk '/^some/{printf "%.1f", $2}' /proc/pressure/io 2>/dev/null || echo "")
+        if [[ -n "$psi_io" ]]; then
+            local psi_io_int; psi_io_int=$(printf "%.0f" "$psi_io" 2>/dev/null || echo "0")
+            if (( psi_io_int >= 30 )); then
+                _row "I/O PSI"    "!   some=${psi_io}% — significant I/O wait"
+                _rec "I/O pressure ${psi_io}% — check: iotop -o or iostat -x 1 5"
             fi
         fi
     fi
@@ -4342,13 +7271,75 @@ _section_runtime_health() {
         fi
         _row "oomd"        "OK  running${psi_mem:+  (${psi_mem})}"
     elif systemctl is-enabled --quiet systemd-oomd 2>/dev/null; then
-        _row "oomd"        "!!  enabled but not running — system freeze protection inactive"
+        _row "oomd"        "!   enabled but not running — system freeze protection inactive"
         _rec "systemd-oomd not running — run: systemctl start systemd-oomd  [auto]"
     else
-        _row "oomd"        "!!  not enabled — system freeze protection inactive"
-        _rec "Enable systemd-oomd: systemctl enable --now systemd-oomd  [auto]"
+        if systemctl is-active --quiet earlyoom 2>/dev/null; then
+            _row "oomd"    "--  not enabled (earlyoom active)"
+        else
+            _row "oomd"        "!   not enabled — system freeze protection inactive"
+            _rec "Enable systemd-oomd: systemctl enable --now systemd-oomd  [auto]"
+        fi
     fi
 
+
+    # ── Network interface errors ──────────────────────────────────────────────
+    local _iface_errors=()
+    while IFS= read -r _iface; do
+        [[ -z "$_iface" || "$_iface" == lo ]] && continue
+        local _rx_err _tx_err _rx_drop _tx_drop
+        _rx_err=$(ip  -s link show "$_iface" 2>/dev/null | awk '/RX:/{getline; print $3}' | head -1 || echo "0")
+        _tx_err=$(ip  -s link show "$_iface" 2>/dev/null | awk '/TX:/{getline; print $3}' | head -1 || echo "0")
+        _rx_drop=$(ip -s link show "$_iface" 2>/dev/null | awk '/RX:/{getline; print $4}' | head -1 || echo "0")
+        _tx_drop=$(ip -s link show "$_iface" 2>/dev/null | awk '/TX:/{getline; print $4}' | head -1 || echo "0")
+        local _tot_err=$(( ${_rx_err:-0} + ${_tx_err:-0} ))
+        local _tot_drop=$(( ${_rx_drop:-0} + ${_tx_drop:-0} ))
+        if (( _tot_err > 0 || _tot_drop > 100 )); then
+            _iface_errors+=("${_iface}: err=${_tot_err} drop=${_tot_drop}")
+        fi
+    done < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+    if [[ ${#_iface_errors[@]} -gt 0 ]]; then
+        _row "NIC errors"  "!   ${_iface_errors[0]}"
+        for (( _ni=1; _ni<${#_iface_errors[@]}; _ni++ )); do
+            _row2 "    ${_iface_errors[$_ni]}"
+        done
+        _rec "Network interface errors/drops — check: ip -s link show <iface>"
+    fi
+
+    # Pre-check: earlyoom+oomd conflict must always show
+    if command -v earlyoom &>/dev/null || systemctl cat earlyoom &>/dev/null 2>&1; then
+        if systemctl is-enabled --quiet earlyoom 2>/dev/null && \
+           systemctl is-active  --quiet systemd-oomd 2>/dev/null; then
+            _row "earlyoom" "!!  enabled but systemd-oomd already active — duplicate OOM handling; disable one: systemctl disable --now earlyoom"
+            _rec "earlyoom enabled but systemd-oomd already active — disable one: systemctl disable --now earlyoom"
+        fi
+    fi
+    _optional_begin
+    # ── earlyoom (early OOM process killer) ───────────────────────────────────
+    # Kills processes before the kernel OOM killer fires — smoother under pressure.
+    # Warn if active alongside systemd-oomd (already covered) — both serve the
+    # same role and may interfere.
+    if command -v earlyoom &>/dev/null || systemctl cat earlyoom &>/dev/null 2>&1; then
+        if systemctl is-active --quiet earlyoom 2>/dev/null; then
+            _row "earlyoom"    "OK  running"
+            if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+                _row2 "!   systemd-oomd also active — duplicate OOM handling"
+                _rec  "Both earlyoom and systemd-oomd are active — disable one to avoid conflicts"
+            fi
+        elif systemctl is-enabled --quiet earlyoom 2>/dev/null; then
+            if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+                _row "earlyoom"    "!!  enabled but systemd-oomd already active — duplicate OOM handling; disable one: systemctl disable --now earlyoom"
+                _rec "earlyoom enabled but systemd-oomd already active — disable one: systemctl disable --now earlyoom"
+            else
+                _row "earlyoom"    "!   enabled but not running"
+                _rec "earlyoom not running — run: systemctl start earlyoom  [auto]"
+            fi
+        fi
+        # Silent when not installed/enabled
+    fi
+
+
+    _optional_end
 }
 
 _section_coredump() {
@@ -4395,14 +7386,12 @@ _section_coredump() {
 
     # Check storage config — /etc/systemd/coredump.conf
     local coredump_storage=""
-    if [[ -f /etc/systemd/coredump.conf ]]; then
-        coredump_storage=$(grep -E '^Storage=' /etc/systemd/coredump.conf 2>/dev/null \
-            | cut -d= -f2 | tr -d '[:space:]' || echo "")
-    fi
-    # Also check drop-ins
-    [[ -z "$coredump_storage" ]] && \
-        coredump_storage=$(grep -rh -E '^Storage=' /etc/systemd/coredump.conf.d/ 2>/dev/null \
-            | tail -1 | cut -d= -f2 | tr -d '[:space:]' || echo "")
+    # Read coredump storage setting from all config layers (usr/lib < etc drop-ins < etc main)
+    coredump_storage=$(grep -rshE '^Storage=' \
+        /usr/lib/systemd/coredump.conf.d/ \
+        /etc/systemd/coredump.conf.d/ \
+        /etc/systemd/coredump.conf 2>/dev/null \
+        | tail -1 | cut -d= -f2 | tr -d '[:space:]' || echo "")
     if [[ -n "$coredump_storage" ]]; then
         _row "Storage"    "--  ${coredump_storage}"
         if [[ "$coredump_storage" == "none" ]]; then
@@ -4431,244 +7420,7 @@ _section_coredump() {
 _section_system_health() {
     _head "System Health"
 
-    local running installed
-    running=$(uname -r 2>/dev/null || echo "")
-    installed=$(find /usr/lib/modules/ -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^/]*$' | sort -V | tail -1 || echo "")
-    if [[ -n "$running" && -n "$installed" ]]; then
-        if [[ "$running" == "$installed" ]]; then
-            _row "Kernel"     "OK  ${running}"
-        else
-            _row "Kernel"     "!   running ${running}  /  installed ${installed}"
-            _rec "Kernel mismatch: running ${running}, installed ${installed} — reboot"
-        fi
-    fi
-
-    # ── Boot time ─────────────────────────────────────────────────────────────
-    if command -v systemd-analyze &>/dev/null; then
-        local bt bt_sec bt_raw
-        # systemd-analyze outputs: "Startup finished in Xs (kernel) + Ys (userspace) = TOTALs"
-        # or "= Xmin Y.Zs" on longer boots. Extract the total after '='.
-        bt_raw=$(systemd-analyze 2>/dev/null | head -1 || echo "")
-        bt=$(echo "$bt_raw" | sed 's/.*= *//' | tr -d '\n' | sed 's/[[:space:]]*$//' || echo "")
-        if [[ -n "$bt" ]]; then
-            # Convert to integer seconds for threshold comparison.
-            # Handle "Xmin Y.Zs", "X.Ys", "Xs"
-            if echo "$bt" | grep -q 'min'; then
-                local _bt_mins _bt_secs
-                _bt_mins=$(echo "$bt" | awk -F'min' '{gsub(/[^0-9]/,"",$1); print $1+0}')
-                _bt_secs=$(echo "$bt" | grep -oE '[0-9]+(\.[0-9]+)?s' | grep -oE '^[0-9]+' | tail -1 || echo "0")
-                bt_sec=$(( _bt_mins * 60 + _bt_secs ))
-            else
-                bt_sec=$(echo "$bt" | grep -oE '^[0-9]+' || echo "0")
-            fi
-            if (( bt_sec >= 45 )); then
-                _row "Boot time"  "!   ${bt}  (slow — run: systemd-analyze blame)"
-                # Inline top 3 slowest units — filter transient/sleep units
-                # that appear in blame but are not boot-critical
-                local _blame
-                _blame=$(systemd-analyze blame 2>/dev/null \
-                    | grep -vE "systemd-(suspend|hibernate|hybrid-sleep|sleep)\.service" \
-                    | head -3 | sed 's/^ *//' || true)
-                while IFS= read -r line; do
-                    [[ -n "$line" ]] && _row2 "--  $line"
-                done <<< "$_blame"
-            else
-                _row "Boot time"  "OK  ${bt}"
-            fi
-        fi
-    fi
-
-    # ── OOM kills ─────────────────────────────────────────────────────────────
-    local oom_kernel oom_oomd oom_total
-    oom_kernel=$(journalctl -k -b 0 --no-pager -q 2>/dev/null         | grep -c 'Out of memory\|oom_kill_process\|Killed process' 2>/dev/null || true)
-    oom_kernel=$(echo "${oom_kernel:-0}" | tr -d '[:space:]')
-    [[ "$oom_kernel" =~ ^[0-9]+$ ]] || oom_kernel=0
-    oom_oomd=$(journalctl -b 0 --no-pager -q -u systemd-oomd 2>/dev/null         | grep -c 'Killed\|killed' 2>/dev/null || true)
-    oom_oomd=$(echo "${oom_oomd:-0}" | tr -d '[:space:]')
-    [[ "$oom_oomd" =~ ^[0-9]+$ ]] || oom_oomd=0
-    oom_total=$(( oom_kernel + oom_oomd ))
-    if (( oom_total > 0 )); then
-        local _oom_detail=""
-        (( oom_kernel > 0 )) && _oom_detail+=" kernel:${oom_kernel}"
-        (( oom_oomd   > 0 )) && _oom_detail+=" oomd:${oom_oomd}"
-        _row "OOM kills"  "!   ${oom_total} event(s) this boot (${_oom_detail# })"
-        _rec "${oom_total} OOM kill(s) this boot — consider more RAM or swap"
-    else
-        _row "OOM kills"  "OK  none this boot"
-    fi
-
-    # ── /home usage per user ──────────────────────────────────────────────────
-    if findmnt -n /home &>/dev/null; then
-        local home_warn=() home_crit=() home_info=()
-        for user_dir in /home/*/; do
-            [[ -d "$user_dir" ]] || continue
-            local uname; uname=$(basename "$user_dir")
-            local used_mb
-            used_mb=$(du -sm "$user_dir" 2>/dev/null | awk '{print $1}' || echo "")
-            [[ "$used_mb" =~ ^[0-9]+$ ]] || continue
-            (( used_mb == 0 )) && continue   # skip empty home dirs (e.g. builduser)
-            if (( used_mb > 51200 )); then      # > 50 GB
-                home_crit+=("${uname}:${used_mb}MB")
-            elif (( used_mb > 20480 )); then    # > 20 GB
-                home_warn+=("${uname}:${used_mb}MB")
-            else
-                home_info+=("${uname}:${used_mb}MB")
-            fi
-        done
-        if [[ ${#home_crit[@]} -gt 0 ]]; then
-            _row "Home usage" "!   large: $(_join "${home_crit[@]}")"
-            _rec "Home directories using significant space ($(_join "${home_crit[@]}")) — review with: du -sh /home/*"
-            if [[ ${#home_warn[@]} -gt 0 || ${#home_info[@]} -gt 0 ]]; then
-                local _rest_str; _rest_str=$(IFS=' '; echo "${home_warn[*]} ${home_info[*]}" | xargs)
-                _row2 "--  also: ${_rest_str}"
-            fi
-        elif [[ ${#home_warn[@]} -gt 0 ]]; then
-            _row "Home usage" "--  $(_join "${home_warn[@]}")"
-            if [[ ${#home_info[@]} -gt 0 ]]; then
-                local _info_str; _info_str=$(IFS=' '; echo "${home_info[*]}")
-                _row2 "--  also: ${_info_str}"
-            fi
-        elif [[ ${#home_info[@]} -gt 0 ]]; then
-            local _info_str; _info_str=$(IFS=' '; echo "${home_info[*]}")
-            _row "Home usage" "--  ${_info_str}"
-        fi
-    fi
-
-    # ── Kernel performance parameters ─────────────────────────────────────────
-    # Verify ShaniOS gaming/performance sysctl values are active. These are set
-    # at boot by the OS — a mismatch means the kernel parameter was overridden
-    # or not applied. Checks only the most impactful values.
-    local sysctl_issues=() sysctl_ok=0
-    local -A EXPECTED_SYSCTLS=(
-        ["vm.swappiness"]="133"
-        ["vm.max_map_count"]="2147483642"
-        ["kernel.pid_max"]="65535"
-        ["net.ipv4.tcp_fin_timeout"]="5"
-    )
-    for key in "${!EXPECTED_SYSCTLS[@]}"; do
-        local actual_val expected_val
-        actual_val=$(sysctl -n "$key" 2>/dev/null | tr -d '[:space:]' || echo "")
-        expected_val="${EXPECTED_SYSCTLS[$key]}"
-        if [[ -z "$actual_val" ]]; then
-            : # Key not present on this kernel — skip silently
-        elif [[ "$actual_val" != "$expected_val" ]]; then
-            sysctl_issues+=("${key}=${actual_val} (expected ${expected_val})")
-        else
-            sysctl_ok=$(( sysctl_ok + 1 ))
-        fi
-    done
-    if [[ ${#sysctl_issues[@]} -eq 0 ]]; then
-        _row "Sysctls"    "OK  performance params active (${sysctl_ok} checked)"
-    else
-        local _si_str; _si_str=$(IFS='; '; echo "${sysctl_issues[*]}")
-        _row "Sysctls"    "!   mismatch: ${_si_str}"
-        _rec "Kernel performance parameters overridden — check /etc/sysctl.d/ for conflicting rules"
-    fi
-
-    # ── Journal errors ────────────────────────────────────────────────────────
-    local j_err j_crit
-    j_err=$( journalctl -b 0 -p err  --no-pager -q 2>/dev/null | wc -l || echo "0")
-    j_crit=$(journalctl -b 0 -p crit --no-pager -q 2>/dev/null | wc -l || echo "0")
-    if [[ "$j_crit" =~ ^[0-9]+$ ]] && (( j_crit > 0 )); then
-        _row "Journal"    "!!  ${j_crit} critical (p≤2), ${j_err} errors (p≤3) — journalctl -b 0 -p crit"
-        _rec "${j_crit} critical journal message(s) this boot — run: journalctl -b 0 -p crit"
-    elif [[ "$j_err" =~ ^[0-9]+$ ]] && (( j_err > 20 )); then
-        _row "Journal"    "!   ${j_err} error(s) this boot"
-    else
-        _row "Journal"    "OK  ${j_err:-0} error(s) (normal range)"
-    fi
-
-    # ── Journal disk usage ────────────────────────────────────────────────────
-    # journalctl --disk-usage: "Archived and active journals take up X.XG in the file system."
-    if command -v journalctl &>/dev/null; then
-        local j_disk_usage=""
-        j_disk_usage=$(journalctl --disk-usage 2>/dev/null \
-            | sed -n 's/.*take up \([^ ][^ ]*\) in.*/\1/p' | head -1 || echo "")
-        local j_max_use=""
-        j_max_use=$(grep -rh 'SystemMaxUse=' /etc/systemd/journald.conf \
-            /etc/systemd/journald.conf.d/ 2>/dev/null | tail -1 | cut -d= -f2 \
-            | tr -d '[:space:]' || echo "")
-        if [[ -n "$j_disk_usage" ]]; then
-            _row "Journal sz"  "--  ${j_disk_usage}${j_max_use:+  (limit: ${j_max_use})}"
-        fi
-    fi
-
-    # ── Dirty / writeback memory ──────────────────────────────────────────────
-    # High dirty memory means unflushed writes are buffered in RAM. On a system
-    # with volatile /var (tmpfs) this is normal, but very high values on the
-    # data subvolume can indicate I/O pressure or a stalled writeback worker.
-    local dirty_kb writeback_kb
-    dirty_kb=$(    awk '/^Dirty:/     {print $2}' /proc/meminfo 2>/dev/null || echo "0")
-    writeback_kb=$(awk '/^Writeback:/ {print $2}' /proc/meminfo 2>/dev/null || echo "0")
-    dirty_kb=$(echo "${dirty_kb:-0}" | tr -d '[:space:]')
-    writeback_kb=$(echo "${writeback_kb:-0}" | tr -d '[:space:]')
-    if [[ "$dirty_kb" =~ ^[0-9]+$ ]] && (( dirty_kb > 524288 )); then
-        # > 512 MB dirty — noteworthy
-        local dirty_mb=$(( dirty_kb / 1024 ))
-        _row "Dirty mem"  "!   ${dirty_mb} MB dirty — high unflushed write buffer"
-        _rec "High dirty memory (${dirty_mb} MB) — possible I/O pressure; check: iostat -x 1 5"
-    fi
-    if [[ "$writeback_kb" =~ ^[0-9]+$ ]] && (( writeback_kb > 102400 )); then
-        local wb_mb=$(( writeback_kb / 1024 ))
-        _row "Writeback"  "!   ${wb_mb} MB writeback in progress — I/O under pressure"
-    fi
-
-    # ── Needs-restart (kernel / libraries) ───────────────────────────────────
-    # After a kernel or glibc update, running processes still use old code.
-    # needrestart is the standard tool for this on Arch-based systems.
-    if command -v needrestart &>/dev/null; then
-        local _nr_out _nr_kernel _nr_services
-        _nr_out=$(needrestart -b 2>/dev/null || true)
-        _nr_kernel=$(echo "$_nr_out" | awk -F: '/NEEDRESTART-KSTA/{gsub(/ /,"",$2); print $2}' || echo "")
-        _nr_services=$(echo "$_nr_out" | grep -c 'NEEDRESTART-SVC' || true)
-        # kernel status: 1=up-to-date, 2=ABI-compatible upgrade, 3=version change
-        if [[ "$_nr_kernel" == "3" ]]; then
-            _row "Needs restart" "!   kernel updated — reboot required to run new kernel"
-            _rec "Kernel was updated — reboot to activate new kernel"
-        elif [[ "$_nr_kernel" == "2" ]]; then
-            _row "Needs restart" "--  kernel ABI upgrade pending — reboot recommended"
-        fi
-        if [[ "$_nr_services" =~ ^[0-9]+$ ]] && (( _nr_services > 0 )); then
-            _row2 "--  ${_nr_services} service(s) using outdated libraries — run: needrestart"
-        fi
-    fi
-
-    # ── Hardware errors (MCE / EDAC) ──────────────────────────────────────────
-    # Machine Check Exceptions indicate CPU, memory, or bus hardware faults.
-    # Even a single MCE is serious — it means the hardware detected an error.
-    local _mce_count=0
-    _mce_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null \
-        | grep -ciE 'mce|machine check|EDAC|hardware error|corrected error' || true)
-    _mce_count=$(echo "${_mce_count:-0}" | tr -d '[:space:]')
-    [[ "$_mce_count" =~ ^[0-9]+$ ]] || _mce_count=0
-    if (( _mce_count > 0 )); then
-        _row "HW errors"  "!!  ${_mce_count} MCE/EDAC event(s) this boot — possible hardware fault"
-        _rec "${_mce_count} hardware error(s) in kernel log — check: journalctl -k -b 0 | grep -i mce"
-    fi
-
-    # ── Entropy pool ─────────────────────────────────────────────────────────
-    # Low entropy stalls cryptographic operations (TLS, SSH keygen, LUKS).
-    # On modern kernels /dev/random never blocks but very low values can still
-    # indicate a misconfigured or missing entropy source (e.g. missing rngd).
-    local _entropy=""
-    _entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null | tr -d '[:space:]' || echo "")
-    if [[ "$_entropy" =~ ^[0-9]+$ ]] && (( _entropy < 256 )); then
-        _row "Entropy"    "!   ${_entropy} bits — low (may stall crypto on older kernels)"
-    fi
-
-    local tmp_type="" tmp_size=""
-    tmp_type=$(findmnt -n -o FSTYPE /tmp 2>/dev/null | tr -d '[:space:]' || echo "")
-    tmp_size=$(findmnt -n -o SIZE   /tmp 2>/dev/null | tr -d '[:space:]' || echo "")
-    if [[ "$tmp_type" == "tmpfs" ]]; then
-        _row "/tmp"         "OK  tmpfs${tmp_size:+  (${tmp_size})}"
-    elif [[ -z "$tmp_type" ]]; then
-        # /tmp not separately mounted — lives on root; fine but worth noting
-        _row "/tmp"         "--  on root filesystem (not a tmpfs)"
-    else
-        _row "/tmp"         "--  ${tmp_type}${tmp_size:+  (${tmp_size})}  (not tmpfs)"
-    fi
-
+    # ── Session infrastructure ──────────────────────────────────────────────
     # ── D-Bus ─────────────────────────────────────────────────────────────────
     if systemctl is-active --quiet dbus 2>/dev/null || \
        systemctl is-active --quiet dbus.socket 2>/dev/null; then
@@ -4689,6 +7441,17 @@ _section_system_health() {
         else
             _row "logind"   "!!  disabled — session/seat management unavailable"
             _rec "systemd-logind not enabled — run: systemctl enable --now systemd-logind  [auto]"
+        fi
+    fi
+
+    # ── System daemons ────────────────────────────────────────────────────────
+    # accountsservice: core dependency for GDM, KDE login manager, user settings.
+    if systemctl cat accounts-daemon &>/dev/null 2>&1; then
+        if systemctl is-active --quiet accounts-daemon 2>/dev/null; then
+            _row "accountssvc"  "OK  accounts-daemon running"
+        else
+            _row "accountssvc"  "!!  not running — user login/settings panels may fail"
+            _rec "accounts-daemon not running — run: systemctl enable --now accounts-daemon  [auto]"
         fi
     fi
 
@@ -4766,6 +7529,510 @@ _section_system_health() {
         fi
     fi
 
+    # ── Kernel & boot ───────────────────────────────────────────────────────
+    local running installed
+    running=$(uname -r 2>/dev/null || echo "")
+    installed=$(find /usr/lib/modules/ -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^/]*$' | sort -V | tail -1 || echo "")
+    if [[ -n "$running" && -n "$installed" ]]; then
+        if [[ "$running" == "$installed" ]]; then
+            _row "Kernel"     "OK  ${running}"
+        else
+            _row "Kernel"     "!   running ${running}  /  installed ${installed}"
+            _rec "Kernel mismatch: running ${running}, installed ${installed} — reboot"
+        fi
+    fi
+
+    # ── Boot time ─────────────────────────────────────────────────────────────
+    if command -v systemd-analyze &>/dev/null; then
+        local bt bt_sec bt_raw
+        # systemd-analyze outputs: "Startup finished in Xs (kernel) + Ys (userspace) = TOTALs"
+        # or "= Xmin Y.Zs" on longer boots. Extract the total after '='.
+        bt_raw=$(systemd-analyze 2>/dev/null | head -1 || echo "")
+        bt=$(echo "$bt_raw" | sed 's/.*= *//' | tr -d '\n' | sed 's/[[:space:]]*$//' || echo "")
+        if [[ -n "$bt" ]]; then
+            # Convert to integer seconds for threshold comparison.
+            # Handle "Xmin Y.Zs", "X.Ys", "Xs"
+            if echo "$bt" | grep -q 'min'; then
+                local _bt_mins _bt_secs
+                _bt_mins=$(echo "$bt" | awk -F'min' '{gsub(/[^0-9]/,"",$1); print $1+0}')
+                _bt_secs=$(echo "$bt" | grep -oE '[0-9]+(\.[0-9]+)?s' | grep -oE '^[0-9]+' | tail -1 || echo "0")
+                bt_sec=$(( _bt_mins * 60 + _bt_secs ))
+            else
+                bt_sec=$(echo "$bt" | grep -oE '^[0-9]+' || echo "0")
+            fi
+            if (( bt_sec >= 45 )); then
+                _row "Boot time"  "!   ${bt}  (slow — run: systemd-analyze blame)"
+                # Inline top 3 slowest units — filter transient/sleep units
+                # that appear in blame but are not boot-critical
+                local _blame
+                _blame=$(systemd-analyze blame 2>/dev/null \
+                    | grep -vE "systemd-(suspend|hibernate|hybrid-sleep|sleep)\.service" \
+                    | head -3 | sed 's/^ *//' || true)
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] && _row2 "--  $line"
+                done <<< "$_blame"
+                # Targeted advice for the two most common desktop slow-boot culprits
+                if echo "$_blame" | grep -q 'NetworkManager-wait-online'; then
+                    _rec "NetworkManager-wait-online.service is slowing boot — disable if not needed: systemctl disable NetworkManager-wait-online.service  [auto]"
+                fi
+                if echo "$_blame" | grep -qE 'dev-tpm0\.device|tpm.*device'; then
+                    _rec "TPM device enumeration is slowing boot — if TPM auto-unlock is not used, consider: systemctl mask dev-tpm0.device"
+                fi
+            else
+                _row "Boot time"  "OK  ${bt}"
+            fi
+        fi
+    fi
+
+    # ── Kernel performance parameters ─────────────────────────────────────────
+    # Verify ShaniOS gaming/performance sysctl values are active. These are set
+    # at boot by the OS — a mismatch means the kernel parameter was overridden
+    # or not applied. Checks only the most impactful values.
+    local sysctl_issues=() sysctl_ok=0
+    local -A EXPECTED_SYSCTLS=(
+        ["vm.swappiness"]="133"
+        ["vm.max_map_count"]="2147483642"
+        ["kernel.pid_max"]="65535"
+        ["net.ipv4.tcp_fin_timeout"]="5"
+    )
+    for key in "${!EXPECTED_SYSCTLS[@]}"; do
+        local actual_val expected_val
+        actual_val=$(sysctl -n "$key" 2>/dev/null | tr -d '[:space:]' || echo "")
+        expected_val="${EXPECTED_SYSCTLS[$key]}"
+        if [[ -z "$actual_val" ]]; then
+            : # Key not present on this kernel — skip silently
+        elif [[ "$actual_val" != "$expected_val" ]]; then
+            sysctl_issues+=("${key}=${actual_val} (expected ${expected_val})")
+        else
+            sysctl_ok=$(( sysctl_ok + 1 ))
+        fi
+    done
+    if [[ ${#sysctl_issues[@]} -eq 0 ]]; then
+        _row "Sysctls"    "OK  performance params active (${sysctl_ok} checked)"
+    else
+        local _si_str; _si_str=$(IFS='; '; echo "${sysctl_issues[*]}")
+        _row "Sysctls"    "!   mismatch: ${_si_str}"
+        _rec "Kernel performance parameters overridden — check /etc/sysctl.d/ for conflicting rules"
+    fi
+
+    # ── Runtime pressure ────────────────────────────────────────────────────
+    # ── OOM kills ─────────────────────────────────────────────────────────────
+    local oom_kernel oom_oomd oom_total
+    oom_kernel=$(journalctl -k -b 0 --no-pager -q 2>/dev/null         | grep -c 'Out of memory\|oom_kill_process\|Killed process' 2>/dev/null || true)
+    oom_kernel=$(echo "${oom_kernel:-0}" | tr -d '[:space:]')
+    [[ "$oom_kernel" =~ ^[0-9]+$ ]] || oom_kernel=0
+    oom_oomd=$(journalctl -b 0 --no-pager -q -u systemd-oomd 2>/dev/null         | grep -c 'Killed\|killed' 2>/dev/null || true)
+    oom_oomd=$(echo "${oom_oomd:-0}" | tr -d '[:space:]')
+    [[ "$oom_oomd" =~ ^[0-9]+$ ]] || oom_oomd=0
+    oom_total=$(( oom_kernel + oom_oomd ))
+    if (( oom_total > 0 )); then
+        local _oom_detail=""
+        (( oom_kernel > 0 )) && _oom_detail+=" kernel:${oom_kernel}"
+        (( oom_oomd   > 0 )) && _oom_detail+=" oomd:${oom_oomd}"
+        _row "OOM kills"  "!   ${oom_total} event(s) this boot (${_oom_detail# })"
+        _rec "${oom_total} OOM kill(s) this boot — consider more RAM or swap"
+    else
+        _row "OOM kills"  "OK  none this boot"
+    fi
+
+    # ── Dirty / writeback memory ──────────────────────────────────────────────
+    # High dirty memory means unflushed writes are buffered in RAM. On a system
+    # with volatile /var (tmpfs) this is normal, but very high values on the
+    # data subvolume can indicate I/O pressure or a stalled writeback worker.
+    local dirty_kb writeback_kb
+    dirty_kb=$(    awk '/^Dirty:/     {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    writeback_kb=$(awk '/^Writeback:/ {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    dirty_kb=$(echo "${dirty_kb:-0}" | tr -d '[:space:]')
+    writeback_kb=$(echo "${writeback_kb:-0}" | tr -d '[:space:]')
+    if [[ "$dirty_kb" =~ ^[0-9]+$ ]] && (( dirty_kb > 524288 )); then
+        # > 512 MB dirty — noteworthy
+        local dirty_mb=$(( dirty_kb / 1024 ))
+        _row "Dirty mem"  "!   ${dirty_mb} MB dirty — high unflushed write buffer"
+        _rec "High dirty memory (${dirty_mb} MB) — possible I/O pressure; check: iostat -x 1 5"
+    fi
+    if [[ "$writeback_kb" =~ ^[0-9]+$ ]] && (( writeback_kb > 102400 )); then
+        local wb_mb=$(( writeback_kb / 1024 ))
+        _row "Writeback"  "!   ${wb_mb} MB writeback in progress — I/O under pressure"
+    fi
+
+    # ── Needs-restart (kernel / libraries) ───────────────────────────────────
+    # After a kernel or glibc update, running processes still use old code.
+    # needrestart is the standard tool for this on Arch-based systems.
+    if command -v needrestart &>/dev/null; then
+        local _nr_out _nr_kernel _nr_services
+        _nr_out=$(needrestart -b 2>/dev/null || true)
+        _nr_kernel=$(echo "$_nr_out" | awk -F: '/NEEDRESTART-KSTA/{gsub(/ /,"",$2); print $2}' || echo "")
+        _nr_services=$(echo "$_nr_out" | grep -c 'NEEDRESTART-SVC' || true)
+        # kernel status: 1=up-to-date, 2=ABI-compatible upgrade, 3=version change
+        if [[ "$_nr_kernel" == "3" ]]; then
+            _row "Needs restart" "!   kernel updated — reboot required to run new kernel"
+            _rec "Kernel was updated — reboot to activate new kernel"
+        elif [[ "$_nr_kernel" == "2" ]]; then
+            _row "Needs restart" "--  kernel ABI upgrade pending — reboot recommended"
+        fi
+        if [[ "$_nr_services" =~ ^[0-9]+$ ]] && (( _nr_services > 0 )); then
+            _row2 "--  ${_nr_services} service(s) using outdated libraries — run: needrestart"
+        fi
+    fi
+
+    # ── Kernel oops / panic ───────────────────────────────────────────────────
+    local _oops_count=0
+    _oops_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null \
+        | grep -cE 'BUG:|kernel BUG|Oops:|general protection fault|Kernel panic' \
+        || echo "0")
+    _oops_count=$(echo "${_oops_count:-0}" | tr -d '[:space:]')
+    [[ "$_oops_count" =~ ^[0-9]+$ ]] || _oops_count=0
+    if (( _oops_count > 0 )); then
+        _row "Kernel oops"  "!!  ${_oops_count} BUG/Oops/panic event(s) this boot"
+        _rec "${_oops_count} kernel fault(s) — run: journalctl -k -b 0 | grep -A5 'BUG:\|Oops:'"
+    fi
+
+    # ── Hardware errors (MCE / EDAC) ──────────────────────────────────────────
+    # Machine Check Exceptions indicate CPU, memory, or bus hardware faults.
+    # Filter out known-harmless EDAC driver init messages (device registration,
+    # version strings, "Enabled" lines) that match broad patterns but are not
+    # errors. Focus on actual error signals: UE/CE counters, Hardware Error
+    # messages, and MCE exception records.
+    local _mce_count=0
+    _mce_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null \
+        | grep -iE \
+            'mce:.*\[Hardware Error\]|machine check exception|Machine check events logged|'\
+'EDAC [A-Z]+[0-9]+: [0-9]+ (UE|CE) |'\
+'mce: Corrected MCE|mce: [0-9]+ me=|'\
+'hardware error|uncorrected error' \
+        | grep -ivE \
+            'Giving out device|registered to driver|DRAM-Error-Check|Ver: [0-9]|'\
+'F[0-9]+h.*Enabled|support.*MCE|CPU supports.*MCE bank|'\
+'mce: This is not a hardware problem|test injection' \
+        | wc -l || echo "0")
+    _mce_count=$(echo "${_mce_count:-0}" | tr -d '[:space:]')
+    [[ "$_mce_count" =~ ^[0-9]+$ ]] || _mce_count=0
+    if (( _mce_count > 0 )); then
+        _row "HW errors"  "!!  ${_mce_count} MCE/EDAC event(s) this boot — possible hardware fault"
+        _rec "${_mce_count} hardware error(s) in kernel log — check: journalctl -k -b 0 | grep -i mce"
+    fi
+
+    # ── Entropy pool ─────────────────────────────────────────────────────────
+    # Low entropy stalls cryptographic operations (TLS, SSH keygen, LUKS).
+    # On modern kernels /dev/random never blocks but very low values can still
+    # indicate a misconfigured or missing entropy source (e.g. missing rngd).
+    local _entropy=""
+    _entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ "$_entropy" =~ ^[0-9]+$ ]] && (( _entropy < 256 )); then
+        _row "Entropy"    "!   ${_entropy} bits — low (may stall crypto on older kernels)"
+    fi
+
+    local tmp_type="" tmp_size=""
+    tmp_type=$(findmnt -n -o FSTYPE /tmp 2>/dev/null | tr -d '[:space:]' || echo "")
+    tmp_size=$(findmnt -n -o SIZE   /tmp 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ "$tmp_type" == "tmpfs" ]]; then
+        _row "/tmp"         "OK  tmpfs${tmp_size:+  (${tmp_size})}"
+    elif [[ -z "$tmp_type" ]]; then
+        # /tmp not separately mounted — lives on root; fine but worth noting
+        _row "/tmp"         "--  on root filesystem (not a tmpfs)"
+    else
+        _row "/tmp"         "--  ${tmp_type}${tmp_size:+  (${tmp_size})}  (not tmpfs)"
+    fi
+
+    # ── systemd-tmpfiles-clean (stale file cleanup timer) ────────────────────
+    # Fires systemd-tmpfiles-clean.service periodically to enforce age-based
+    # rules in /etc/tmpfiles.d/ and /usr/lib/tmpfiles.d/ — purges stale sockets,
+    # old locks, and cruft from /tmp, /var/tmp, /run. Silently stops working
+    # if the timer is inactive; no direct error is surfaced to the user.
+    if systemctl cat systemd-tmpfiles-clean.timer &>/dev/null 2>&1; then
+        if systemctl is-active --quiet systemd-tmpfiles-clean.timer 2>/dev/null; then
+            _row "tmpfiles"    "OK  cleanup timer active"
+        elif systemctl is-enabled --quiet systemd-tmpfiles-clean.timer 2>/dev/null || \
+             [[ "$(systemctl is-enabled systemd-tmpfiles-clean.timer 2>/dev/null)" == "static" ]]; then
+            _row "tmpfiles"    "!   cleanup timer enabled but not active"
+            _rec "systemd-tmpfiles-clean.timer not active — run: systemctl start systemd-tmpfiles-clean.timer  [auto]"
+        else
+            _row "tmpfiles"    "!   systemd-tmpfiles-clean.timer not active — stale file cleanup inactive"
+            _rec "Enable tmpfiles cleanup: systemctl enable --now systemd-tmpfiles-clean.timer  [auto]"
+        fi
+    fi
+
+    # ── /home usage per user ──────────────────────────────────────────────────
+    if findmnt -n /home &>/dev/null; then
+        local home_warn=() home_crit=() home_info=()
+        for user_dir in /home/*/; do
+            [[ -d "$user_dir" ]] || continue
+            local uname; uname=$(basename "$user_dir")
+            local used_mb
+            used_mb=$(du -sm "$user_dir" 2>/dev/null | awk '{print $1}' || echo "")
+            [[ "$used_mb" =~ ^[0-9]+$ ]] || continue
+            (( used_mb == 0 )) && continue   # skip empty home dirs (e.g. builduser)
+            if (( used_mb > 51200 )); then      # > 50 GB
+                home_crit+=("${uname}:${used_mb}MB")
+            elif (( used_mb > 20480 )); then    # > 20 GB
+                home_warn+=("${uname}:${used_mb}MB")
+            else
+                home_info+=("${uname}:${used_mb}MB")
+            fi
+        done
+        if [[ ${#home_crit[@]} -gt 0 ]]; then
+            _row "Home usage" "!   large: $(_join "${home_crit[@]}")"
+            _rec "Home directories using significant space ($(_join "${home_crit[@]}")) — review with: du -sh /home/*"
+            if [[ ${#home_warn[@]} -gt 0 || ${#home_info[@]} -gt 0 ]]; then
+                local _rest_str; _rest_str=$(IFS=' '; echo "${home_warn[*]} ${home_info[*]}" | xargs)
+                _row2 "--  also: ${_rest_str}"
+            fi
+        elif [[ ${#home_warn[@]} -gt 0 ]]; then
+            _row "Home usage" "--  $(_join "${home_warn[@]}")"
+            if [[ ${#home_info[@]} -gt 0 ]]; then
+                local _info_str; _info_str=$(IFS=' '; echo "${home_info[*]}")
+                _row2 "--  also: ${_info_str}"
+            fi
+        elif [[ ${#home_info[@]} -gt 0 ]]; then
+            local _info_str; _info_str=$(IFS=' '; echo "${home_info[*]}")
+            _row "Home usage" "--  ${_info_str}"
+        fi
+    fi
+
+    # ── Maintenance ─────────────────────────────────────────────────────────
+    # ── Maintenance ─────────────────────────────────────────────────────────────
+    # ── Scheduled tasks / logging ─────────────────────────────────────────────
+    # cronie: if dead, all user and system cron jobs silently stop running.
+    if command -v crond &>/dev/null || systemctl cat cronie &>/dev/null 2>&1; then
+        if systemctl is-active --quiet cronie 2>/dev/null; then
+            local _cron_jobs=""
+            _cron_jobs=$(crontab -l 2>/dev/null | grep -cvE '^[[:space:]]*#|^[[:space:]]*$' || echo "")
+            _row "cronie"      "OK  running${_cron_jobs:+  (${_cron_jobs} root crontab job(s))}"
+        elif systemctl is-enabled --quiet cronie 2>/dev/null; then
+            _row "cronie"      "!   enabled but not running — cron jobs not executing"
+            _rec "cronie not running — run: systemctl start cronie  [auto]"
+        else
+            _row "cronie"      "~~  not enabled — scheduled tasks inactive: systemctl enable --now cronie"
+        fi
+    fi
+
+    # logrotate: without it, logs grow unbounded. Only the timer needs to be active.
+    if command -v logrotate &>/dev/null || systemctl cat logrotate.timer &>/dev/null 2>&1; then
+        if systemctl is-active --quiet logrotate.timer 2>/dev/null; then
+            local _lr_last=""
+            _lr_last=$(systemctl show logrotate.service \
+                --property=ExecMainExitTimestamp --value 2>/dev/null \
+                | grep -v '^n/a\|^$' | head -1 || echo "")
+            _row "logrotate"   "OK  timer active${_lr_last:+  (last run: ${_lr_last})}"
+        elif systemctl is-enabled --quiet logrotate.timer 2>/dev/null; then
+            _row "logrotate"   "!   timer enabled but not active"
+            _rec "logrotate.timer not active — run: systemctl start logrotate.timer  [auto]"
+        else
+            _row "logrotate"   "!   timer not enabled — logs will not be rotated automatically"
+            _rec "Enable log rotation: systemctl enable --now logrotate.timer  [auto]"
+        fi
+    fi
+
+    # sysstat: service + collect + summary timers all needed for sar/iostat history.
+    if command -v sar &>/dev/null || systemctl cat sysstat.service &>/dev/null 2>&1; then
+        local _ss_svc _ss_collect _ss_summary
+        _ss_svc=$(systemctl is-active sysstat.service 2>/dev/null || echo "inactive")
+        _ss_collect=$(systemctl is-active sysstat-collect.timer 2>/dev/null || echo "inactive")
+        _ss_summary=$(systemctl is-active sysstat-summary.timer 2>/dev/null || echo "inactive")
+        if [[ "$_ss_svc" == "active" && "$_ss_collect" == "active" && "$_ss_summary" == "active" ]]; then
+            _row "sysstat"     "OK  accounting active (service + collect + summary timers running)"
+        elif systemctl is-enabled --quiet sysstat.service 2>/dev/null || \
+             systemctl is-active  --quiet sysstat.service 2>/dev/null; then
+            local _ss_issues=()
+            [[ "$_ss_svc"     != "active" ]] && _ss_issues+=("sysstat.service inactive")
+            [[ "$_ss_collect" != "active" ]] && _ss_issues+=("collect timer inactive")
+            [[ "$_ss_summary" != "active" ]] && _ss_issues+=("summary timer inactive")
+            if [[ ${#_ss_issues[@]} -gt 0 ]]; then
+                _row "sysstat"     "!   partially active — ${_ss_issues[*]}"
+                _rec "sysstat timers not fully active — run: systemctl enable --now sysstat.service sysstat-collect.timer sysstat-summary.timer  [auto]"
+            else
+                _row "sysstat"     "OK  accounting active"
+            fi
+        else
+            _row "sysstat"     "~~  not enabled — sar/iostat history unavailable: systemctl enable --now sysstat.service"
+        fi
+    fi
+
+
+    # ── Time sync ────────────────────────────────────────────────────────────
+    # ── Time sync ─────────────────────────────────────────────────────────────
+    if command -v timedatectl &>/dev/null; then
+        local td_out ntp_active ntp_synced tsync
+        td_out=$(timedatectl show 2>/dev/null || true)
+        ntp_active=$(echo "$td_out" | awk -F= '/^NTP=/{print $2}'             | tr -d '[:space:]')
+        ntp_synced=$(echo "$td_out" | awk -F= '/^NTPSynchronized=/{print $2}' | tr -d '[:space:]')
+        tsync=$(systemctl is-active systemd-timesyncd 2>/dev/null || echo "inactive")
+        if [[ "$ntp_synced" == "yes" && "$tsync" == "active" ]]; then
+            # Show which NTP server is actually being used
+            local _ntp_server="" _ntp_offset=""
+            _ntp_server=$(timedatectl timesync-status 2>/dev/null \
+                | awk '/^[[:space:]]*Server:/{print $2}' | head -1 || echo "")
+            [[ -z "$_ntp_server" ]] && \
+                _ntp_server=$(journalctl -u systemd-timesyncd -n 50 --no-pager 2>/dev/null \
+                    | grep -oP '(?<=synchronized to )\S+' | tail -1 || echo "")
+            # Clock offset — flag if large (indicates stale hardware clock or poor NTP)
+            _ntp_offset=$(timedatectl timesync-status 2>/dev/null \
+                | awk '/^[[:space:]]*Offset:/{print $2,$3}' | head -1 || echo "")
+            _row "timesyncd"  "OK  synchronised${_ntp_server:+  (${_ntp_server})}"
+            if [[ -n "$_ntp_offset" ]]; then
+                # Extract numeric value — flag if offset > 1s (1000ms)
+                local _off_ms; _off_ms=$(echo "$_ntp_offset" | grep -oE '[0-9]+' | head -1 || echo "0")
+                local _off_unit; _off_unit=$(echo "$_ntp_offset" | grep -oE '[a-z]+' | head -1 || echo "")
+                local _off_large=0
+                [[ "$_off_unit" == "s" || "$_off_unit" == "min" ]] && _off_large=1
+                [[ "$_off_unit" == "ms" && "$_off_ms" =~ ^[0-9]+$ ]] && (( _off_ms > 1000 )) && _off_large=1
+                if (( _off_large )); then
+                    _row2 "!   offset ${_ntp_offset} — large clock drift, check hardware clock"
+                    _rec "NTP clock offset is ${_ntp_offset} — large drift; check: hwclock --systohc"
+                else
+                    _row2 "--  offset ${_ntp_offset}"
+                fi
+            fi
+        elif [[ "$ntp_active" == "yes" && "$tsync" == "active" ]]; then
+            _row "timesyncd"  "!   running but not yet synchronised"
+        elif [[ "$ntp_active" == "yes" ]]; then
+            _row "timesyncd"  "!!  NTP enabled but service is ${tsync}"
+            _rec "systemd-timesyncd not running — run: systemctl enable --now systemd-timesyncd  [auto]"
+        else
+            _row "timesyncd"  "!!  disabled"
+            _rec "NTP disabled — run: systemctl enable --now systemd-timesyncd && timedatectl set-ntp true  [auto]"
+        fi
+    else
+        _row "timesyncd"  "--  timedatectl not available"
+    fi
+
+    # ── chrony (NTP alternative to systemd-timesyncd) ─────────────────────────
+    # More precise than timesyncd; preferred in server or VM-host contexts.
+    # Warn if both chrony and timesyncd are active — they conflict.
+    if command -v chronyc &>/dev/null || systemctl cat chronyd &>/dev/null 2>&1; then
+        local _chrony_cfg=0
+        [[ -f /etc/chrony.conf ]] &&             grep -qE '^(server|pool) ' /etc/chrony.conf 2>/dev/null &&             _chrony_cfg=1
+        if systemctl is-active --quiet chronyd 2>/dev/null; then
+            local _chr_src=""
+            _chr_src=$(chronyc tracking 2>/dev/null \
+                | awk '/^Reference ID/{print $5}' | head -1 || echo "")
+            _row "chrony"      "OK  running${_chr_src:+  (${_chr_src})}"
+            if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+                _row2 "!   systemd-timesyncd also active — NTP conflict"
+                _rec "Both chrony and systemd-timesyncd active — disable one: systemctl disable --now systemd-timesyncd  [auto]"
+            fi
+        elif systemctl is-enabled --quiet chronyd 2>/dev/null; then
+            if (( ! _chrony_cfg )); then
+                _row "chrony"      "!   enabled but not configured — add server/pool lines to /etc/chrony.conf"
+                _rec "chrony enabled but no server/pool in /etc/chrony.conf — add NTP servers before starting"
+            elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+                _row "chrony"      "!!  enabled but timesyncd also active — NTP conflict; disable one: systemctl disable --now systemd-timesyncd  or  systemctl disable --now chronyd"
+                _rec "chrony and timesyncd both enabled — disable timesyncd first: systemctl disable --now systemd-timesyncd"
+            else
+                _row "chrony"      "!   enabled but not running"
+                _rec "chronyd not running — run: systemctl start chronyd  [auto]"
+            fi
+        elif (( _chrony_cfg )); then
+            _row "chrony"      "~~  configured, not enabled — timesyncd active; to switch: systemctl disable --now systemd-timesyncd"
+        fi
+        # Silent when not installed/configured — timesyncd handles NTP by default
+    fi
+
+    # ── openntpd (OpenBSD NTP daemon — lightweight alternative) ──────────────
+    if command -v ntpd &>/dev/null || systemctl cat openntpd &>/dev/null 2>&1; then
+        local _ntpd_cfg=0
+        [[ -f /etc/ntpd.conf ]] &&             grep -qE '^(server|servers) ' /etc/ntpd.conf 2>/dev/null &&             _ntpd_cfg=1
+        if systemctl is-active --quiet openntpd 2>/dev/null; then
+            _row "openntpd"    "OK  running"
+            if systemctl is-active --quiet systemd-timesyncd 2>/dev/null || \
+               systemctl is-active --quiet chronyd 2>/dev/null; then
+                _row2 "!   another NTP daemon also active — conflict likely"
+                _rec "Multiple NTP daemons active alongside openntpd — disable duplicates"
+            fi
+        elif systemctl is-enabled --quiet openntpd 2>/dev/null; then
+            if (( ! _ntpd_cfg )); then
+                _row "openntpd"    "!   enabled but not configured — add server lines to /etc/ntpd.conf"
+                _rec "openntpd enabled but no server entries in /etc/ntpd.conf — configure NTP servers before starting"
+            elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null || \
+                 systemctl is-active --quiet chronyd 2>/dev/null; then
+                _row "openntpd"    "!!  enabled but another NTP daemon also active — conflict; disable one first"
+                _rec "openntpd and another NTP daemon both enabled — disable timesyncd: systemctl disable --now systemd-timesyncd"
+            else
+                _row "openntpd"    "!   enabled but not running"
+                _rec "openntpd not running — run: systemctl start openntpd  [auto]"
+            fi
+        elif (( _ntpd_cfg )); then
+            _row "openntpd"    "~~  configured, not enabled — timesyncd active; to switch: systemctl disable --now systemd-timesyncd"
+        fi
+        # Silent when not installed/configured — timesyncd handles NTP by default
+    fi
+
+
+    # ── Journal ─────────────────────────────────────────────────────────────
+    # ── Journal errors ────────────────────────────────────────────────────────
+    local j_err j_crit
+    j_err=$( journalctl -b 0 -p err  --no-pager -q 2>/dev/null | wc -l || echo "0")
+    j_crit=$(journalctl -b 0 -p crit --no-pager -q 2>/dev/null | wc -l || echo "0")
+    if [[ "$j_crit" =~ ^[0-9]+$ ]] && (( j_crit > 0 )); then
+        _row "Journal"    "!!  ${j_crit} critical (p≤2), ${j_err} errors (p≤3) — journalctl -b 0 -p crit"
+        _rec "${j_crit} critical journal message(s) this boot — run: journalctl -b 0 -p crit"
+    elif [[ "$j_err" =~ ^[0-9]+$ ]] && (( j_err > 20 )); then
+        _row "Journal"    "!   ${j_err} error(s) this boot"
+    else
+        _row "Journal"    "OK  ${j_err:-0} error(s) (normal range)"
+    fi
+
+    # ── Journal disk usage ────────────────────────────────────────────────────
+    # journalctl --disk-usage: "Archived and active journals take up X.XG in the file system."
+    if command -v journalctl &>/dev/null; then
+        local j_disk_usage=""
+        j_disk_usage=$(journalctl --disk-usage 2>/dev/null \
+            | sed -n 's/.*take up \([^ ][^ ]*\) in.*/\1/p' | head -1 || echo "")
+        local j_max_use=""
+        j_max_use=$(grep -rshE '^SystemMaxUse=' \
+            /usr/lib/systemd/journald.conf.d/ \
+            /etc/systemd/journald.conf.d/ \
+            /etc/systemd/journald.conf 2>/dev/null \
+            | tail -1 | cut -d= -f2 | tr -d '[:space:]' || echo "")
+        if [[ -n "$j_disk_usage" ]]; then
+            _row "Journal sz"  "--  ${j_disk_usage}${j_max_use:+  (limit: ${j_max_use})}"
+        fi
+    fi
+
+    _optional_begin
+    # ── Maintenance ────────────────────────────────────────────────────────
+    # ── Logging daemons ──────────────────────────────────────────────────────
+    # ── rsyslog / syslog-ng (traditional syslog daemons) ─────────────────────
+    # Both conflict with journald if they duplicate log collection; surface when
+    # installed and enabled so the user knows the logging stack in use.
+    for _syslog_unit in rsyslog syslog-ng; do
+        if command -v "$_syslog_unit" &>/dev/null || \
+           systemctl cat "$_syslog_unit" &>/dev/null 2>&1; then
+            if systemctl is-active --quiet "$_syslog_unit" 2>/dev/null; then
+                _row "$_syslog_unit"   "OK  running (syslog alongside journald)"
+            elif systemctl is-enabled --quiet "$_syslog_unit" 2>/dev/null; then
+                _row "$_syslog_unit"   "!   enabled but not running"
+                _rec "${_syslog_unit} not running — run: systemctl start ${_syslog_unit}  [auto]"
+            else
+                _row "$_syslog_unit"   "~~  not enabled — journald handles logging by default"
+            fi
+        fi
+    done
+
+    # ── systemd-journal-remote / upload (log forwarding) ─────────────────────
+    # journal-remote receives logs from remote hosts via its .socket unit —
+    # socket-activated, idle between incoming connections is normal.
+    # journal-upload pushes local logs to a collector — should run persistently
+    # when enabled. Only warn when explicitly enabled as a service (not socket).
+    for _jfwd_unit in systemd-journal-remote systemd-journal-upload; do
+        if systemctl cat "${_jfwd_unit}" &>/dev/null 2>&1; then
+            local _jfwd_en
+            _jfwd_en=$(systemctl is-enabled "${_jfwd_unit}" 2>/dev/null || echo "disabled")
+            if systemctl is-active --quiet "${_jfwd_unit}" 2>/dev/null; then
+                _row "${_jfwd_unit##*-}"  "OK  ${_jfwd_unit} running"
+            elif [[ "$_jfwd_en" == "static" ]]; then
+                # static = socket-activated, idle is normal
+                _row "${_jfwd_unit##*-}"  ">>  enabled (idle — socket-activated)"
+            elif [[ "$_jfwd_en" == "enabled" ]]; then
+                _row "${_jfwd_unit##*-}"  "!   ${_jfwd_unit} enabled but not running"
+                _rec "${_jfwd_unit} not running — run: systemctl start ${_jfwd_unit}  [auto]"
+            fi
+            # Silent when disabled
+        fi
+    done
+
+    _optional_end
 }
 
 security_report() {
@@ -4883,9 +8150,8 @@ system_info() {
     _section_update_tools
     _section_data_state
 
-    # ── Immutability & Filesystem ─────────────────────────────────────────────
+    # ── Immutability ──────────────────────────────────────────────────────────
     _section_immutability
-    _section_storage
 
     # ── Security ──────────────────────────────────────────────────────────────
     _section_secureboot         "$booted" uki_booted_bad "$hibernate_stale"
@@ -4903,23 +8169,24 @@ system_info() {
     _section_hardware
     _section_disk               "$booted" hibernate_stale "$uki_booted_bad"
     _section_battery
+    _section_storage
     _section_firmware
 
-    # ── Core Services ─────────────────────────────────────────────────────────
-    _section_printing       # Printing & Scanning
-    _section_performance    # Performance
-    _section_network        # Network (incl. SSH, ModemManager)
-    _section_system_services # Servers (Samba, NFS, Caddy)
-    _section_audio_display  # Audio & Display
-    _section_units          # Units
+    # ── Services ──────────────────────────────────────────────────────────────
+    _section_performance
+    _section_network
+    _section_servers
+    _section_printing
+    _section_audio_display
 
-    # ── Package Managers & Containers ─────────────────────────────────────────
+    # ── Software ──────────────────────────────────────────────────────────────
     _section_package_managers
     _section_containers
     _section_virtualization
 
     # ── Runtime ───────────────────────────────────────────────────────────────
     _section_runtime_health
+    _section_units
     _section_coredump
     _section_system_health
 
@@ -5229,7 +8496,7 @@ _fix_services() {
         _apply_fix "Enable shani-user-setup.path"  systemctl enable --now shani-user-setup.path
     fi
 
-    # Power management — enable ppd, stop conflicting daemons if found
+
     local _ppd_active=0 _tlp_active=0 _acpufreq_active=0
     systemctl is-active --quiet power-profiles-daemon 2>/dev/null && _ppd_active=1
     systemctl is-active --quiet tlp                   2>/dev/null && _tlp_active=1
@@ -5286,8 +8553,13 @@ _fix_services() {
         _live_km=$(localectl status 2>/dev/null \
             | awk -F': ' '/VC Keymap/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "")
     fi
-    _vconsole_km2=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
-        | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+    if command -v localectl &>/dev/null; then
+        _vconsole_km2=$(localectl status 2>/dev/null \
+            | awk -F': +' '/VC Keymap:/{print $2}' | tr -d '[:space:]' || echo "")
+    fi
+    [[ -z "$_vconsole_km2" ]] && \
+        _vconsole_km2=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+            | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
     if [[ -n "$_vconsole_km2" && -n "$_live_km" && "$_live_km" != "$_vconsole_km2" ]]; then
         _apply_fix "Sync live keymap to ${_vconsole_km2}"  localectl set-keymap "$_vconsole_km2"
     fi
@@ -5382,8 +8654,14 @@ _fix_security() {
     # SSH root login
     if [[ -f /etc/ssh/sshd_config ]]; then
         local ssh_root
-        ssh_root=$(grep -rh '^PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ \
-            2>/dev/null | tail -1 | awk '{print $2}' || echo "")
+        local _sshd_T_fix; _sshd_T_fix=$(sshd -T 2>/dev/null || echo "")
+        if [[ -n "$_sshd_T_fix" ]]; then
+            ssh_root=$(echo "$_sshd_T_fix" | awk '/^permitrootlogin /{print $2}' | head -1 || echo "")
+        else
+            ssh_root=$(grep -rsh '^PermitRootLogin' \
+                /usr/lib/ssh/sshd_config.d/ /etc/ssh/sshd_config.d/ /etc/ssh/sshd_config \
+                2>/dev/null | tail -1 | awk '{print $2}' || echo "")
+        fi
         if [[ "$ssh_root" == "yes" ]]; then
             if sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config 2>/dev/null \
                 && systemctl reload sshd 2>/dev/null; then
@@ -5477,6 +8755,102 @@ _fix_boot() {
             _apply_fix "Enable ${timer}"  systemctl enable --now "$timer"
     done
 
+    # Maintenance timers with [Install] section (use enable --now)
+    if command -v logrotate &>/dev/null || systemctl cat logrotate.timer &>/dev/null 2>&1; then
+        if ! systemctl is-active --quiet logrotate.timer 2>/dev/null; then
+            local _lr_en; _lr_en=$(systemctl is-enabled logrotate.timer 2>/dev/null || echo "")
+            if [[ "$_lr_en" == "enabled" ]]; then
+                _apply_fix "Start logrotate.timer"  systemctl start logrotate.timer
+            elif [[ "$_lr_en" != "static" ]]; then
+                _apply_fix "Enable logrotate.timer"  systemctl enable --now logrotate.timer
+            fi
+        fi
+    fi
+
+    if command -v mandb &>/dev/null || systemctl cat man-db.timer &>/dev/null 2>&1; then
+        if ! systemctl is-active --quiet man-db.timer 2>/dev/null; then
+            local _mdb_en; _mdb_en=$(systemctl is-enabled man-db.timer 2>/dev/null || echo "")
+            if [[ "$_mdb_en" == "enabled" ]]; then
+                _apply_fix "Start man-db.timer"  systemctl start man-db.timer
+            elif [[ "$_mdb_en" == "static" ]]; then
+                _apply_fix "Start man-db.timer (static)"  systemctl start man-db.timer
+            else
+                _apply_fix "Enable man-db.timer"  systemctl enable --now man-db.timer
+            fi
+        fi
+    fi
+
+    # Static timers (enabled via timers.target.wants — use start not enable --now)
+    for _static_timer in systemd-tmpfiles-clean.timer plocate-updatedb.timer; do
+        if systemctl cat "$_static_timer" &>/dev/null 2>&1 && \
+           ! systemctl is-active --quiet "$_static_timer" 2>/dev/null; then
+            _apply_fix "Start ${_static_timer}"  systemctl start "$_static_timer"
+        fi
+    done
+
+    # Btrfs qgroup consistency
+    if findmnt -n -t btrfs / &>/dev/null; then
+        local _qg_out; _qg_out=$(btrfs qgroup show / 2>/dev/null || echo "")
+        if echo "$_qg_out" | grep -qi 'inconsistent\|stale'; then
+            _apply_fix "Rescan Btrfs qgroups"  btrfs quota rescan /
+        fi
+    fi
+
+    # gssproxy (Kerberos — only if already enabled)
+    if command -v gssproxy &>/dev/null && \
+       systemctl is-enabled --quiet gssproxy 2>/dev/null && \
+       ! systemctl is-active --quiet gssproxy 2>/dev/null; then
+        _apply_fix "Start gssproxy"  systemctl start gssproxy
+    fi
+
+    # gpg-agent / dirmngr / keyboxd — reset if in failed state
+    if command -v gpg &>/dev/null || command -v gpg2 &>/dev/null; then
+        for _gpg_unit in gpg-agent dirmngr keyboxd; do
+            if _sysd_user is-failed --quiet "${_gpg_unit}.service" 2>/dev/null; then
+                _log "Resetting failed gpg unit: ${_gpg_unit}..."
+                if _sysd_user reset-failed "${_gpg_unit}.service" 2>/dev/null; then
+                    _log_ok "gpg ${_gpg_unit} reset"
+                    fixed=$(( fixed + 1 ))
+                else
+                    _log_warn "gpg ${_gpg_unit} reset failed"
+                    failed=$(( failed + 1 ))
+                fi
+            fi
+        done
+    fi
+
+    # wpa_supplicant — reset-failed if in failed state
+    if systemctl is-failed --quiet wpa_supplicant.service 2>/dev/null; then
+        _apply_fix "Reset wpa_supplicant" \
+            bash -c "systemctl reset-failed wpa_supplicant && systemctl start wpa_supplicant"
+    fi
+
+    # NM-wait-online — disable if it's slowing boot and NM doesn't need it
+    # Only disable when boot was slow AND NM-wait-online appears in blame
+    if systemctl is-enabled --quiet NetworkManager-wait-online.service 2>/dev/null; then
+        local _bt_sec=0
+        local _bt_raw; _bt_raw=$(systemd-analyze 2>/dev/null | head -1 | sed 's/.*= *//' || echo "")
+        if echo "$_bt_raw" | grep -q 'min'; then
+            local _bm _bs
+            _bm=$(echo "$_bt_raw" | awk -F'min' '{gsub(/[^0-9]/,"",$1); print $1+0}')
+            _bs=$(echo "$_bt_raw" | grep -oE '[0-9]+(\.[0-9]+)?s' | grep -oE '^[0-9]+' | tail -1 || echo "0")
+            _bt_sec=$(( _bm * 60 + _bs ))
+        else
+            _bt_sec=$(echo "$_bt_raw" | grep -oE '^[0-9]+' || echo "0")
+        fi
+        if (( _bt_sec >= 45 )) && \
+           systemd-analyze blame 2>/dev/null | grep -q 'NetworkManager-wait-online'; then
+            _apply_fix "Disable NetworkManager-wait-online.service (boot bottleneck)" \
+                systemctl disable NetworkManager-wait-online.service
+        fi
+    fi
+
+    # fstrim.timer — static unit, use start not enable--now
+    if systemctl cat fstrim.timer &>/dev/null 2>&1 && \
+       ! systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+        _apply_fix "Start fstrim.timer"  systemctl start fstrim.timer
+    fi
+
     # systemd-oomd — memory pressure freeze protection
     if ! systemctl is-active --quiet systemd-oomd 2>/dev/null; then
         _apply_fix "Enable systemd-oomd"  systemctl enable --now systemd-oomd
@@ -5554,7 +8928,24 @@ _fix_boot() {
             if [[ "$_snap_upd" =~ ^[0-9]+$ ]] && (( _snap_upd > 0 )); then
                 _apply_fix "Refresh ${_snap_upd} snap(s)"  snap refresh
             fi
+            # Stale snap revisions — set retain=2 to auto-clean on next refresh
+            local _snap_stale
+            _snap_stale=$(timeout 5 snap list --all 2>/dev/null \
+                | awk '/disabled/{c++} END{print c+0}' || echo "0")
+            if [[ "$_snap_stale" =~ ^[0-9]+$ ]] && (( _snap_stale > 0 )); then
+                _apply_fix "Set snap refresh.retain=2 to remove ${_snap_stale} stale revision(s)" \
+                    snap set system refresh.retain=2
+            fi
         fi
+        # Reset failed snap.mount units (stale mounts from removed snaps)
+        local _failed_snap_mounts=()
+        mapfile -t _failed_snap_mounts < <(
+            systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
+                | awk '{print $2}' | grep -E '^snap[-.].*\.mount$' || true)
+        for _sm in "${_failed_snap_mounts[@]}"; do
+            _apply_fix "Reset failed snap mount: ${_sm}" \
+                systemctl reset-failed "$_sm"
+        done
     fi
 
     # shani-update.timer — enable as the calling user if not yet enabled;
@@ -5807,7 +9198,11 @@ _fix_data() {
 
     # Keymap UKI mismatch — regenerate booted slot UKI
     local _vconsole_km=""
-    [[ -f /etc/vconsole.conf ]] && \
+    if command -v localectl &>/dev/null; then
+        _vconsole_km=$(localectl status 2>/dev/null \
+            | awk -F': +' '/VC Keymap:/{print $2}' | tr -d '[:space:]' || echo "")
+    fi
+    [[ -z "$_vconsole_km" ]] && [[ -f /etc/vconsole.conf ]] && \
         _vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
             | cut -d= -f2 | tr -d '"'"'" | tr -cd 'A-Za-z0-9._-' || echo "")
     local _cmdline_km
@@ -6683,7 +10078,7 @@ network_report() {
     _focused_header "ShaniOS Network Report"
 
     _section_network
-    _section_system_services
+    _section_servers
 
     _focused_summary
 }

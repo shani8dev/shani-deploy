@@ -1544,16 +1544,15 @@ title   ${OS_NAME}-${candidate_slot} (Candidate)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
 EOF
 
-    # Use a glob on the tries path so the default keeps matching as systemd-boot
-    # renames the entry from +3-0 to +2-1, +1-2, +0-3 across successive boots.
-    # On the no-tries path (rollback/restore) the entry is a plain .conf — use
-    # the exact filename so systemd-boot reliably finds it as the default.
-    local loader_default
-    if [[ "$use_tries" == "yes" ]]; then
-        loader_default="${OS_NAME}-${active_slot}+*.conf"
-    else
-        loader_default="${OS_NAME}-${active_slot}.conf"
-    fi
+    # Use the exact entry filename as the default — systemd-boot glob matching
+    # with '+' in the pattern is unreliable in practice (glob does not match
+    # tries-suffixed filenames correctly on some builds). This is safe because
+    # loader.conf default only needs to match on the very first boot after deploy:
+    # once systemd-boot boots the entry it takes over tries counting autonomously,
+    # renaming the file each boot regardless of what loader.conf says.
+    # On subsequent failed boots systemd-boot falls back to the candidate slot
+    # via the tries exhaustion mechanism, not via loader.conf.
+    local loader_default="${active_filename}"
     local loader_conf="$ESP/loader/loader.conf"
     if [[ -f "$loader_conf" ]]; then
         grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true

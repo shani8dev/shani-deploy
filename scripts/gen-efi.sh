@@ -317,7 +317,7 @@ generate_cmdline() {
 
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
         local underlying
-        underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' || true)
+        underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' | tr -d '\n')
         local luks_uuid
         luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
         if [[ -z "$luks_uuid" ]]; then
@@ -386,7 +386,7 @@ generate_cmdline() {
 ensure_crypttab() {
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-        | sed -n 's/^ *device: //p' || true)
+        | sed -n 's/^ *device: //p' | tr -d '\n')
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying device for /dev/mapper/${ROOTLABEL}"
 
     local luks_uuid
@@ -712,7 +712,7 @@ enroll_tpm2() {
     # Derive the underlying LUKS block device
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-        | sed -n 's/^ *device: //p' || true)
+        | sed -n 's/^ *device: //p' | tr -d '\n')
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
     log "LUKS device: ${underlying}"
 

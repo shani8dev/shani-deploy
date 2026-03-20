@@ -841,10 +841,10 @@ _section_boot_entries() {
     if [[ -f "$loader_conf" ]]; then
         local default_entry
         default_entry=$(grep '^default' "$loader_conf" 2>/dev/null | awk '{print $2}' || echo "")
-        # default= is written as a glob by finalize_boot_entries:
-        #   tries path  → shanios-blue+*.conf  (matches +3-0, +2-1 … as boot counting renames it)
-        #   no-tries    → shanios-blue.conf    (rollback/restore — both slots known-good)
-        # Check that the glob/filename contains the current-slot name as a distinct token.
+        # default= is written as the base entry ID (without tries suffix) by finalize_boot_entries:
+        #   shanios-blue.conf  — systemd-boot resolves this ID to shanios-blue+3-0.conf on disk.
+        #   Globs (shanios-blue+*.conf) and exact tries filenames do not match entry IDs.
+        # Check that the default contains the current-slot name as a distinct token.
         if [[ -n "$default_entry" && -n "$current_slot" ]]; then
             if echo "$default_entry" | grep -qiE "(^|[-_])${current_slot}([-_+.]|$)"; then
                 _row "Boot default" "OK  default entry targets @${current_slot}  (${default_entry})"
@@ -8698,9 +8698,10 @@ _fix_boot() {
             fixed=$(( fixed + 1 ))
         fi
 
-        # Fix default= slot mismatch — rewrite using same glob logic as finalize_boot_entries:
-        #   tries path  → shanios-<slot>+*.conf
-        #   no-tries    → shanios-<slot>.conf  (rollback/restore — plain .conf, no boot counting)
+        # Fix default= slot mismatch — rewrite using base entry ID (without tries suffix).
+        # systemd-boot matches loader.conf default= against entry IDs, not filenames.
+        # The ID is always the plain .conf name — shanios-blue+3-0.conf has ID shanios-blue.conf.
+        # Globs (shanios-blue+*.conf) and exact tries filenames do not match IDs.
         local _fix_current_slot
         _fix_current_slot=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
         if [[ -n "$_fix_current_slot" ]]; then
@@ -8708,15 +8709,7 @@ _fix_boot() {
             _def_entry=$(grep '^default' "$loader_conf" 2>/dev/null | awk '{print $2}' || echo "")
             if [[ -n "$_def_entry" ]] && \
                ! echo "$_def_entry" | grep -qiE "(^|[-_])${_fix_current_slot}([-_+.]|$)"; then
-                # Determine correct glob: use tries if a +N-N entry exists for this slot,
-                # else use the plain filename (rollback/no-tries path)
-                local _new_default
-                if ls "$ESP/loader/entries/${OS_NAME}-${_fix_current_slot}"+*.conf \
-                        &>/dev/null 2>&1; then
-                    _new_default="${OS_NAME}-${_fix_current_slot}+*.conf"
-                else
-                    _new_default="${OS_NAME}-${_fix_current_slot}.conf"
-                fi
+                local _new_default="${OS_NAME}-${_fix_current_slot}.conf"
                 if grep -q '^default' "$loader_conf" 2>/dev/null; then
                     grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
                     echo "default ${_new_default}" >> "${loader_conf}.tmp"
@@ -8724,6 +8717,7 @@ _fix_boot() {
                 else
                     echo "default ${_new_default}" >> "$loader_conf"
                 fi
+                bootctl set-default "${_new_default}" &>/dev/null || true
                 _log_ok "loader.conf default= updated to ${_new_default}"
                 fixed=$(( fixed + 1 ))
             fi

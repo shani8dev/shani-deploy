@@ -343,6 +343,98 @@ _section_os_slots() {
         _rec "Unknown shani-profile '${profile}' — expected 'gnome' or 'plasma'"
     fi
 
+    # machine-id — must exist, be non-empty, and be 32 hex chars
+    local mid=""
+    mid=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ -z "$mid" ]]; then
+        _row "machine-id"  "!!  /etc/machine-id missing or empty"
+        _rec "machine-id missing — run: systemd-machine-id-setup  [auto]"
+    elif ! [[ "$mid" =~ ^[0-9a-f]{32}$ ]]; then
+        _row "machine-id"  "!   invalid format: ${mid}"
+        _rec "machine-id '${mid}' is not a valid 32-char hex ID — run: systemd-machine-id-setup"
+    else
+        _row "machine-id"  "--  ${mid}"
+    fi
+
+    # Locale — /etc/locale.conf must exist and set LANG
+    local sys_lang=""
+    if [[ -f /etc/locale.conf ]]; then
+        sys_lang=$(grep -E '^LANG=' /etc/locale.conf 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "")
+        if [[ -z "$sys_lang" ]]; then
+            _row "Locale"     "!   /etc/locale.conf exists but LANG not set"
+            _rec "Set LANG in /etc/locale.conf (e.g. LANG=en_US.UTF-8)"
+        else
+            # Check locale is actually generated — only warn if locale -a explicitly
+            # lists NO locales at all (not just this one), to avoid false positives
+            # on systems where locale binary behaves differently
+            local locale_ok=1  # assume OK unless we can definitively confirm it's missing
+            if command -v locale &>/dev/null; then
+                local _locale_list; _locale_list=$(locale -a 2>/dev/null || echo "")
+                if [[ -n "$_locale_list" ]]; then
+                    # locale -a works — check if our locale (or its base, e.g. en_US) appears
+                    echo "$_locale_list" | grep -qi "${sys_lang%%.*}" || locale_ok=0
+                fi
+                # If locale -a returned nothing, we can't determine — keep locale_ok=1
+            fi
+            if (( locale_ok )); then
+                _row "Locale"     "OK  ${sys_lang}"
+            else
+                _row "Locale"     "!   ${sys_lang}  (not generated — run: locale-gen)"
+                _rec "Locale '${sys_lang}' set but not generated — run: locale-gen"
+            fi
+        fi
+    else
+        _row "Locale"     "!   /etc/locale.conf missing — locale may fall back to C"
+        _rec "Create /etc/locale.conf with LANG=en_US.UTF-8 (or your preferred locale)"
+    fi
+
+    # Live keymap (what localectl reports as currently active, not just the UKI param)
+    local live_keymap=""
+    if command -v localectl &>/dev/null; then
+        live_keymap=$(localectl status 2>/dev/null \
+            | awk -F': ' '/VC Keymap/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "")
+    fi
+    # Also check vconsole.conf for consistency
+    local vconsole_km=""
+    vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+        | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+    if [[ -n "$live_keymap" && -n "$vconsole_km" && "$live_keymap" != "$vconsole_km" ]]; then
+        _row "Keymap"      "!   live='${live_keymap}' but vconsole.conf='${vconsole_km}' — run: localectl set-keymap ${vconsole_km}"
+        _rec "Live keymap '${live_keymap}' differs from vconsole.conf '${vconsole_km}' — run: localectl set-keymap ${vconsole_km}  [auto]"
+    elif [[ -n "$live_keymap" ]]; then
+        _row "Keymap"      "OK  ${live_keymap}  (live)"
+    elif [[ -n "$vconsole_km" ]]; then
+        _row "Keymap"      "--  ${vconsole_km}  (from vconsole.conf, not yet applied)"
+    fi
+
+    # Console font (vconsole.conf FONT=)
+    local vconsole_font=""
+    vconsole_font=$(grep -E '^FONT=' /etc/vconsole.conf 2>/dev/null \
+        | cut -d= -f2 | tr -d "\"'" || echo "")
+    if [[ -n "$vconsole_font" ]]; then
+        _row "Font"        "--  ${vconsole_font}  (vconsole)"
+    fi
+
+    # Pretty hostname — cosmetic but useful for mDNS/hostnamectl
+    local pretty_hostname=""
+    if command -v hostnamectl &>/dev/null; then
+        pretty_hostname=$(hostnamectl --no-ask-password 2>/dev/null \
+            | grep -i 'Pretty hostname' | cut -d: -f2- | sed 's/^ *//' || echo "")
+    fi
+    if [[ -z "$pretty_hostname" || "$pretty_hostname" == "$hostname" ]]; then
+        _row "Pretty host"  "--  not set  (optional: hostnamectl set-hostname --pretty 'My PC')"
+    else
+        _row "Pretty host"  "--  ${pretty_hostname}"
+    fi
+
+    # Chassis type (hostnamectl) — informational
+    local chassis=""
+    if command -v hostnamectl &>/dev/null; then
+        chassis=$(hostnamectl --no-ask-password 2>/dev/null \
+            | grep -i 'Chassis' | cut -d: -f2- | sed 's/^ *//' || echo "")
+    fi
+    [[ -n "$chassis" ]] && _row "Chassis"     "--  ${chassis}"
+
     _head "Slots"
 
     # Booted — what is actually running right now
@@ -575,7 +667,7 @@ _section_boot_entries() {
         [[ -f "$sdboot_src" && "$sdboot_src" -nt "$sdboot_dst" ]] && stale_efi+=("sd-boot")
         if [[ ${#stale_efi[@]} -gt 0 ]]; then
             local _stale_str; _stale_str=$(IFS='+'; echo "${stale_efi[*]}")
-            _row2 "!  ${_stale_str} source newer than ESP copy — run: gen-efi configure <booted_slot>  [auto]"
+            _row2 "!  ${_stale_str} source newer than ESP copy — run: gen-efi configure <booted_slot>"
             _rec "ESP ${_stale_str} is stale (newer source available) — run: gen-efi configure <booted_slot>  [auto]"
         fi
     else
@@ -874,7 +966,7 @@ _section_update_tools() {
     command -v curl   &>/dev/null && dl_tools+=("curl")
     if [[ ${#dl_tools[@]} -eq 0 ]]; then
         _row "DL tools"   "!!  no download tool found (aria2c/wget/curl) — updates will fail"
-        _rec "No download tools available — install aria2c, wget, or curl"
+        _rec "No download tools available — aria2c, wget, or curl required"
     else
         command -v pv &>/dev/null || \
             _row2 "--  pv not installed (no extraction progress display)"
@@ -1055,12 +1147,14 @@ _section_immutability() {
             _row2         "!  large overlay (${count} files) — significant config drift"
             _rec "Large /etc overlay (${count} files) — consider upstreaming to base image"
         elif [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
-            local top_dirs
+            local top_dirs overlay_size
             top_dirs=$(find "$overlay_upper" -mindepth 2 -maxdepth 2 2>/dev/null \
                 | sed "s|${overlay_upper}/||" | cut -d/ -f1 \
                 | sort | uniq -c | sort -rn | head -5 \
                 | awk '{printf "%s(%s) ",$2,$1}')
+            overlay_size=$(du -sh "$overlay_upper" 2>/dev/null | awk '{print $1}' || echo "")
             [[ -n "$top_dirs" ]] && _row2 "--  top dirs: ${top_dirs}"
+            [[ -n "$overlay_size" ]] && _row2 "--  overlay size: ${overlay_size}"
         fi
     else
         _row "/etc"   "!!  overlay upper dir missing — run shanios-tmpfiles-data.service"
@@ -1256,7 +1350,7 @@ _section_secureboot() {
     done
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         _row "UKI tools"  "!!  missing: $(_join "${missing_tools[@]}") — gen-efi / UKI rebuild will fail"
-        _rec "Install missing UKI build tools: $(_join "${missing_tools[@]}")"
+        _rec "Missing UKI build tools: $(_join "${missing_tools[@]}")"
     fi
 }
 
@@ -1465,7 +1559,6 @@ _section_security_services() {
         fi
     else
         _row "Firewall"   "!!  not installed — system has no firewall"
-        _rec "Install firewalld: pacman -S firewalld && systemctl enable --now firewalld"
     fi
 
     if command -v fail2ban-client &>/dev/null; then
@@ -1530,7 +1623,8 @@ _section_security_services() {
     # Wiki confirms 'audit' is installed as part of the security stack
     if command -v auditctl &>/dev/null; then
         if systemctl is-active --quiet auditd 2>/dev/null; then
-            local audit_rules; audit_rules=$(auditctl -l 2>/dev/null | grep -vc '^No rules' || echo "?")
+            local audit_rules; audit_rules=$(auditctl -l 2>/dev/null | grep -c '^-' || true)
+            [[ -z "$audit_rules" ]] && audit_rules="?"
             _row "auditd"    "OK  running${audit_rules:+ (${audit_rules} rule(s))}"
         else
             local audit_en; audit_en=$(systemctl is-enabled auditd 2>/dev/null || echo "disabled")
@@ -1538,7 +1632,7 @@ _section_security_services() {
                 _row "auditd"    "!   enabled but not running"
                 _rec "auditd enabled but not active — run: systemctl start auditd  [auto]"
             else
-                _row "auditd"    "--  installed but not enabled (to enable kernel security logging: systemctl enable --now auditd)"
+                _row "auditd"    "--  installed but not enabled"
             fi
         fi
     fi
@@ -1601,10 +1695,10 @@ _section_security_audit() {
             else
                 if (( lynis_age_days > 30 )); then
                     _row "lynis"     "!   last scan ${lynis_age_days}d ago${lynis_score_str} — run: lynis audit system"
-                    _rec "Lynis last ran ${lynis_age_days} days ago — enable timer: systemctl enable --now lynis.timer  [auto]"
+                    _rec "Lynis last ran ${lynis_age_days} days ago — enable timer: systemctl enable --now lynis.timer"
                 else
                     _row "lynis"     "OK  last scan ${lynis_age_days}d ago${lynis_score_str}"
-                    _row2 "--  timer not active — run: systemctl enable --now lynis.timer  [auto]"
+                    _row2 "--  timer not active — run: systemctl enable --now lynis.timer"
                 fi
             fi
         else
@@ -1612,7 +1706,7 @@ _section_security_audit() {
                 _row "lynis"     "--  timer active, no scan recorded yet${lynis_next_str}"
             else
                 _row "lynis"     "--  installed, no scan recorded — run: lynis audit system"
-                _rec "Enable lynis timer: systemctl enable --now lynis.timer  [auto]"
+                _rec "Enable lynis timer: systemctl enable --now lynis.timer"
             fi
         fi
     fi
@@ -1859,8 +1953,7 @@ _section_groups() {
     local rt_line rt_members=()
     rt_line=$(getent group realtime 2>/dev/null || grep '^realtime:' /etc/group 2>/dev/null || true)
     if [[ -z "$rt_line" ]]; then
-        _row "realtime"  "!!  group missing — install realtime-privileges"
-        _rec "'realtime' group missing — install: pacman -S realtime-privileges"
+        _row "realtime"  "!!  group missing — realtime-privileges package required"
     else
         IFS=',' read -ra rt_members <<< "${rt_line##*:}"
         local rt_display; rt_display=$(IFS=' '; echo "${rt_members[*]}" | tr -s ' ' | xargs)
@@ -2063,6 +2156,33 @@ _section_hardware() {
         fi
     fi
 
+    # ── GPU temperature ───────────────────────────────────────────────────────
+    # AMD: /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input (millidegrees)
+    # NVIDIA: nvidia-smi (if installed)
+    local gpu_temp=""
+    for _hwmon in /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input; do
+        [[ -f "$_hwmon" ]] || continue
+        local _raw; _raw=$(cat "$_hwmon" 2>/dev/null || echo "")
+        if [[ "$_raw" =~ ^[0-9]+$ ]] && (( _raw > 0 )); then
+            gpu_temp=$(( _raw / 1000 ))
+            break
+        fi
+    done
+    if [[ -z "$gpu_temp" ]] && command -v nvidia-smi &>/dev/null; then
+        gpu_temp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null \
+            | head -1 | tr -d '[:space:]' || echo "")
+    fi
+    if [[ "$gpu_temp" =~ ^[0-9]+$ ]]; then
+        if (( gpu_temp >= 90 )); then
+            _row "GPU temp"   "!!  ${gpu_temp}°C — critically hot"
+            _rec "GPU temperature is ${gpu_temp}°C — check cooling and GPU fan"
+        elif (( gpu_temp >= 75 )); then
+            _row "GPU temp"   "!   ${gpu_temp}°C (hot)"
+        else
+            _row "GPU temp"   "OK  ${gpu_temp}°C"
+        fi
+    fi
+
     # ── RAM ───────────────────────────────────────────────────────────────────
     local mem_total_kb mem_total_gb
     mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
@@ -2200,7 +2320,7 @@ _section_hardware() {
             _row "Bluetooth"  "!   hardware present but bluetooth.service not enabled"
             _rec "Enable bluetooth: systemctl enable --now bluetooth  [auto]"
         else
-            _row "Bluetooth"  "--  installed, not enabled (to enable: systemctl enable --now bluetooth)"
+            _row "Bluetooth"  "--  installed, not enabled"
         fi
     fi
 
@@ -2228,7 +2348,7 @@ _section_hardware() {
                 _rec "Enable bolt for Thunderbolt device authorization: systemctl enable --now bolt  [auto]"
             fi
         else
-            _row "Thunderbolt" "--  hardware present, bolt not installed (to manage device auth: pacman -S bolt && systemctl enable --now bolt)"
+            _row "Thunderbolt" "--  hardware present, bolt not installed"
         fi
     fi
 
@@ -2273,20 +2393,31 @@ _section_disk() {
             local smart_json
             smart_json=$(smartctl -j -A "/dev/${root_disk}" 2>/dev/null || true)
             if [[ -n "$smart_json" ]]; then
-                # NVMe: percentage_used field; SATA: wear_leveling_count (ID 177)
-                local nvme_wear nvme_temp sata_wear sata_temp wear temp
+                # NVMe: percentage_used is direct wear% (0-100+)
+                # SATA ID 177 Wear_Leveling_Count: normalized value starts at 100 (new)
+                #   and decreases → actual wear% = 100 - value
+                # SATA ID 190/194 Temperature: use raw_value (actual °C), not normalized value
+                local nvme_wear="" nvme_temp="" sata_wear="" sata_temp="" wear="" temp=""
                 nvme_wear=$(echo "$smart_json" | grep -o '"percentage_used"[^,}]*' \
                     | grep -o '[0-9]*' | head -1 || echo "")
                 nvme_temp=$(echo "$smart_json" | grep -o '"temperature"[^,}]*' \
                     | grep -o '[0-9]\{2,3\}' | head -1 || echo "")
-                sata_wear=$(echo "$smart_json" | grep -A5 '"id" *: *177' \
+                # ID 177: value field is normalized (100=new, decreases with wear)
+                local _sata_177_val=""
+                _sata_177_val=$(echo "$smart_json" | grep -A10 '"id" *: *177' \
                     | grep '"value"' | grep -o '[0-9]*' | head -1 || echo "")
-                sata_temp=$(echo "$smart_json" | grep -A5 '"id" *: *19[04]' \
-                    | grep '"value"' | grep -o '[0-9]*' | head -1 || echo "")
+                if [[ -n "$_sata_177_val" && "$_sata_177_val" =~ ^[0-9]+$ ]]; then
+                    sata_wear=$(( 100 - _sata_177_val ))
+                    (( sata_wear < 0 )) && sata_wear=0
+                fi
+                # ID 194 Temperature_Celsius: raw_value[0] is actual temp in °C
+                # ID 190 Airflow temp: same — use raw_value not normalized value
+                sata_temp=$(echo "$smart_json" | grep -A15 '"id" *: *19[04]' \
+                    | grep '"raw_value"' | grep -o '[0-9]\{2,3\}' | head -1 || echo "")
                 wear="${nvme_wear:-$sata_wear}"
                 temp="${nvme_temp:-$sata_temp}"
 
-                if [[ -n "$wear" ]]; then
+                if [[ -n "$wear" && "$wear" =~ ^[0-9]+$ ]]; then
                     if (( wear >= 90 )); then
                         _row "SSD wear"  "!!  ${wear}% used — replace soon"
                         _rec "SSD wear at ${wear}% — plan replacement before failure"
@@ -2296,7 +2427,7 @@ _section_disk() {
                         _row "SSD wear"  "OK  ${wear}% used"
                     fi
                 fi
-                if [[ -n "$temp" ]]; then
+                if [[ -n "$temp" && "$temp" =~ ^[0-9]+$ ]]; then
                     if (( temp >= 65 )); then
                         _row "Disk temp"  "!!  ${temp}°C — critically hot"
                         _rec "Disk temperature is ${temp}°C — check cooling"
@@ -2338,11 +2469,11 @@ _section_disk() {
         local has_swapfile=0; [[ -n "$swapfile" ]] && has_swapfile=1
 
         if (( has_zram && has_swapfile )); then
-            _row2 "zram + swapfile (hibernate capable)"
+            _row2 "--  zram + swapfile (hibernate capable)"
         elif (( has_zram )); then
-            _row2 "zram only — hibernate not available"
+            _row2 "--  zram only — hibernate not available"
         elif (( has_swapfile )); then
-            _row2 "swapfile: $swapfile"
+            _row2 "--  swapfile: $swapfile"
         fi
 
         if (( has_swapfile )); then
@@ -2583,7 +2714,7 @@ _section_storage() {
     if ! command -v compsize &>/dev/null; then
         # compsize is Btrfs-specific; only nag if this is a Btrfs system
         if findmnt -n -t btrfs / &>/dev/null; then
-            _row "compsize"  "--  not installed (needed for --storage-info compression analysis: pacman -S compsize)"
+            _row "compsize"  "--  not installed"
         fi
     fi
 }
@@ -2745,7 +2876,7 @@ _section_printing() {
             _row "SANE"       "OK  saned.socket enabled"
         else
             _row "SANE"       "--  saned.socket not enabled (network scanning unavailable; local USB scanning still works)"
-            _rec "Enable saned.socket for network scanning access: systemctl enable saned.socket  [auto]"
+            _rec "Enable saned.socket for network scanning access: systemctl enable saned.socket"
         fi
     fi
 
@@ -2811,7 +2942,7 @@ _section_system_services() {
             _row "Caddy"     "!   enabled but not running"
             _rec "Caddy not running — run: systemctl start caddy  [auto]"
         else
-            _row "Caddy"     "--  installed but not enabled (to serve sites: create /etc/caddy/Caddyfile, then systemctl enable --now caddy)"
+            _row "Caddy"     "--  installed, not configured or enabled (to serve sites: create /etc/caddy/Caddyfile, then systemctl enable --now caddy)"
         fi
     fi
 
@@ -3017,7 +3148,7 @@ _section_performance() {
         _row "Power"  "!   power-profiles-daemon installed but not running (${ppd_en})"
         _rec "power-profiles-daemon not active — run: systemctl enable --now power-profiles-daemon  [auto]"
     elif (( bat_present )); then
-        _row "Power"  "--  no power manager detected (install: power-profiles-daemon)"
+        _row "Power"  "--  no power manager detected"
     fi
 
     # ── irqbalance ────────────────────────────────────────────────────────────
@@ -3035,7 +3166,6 @@ _section_performance() {
         fi
     else
         _row "irqbalance"  "!!  not installed — all IRQs handled by one core"
-        _rec "Install irqbalance: pacman -S irqbalance && systemctl enable --now irqbalance"
     fi
 
     # ── ananicy-cpp ───────────────────────────────────────────────────────────
@@ -3050,7 +3180,7 @@ _section_performance() {
             _rec "Enable ananicy-cpp: systemctl enable --now ananicy-cpp  [auto]"
         fi
     else
-        _row "ananicy-cpp" "--  not installed (to enable process priority management: pacman -S ananicy-cpp)"
+        _row "ananicy-cpp" "--  not installed"
     fi
 
     # ── gamemode ──────────────────────────────────────────────────────────────
@@ -3080,7 +3210,7 @@ _section_performance() {
             _row "PSD"        "!   enabled but not running"
             _rec "Profile Sync Daemon enabled but not active — run: systemctl --user start psd  [auto]"
         else
-            _row "PSD"        "--  installed, not enabled (to sync browser profiles to RAM: systemctl --user enable --now psd)"
+            _row "PSD"        "--  installed, not enabled"
         fi
     fi
 }
@@ -3132,6 +3262,21 @@ _section_network() {
     fi
     if (( _inet_ok )); then
         _row "Internet"   "OK  reachable"
+        # IPv6 — informational, show if active
+        local _ipv6_ok=0
+        if timeout 3 bash -c 'echo > /dev/tcp/2606:4700:4700::1111/53' 2>/dev/null; then
+            _ipv6_ok=1
+        fi
+        local _ipv6_addr=""
+        _ipv6_addr=$(ip -6 addr show scope global 2>/dev/null \
+            | awk '/inet6/{print $2}' | grep -v '^fd' | head -1 | cut -d/ -f1 || echo "")
+        if (( _ipv6_ok )); then
+            _row2 "--  IPv6 reachable${_ipv6_addr:+  (${_ipv6_addr})}"
+        elif [[ -n "$_ipv6_addr" ]]; then
+            _row2 "--  IPv6 address present but unreachable (${_ipv6_addr})"
+        else
+            _row2 "--  IPv6 not configured"
+        fi
     else
         _row "Internet"   "!!  no internet connectivity"
         _rec "Cannot reach internet — check default route and upstream connection"
@@ -3159,7 +3304,6 @@ _section_network() {
         fi
     else
         _row "openresolv" "!!  resolvconf not found — DNS management broken"
-        _rec "openresolv (resolvconf) missing — install: pacman -S openresolv"
     fi
 
     # ── /etc/resolv.conf usability ────────────────────────────────────────────
@@ -3194,7 +3338,8 @@ _section_network() {
     local _dns_probe="archlinux.org"
     local _dns_resolved=""
     if command -v dig &>/dev/null; then
-        _dns_resolved=$(dig +short +timeout=3 "$_dns_probe" A 2>/dev/null | head -1 || echo "")
+        _dns_resolved=$(dig +short +timeout=3 "$_dns_probe" A 2>/dev/null \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | head -1 || echo "")
     elif command -v getent &>/dev/null; then
         _dns_resolved=$(getent hosts "$_dns_probe" 2>/dev/null | awk '{print $1}' | head -1 || echo "")
     fi
@@ -3248,10 +3393,9 @@ _section_network() {
             _rec "avahi-daemon not running — run: systemctl start avahi-daemon  [auto]"
         else
             _row "Avahi"      "--  not enabled (to enable mDNS/.local resolution: systemctl enable --now avahi-daemon)"
-            _rec "Enable avahi-daemon for mDNS: systemctl enable --now avahi-daemon  [auto]"
         fi
     else
-        _row "Avahi"          "--  not installed (to enable mDNS: pacman -S avahi && systemctl enable --now avahi-daemon)"
+        _row "Avahi"          "--  not installed"
     fi
 
     # ── Time sync ─────────────────────────────────────────────────────────────
@@ -3263,13 +3407,30 @@ _section_network() {
         tsync=$(systemctl is-active systemd-timesyncd 2>/dev/null || echo "inactive")
         if [[ "$ntp_synced" == "yes" && "$tsync" == "active" ]]; then
             # Show which NTP server is actually being used
-            local _ntp_server=""
+            local _ntp_server="" _ntp_offset=""
             _ntp_server=$(timedatectl timesync-status 2>/dev/null \
                 | awk '/^[[:space:]]*Server:/{print $2}' | head -1 || echo "")
             [[ -z "$_ntp_server" ]] && \
                 _ntp_server=$(journalctl -u systemd-timesyncd -n 50 --no-pager 2>/dev/null \
                     | grep -oP '(?<=synchronized to )\S+' | tail -1 || echo "")
+            # Clock offset — flag if large (indicates stale hardware clock or poor NTP)
+            _ntp_offset=$(timedatectl timesync-status 2>/dev/null \
+                | awk '/^[[:space:]]*Offset:/{print $2,$3}' | head -1 || echo "")
             _row "timesyncd"  "OK  synchronised${_ntp_server:+  (${_ntp_server})}"
+            if [[ -n "$_ntp_offset" ]]; then
+                # Extract numeric value — flag if offset > 1s (1000ms)
+                local _off_ms; _off_ms=$(echo "$_ntp_offset" | grep -oE '[0-9]+' | head -1 || echo "0")
+                local _off_unit; _off_unit=$(echo "$_ntp_offset" | grep -oE '[a-z]+' | head -1 || echo "")
+                local _off_large=0
+                [[ "$_off_unit" == "s" || "$_off_unit" == "min" ]] && _off_large=1
+                [[ "$_off_unit" == "ms" && "$_off_ms" =~ ^[0-9]+$ ]] && (( _off_ms > 1000 )) && _off_large=1
+                if (( _off_large )); then
+                    _row2 "!   offset ${_ntp_offset} — large clock drift, check hardware clock"
+                    _rec "NTP clock offset is ${_ntp_offset} — large drift; check: hwclock --systohc"
+                else
+                    _row2 "--  offset ${_ntp_offset}"
+                fi
+            fi
         elif [[ "$ntp_active" == "yes" && "$tsync" == "active" ]]; then
             _row "timesyncd"  "!   running but not yet synchronised"
         elif [[ "$ntp_active" == "yes" ]]; then
@@ -3291,7 +3452,7 @@ _section_network() {
             _row "ModemMgr"   "!   enabled but not running — mobile broadband unavailable"
             _rec "ModemManager not running — run: systemctl start ModemManager  [auto]"
         else
-            _row "ModemMgr"   "--  installed but not enabled (to use: systemctl enable --now ModemManager)"
+            _row "ModemMgr"   "--  installed but not enabled"
         fi
     fi
 
@@ -3352,12 +3513,48 @@ _section_audio_display() {
         fi
     fi
 
+    # ── xdg-desktop-portal ────────────────────────────────────────────────────
+    # Required for Flatpak sandboxing, file pickers, screen sharing, and
+    # camera/location access on Wayland. The backend must match the DE profile.
+    if command -v xdg-desktop-portal &>/dev/null || \
+       systemctl --user cat xdg-desktop-portal.service &>/dev/null 2>&1 || \
+       _sysd_user cat xdg-desktop-portal.service &>/dev/null 2>&1; then
+        local _xdp_st; _xdp_st=$(_sysd_user is-active xdg-desktop-portal 2>/dev/null | tr -d '[:space:]' || echo "inactive")
+        local _xdp_backend=""
+        # Detect the active backend (plasma or gnome)
+        if _sysd_user is-active plasma-xdg-desktop-portal-kde &>/dev/null 2>&1; then
+            _xdp_backend="kde"
+        elif _sysd_user is-active xdg-desktop-portal-gnome &>/dev/null 2>&1; then
+            _xdp_backend="gnome"
+        elif _sysd_user is-active xdg-desktop-portal-gtk &>/dev/null 2>&1; then
+            _xdp_backend="gtk"
+        fi
+        if [[ "$_xdp_st" == "active" ]]; then
+            _row "XDG portal"  "OK  active${_xdp_backend:+  (${_xdp_backend} backend)}"
+            # Warn if backend doesn't match DE profile — gtk fallback on Plasma
+            # means file pickers, screen share, and camera may not work correctly
+            local _xdp_profile; _xdp_profile=$(cat /etc/shani-profile 2>/dev/null | tr -d '[:space:]' || echo "")
+            if [[ "$_xdp_profile" == "plasma" && "$_xdp_backend" != "kde" ]]; then
+                _row2 "!   expected kde backend for Plasma — xdg-desktop-portal-kde may not be running"
+                _rec "XDG portal using ${_xdp_backend:-unknown} backend on Plasma — xdg-desktop-portal-kde should be active"
+            elif [[ "$_xdp_profile" == "gnome" && "$_xdp_backend" != "gnome" ]]; then
+                _row2 "!   expected gnome backend for GNOME — xdg-desktop-portal-gnome may not be running"
+                _rec "XDG portal using ${_xdp_backend:-unknown} backend on GNOME — xdg-desktop-portal-gnome should be active"
+            fi
+        elif [[ "$_xdp_st" == "activating" ]]; then
+            _row "XDG portal"  "--  activating"
+        else
+            _row "XDG portal"  "!   not running — Flatpak portals and screen sharing unavailable"
+            _rec "xdg-desktop-portal not running — run: systemctl --user start xdg-desktop-portal  [auto]"
+        fi
+    fi
+
 }
 
 _section_units() {
     _head "Units"
 
-    # ── Failed units ──────────────────────────────────────────────────────────
+    # ── Failed system units ───────────────────────────────────────────────────
     local failed_units=()
     # Filter known transient oneshot units that legitimately enter failed state
     # (e.g. systemd-suspend.service fails after every suspend cycle by design)
@@ -3373,6 +3570,42 @@ _section_units() {
         _row "Units"     "!!  ${#failed_units[@]} failed: ${_fu_str}"
         _rec "Failed units: ${_fu_str} — run: systemctl status ${_fu_str}"
     fi
+
+    # ── Failed user units ─────────────────────────────────────────────────────
+    # Filter transient user units that legitimately fail when idle:
+    # drkonqi-coredump-pickup: KDE crash reporter — exits non-zero when no
+    #   pending crash reports exist; this is its normal "nothing to do" state.
+    local _user_transient_ok="drkonqi-coredump-pickup.service|drkonqi-coredump-launcher.service"
+    if [[ -n "$_CALLER_USER" && "$_CALLER_USER" != "root" ]]; then
+        local failed_user_units=()
+        mapfile -t failed_user_units < <(
+            _sysd_user list-units --state=failed --no-legend --no-pager 2>/dev/null \
+                | awk '{print $2}' | grep -v '^$' | grep '\.' \
+                | grep -vE "^(${_user_transient_ok})$" || true)
+        if [[ ${#failed_user_units[@]} -eq 0 ]]; then
+            _row "User units" "OK  no failed user units (${_CALLER_USER})"
+        else
+            local _fuu_str; _fuu_str=$(IFS=' '; echo "${failed_user_units[*]}")
+            _row "User units" "!!  ${#failed_user_units[@]} failed (${_CALLER_USER}): ${_fuu_str}"
+            _rec "Failed user units (${_CALLER_USER}): ${_fuu_str} — run: systemctl --user status ${_fuu_str}"
+        fi
+    fi
+
+    # ── Systemd inhibitors ────────────────────────────────────────────────────
+    # Inhibitors that block shutdown/sleep can cause hangs at power-off or
+    # prevent suspend from working. Show any non-idle block or delay locks.
+    if command -v systemd-inhibit &>/dev/null; then
+        local _inh_block _inh_delay
+        _inh_block=$(systemd-inhibit --list --no-legend 2>/dev/null \
+            | grep -c 'block' || true)
+        _inh_delay=$(systemd-inhibit --list --no-legend 2>/dev/null \
+            | grep -c 'delay' || true)
+        local _inh_total=$(( ${_inh_block:-0} + ${_inh_delay:-0} ))
+        if (( _inh_total > 0 )); then
+            _row "Inhibitors" "--  ${_inh_block:-0} block, ${_inh_delay:-0} delay — run: systemd-inhibit --list"
+        fi
+    fi
+
 }
 
 _section_package_managers() {
@@ -3394,10 +3627,21 @@ _section_package_managers() {
             _row "Flatpak"    "!   auto-update timer not active  (${flatpak_apps} apps${fp_sz_str})"
             _rec "Flatpak auto-update timer not active — run: systemctl enable --now flatpak-update-system.timer  [auto]"
         fi
-        # Per-user timer — wiki says two independent timers (system + user) are enabled
-        if [[ "$flatpak_usr" != "active" ]]; then
-            _row2 "!   flatpak-update-user.timer not active for ${_CALLER_USER}"
-            _rec "Flatpak user update timer not active — run: systemctl --user enable --now flatpak-update-user.timer  [auto]"
+        # Per-user timer — only check if the user has an active session
+        # (is-active requires a running user bus; without a session it always returns inactive)
+        local _fp_has_session=0
+        loginctl list-sessions --no-legend 2>/dev/null \
+            | awk '{print $3}' | grep -qx "$_CALLER_USER" && _fp_has_session=1
+        if (( _fp_has_session )) && [[ "$flatpak_usr" != "active" ]]; then
+            local _fp_usr_en
+            _fp_usr_en=$(_sysd_user is-enabled flatpak-update-user.timer 2>/dev/null || echo "")
+            if [[ "$_fp_usr_en" != "enabled" && "$_fp_usr_en" != "static" ]]; then
+                _row2 "!   flatpak-update-user.timer not enabled for ${_CALLER_USER}"
+                _rec "Flatpak user update timer not enabled — run: systemctl --user enable --now flatpak-update-user.timer  [auto]"
+            else
+                _row2 "!   flatpak-update-user.timer enabled but not active for ${_CALLER_USER}"
+                _rec "Flatpak user update timer not active — run: systemctl --user start flatpak-update-user.timer  [auto]"
+            fi
         fi
         # Flatpak runtime count as continuation (size detail in --storage-info)
         if [[ "$flatpak_mb" =~ ^[0-9]+$ ]]; then
@@ -3459,7 +3703,7 @@ _section_package_managers() {
             fi
         fi
     elif command -v snap &>/dev/null || systemctl cat snapd &>/dev/null 2>&1; then
-        _row "Snap"       "--  installed but @snapd subvolume not mounted (to activate: mount /var/lib/snapd, then systemctl enable --now snapd.socket)"
+        _row "Snap"       "--  installed but @snapd subvolume not mounted"
     fi
 
     # ── Nix ───────────────────────────────────────────────────────────────────
@@ -3531,8 +3775,7 @@ _section_package_managers() {
             _row "AppImage"   "OK  FUSE available"
         else
             _row "AppImage"   "!!  .AppImage files found but FUSE not loaded — they will not run"
-            _rec "FUSE not available — install fuse3 or load the fuse module"
-        fi
+            fi
     elif command -v fusermount3 &>/dev/null || lsmod 2>/dev/null | grep -qw 'fuse'; then
         _row "AppImage"   "--  FUSE available (no .AppImage files found)"
     fi
@@ -3600,7 +3843,7 @@ _section_virtualization() {
             _row "libvirtd"  "!   enabled but not running"
             _rec "libvirtd/virtqemud enabled but not active — run: systemctl start virtqemud.socket  [auto]"
         else
-            _row "libvirtd"  "--  installed but not enabled (to manage VMs: systemctl enable --now libvirtd)"
+            _row "libvirtd"  "--  installed but not enabled"
         fi
 
         # ── Modular daemon health ─────────────────────────────────────────────
@@ -3851,6 +4094,12 @@ _section_containers() {
         else
             _row "Podman"     "--  installed${podman_ver:+  v${podman_ver}}  socket inactive${rl_str}"
         fi
+        # Running containers
+        local podman_running=""
+        podman_running=$(podman ps -q 2>/dev/null | wc -l | tr -d '[:space:]' || echo "")
+        if [[ "$podman_running" =~ ^[0-9]+$ ]] && (( podman_running > 0 )); then
+            _row2 "--  ${podman_running} container(s) running"
+        fi
         # Distrobox: depends on Podman — flag if installed but Podman socket is down
         if command -v distrobox &>/dev/null && \
            [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
@@ -3915,7 +4164,7 @@ _section_containers() {
             _rec "Waydroid container not running — run: systemctl enable --now waydroid-container  [auto]"
         fi
     elif command -v waydroid &>/dev/null; then
-        _row "Waydroid"   "--  installed, not initialised (to set up: waydroid init, then systemctl enable --now waydroid-container)"
+        _row "Waydroid"   "--  installed, not initialised"
     fi
 
     # ── systemd-nspawn (systemd-machined) ─────────────────────────────────────
@@ -4070,7 +4319,6 @@ _section_runtime_health() {
         fi
     else
         _row "ZRAM"          "!   not configured — memory pressure handled by swapfile only"
-        _rec "ZRAM not configured — install zram-generator and create /etc/systemd/zram-generator.conf"
     fi
 
     # ── systemd-oomd ──────────────────────────────────────────────────────────
@@ -4101,6 +4349,83 @@ _section_runtime_health() {
         _rec "Enable systemd-oomd: systemctl enable --now systemd-oomd  [auto]"
     fi
 
+}
+
+_section_coredump() {
+    _head "Core Dumps"
+
+    # systemd-coredump — is the handler wired up?
+    local core_pattern=""
+    core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo "")
+
+    if [[ "$core_pattern" == "|/usr/lib/systemd/systemd-coredump"* ]]; then
+        _row "Handler"    "OK  systemd-coredump active"
+    elif [[ "$core_pattern" == "core"* || "$core_pattern" == "./"* || "$core_pattern" =~ ^/ ]]; then
+        _row "Handler"    "--  writing to file: ${core_pattern}  (systemd-coredump not configured)"
+    elif [[ -z "$core_pattern" ]]; then
+        _row "Handler"    "!   core_pattern empty — crashes silently lost"
+        _rec "Configure systemd-coredump or set core_pattern: systemctl enable --now systemd-coredump  [auto]"
+    else
+        _row "Handler"    "--  custom: ${core_pattern}"
+    fi
+
+    # Is systemd-coredump installed and the socket present?
+    if systemctl cat systemd-coredump.socket &>/dev/null 2>&1; then
+        local _cd_en; _cd_en=$(systemctl is-enabled systemd-coredump.socket 2>/dev/null || echo "")
+        local _cd_failed=0
+        systemctl is-failed --quiet systemd-coredump.socket 2>/dev/null && _cd_failed=1
+        if (( _cd_failed )); then
+            _row "Socket"     "!!  systemd-coredump.socket failed — core dump capture broken"
+            _rec "Reset coredump socket: systemctl reset-failed systemd-coredump.socket  [auto]"
+        elif [[ "$_cd_en" == "static" ]]; then
+            # static = socket-activated, wakes on crash signal — inactive is expected/normal
+            _row "Socket"     "OK  systemd-coredump.socket ready (socket-activated)"
+        elif systemctl is-active --quiet systemd-coredump.socket 2>/dev/null; then
+            _row "Socket"     "OK  systemd-coredump.socket active"
+        elif [[ "$_cd_en" == "enabled" ]]; then
+            _row "Socket"     "!   systemd-coredump.socket enabled but not active"
+            _rec "Start coredump socket: systemctl start systemd-coredump.socket  [auto]"
+        else
+            _row "Socket"     "--  systemd-coredump installed but socket not enabled"
+            _rec "Enable coredump capture: systemctl enable --now systemd-coredump.socket  [auto]"
+        fi
+    else
+        _row "Socket"     "--  systemd-coredump not installed "
+    fi
+
+    # Check storage config — /etc/systemd/coredump.conf
+    local coredump_storage=""
+    if [[ -f /etc/systemd/coredump.conf ]]; then
+        coredump_storage=$(grep -E '^Storage=' /etc/systemd/coredump.conf 2>/dev/null \
+            | cut -d= -f2 | tr -d '[:space:]' || echo "")
+    fi
+    # Also check drop-ins
+    [[ -z "$coredump_storage" ]] && \
+        coredump_storage=$(grep -rh -E '^Storage=' /etc/systemd/coredump.conf.d/ 2>/dev/null \
+            | tail -1 | cut -d= -f2 | tr -d '[:space:]' || echo "")
+    if [[ -n "$coredump_storage" ]]; then
+        _row "Storage"    "--  ${coredump_storage}"
+        if [[ "$coredump_storage" == "none" ]]; then
+            _row2 "!  Storage=none — core dumps discarded even if captured"
+        fi
+    fi
+
+    # Recent core dumps this boot
+    local coredump_count=0
+    if command -v coredumpctl &>/dev/null; then
+        coredump_count=$(coredumpctl list --no-pager -q 2>/dev/null | grep -c '' || echo "0")
+        coredump_count=$(echo "${coredump_count:-0}" | tr -d '[:space:]')
+        [[ "$coredump_count" =~ ^[0-9]+$ ]] || coredump_count=0
+        if (( coredump_count > 0 )); then
+            _row "Dumps"      "!   ${coredump_count} core dump(s) recorded — run: coredumpctl list"
+            local _last_crash
+            _last_crash=$(coredumpctl list --no-pager -q 2>/dev/null | tail -1 \
+                | awk '{print $1, $2, $NF}' || echo "")
+            [[ -n "$_last_crash" ]] && _row2 "--  last: ${_last_crash}"
+        else
+            _row "Dumps"      "OK  no core dumps recorded"
+        fi
+    fi
 }
 
 _section_system_health() {
@@ -4182,6 +4507,7 @@ _section_system_health() {
             local used_mb
             used_mb=$(du -sm "$user_dir" 2>/dev/null | awk '{print $1}' || echo "")
             [[ "$used_mb" =~ ^[0-9]+$ ]] || continue
+            (( used_mb == 0 )) && continue   # skip empty home dirs (e.g. builduser)
             if (( used_mb > 51200 )); then      # > 50 GB
                 home_crit+=("${uname}:${used_mb}MB")
             elif (( used_mb > 20480 )); then    # > 20 GB
@@ -4253,6 +4579,193 @@ _section_system_health() {
         _row "Journal"    "OK  ${j_err:-0} error(s) (normal range)"
     fi
 
+    # ── Journal disk usage ────────────────────────────────────────────────────
+    # journalctl --disk-usage: "Archived and active journals take up X.XG in the file system."
+    if command -v journalctl &>/dev/null; then
+        local j_disk_usage=""
+        j_disk_usage=$(journalctl --disk-usage 2>/dev/null \
+            | sed -n 's/.*take up \([^ ][^ ]*\) in.*/\1/p' | head -1 || echo "")
+        local j_max_use=""
+        j_max_use=$(grep -rh 'SystemMaxUse=' /etc/systemd/journald.conf \
+            /etc/systemd/journald.conf.d/ 2>/dev/null | tail -1 | cut -d= -f2 \
+            | tr -d '[:space:]' || echo "")
+        if [[ -n "$j_disk_usage" ]]; then
+            _row "Journal sz"  "--  ${j_disk_usage}${j_max_use:+  (limit: ${j_max_use})}"
+        fi
+    fi
+
+    # ── Dirty / writeback memory ──────────────────────────────────────────────
+    # High dirty memory means unflushed writes are buffered in RAM. On a system
+    # with volatile /var (tmpfs) this is normal, but very high values on the
+    # data subvolume can indicate I/O pressure or a stalled writeback worker.
+    local dirty_kb writeback_kb
+    dirty_kb=$(    awk '/^Dirty:/     {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    writeback_kb=$(awk '/^Writeback:/ {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    dirty_kb=$(echo "${dirty_kb:-0}" | tr -d '[:space:]')
+    writeback_kb=$(echo "${writeback_kb:-0}" | tr -d '[:space:]')
+    if [[ "$dirty_kb" =~ ^[0-9]+$ ]] && (( dirty_kb > 524288 )); then
+        # > 512 MB dirty — noteworthy
+        local dirty_mb=$(( dirty_kb / 1024 ))
+        _row "Dirty mem"  "!   ${dirty_mb} MB dirty — high unflushed write buffer"
+        _rec "High dirty memory (${dirty_mb} MB) — possible I/O pressure; check: iostat -x 1 5"
+    fi
+    if [[ "$writeback_kb" =~ ^[0-9]+$ ]] && (( writeback_kb > 102400 )); then
+        local wb_mb=$(( writeback_kb / 1024 ))
+        _row "Writeback"  "!   ${wb_mb} MB writeback in progress — I/O under pressure"
+    fi
+
+    # ── Needs-restart (kernel / libraries) ───────────────────────────────────
+    # After a kernel or glibc update, running processes still use old code.
+    # needrestart is the standard tool for this on Arch-based systems.
+    if command -v needrestart &>/dev/null; then
+        local _nr_out _nr_kernel _nr_services
+        _nr_out=$(needrestart -b 2>/dev/null || true)
+        _nr_kernel=$(echo "$_nr_out" | awk -F: '/NEEDRESTART-KSTA/{gsub(/ /,"",$2); print $2}' || echo "")
+        _nr_services=$(echo "$_nr_out" | grep -c 'NEEDRESTART-SVC' || true)
+        # kernel status: 1=up-to-date, 2=ABI-compatible upgrade, 3=version change
+        if [[ "$_nr_kernel" == "3" ]]; then
+            _row "Needs restart" "!   kernel updated — reboot required to run new kernel"
+            _rec "Kernel was updated — reboot to activate new kernel"
+        elif [[ "$_nr_kernel" == "2" ]]; then
+            _row "Needs restart" "--  kernel ABI upgrade pending — reboot recommended"
+        fi
+        if [[ "$_nr_services" =~ ^[0-9]+$ ]] && (( _nr_services > 0 )); then
+            _row2 "--  ${_nr_services} service(s) using outdated libraries — run: needrestart"
+        fi
+    fi
+
+    # ── Hardware errors (MCE / EDAC) ──────────────────────────────────────────
+    # Machine Check Exceptions indicate CPU, memory, or bus hardware faults.
+    # Even a single MCE is serious — it means the hardware detected an error.
+    local _mce_count=0
+    _mce_count=$(journalctl -k -b 0 --no-pager -q 2>/dev/null \
+        | grep -ciE 'mce|machine check|EDAC|hardware error|corrected error' || true)
+    _mce_count=$(echo "${_mce_count:-0}" | tr -d '[:space:]')
+    [[ "$_mce_count" =~ ^[0-9]+$ ]] || _mce_count=0
+    if (( _mce_count > 0 )); then
+        _row "HW errors"  "!!  ${_mce_count} MCE/EDAC event(s) this boot — possible hardware fault"
+        _rec "${_mce_count} hardware error(s) in kernel log — check: journalctl -k -b 0 | grep -i mce"
+    fi
+
+    # ── Entropy pool ─────────────────────────────────────────────────────────
+    # Low entropy stalls cryptographic operations (TLS, SSH keygen, LUKS).
+    # On modern kernels /dev/random never blocks but very low values can still
+    # indicate a misconfigured or missing entropy source (e.g. missing rngd).
+    local _entropy=""
+    _entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ "$_entropy" =~ ^[0-9]+$ ]] && (( _entropy < 256 )); then
+        _row "Entropy"    "!   ${_entropy} bits — low (may stall crypto on older kernels)"
+    fi
+
+    local tmp_type="" tmp_size=""
+    tmp_type=$(findmnt -n -o FSTYPE /tmp 2>/dev/null | tr -d '[:space:]' || echo "")
+    tmp_size=$(findmnt -n -o SIZE   /tmp 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ "$tmp_type" == "tmpfs" ]]; then
+        _row "/tmp"         "OK  tmpfs${tmp_size:+  (${tmp_size})}"
+    elif [[ -z "$tmp_type" ]]; then
+        # /tmp not separately mounted — lives on root; fine but worth noting
+        _row "/tmp"         "--  on root filesystem (not a tmpfs)"
+    else
+        _row "/tmp"         "--  ${tmp_type}${tmp_size:+  (${tmp_size})}  (not tmpfs)"
+    fi
+
+    # ── D-Bus ─────────────────────────────────────────────────────────────────
+    if systemctl is-active --quiet dbus 2>/dev/null || \
+       systemctl is-active --quiet dbus.socket 2>/dev/null; then
+        _row "D-Bus"        "OK  running"
+    else
+        _row "D-Bus"        "!!  not running — most desktop services will fail"
+        _rec "D-Bus is not running — run: systemctl enable --now dbus  [auto]"
+    fi
+
+    # ── systemd-logind ────────────────────────────────────────────────────────
+    if systemctl is-active --quiet systemd-logind 2>/dev/null; then
+        _row "logind"       "OK  running"
+    else
+        local _logind_en; _logind_en=$(systemctl is-enabled systemd-logind 2>/dev/null || echo "")
+        if [[ "$_logind_en" == "enabled" || "$_logind_en" == "static" ]]; then
+            _row "logind"   "!!  not running — session/seat management broken"
+            _rec "systemd-logind not running — run: systemctl start systemd-logind  [auto]"
+        else
+            _row "logind"   "!!  disabled — session/seat management unavailable"
+            _rec "systemd-logind not enabled — run: systemctl enable --now systemd-logind  [auto]"
+        fi
+    fi
+
+    # ── nsswitch.conf sanity ──────────────────────────────────────────────────
+    # A broken nsswitch.conf causes silent failures in getent, sudo, login, etc.
+    if [[ -f /etc/nsswitch.conf ]]; then
+        local nss_passwd nss_hosts
+        nss_passwd=$(grep -E '^passwd:' /etc/nsswitch.conf 2>/dev/null | head -1 || echo "")
+        nss_hosts=$(grep  -E '^hosts:'  /etc/nsswitch.conf 2>/dev/null | head -1 || echo "")
+        local nss_issues=()
+        [[ -z "$nss_passwd" ]] && nss_issues+=("passwd line missing")
+        [[ -z "$nss_hosts"  ]] && nss_issues+=("hosts line missing")
+        # hosts line should include 'files' and 'dns' at minimum
+        if [[ -n "$nss_hosts" ]]; then
+            echo "$nss_hosts" | grep -q '\bfiles\b' || nss_issues+=("hosts: 'files' missing")
+            echo "$nss_hosts" | grep -q '\bdns\b'   || nss_issues+=("hosts: 'dns' missing")
+        fi
+        if [[ ${#nss_issues[@]} -eq 0 ]]; then
+            _row "nsswitch"     "OK  passwd + hosts entries present"
+        else
+            _row "nsswitch"     "!   ${nss_issues[*]}"
+            _rec "nsswitch.conf issues: ${nss_issues[*]} — check /etc/nsswitch.conf"
+        fi
+    else
+        _row "nsswitch"         "!!  /etc/nsswitch.conf missing — name resolution broken"
+        _rec "/etc/nsswitch.conf missing — restore from /etc/nsswitch.conf.pacsave or reinstall glibc"
+    fi
+
+    # ── Failed login attempts (lastb) ─────────────────────────────────────────
+    if command -v lastb &>/dev/null && [[ -f /var/log/btmp ]]; then
+        local _lastb_count=0
+        local _since_ts; _since_ts=$(date -d '-24 hours' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+        if [[ -n "$_since_ts" ]]; then
+            # Filter out the trailing "btmp begins..." summary line and blank lines
+            _lastb_count=$(lastb -s "$_since_ts" 2>/dev/null \
+                | grep -cvE '^$|^btmp begins' || echo "0")
+        else
+            # Fallback: count all entries (no since filter)
+            _lastb_count=$(lastb 2>/dev/null \
+                | grep -cvE '^$|^btmp begins' || echo "0")
+        fi
+        _lastb_count=$(echo "${_lastb_count:-0}" | tr -d '[:space:]')
+        [[ "$_lastb_count" =~ ^[0-9]+$ ]] || _lastb_count=0
+        if (( _lastb_count >= 20 )); then
+            _row "Failed logins" "!   ${_lastb_count} failed attempt(s) in last 24h — run: lastb | head"
+            _rec "${_lastb_count} failed login attempts in 24h — check: lastb | head -20"
+        elif (( _lastb_count > 0 )); then
+            _row "Failed logins" "--  ${_lastb_count} failed attempt(s) in last 24h"
+        else
+            _row "Failed logins" "OK  none in last 24h"
+        fi
+    fi
+
+    # ── Active login sessions ─────────────────────────────────────────────────
+    # loginctl list-sessions columns: SESSION  UID  USER  SEAT  TTY
+    if command -v loginctl &>/dev/null; then
+        local _sessions
+        _sessions=$(loginctl list-sessions --no-legend 2>/dev/null | grep -c '.' || echo "0")
+        _sessions=$(echo "${_sessions:-0}" | tr -d '[:space:]')
+        [[ "$_sessions" =~ ^[0-9]+$ ]] || _sessions=0
+        if (( _sessions > 0 )); then
+            local _sess_detail
+            # Show: user@seat (tty) — e.g. shlok@seat0 (tty2)
+            _sess_detail=$(loginctl list-sessions --no-legend 2>/dev/null \
+                | awk '{
+                    user=$3; seat=$4; tty=$5
+                    if (seat == "-") seat=""
+                    if (tty == "-") tty=""
+                    label = user
+                    if (seat != "") label = label "@" seat
+                    if (tty != "") label = label " (" tty ")"
+                    printf "%s  ", label
+                }' | sed 's/[[:space:]]*$//' || echo "")
+            _row "Sessions"    "--  ${_sessions} active: ${_sess_detail}"
+        fi
+    fi
+
 }
 
 security_report() {
@@ -4303,7 +4816,7 @@ security_report() {
         printf "  ${_C_GREEN}${_C_BOLD}${_SYM_OK}  No security issues found${_C_RESET}\n"
     else
         printf "  ${_C_BOLD}${_C_YELLOW}Security Recommendations (${#_RECS[@]})${_C_RESET}\n"
-        printf "  ${_C_DIM}%.54s${_C_RESET}\n" "──────────────────────────────────────────────────────"
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "──────────────────────────────────────────────────────"
         local i=1
         for rec in "${_RECS[@]}"; do
             local display="${rec/\[auto\]/${_C_CYAN}[auto]${_C_RESET}}"
@@ -4313,9 +4826,9 @@ security_report() {
         echo ""
         # Count auto-fixable items
         local _auto_count=0
-        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && (( _auto_count++ )); done
+        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && _auto_count=$(( _auto_count + 1 )); done
         if (( _auto_count > 0 )); then
-            printf "  ${_C_DIM}%d item(s) marked ${_C_CYAN}[auto]${_C_DIM} can be fixed by: shani-health --fix${_C_RESET}\n" "$_auto_count"
+            printf "  ${_C_BOLD}${_C_YELLOW}→  %d item(s) marked [auto] — run: shani-health --fix${_C_RESET}\n" "$_auto_count"
         fi
     fi
     echo ""
@@ -4407,6 +4920,7 @@ system_info() {
 
     # ── Runtime ───────────────────────────────────────────────────────────────
     _section_runtime_health
+    _section_coredump
     _section_system_health
 
     # Summary
@@ -4415,7 +4929,7 @@ system_info() {
         printf "  ${_C_GREEN}${_C_BOLD}${_SYM_OK}  All checks passed — no issues found${_C_RESET}\n"
     else
         printf "  ${_C_BOLD}${_C_YELLOW}Recommendations (${#_RECS[@]})${_C_RESET}\n"
-        printf "  ${_C_DIM}%.54s${_C_RESET}\n" "──────────────────────────────────────────────────────"
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "──────────────────────────────────────────────────────"
         local i=1
         for rec in "${_RECS[@]}"; do
             # Highlight [auto] tag in cyan
@@ -4426,9 +4940,9 @@ system_info() {
         echo ""
         # Count auto-fixable items
         local _auto_count=0
-        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && (( _auto_count++ )); done
+        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && _auto_count=$(( _auto_count + 1 )); done
         if (( _auto_count > 0 )); then
-            printf "  ${_C_DIM}%d item(s) marked ${_C_CYAN}[auto]${_C_DIM} can be fixed by: shani-health --fix${_C_RESET}\n" "$_auto_count"
+            printf "  ${_C_BOLD}${_C_YELLOW}→  %d item(s) marked [auto] — run: shani-health --fix${_C_RESET}\n" "$_auto_count"
         fi
     fi
     echo ""
@@ -4503,16 +5017,18 @@ _fix_services() {
         fi
     fi
 
-    # saned.socket — scanner daemon (socket-activated, just enable if missing)
+    # saned.socket — scanner daemon (socket-activated)
+    # Only enable if explicitly disabled; static = already managed by systemd
     if { command -v sane-find-scanner &>/dev/null || [[ -f /etc/sane.d/dll.conf ]]; } && \
-       [[ "$(systemctl is-enabled saned.socket 2>/dev/null)" != "enabled" ]]; then
+       [[ "$(systemctl is-enabled saned.socket 2>/dev/null)" == "disabled" ]]; then
         _apply_fix "Enable saned.socket"  systemctl enable saned.socket
     fi
 
     # pcscd.socket — smart card / FIDO2 / YubiKey
+    # Only enable if explicitly disabled; static = already managed by systemd
     if { command -v pcsc_scan &>/dev/null || [[ -d /usr/lib/pcsc ]] || \
          systemctl cat pcscd.socket &>/dev/null 2>&1; } && \
-       [[ "$(systemctl is-enabled pcscd.socket 2>/dev/null)" != "enabled" ]]; then
+       [[ "$(systemctl is-enabled pcscd.socket 2>/dev/null)" == "disabled" ]]; then
         _apply_fix "Enable pcscd.socket"  systemctl enable pcscd.socket
     fi
 
@@ -4672,6 +5188,20 @@ _fix_services() {
         _apply_fix "Start tailscaled"  systemctl start tailscaled
     fi
 
+    # xdg-desktop-portal (user service)
+    if { _sysd_user cat xdg-desktop-portal.service &>/dev/null 2>&1 || \
+         command -v xdg-desktop-portal &>/dev/null; } && \
+       ! _sysd_user is-active --quiet xdg-desktop-portal 2>/dev/null; then
+        _log "Starting xdg-desktop-portal for ${_CALLER_USER}..."
+        if _sysd_user start xdg-desktop-portal 2>/dev/null; then
+            _log_ok "xdg-desktop-portal started"
+            fixed=$(( fixed + 1 ))
+        else
+            _log_warn "xdg-desktop-portal start failed"
+            failed=$(( failed + 1 ))
+        fi
+    fi
+
     # Profile Sync Daemon (user service)
     if _sysd_user is-enabled --quiet psd 2>/dev/null && \
        ! _sysd_user is-active --quiet psd 2>/dev/null; then
@@ -4712,6 +5242,54 @@ _fix_services() {
     fi
     if (( _ppd_active && _acpufreq_active )); then
         _apply_fix "Stop conflicting auto-cpufreq"  systemctl disable --now auto-cpufreq
+    fi
+
+    # systemd-coredump.socket — fix only if failed or explicitly disabled
+    if systemctl cat systemd-coredump.socket &>/dev/null 2>&1; then
+        local _cd_en; _cd_en=$(systemctl is-enabled systemd-coredump.socket 2>/dev/null || echo "")
+        if systemctl is-failed --quiet systemd-coredump.socket 2>/dev/null; then
+            _apply_fix "Reset systemd-coredump.socket"  systemctl reset-failed systemd-coredump.socket
+        elif [[ "$_cd_en" == "enabled" ]] && \
+             ! systemctl is-active --quiet systemd-coredump.socket 2>/dev/null; then
+            _apply_fix "Start systemd-coredump.socket"  systemctl start systemd-coredump.socket
+        elif [[ "$_cd_en" != "static" && "$_cd_en" != "enabled" ]]; then
+            _apply_fix "Enable systemd-coredump.socket"  systemctl enable --now systemd-coredump.socket
+        fi
+        # static = socket-activated, no action needed
+    fi
+
+    # machine-id — initialise if missing or empty
+    local _mid; _mid=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [[ -z "$_mid" ]] || ! [[ "$_mid" =~ ^[0-9a-f]{32}$ ]]; then
+        _apply_fix "Initialise /etc/machine-id"  systemd-machine-id-setup
+    fi
+
+    # D-Bus — start if not running
+    if ! systemctl is-active --quiet dbus 2>/dev/null && \
+       ! systemctl is-active --quiet dbus.socket 2>/dev/null; then
+        if systemctl cat dbus.socket &>/dev/null 2>&1; then
+            _apply_fix "Start dbus.socket"  systemctl enable --now dbus.socket
+        elif systemctl cat dbus &>/dev/null 2>&1; then
+            _apply_fix "Start dbus"  systemctl enable --now dbus
+        fi
+    fi
+
+    # systemd-logind — start if enabled but not running
+    if systemctl is-enabled systemd-logind &>/dev/null 2>&1 && \
+       ! systemctl is-active --quiet systemd-logind 2>/dev/null; then
+        _apply_fix "Start systemd-logind"  systemctl start systemd-logind
+    fi
+
+    # Live keymap — sync from vconsole.conf if mismatched
+    local _live_km="" _vconsole_km2=""
+    if command -v localectl &>/dev/null; then
+        _live_km=$(localectl status 2>/dev/null \
+            | awk -F': ' '/VC Keymap/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "")
+    fi
+    _vconsole_km2=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+        | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+    if [[ -n "$_vconsole_km2" && -n "$_live_km" && "$_live_km" != "$_vconsole_km2" ]]; then
+        _apply_fix "Sync live keymap to ${_vconsole_km2}"  localectl set-keymap "$_vconsole_km2"
     fi
 
     echo ""
@@ -4794,8 +5372,9 @@ _fix_security() {
         fi
     fi
 
-    # lynis timer — security audit scheduling
+    # lynis timer — only fix if the unit file actually exists
     if command -v lynis &>/dev/null && \
+       systemctl cat lynis.timer &>/dev/null 2>&1 && \
        ! systemctl is-active --quiet lynis.timer 2>/dev/null; then
         _apply_fix "Enable lynis.timer"  systemctl enable --now lynis.timer
     fi
@@ -4910,9 +5489,10 @@ _fix_boot() {
         fi
     fi
 
-    # flatpak user update timer
+    # flatpak user update timer — enable if not already enabled
     if command -v flatpak &>/dev/null; then
-        if ! _sysd_user is-active --quiet flatpak-update-user.timer 2>/dev/null; then
+        local _fp_en; _fp_en=$(_sysd_user is-enabled flatpak-update-user.timer 2>/dev/null || echo "")
+        if [[ "$_fp_en" != "enabled" && "$_fp_en" != "static" ]]; then
             _log "Enabling flatpak-update-user.timer for ${_CALLER_USER}..."
             if _sysd_user enable --now flatpak-update-user.timer 2>/dev/null; then
                 _log_ok "flatpak-update-user.timer enabled"
@@ -4977,15 +5557,25 @@ _fix_boot() {
         fi
     fi
 
-    # shani-update.timer — enable as the calling user
-    if ! _sysd_user is-active --quiet shani-update.timer 2>/dev/null && \
-       _sysd_user is-enabled --quiet shani-update.timer 2>/dev/null; then
+    # shani-update.timer — enable as the calling user if not yet enabled;
+    # if enabled but inactive (stopped manually), start it
+    local _su_en; _su_en=$(_sysd_user is-enabled shani-update.timer 2>/dev/null || echo "")
+    if [[ "$_su_en" != "enabled" && "$_su_en" != "static" ]]; then
         _log "Enabling shani-update.timer for ${_CALLER_USER}..."
         if _sysd_user enable --now shani-update.timer 2>/dev/null; then
             _log_ok "shani-update.timer enabled"
             fixed=$(( fixed + 1 ))
         else
             _log_warn "shani-update.timer enable failed"
+            failed=$(( failed + 1 ))
+        fi
+    elif ! _sysd_user is-active --quiet shani-update.timer 2>/dev/null; then
+        _log "Starting shani-update.timer for ${_CALLER_USER}..."
+        if _sysd_user start shani-update.timer 2>/dev/null; then
+            _log_ok "shani-update.timer started"
+            fixed=$(( fixed + 1 ))
+        else
+            _log_warn "shani-update.timer start failed"
             failed=$(( failed + 1 ))
         fi
     fi
@@ -5769,7 +6359,7 @@ analyze_storage() {
 
     # ── Part 2: Deep analysis (requires subvolid=5 mount) ────────────────────
     echo ""
-    printf "  ${_C_DIM}%.54s${_C_RESET}\n" "── Deep Analysis ──────────────────────────────────────"
+    printf "  ${_C_DIM}%s${_C_RESET}\n" "── Deep Analysis ──────────────────────────────────────"
 
     # ── Filesystem-level usage detail ────────────────────────────────────────
     _head "Filesystem Usage"
@@ -5969,8 +6559,7 @@ analyze_storage() {
         _row2 "--  deduplicates @blue/@green and backup snapshots across slots"
     else
         hints=$(( hints + 1 ))
-        _row "Dedup"      "--  duperemove not installed — install for cross-slot deduplication"
-        _row2 "--  pacman -S duperemove  then: shani-deploy --optimize"
+        _row "Dedup"      "--  duperemove not installed — cross-slot deduplication unavailable"
     fi
 
     # bees status — only flag here if not already reported in Part 1 as running
@@ -5989,7 +6578,7 @@ analyze_storage() {
     echo ""
     if [[ ${#_RECS[@]} -gt 0 ]]; then
         printf "  ${_C_BOLD}${_C_YELLOW}Recommendations (${#_RECS[@]})${_C_RESET}\n"
-        printf "  ${_C_DIM}%.54s${_C_RESET}\n" "──────────────────────────────────────────────────────"
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "──────────────────────────────────────────────────────"
         local i=1
         for rec in "${_RECS[@]}"; do
             local display="${rec/\[auto\]/${_C_CYAN}[auto]${_C_RESET}}"
@@ -5999,9 +6588,9 @@ analyze_storage() {
         echo ""
         # Count auto-fixable items
         local _auto_count=0
-        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && (( _auto_count++ )); done
+        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && _auto_count=$(( _auto_count + 1 )); done
         if (( _auto_count > 0 )); then
-            printf "  ${_C_DIM}%d item(s) marked ${_C_CYAN}[auto]${_C_DIM} can be fixed by: shani-health --fix${_C_RESET}\n" "$_auto_count"
+            printf "  ${_C_BOLD}${_C_YELLOW}→  %d item(s) marked [auto] — run: shani-health --fix${_C_RESET}\n" "$_auto_count"
         fi
     fi
     echo ""
@@ -6031,7 +6620,7 @@ _focused_summary() {
         printf "  ${_C_GREEN}${_C_BOLD}${_SYM_OK}  No issues found${_C_RESET}\n"
     else
         printf "  ${_C_BOLD}${_C_YELLOW}Recommendations (${#_RECS[@]})${_C_RESET}\n"
-        printf "  ${_C_DIM}%.54s${_C_RESET}\n" "──────────────────────────────────────────────────────"
+        printf "  ${_C_DIM}%s${_C_RESET}\n" "──────────────────────────────────────────────────────"
         local i=1
         for rec in "${_RECS[@]}"; do
             local display="${rec/\[auto\]/${_C_CYAN}[auto]${_C_RESET}}"
@@ -6040,9 +6629,9 @@ _focused_summary() {
         done
         echo ""
         local _auto_count=0
-        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && (( _auto_count++ )); done
+        for _r in "${_RECS[@]}"; do [[ "$_r" == *"[auto]"* ]] && _auto_count=$(( _auto_count + 1 )); done
         if (( _auto_count > 0 )); then
-            printf "  ${_C_DIM}%d item(s) marked ${_C_CYAN}[auto]${_C_DIM} can be fixed by: shani-health --fix${_C_RESET}\n" "$_auto_count"
+            printf "  ${_C_BOLD}${_C_YELLOW}→  %d item(s) marked [auto] — run: shani-health --fix${_C_RESET}\n" "$_auto_count"
         fi
     fi
     echo ""

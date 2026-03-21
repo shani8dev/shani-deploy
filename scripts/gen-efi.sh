@@ -5,6 +5,7 @@
 #   ./gen-efi.sh configure <target_slot>  — generate/update UKI for a slot
 #   ./gen-efi.sh enroll-mok               — stage MOK enrollment without rebuilding UKI
 #   ./gen-efi.sh enroll-tpm2              — enroll TPM2 for automatic LUKS unlock
+#   ./gen-efi.sh cleanup-mok             — remove old MOK keys after new key is confirmed
 #
 # ENHANCED:
 # - Validates target slot against booted slot
@@ -37,11 +38,12 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
+    echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
     exit 1
 fi
 
@@ -137,13 +139,6 @@ _mokutil_hash_enroll() {
     local tmp_hash tmp_err
     tmp_hash=$(mktemp)
     tmp_err=$(mktemp)
-
-    # Check if this key is already pending enrollment (queued but not yet confirmed)
-    if mokutil --list-new 2>/dev/null | grep -q .; then
-        log "MOK enrollment already pending — reboot and confirm in MokManager"
-        rm -f "$tmp_hash" "$tmp_err"
-        return 0
-    fi
 
     local hash_ok=0 import_ok=0
     if mokutil --generate-hash=shanios > "$tmp_hash" 2>"$tmp_err"; then
@@ -446,34 +441,170 @@ ensure_crypttab() {
 }
 
 
+# _get_mok_fingerprint <der_file>
+# Print the lowercase no-colon SHA1 fingerprint of a DER certificate.
+_get_mok_fingerprint() {
+    openssl x509 -in "$1" -inform DER -noout -fingerprint -sha1 2>/dev/null \
+        | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo ""
+}
+
+# _current_key_enrolled — return 0 if MOK.der is enrolled in firmware.
+# Uses mokutil --test-key which is the correct API for this check.
+_current_key_enrolled() {
+    local mok_der="$1"
+    [[ ! -f "$mok_der" ]] && return 1
+    mokutil --test-key "$mok_der" 2>/dev/null | grep -qi 'is already enrolled'
+}
+
+# _has_old_enrolled_keys — return 0 if any enrolled key does NOT match MOK.der.
+_has_old_enrolled_keys() {
+    local mok_der="$1"
+    local local_fp
+    local_fp=$(_get_mok_fingerprint "$mok_der")
+    [[ -z "$local_fp" ]] && return 1
+
+    # Parse all SHA1 fingerprints from enrolled list
+    local enrolled_fps
+    enrolled_fps=$(mokutil --list-enrolled 2>/dev/null \
+        | grep -i 'SHA1 Fingerprint' \
+        | sed 's/.*: //' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+    while IFS= read -r fp; do
+        [[ -z "$fp" ]] && continue
+        [[ "$fp" != "$local_fp" ]] && return 0   # found a foreign key
+    done <<< "$enrolled_fps"
+    return 1
+}
+
 # _stage_mok_enrollment — stage MOK key enrollment via mokutil.
-# Shared by reenroll_mok_keys and enroll_mok.
+# Shared by reenroll_mok_keys, enroll_mok, and generate_uki (key rotation path).
 #
-# If the key is already enrolled in firmware, nothing more is needed.
-# If not, stages it via mokutil --import so MokManager presents it on next boot.
-# The user must confirm enrollment in MokManager once — this is a firmware
-# security gate and cannot be bypassed from a running OS.
+# Behaviour:
+#   - Current key already enrolled            → silent, nothing to do
+#   - Current key not enrolled, none pending  → stage via mokutil --import
+#   - Current key not enrolled, different key pending → clear pending, re-stage
+#   - Current key not enrolled, same key pending      → already queued, skip
+#
+# Always warns if old (different) keys remain enrolled — user should run
+# "gen-efi cleanup-mok" after confirming the new key.
 _stage_mok_enrollment() {
     local mok_der="/etc/secureboot/keys/MOK.der"
 
-    # Always copy DER to ESP and stage enrollment regardless of whether Secure Boot
-    # is currently enabled. If SB is off now but the user enables it later, the key
-    # must already be enrolled — otherwise the system will not boot.
-    cp "$mok_der" "$ESP/EFI/BOOT/MOK.der"         || log_warn "Failed to copy MOK.der to ESP"
+    # Always copy DER to ESP — needed for MokManager manual fallback and TPM re-enroll
+    cp "$mok_der" "$ESP/EFI/BOOT/MOK.der" || log_warn "Failed to copy MOK.der to ESP"
 
-    # Check if this exact key is already enrolled in firmware — nothing to do
-    local local_fp
-    local_fp=$(openssl x509 -in "$mok_der" -inform DER -noout -fingerprint -sha1         2>/dev/null | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
-    if [[ -n "$local_fp" ]] &&        mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr '[:upper:]' '[:lower:]'        | grep -q "$local_fp"; then
-        log "MOK key already enrolled in firmware — no action needed"
+    # Current key already enrolled — nothing to do
+    if _current_key_enrolled "$mok_der"; then
+        log "MOK key already enrolled in firmware"
+        # Warn if stale keys also exist (leftover from a previous rotation)
+        if _has_old_enrolled_keys "$mok_der"; then
+            log_warn "Old MOK keys detected in firmware — run: gen-efi cleanup-mok"
+        fi
         return 0
     fi
 
-    # Key not yet enrolled — stage it via mokutil --import --hash-file.
-    # MokManager will prompt the user to confirm on next boot (one-time only).
-    _mokutil_hash_enroll "$mok_der"
+    # Current key not enrolled — check pending queue
+    local pending_fps
+    pending_fps=$(mokutil --list-new 2>/dev/null \
+        | grep -i 'SHA1 Fingerprint' \
+        | sed 's/.*: //' | tr -d ':' | tr '[:upper:]' '[:lower:]')
 
-    log_warn "ACTION REQUIRED: reboot and confirm MOK enrollment in the MokManager prompt"
+    local local_fp
+    local_fp=$(_get_mok_fingerprint "$mok_der")
+
+    if [[ -n "$local_fp" ]] && echo "$pending_fps" | grep -qx "$local_fp"; then
+        # Correct key is already queued — just remind user
+        log "MOK enrollment already pending for current key"
+        log_warn "ACTION REQUIRED: reboot and confirm MOK enrollment in MokManager"
+        return 0
+    fi
+
+    # A different key is pending — clear it and re-stage with current key
+    if [[ -n "$pending_fps" ]]; then
+        log_warn "Pending MOK enrollment is for a different key — clearing and re-staging"
+        mokutil --revoke-import 2>/dev/null || log_warn "mokutil --revoke-import failed — proceeding anyway"
+    fi
+
+    # Stage enrollment
+    _mokutil_hash_enroll "$mok_der"
+    log_warn "ACTION REQUIRED: reboot and confirm MOK enrollment in MokManager"
+
+    # Inform about old enrolled keys that will remain until cleanup
+    if _has_old_enrolled_keys "$mok_der"; then
+        log_warn "Old MOK keys remain enrolled — after reboot run: gen-efi cleanup-mok"
+    fi
+}
+
+# cleanup_mok — delete enrolled MOK keys that don't match the current MOK.der.
+#
+# Safe to run only AFTER the new key has been confirmed enrolled in firmware.
+# Deletes stale keys left over from a key rotation (e.g. image shipped with
+# a new key replacing the old one).
+#
+# Each deletion is staged via mokutil --delete and confirmed in MokManager on
+# the next reboot — same one-time prompt as enrollment.
+cleanup_mok() {
+    if in_chroot; then
+        error_exit "cleanup-mok must run on the live booted system, not inside a chroot"
+    fi
+
+    local mok_der="/etc/secureboot/keys/MOK.der"
+    [[ ! -f "$mok_der" ]] && error_exit "MOK.der not found at ${mok_der}"
+
+    # Ensure current key is enrolled before deleting anything
+    if ! _current_key_enrolled "$mok_der"; then
+        error_exit "Current MOK key is not yet enrolled — enroll it first (reboot and confirm MokManager), then run cleanup-mok"
+    fi
+
+    if ! _has_old_enrolled_keys "$mok_der"; then
+        log "No old MOK keys to clean up — firmware is up to date"
+        return 0
+    fi
+
+    local local_fp
+    local_fp=$(_get_mok_fingerprint "$mok_der")
+
+    log "Staging deletion of old MOK keys..."
+
+    local deleted=0
+
+    # mokutil --export writes each enrolled cert as MoK-0001, MoK-0002 etc into CWD.
+    # Work in a temp dir so exported files don't land in an unpredictable location.
+    local export_dir
+    export_dir=$(mktemp -d)
+    # Run export in a known CWD so MoK-* files land predictably
+    pushd "$export_dir" >/dev/null
+    mokutil --export 2>/dev/null || true
+    popd >/dev/null
+    for cert_file in "$export_dir"/MoK-*; do  # files exported directly into export_dir
+        [[ -f "$cert_file" ]] || continue
+        local fp
+        fp=$(openssl x509 -in "$cert_file" -inform DER -noout -fingerprint -sha1 2>/dev/null \
+            | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]' || echo "")
+        if [[ -n "$fp" && "$fp" != "$local_fp" ]]; then
+            log "Staging deletion of old key: ${fp}"
+            local tmp_hash_del tmp_err_del
+            tmp_hash_del=$(mktemp)
+            tmp_err_del=$(mktemp)
+            if mokutil --generate-hash=shanios > "$tmp_hash_del" 2>"$tmp_err_del" && \
+               mokutil --delete "$cert_file" --hash-file "$tmp_hash_del" >"$tmp_err_del" 2>&1; then
+                (( deleted++ ))
+            else
+                log_warn "Failed to stage deletion for ${fp}: $(cat "$tmp_err_del" 2>/dev/null)"
+                log_warn "Manual removal: mokutil --delete <key.der>"
+            fi
+            rm -f "$tmp_hash_del" "$tmp_err_del"
+        fi
+    done
+    rm -rf "$export_dir"
+
+    if (( deleted > 0 )); then
+        log_warn "ACTION REQUIRED: reboot and confirm MOK key deletion in MokManager (${deleted} old key(s) staged for removal)"
+    else
+        log_warn "Could not automatically stage old key deletion — remove manually via MokManager"
+        log_warn "  List enrolled: mokutil --list-enrolled"
+        log_warn "  Delete a key:  mokutil --delete <key.der>"
+    fi
 }
 
 
@@ -576,15 +707,14 @@ generate_uki() {
     mkdir -p "$EFI_DIR"
 
     # If keys were just generated, re-sign existing EFI binaries and stage enrollment
-    # now that ESP is mounted.
+    # now that ESP is mounted. reenroll_mok_keys calls update_bootloader force
+    # internally, so skip the regular update_bootloader call below in that case.
     if [[ $MOK_KEYS_GENERATED -eq 1 ]]; then
         reenroll_mok_keys
+    else
+        # Update shim and systemd-boot on the ESP if source binaries are newer.
+        update_bootloader
     fi
-
-    # Update shim and systemd-boot on the ESP if source binaries are newer.
-    # Must run after reenroll_mok_keys (which may have just installed new keys)
-    # so the sign step uses the correct current keys.
-    update_bootloader
 
     local kernel_ver
     kernel_ver=$(get_kernel_version)
@@ -605,6 +735,13 @@ generate_uki() {
 
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
     sign_efi_binary "$uki_path"
+
+    # Key rotation: if the current key is not yet enrolled in firmware, stage
+    # enrollment automatically. Silent when already enrolled (common case).
+    # Skipped in chroot — mokutil needs live firmware access.
+    if ! in_chroot; then
+        _stage_mok_enrollment
+    fi
 }
 
 
@@ -662,7 +799,7 @@ enroll_mok() {
         local uki="$EFI_DIR/${OS_NAME}-${slot}.efi"
         if [[ -f "$uki" ]]; then
             log "Re-signing ${uki}"
-            sign_efi_binary "$uki" || log_warn "Failed to re-sign ${uki} — continuing"
+            sign_efi_binary "$uki" 2>/dev/null || log_warn "Failed to re-sign ${uki} — continuing"
         fi
     done
 
@@ -785,11 +922,15 @@ case "${1:-}" in
     enroll-tpm2)
         enroll_tpm2
         ;;
+    cleanup-mok)
+        cleanup_mok
+        ;;
     *)
         echo "Usage:"
         echo "  $0 configure <target_slot>"
         echo "  $0 enroll-mok"
         echo "  $0 enroll-tpm2"
+        echo "  $0 cleanup-mok"
         exit 1
         ;;
 esac

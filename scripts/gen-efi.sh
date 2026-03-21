@@ -738,10 +738,9 @@ generate_uki() {
 
     # Key rotation: if the current key is not yet enrolled in firmware, stage
     # enrollment automatically. Silent when already enrolled (common case).
-    # Skipped in chroot — mokutil needs live firmware access.
-    if ! in_chroot; then
-        _stage_mok_enrollment
-    fi
+    # Runs in chroot too — shani-deploy bind-mounts /sys so mokutil can reach
+    # the live EFI variable store via /sys/firmware/efi/efivars.
+    _stage_mok_enrollment
 }
 
 

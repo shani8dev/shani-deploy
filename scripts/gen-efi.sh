@@ -132,7 +132,7 @@ reenroll_mok_keys() {
     # Force-restore + re-sign bootloader binaries (grubx64.efi, shim)
     # then stage MOK enrollment via the shared helpers.
     update_bootloader force
-    _stage_mok_enrollment
+    _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — EFI binaries were re-signed successfully"
 }
 
 _mokutil_hash_enroll() {
@@ -273,11 +273,11 @@ sign_efi_binary() {
     fi
 
     # Not signed with our key — sign it now.
-    # Keep a backup of the original so we can restore it if sbverify fails
-    # after mv — otherwise the ESP has a signed-but-corrupt binary.
-    local tmp_signed tmp_backup
-    tmp_signed=$(mktemp "${file}.signed.XXXXXX")
-    tmp_backup=$(mktemp "${file}.orig.XXXXXX")
+    # Use fixed .tmp names (not mktemp) so the EXIT trap and any manual cleanup
+    # can find and remove them reliably. Only one root process runs at a time.
+    local tmp_signed="${file}.signed.tmp"
+    local tmp_backup="${file}.orig.tmp"
+    rm -f "$tmp_signed" "$tmp_backup"
     cp "$file" "$tmp_backup" || { rm -f "$tmp_signed" "$tmp_backup"; error_exit "Failed to backup ${file} before signing"; }
     if sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$tmp_signed" "$file"; then
         mv "$tmp_signed" "$file"
@@ -860,9 +860,6 @@ generate_uki() {
     # Ensure keys exist — generate if missing
     ensure_mok_keys
 
-    # Ensure ESP is unmounted and any stale cmdline tmp file is cleaned up on exit
-    trap 'cleanup_esp; rm -f "${CMDLINE_FILE}.tmp"' EXIT
-
     # Ensure ESP is mounted before we start
     ensure_esp_mounted
     mkdir -p "$EFI_DIR"
@@ -881,6 +878,10 @@ generate_uki() {
     kernel_ver=$(get_kernel_version)
     log "Using kernel: $kernel_ver"
     local uki_path="$EFI_DIR/${OS_NAME}-${slot}.efi"
+
+    # Now that uki_path is defined, arm the EXIT trap to clean up tmp files
+    # and unmount ESP if we mounted it.
+    trap 'cleanup_esp; rm -f "${CMDLINE_FILE}.tmp" "${uki_path}.tmp" "${uki_path}.tmp.signed.tmp" "${uki_path}.tmp.orig.tmp"' EXIT
 
     # ensure_crypttab before generate_cmdline — crypttab must exist before
     # dracut runs, and setting it up first keeps the logical order clear.
@@ -901,8 +902,9 @@ generate_uki() {
         error_exit "Kernel command line is empty."
     fi
 
-    dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
-    sign_efi_binary "$uki_path"
+    dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "${uki_path}.tmp" || error_exit "dracut failed"
+    sign_efi_binary "${uki_path}.tmp"
+    mv "${uki_path}.tmp" "$uki_path" || error_exit "Failed to move signed UKI into place"
 
     # Key rotation: if the current key is not yet enrolled in firmware, stage
     # enrollment automatically. Silent when already enrolled (common case).
@@ -968,7 +970,7 @@ enroll_mok() {
         local uki="$EFI_DIR/${OS_NAME}-${slot}.efi"
         if [[ -f "$uki" ]]; then
             log "Re-signing ${uki}"
-            sign_efi_binary "$uki" 2>/dev/null || log_warn "Failed to re-sign ${uki} — continuing"
+            ( sign_efi_binary "$uki" ) || log_warn "Failed to re-sign ${uki} — continuing"
         fi
     done
 

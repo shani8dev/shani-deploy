@@ -57,6 +57,7 @@ readonly ROOT_DEV="/dev/disk/by-label/shani_root"
 readonly MIN_FREE_SPACE_MB=10240
 readonly MIN_FILE_SIZE=10485760
 readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
+readonly GENEFI_SCRIPT_URL="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/gen-efi.sh"
 readonly DEPLOY_PENDING="/data/deployment_pending"
 readonly BOOT_FAILURE_FILE="/data/boot_failure"
 readonly BOOT_HARD_FAILURE_FILE="/data/boot_hard_failure"
@@ -90,6 +91,7 @@ declare -g DRY_RUN="${DRY_RUN:-no}"
 declare -g VERBOSE="${VERBOSE:-no}"
 declare -g SKIP_SELF_UPDATE="${SKIP_SELF_UPDATE:-no}"
 declare -g SELF_UPDATE_DONE="${SELF_UPDATE_DONE:-}"
+declare -g UPDATE_GENEFI="${UPDATE_GENEFI:-no}"
 declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
 declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-}"
 declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
@@ -1192,6 +1194,7 @@ self_update() {
     rm -f "$temp"
 }
 
+
 #####################################
 ### System Inhibit                ###
 #####################################
@@ -1234,6 +1237,8 @@ inhibit_system() {
 ### Cleanup Functions             ###
 #####################################
 
+# cleanup_old_backups — keep only the most recent subvolume backup per slot.
+# Runs lazily after a successful deploy. Does NOT touch the ESP.
 cleanup_old_backups() {
     log_verbose "Scanning for old backup subvolumes to clean up..."
     set +e
@@ -1481,9 +1486,50 @@ generate_uki() {
 
     log_verbose "Preparing chroot environment for @${slot}..."
     prepare_chroot "$slot"
-    trap 'cleanup_chroot' RETURN
+    # RETURN trap fires on normal function return; EXIT trap fires when die() calls exit 1.
+    # Both are needed — cleanup_chroot must run regardless of how we leave this function.
+    trap 'cleanup_chroot' RETURN EXIT
 
     [[ "${DRY_RUN}" == "yes" ]] && return 0
+
+    # Inject gen-efi into the chroot so the candidate image always runs a
+    # known-good version, regardless of what was baked into the image.
+    # With --update-genefi: download fresh from upstream directly into the chroot.
+    # Otherwise: copy the host's installed copy into the chroot.
+    # The chroot root is a ro btrfs subvolume — remount rw for the injection
+    # only, then restore ro immediately after. The chroot copy is transient.
+    local chroot_genefi="$MOUNT_DIR${GENEFI_SCRIPT}"
+    local injected=0
+    local tmp_genefi=""
+    if [[ "${UPDATE_GENEFI:-no}" == "yes" ]]; then
+        tmp_genefi=$(mktemp /run/shanios-genefi-update.XXXXXX)
+        log "Downloading gen-efi from upstream for chroot injection..."
+        if download_file "$GENEFI_SCRIPT_URL" "$tmp_genefi" 1 && \
+           grep -q "#!/bin/bash" "$tmp_genefi" && \
+           grep -q "generate_uki\|generate_cmdline" "$tmp_genefi"; then
+            injected=1
+        else
+            log_warn "gen-efi: downloaded copy failed sanity check — falling back to host copy"
+            rm -f "$tmp_genefi"; tmp_genefi=""
+        fi
+    fi
+
+    btrfs property set -f -ts "$MOUNT_DIR" ro false 2>/dev/null \
+        || log_warn "Could not set chroot subvolume rw — gen-efi injection may fail"
+    mkdir -p "$(dirname "$chroot_genefi")"
+    if (( injected )) && [[ -n "$tmp_genefi" ]]; then
+        cp -f "$tmp_genefi" "$chroot_genefi" \
+            && log "gen-efi: upstream version injected into chroot" \
+            || { log_warn "gen-efi: failed to install downloaded copy — falling back to host copy"; injected=0; }
+        rm -f "$tmp_genefi"
+    fi
+    if (( ! injected )); then
+        cp -f "$GENEFI_SCRIPT" "$chroot_genefi" \
+            || log_warn "Could not inject host gen-efi into chroot — using image copy"
+    fi
+    chmod +x "$chroot_genefi" 2>/dev/null || true
+    btrfs property set -f -ts "$MOUNT_DIR" ro true 2>/dev/null \
+        || log_warn "Could not restore chroot subvolume to ro after gen-efi injection"
 
     log "Generating unified kernel image (UKI) for @${slot}..."
     local result=0
@@ -1494,6 +1540,7 @@ generate_uki() {
         result=1
     fi
 
+    trap - EXIT  # RETURN trap still fires; clear EXIT so it doesn't double-fire on normal exit
     return $result
 }
 
@@ -1644,34 +1691,88 @@ restore_candidate() {
         fi
     fi
 
+    # _rc_slot: the slot that remains active (booted). Used for slot markers,
+    # boot entries, and EFI fallback copy. Guard against both being empty.
+    local _rc_slot="${CURRENT_SLOT:-${rc_booted}}"
+    [[ -z "$_rc_slot" ]] && _rc_slot="$rc_booted"
+    local _restore_ok=0
+    local _efi_ok=0
+
+    # Helper: clean up temp_update subvolumes. Called from every path that
+    # holds $MOUNT_DIR mounted at subvolid=5 before unmounting.
+    _rc_cleanup_temp() {
+        btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
+            btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
+        btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
+            btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+    }
+
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
 
         if [[ "${CANDIDATE_MODIFIED:-no}" != "yes" ]]; then
-            # @CANDIDATE_SLOT was never touched (e.g. extraction failed before delete).
-            # The backup is identical to the current slot — skip the restore entirely
-            # to avoid a pointless delete + re-snapshot cycle.
+            # @CANDIDATE_SLOT was never touched — subvolume and EFI are already
+            # correct. Delete the identical backup and temp_update, write markers.
             log "Skipping subvolume restore — @${CANDIDATE_SLOT} was not modified (backup is identical)"
-        else
-        log "Restoring @${CANDIDATE_SLOT} from backup @${BACKUP_NAME}..."
+            _rc_cleanup_temp
+            btrfs property set -f -ts "$MOUNT_DIR/@${BACKUP_NAME}" ro false 2>/dev/null || true
+            btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" 2>/dev/null && \
+                log "Deleted unused backup @${BACKUP_NAME} (candidate was not modified)"
+            echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
+            echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
+            _restore_ok=1
+            _efi_ok=1  # candidate was never touched — EFI is already correct
 
-        if [[ "$CANDIDATE_SLOT" == "$rc_booted" ]]; then
+        elif [[ "$CANDIDATE_SLOT" == "$rc_booted" ]]; then
+            # Candidate is the booted slot — must not touch it. Write markers
+            # to reflect current reality; EFI and subvolume are intact.
             log_warn "Refusing to touch @${CANDIDATE_SLOT} — it is the currently booted slot"
             log_warn "Skipping subvolume restore, booted system is intact"
+            _rc_cleanup_temp
+            echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
+            echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
+            _restore_ok=1
+            _efi_ok=1  # booted slot is intact — EFI is already correct
+
         else
+            log "Restoring @${CANDIDATE_SLOT} from backup @${BACKUP_NAME}..."
             if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
                 btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
             else
                 log_warn "@${CANDIDATE_SLOT} does not exist, restoring directly from backup without delete"
             fi
-            btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null &&                 log_success "Restored @${CANDIDATE_SLOT} from @${BACKUP_NAME}"
-            btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+            if btrfs subvolume snapshot "$MOUNT_DIR/@${BACKUP_NAME}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null; then
+                log_success "Restored @${CANDIDATE_SLOT} from @${BACKUP_NAME}"
+                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+                _restore_ok=1
+            else
+                log_error "Subvolume restore failed — @${CANDIDATE_SLOT} may be in an inconsistent state"
+            fi
+
+            if (( _restore_ok )); then
+                echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
+                echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
+                _rc_cleanup_temp
+                umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+                if generate_uki "$CANDIDATE_SLOT"; then
+                    log "UKI regenerated for @${CANDIDATE_SLOT} from restored subvolume"
+                    _efi_ok=1
+                else
+                    log_warn "UKI regeneration failed — attempting to copy @${_rc_slot} UKI as fallback"
+                    if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${_rc_slot}.efi" \
+                          "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CANDIDATE_SLOT}.efi" 2>/dev/null; then
+                        log_warn "Fallback EFI copy succeeded — @${CANDIDATE_SLOT} will boot with @${_rc_slot} kernel until next deploy"
+                        _efi_ok=1
+                    else
+                        log_error "EFI restore failed — @${CANDIDATE_SLOT} subvolume is restored but its EFI is broken"
+                        log_error "DO NOT reboot into @${CANDIDATE_SLOT} — run: shani-deploy --rollback"
+                    fi
+                fi
+            else
+                _rc_cleanup_temp
+            fi
         fi
 
-        local _rc_slot="${CURRENT_SLOT:-${rc_booted}}"
-        echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null ||             log_warn "Failed to write current-slot"
-        echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null ||             log_warn "Failed to write previous-slot"
-        fi
     else
         log_error "No backup available for @${CANDIDATE_SLOT} — snapshotting @${CURRENT_SLOT} as fallback"
         if [[ -n "${CURRENT_SLOT:-}" && "$CANDIDATE_SLOT" != "$rc_booted" ]] && \
@@ -1680,60 +1781,60 @@ restore_candidate() {
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
                 btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null || true
             fi
-            btrfs subvolume snapshot "$MOUNT_DIR/@${CURRENT_SLOT}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null && \
-                if btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null; then
-                    log "Snapshotted @${CURRENT_SLOT} → @${CANDIDATE_SLOT}"
-                else
-                    log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
-                fi
-
-            local _rc_slot="${CURRENT_SLOT:-${rc_booted}}"
-            echo "$_rc_slot" > "$MOUNT_DIR/@data/current-slot" 2>/dev/null || \
-                log_warn "Failed to write current-slot"
-            echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || \
-                log_warn "Failed to write previous-slot"
-
-            # Unmount before chroot for UKI generation
-            umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
-            if generate_uki "$CANDIDATE_SLOT"; then
-                log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
+            if btrfs subvolume snapshot "$MOUNT_DIR/@${CURRENT_SLOT}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null; then
+                btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
+                log "Snapshotted @${CURRENT_SLOT} → @${CANDIDATE_SLOT}"
+                _restore_ok=1
             else
-                log_warn "UKI generation failed — copying @${CURRENT_SLOT} UKI as fallback"
-                cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CURRENT_SLOT}.efi" \
-                   "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CANDIDATE_SLOT}.efi" 2>/dev/null || true
+                log_warn "Snapshot failed — @${CANDIDATE_SLOT} may be inconsistent"
+            fi
+
+            if (( _restore_ok )); then
+                echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
+                echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
+                _rc_cleanup_temp
+                umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+                if generate_uki "$CANDIDATE_SLOT"; then
+                    log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
+                    _efi_ok=1
+                else
+                    log_warn "UKI generation failed — attempting to copy @${CURRENT_SLOT} UKI as fallback"
+                    if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CURRENT_SLOT}.efi" \
+                          "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CANDIDATE_SLOT}.efi" 2>/dev/null; then
+                        log_warn "Fallback EFI copy succeeded — @${CANDIDATE_SLOT} will boot with @${CURRENT_SLOT} kernel until next deploy"
+                        _efi_ok=1
+                    else
+                        log_error "EFI restore failed — @${CANDIDATE_SLOT} subvolume is restored but its EFI is broken"
+                        log_error "DO NOT reboot into @${CANDIDATE_SLOT} — run: shani-deploy --rollback"
+                    fi
+                fi
+            else
+                _rc_cleanup_temp
             fi
         else
+            _rc_cleanup_temp
             log_error "Cannot restore @${CANDIDATE_SLOT} — no backup and cannot safely snapshot. System remains on @${CURRENT_SLOT:-booted slot}. Run --rollback after next reboot to clean up."
         fi
     fi
 
-    btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
-        btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null
-    btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
-        btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null
-
-    # If @CANDIDATE_SLOT was never modified the backup snapshot is identical to
-    # the live slot — delete it now rather than leaving it for cleanup_old_backups.
-    if [[ "${CANDIDATE_MODIFIED:-no}" != "yes" ]] && \
-       [[ -n "${BACKUP_NAME:-}" ]] && \
-       btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
-        btrfs property set -f -ts "$MOUNT_DIR/@${BACKUP_NAME}" ro false 2>/dev/null || true
-        btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" 2>/dev/null && \
-            log "Deleted unused backup @${BACKUP_NAME} (candidate was not modified)"
-    fi
-
     umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
-    # Clear the reboot-needed marker — the deployment that wrote it was just
-    # rolled back, so showing a restart dialog for that version is misleading.
     rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
-    # Clear all boot failure markers — rollback restores a clean slot regardless
-    # of whether it was triggered by shani-update (which clears them in
-    # _handle_fallback_boot) or by a direct shani-deploy --rollback invocation.
     rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
 
-    finalize_boot_entries "${CURRENT_SLOT:-${rc_booted}}" "$CANDIDATE_SLOT" "no-tries" || \
-        log_warn "Could not update boot entries — you may need to set the default boot slot manually"
+    # Update boot entries only when the candidate slot was actually restored
+    # and is not the currently booted slot (which would invert the entry roles).
+    if (( _restore_ok )) && [[ "$CANDIDATE_SLOT" != "$rc_booted" ]]; then
+        if ! (( _efi_ok )); then
+            log_error "WARNING: @${CANDIDATE_SLOT} subvolume restored but EFI could not be fixed"
+            log_error "Boot entries will keep @${_rc_slot} as default — DO NOT select @${CANDIDATE_SLOT} at boot"
+            log_error "Fix: after reboot run: shani-deploy --rollback"
+        fi
+        finalize_boot_entries "${_rc_slot}" "$CANDIDATE_SLOT" "no-tries" || \
+            log_warn "Could not update boot entries — you may need to set the default boot slot manually"
+    elif ! (( _restore_ok )); then
+        log_warn "Subvolume restore did not complete — skipping boot entry update"
+    fi
 
     log_error "Emergency rollback complete — system remains on @${CURRENT_SLOT:-${rc_booted}}"
     log_error "Please reboot to ensure a clean system state"
@@ -1829,11 +1930,24 @@ rollback_system() {
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
 
         # Generate UKI from within failed_slot chroot (snapshot of booted, so kernel is identical)
-        generate_uki "$failed_slot" || {
-            log_warn "UKI generation failed — copying @${booted} UKI as fallback"
-            cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
-               "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null || true
-        }
+        local _rb_efi_ok=0
+        if generate_uki "$failed_slot"; then
+            _rb_efi_ok=1
+        else
+            log_warn "UKI generation failed — attempting to copy @${booted} UKI as fallback"
+            if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
+                  "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null; then
+                log_warn "Fallback EFI copy succeeded — @${failed_slot} will boot with @${booted} kernel"
+                _rb_efi_ok=1
+            else
+                log_error "EFI restore failed — @${failed_slot} subvolume is ready but its EFI is broken"
+                log_error "DO NOT reboot into @${failed_slot} — run: shani-deploy --rollback again after reboot"
+            fi
+        fi
+        if ! (( _rb_efi_ok )); then
+            log_error "WARNING: rollback subvolume is ready but EFI could not be fixed"
+            log_error "Boot entries will keep @${booted} as default — DO NOT select @${failed_slot} at boot"
+        fi
         finalize_boot_entries "$booted" "$failed_slot" "no-tries"
         rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
         # Clear all boot failure markers so a direct --rollback invocation leaves
@@ -1882,11 +1996,24 @@ rollback_system() {
     safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || umount -R -l "$MOUNT_DIR" 2>/dev/null || die "Cannot unmount before UKI generation"
 
     # Generate UKI for restored slot — booted slot UKI is already valid.
-    generate_uki "$failed_slot" || {
-        log_warn "UKI generation failed — copying @${booted} UKI as fallback"
-        cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
-           "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null || true
-    }
+    local _rb_efi_ok=0
+    if generate_uki "$failed_slot"; then
+        _rb_efi_ok=1
+    else
+        log_warn "UKI generation failed — attempting to copy @${booted} UKI as fallback"
+        if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
+              "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null; then
+            log_warn "Fallback EFI copy succeeded — @${failed_slot} will boot with @${booted} kernel"
+            _rb_efi_ok=1
+        else
+            log_error "EFI restore failed — @${failed_slot} subvolume is ready but its EFI is broken"
+            log_error "DO NOT reboot into @${failed_slot} — run: shani-deploy --rollback again after reboot"
+        fi
+    fi
+    if ! (( _rb_efi_ok )); then
+        log_error "WARNING: rollback subvolume is ready but EFI could not be fixed"
+        log_error "Boot entries will keep @${booted} as default — DO NOT select @${failed_slot} at boot"
+    fi
     finalize_boot_entries "$booted" "$failed_slot" "no-tries"
     rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
     # Clear all boot failure markers so a direct --rollback invocation leaves
@@ -1900,7 +2027,6 @@ rollback_system() {
     log "  Restored slot:     @${failed_slot} (ready for next deploy)"
     log "  Please reboot — the system will boot into @${booted}"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    trap - ERR
 }
 
 #####################################
@@ -2442,6 +2568,7 @@ deploy_update() {
         log "Creating safety backup of @${CANDIDATE_SLOT} → @${BACKUP_NAME}"
         run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${CANDIDATE_SLOT}" "$MOUNT_DIR/@${BACKUP_NAME}" || \
             { safe_umount "$MOUNT_DIR"; die "Backup snapshot failed — aborting to protect your system"; }
+
         # Arm the emergency rollback trap now that CANDIDATE_SLOT and BACKUP_NAME
         # are both set and a real backup snapshot exists on disk.
         # Any subsequent die() or unhandled error will invoke restore_candidate.
@@ -2498,8 +2625,9 @@ deploy_update() {
     CANDIDATE_MODIFIED="yes"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
 
-    btrfs_subvol_exists "$temp/shanios_base" && run_cmd btrfs subvolume delete "$temp/shanios_base"
-    run_cmd btrfs subvolume delete "$temp"
+    btrfs_subvol_exists "$temp/shanios_base" && \
+        { btrfs subvolume delete "$temp/shanios_base" 2>/dev/null || log_warn "Could not delete temp_update/shanios_base — will be cleaned on next deploy"; }
+    btrfs subvolume delete "$temp" 2>/dev/null || log_warn "Could not delete temp_update — will be cleaned on next deploy"
 
     [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"
     log_success "Image deployed to @${CANDIDATE_SLOT} (v${REMOTE_VERSION}) — pending finalization"
@@ -2635,7 +2763,8 @@ Options:
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
   --set-channel           permanently set channel in /etc/shani-channel (latest|stable)
-  --skip-self-update      Skip auto-update
+  --skip-self-update      Skip auto-update of shani-deploy
+  --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
 EOF
 }
 
@@ -2658,6 +2787,7 @@ main() {
             -d|--dry-run) DRY_RUN="yes"; shift ;;
             -v|--verbose) VERBOSE="yes"; shift ;;
             --skip-self-update) SKIP_SELF_UPDATE="yes"; shift ;;
+            --update-genefi) UPDATE_GENEFI="yes"; shift ;;
             --) shift; break ;;
             *) die "Invalid option: $1" ;;
         esac

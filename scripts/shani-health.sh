@@ -1155,8 +1155,13 @@ _section_data_state() {
             marker_age_days=$(( ( $(date +%s) - marker_epoch ) / 86400 ))
 
         if [[ ! -x "$USER_SETUP_BIN" ]]; then
-            _row "User setup" "!!  marker present but ${USER_SETUP_BIN} missing or not executable"
-            _rec "shani-user-setup binary missing — reinstall: ${USER_SETUP_BIN}"
+            if [[ -f "$USER_SETUP_BIN" ]]; then
+                _row "User setup" "!!  marker present but ${USER_SETUP_BIN} not executable — fix: chmod +x ${USER_SETUP_BIN}"
+                _rec "shani-user-setup binary not executable — run: chmod +x ${USER_SETUP_BIN}"
+            else
+                _row "User setup" "!!  marker present but ${USER_SETUP_BIN} missing or not executable"
+                _rec "shani-user-setup binary missing — reinstall: ${USER_SETUP_BIN}"
+            fi
         elif (( marker_age_days >= 1 )); then
             _row "User setup" "!   marker ${marker_age_days}d old — setup not yet run"
             _rec "user-setup-needed marker is ${marker_age_days}d old — run: shani-user-setup"
@@ -2316,8 +2321,8 @@ _section_users() {
         done
         if [[ ${#_home_perm_bad[@]} -gt 0 ]]; then
             local _hpb_str; _hpb_str=$(IFS=' '; echo "${_home_perm_bad[*]}")
-            _row "Home perms"  "!   world-accessible: ${_hpb_str}  (recommend 0750 or 0700)"
-            _rec "Home directories are world-accessible — fix: chmod 750 /home/<user>"
+            _row "Home perms"  "!   world-accessible: ${_hpb_str}  (should be 0700)"
+            _rec "Home directories are world-accessible — fix: chmod 700 /home/<user>"
         else
             _row "Home perms"  "OK  no world-accessible home directories"
         fi

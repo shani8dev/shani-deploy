@@ -38,12 +38,13 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
+    echo "  $0 cleanup-tpm2              — remove stale TPM2 LUKS slots after re-enrolment"
     exit 1
 fi
 
@@ -272,15 +273,24 @@ sign_efi_binary() {
     fi
 
     # Not signed with our key — sign it now.
-    local tmp_signed
+    # Keep a backup of the original so we can restore it if sbverify fails
+    # after mv — otherwise the ESP has a signed-but-corrupt binary.
+    local tmp_signed tmp_backup
     tmp_signed=$(mktemp "${file}.signed.XXXXXX")
+    tmp_backup=$(mktemp "${file}.orig.XXXXXX")
+    cp "$file" "$tmp_backup" || { rm -f "$tmp_signed" "$tmp_backup"; error_exit "Failed to backup ${file} before signing"; }
     if sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$tmp_signed" "$file"; then
         mv "$tmp_signed" "$file"
     else
-        rm -f "$tmp_signed"
+        rm -f "$tmp_signed" "$tmp_backup"
         error_exit "sbsign failed for $file"
     fi
-    sbverify --cert "$MOK_CRT" "$file" || { error_exit "sbverify failed for $file"; }
+    if ! sbverify --cert "$MOK_CRT" "$file" &>/dev/null 2>&1; then
+        log_warn "sbverify failed for $file — restoring original"
+        mv "$tmp_backup" "$file"
+        error_exit "sbverify failed for $file — original restored"
+    fi
+    rm -f "$tmp_backup"
 }
 
 get_kernel_version() {
@@ -305,7 +315,11 @@ generate_cmdline() {
     local fs_uuid
     fs_uuid=$(blkid -s UUID -o value /dev/disk/by-label/"${ROOTLABEL}" 2>/dev/null || true)
     if [[ -z "$fs_uuid" ]]; then
-        error_exit "Failed to retrieve filesystem UUID for label ${ROOTLABEL}"
+        if [[ -f "$CMDLINE_FILE" ]]; then
+            log_warn "Failed to retrieve filesystem UUID for label ${ROOTLABEL} — keeping existing cmdline file unchanged"
+            return 2
+        fi
+        error_exit "Failed to retrieve filesystem UUID for label ${ROOTLABEL} and no existing cmdline to fall back to"
     fi
 
     local rootdev encryption_params resume_uuid
@@ -313,10 +327,21 @@ generate_cmdline() {
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
         local underlying
         underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' | tr -d '\n')
+        if [[ -z "$underlying" ]]; then
+            if [[ -f "$CMDLINE_FILE" ]]; then
+                log_warn "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} — keeping existing cmdline file unchanged"
+                return 2
+            fi
+            error_exit "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} and no existing cmdline to fall back to"
+        fi
         local luks_uuid
         luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
         if [[ -z "$luks_uuid" ]]; then
-            error_exit "Failed to retrieve LUKS UUID from underlying device $underlying"
+            if [[ -f "$CMDLINE_FILE" ]]; then
+                log_warn "Failed to retrieve LUKS UUID from ${underlying} — keeping existing cmdline file unchanged"
+                return 2
+            fi
+            error_exit "Failed to retrieve LUKS UUID from underlying device ${underlying} and no existing cmdline to fall back to"
         fi
         rootdev="/dev/mapper/${ROOTLABEL}"
         encryption_params=" rd.luks.uuid=${luks_uuid} rd.luks.name=${luks_uuid}=${ROOTLABEL} rd.luks.options=${luks_uuid}=tpm2-device=auto"
@@ -360,24 +385,39 @@ generate_cmdline() {
         fi
     fi
 
-    echo "$cmdline" > "$CMDLINE_FILE"
-    chmod 0644 "$CMDLINE_FILE"
+    # Write atomically: write to a fixed-name .tmp sibling then rename into
+    # place. Using a fixed name (not mktemp) is fine — only one root process
+    # runs this at a time and it avoids leaving random tmp files on failure.
+    # The rename(2) is atomic on the same filesystem so the live file is never
+    # partially overwritten.
+    local tmp_cmdline="${CMDLINE_FILE}.tmp"
+    mkdir -p "$(dirname "$CMDLINE_FILE")" || {
+        if [[ -f "$CMDLINE_FILE" ]]; then
+            log_warn "Could not create cmdline directory — keeping existing cmdline file unchanged"
+            return 2
+        fi
+        error_exit "Could not create cmdline directory and no existing cmdline to fall back to"
+    }
+    printf '%s\n' "$cmdline" > "$tmp_cmdline" || {
+        rm -f "$tmp_cmdline"
+        if [[ -f "$CMDLINE_FILE" ]]; then
+            log_warn "Failed to write cmdline — keeping existing cmdline file unchanged"
+            return 2
+        fi
+        error_exit "Failed to write cmdline and no existing cmdline to fall back to"
+    }
+    chmod 0644 "$tmp_cmdline"
+    if ! mv "$tmp_cmdline" "$CMDLINE_FILE"; then
+        rm -f "$tmp_cmdline"
+        if [[ -f "$CMDLINE_FILE" ]]; then
+            log_warn "Failed to rename cmdline into place — keeping existing cmdline file unchanged"
+            return 2
+        fi
+        error_exit "Failed to rename cmdline and no existing cmdline to fall back to"
+    fi
     log "Kernel cmdline generated for ${slot} (saved in ${CMDLINE_FILE})"
 }
 
-# ensure_crypttab — create /etc/crypttab and /etc/dracut.conf.d/99-crypt-key.conf
-# if either is missing. Both are checked independently.
-#
-# Handles two install configurations:
-#   PIN/passphrase (OSI_ENCRYPTION_PIN set at install):
-#     crypttab keyfile field = "none" → dracut conf has no keyfile in install_items
-#   Keyfile (no OSI_ENCRYPTION_PIN at install):
-#     keyfile at /etc/cryptsetup-keys.d/shani_root.bin → dracut conf includes it
-#
-# Keyfile recovery order when crypttab is missing:
-#   1. Already present at /etc/cryptsetup-keys.d/shani_root.bin → use as-is
-#   2. Present on ESP at /boot/efi/crypto_keyfile.bin → copy into place
-#   3. Neither found → "none" (PIN/passphrase at boot)
 ensure_crypttab() {
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
@@ -391,11 +431,33 @@ ensure_crypttab() {
     local keyfile_dest="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
     local keyfile_opt="none"
 
-    # /etc/crypttab — checked first so we can read keyfile_opt from it if present
+    # /etc/crypttab — validate UUID matches live device even if file exists.
+    # Rewrite only the UUID field if stale; preserve keyfile and options columns.
+    # If the file exists but has no entry for ROOTLABEL (e.g. installed for a
+    # different label), treat it as missing and append a correct entry.
     if [[ -f /etc/crypttab ]]; then
-        log "/etc/crypttab already present — skipping"
-        # Read keyfile field from existing crypttab (field 3) so dracut conf
-        # is consistent with it — avoids adding a keyfile that crypttab doesn't use.
+        local recorded_uuid
+        recorded_uuid=$(awk -v label="${ROOTLABEL}" '$1==label {print $2}' /etc/crypttab \
+            | sed 's/UUID=//' 2>/dev/null || true)
+        if [[ -z "$recorded_uuid" ]]; then
+            # No entry for our label — append one rather than rewriting the file
+            log_warn "/etc/crypttab has no entry for ${ROOTLABEL} — appending"
+            printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} none luks,discard" >> /etc/crypttab
+            log "/etc/crypttab entry appended"
+        elif [[ "$recorded_uuid" == "$luks_uuid" ]]; then
+            log "/etc/crypttab UUID matches live device — ok"
+        else
+            log_warn "/etc/crypttab has stale UUID (${recorded_uuid}) — updating to ${luks_uuid}"
+            local stale_keyfile stale_opts
+            stale_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || echo "none")
+            stale_opts=$(awk -v label="${ROOTLABEL}" '$1==label {print $4}' /etc/crypttab 2>/dev/null || echo "luks,discard")
+            # Use defaults if fields were empty
+            [[ -z "$stale_keyfile" ]] && stale_keyfile="none"
+            [[ -z "$stale_opts" ]] && stale_opts="luks,discard"
+            printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} ${stale_keyfile} ${stale_opts}" > /etc/crypttab
+            log "/etc/crypttab UUID corrected"
+        fi
+        # Read keyfile field (post any correction) for dracut conf consistency below
         local existing_keyfile
         existing_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || true)
         if [[ -n "$existing_keyfile" && "$existing_keyfile" != "none" ]]; then
@@ -411,8 +473,14 @@ ensure_crypttab() {
             mkdir -p "$(dirname "$keyfile_dest")"
             cp "${ESP}/crypto_keyfile.bin" "$keyfile_dest"
             chmod 0400 "$keyfile_dest"
-            keyfile_opt="$keyfile_dest"
-            log "Keyfile recovered to ${keyfile_dest}"
+            if cryptsetup open --test-passphrase --key-file="$keyfile_dest" "$underlying" &>/dev/null; then
+                keyfile_opt="$keyfile_dest"
+                log "Keyfile recovered and verified against LUKS volume"
+            else
+                log_warn "Recovered keyfile from ESP does NOT unlock ${underlying} — discarding, falling back to passphrase"
+                rm -f "$keyfile_dest"
+                keyfile_opt="none"
+            fi
         else
             log "No keyfile found — PIN/passphrase system, crypttab will use 'none'"
         fi
@@ -423,20 +491,26 @@ ensure_crypttab() {
         log "/etc/crypttab written: ${entry}"
     fi
 
-    # /etc/dracut.conf.d/99-crypt-key.conf — checked independently
-    # Must be consistent with crypttab: include keyfile in install_items only
-    # if crypttab actually references it. PIN systems use "none" — no keyfile
-    # needed in the initrd.
-    if [[ ! -f /etc/dracut.conf.d/99-crypt-key.conf ]]; then
-        log "/etc/dracut.conf.d/99-crypt-key.conf missing — generating"
-        mkdir -p /etc/dracut.conf.d
-        local install_items="/etc/crypttab"
-        [[ "$keyfile_opt" != "none" ]] && install_items+=" ${keyfile_opt}"
-        printf 'install_items+=" %s "\n' "$install_items" \
-            > /etc/dracut.conf.d/99-crypt-key.conf
-        log "dracut crypt config written (install_items: ${install_items})"
+    # /etc/dracut.conf.d/99-crypt-key.conf — always rewrite to stay in sync
+    # with the current keyfile_opt. A one-time write risks drift if the system
+    # migrates between keyfile and PIN/passphrase configurations.
+    mkdir -p /etc/dracut.conf.d
+    local install_items="/etc/crypttab"
+    [[ "$keyfile_opt" != "none" ]] && install_items+=" ${keyfile_opt}"
+    local expected_conf
+    expected_conf="install_items+=\" ${install_items} \""
+    local current_conf=""
+    [[ -f /etc/dracut.conf.d/99-crypt-key.conf ]] && \
+        current_conf=$(cat /etc/dracut.conf.d/99-crypt-key.conf 2>/dev/null | tr -s ' ' | tr -d '\n')
+    # Normalise expected the same way so trailing newline from printf does not
+    # cause a false mismatch on every run.
+    local expected_conf_norm
+    expected_conf_norm=$(printf '%s' "$expected_conf" | tr -s ' ' | tr -d '\n')
+    if [[ "$current_conf" != "$expected_conf_norm" ]]; then
+        printf '%s\n' "$expected_conf" > /etc/dracut.conf.d/99-crypt-key.conf
+        log "dracut crypt config updated (install_items: ${install_items})"
     else
-        log "/etc/dracut.conf.d/99-crypt-key.conf already present — skipping"
+        log "dracut crypt config up to date"
     fi
 }
 
@@ -532,6 +606,95 @@ _stage_mok_enrollment() {
     # Inform about old enrolled keys that will remain until cleanup
     if _has_old_enrolled_keys "$mok_der"; then
         log_warn "Old MOK keys remain enrolled — after reboot run: gen-efi cleanup-mok"
+    fi
+}
+
+# cleanup_tpm2 — remove stale TPM2 LUKS keyslots left after re-enrolment.
+#
+# Each call to enroll-tpm2 adds a new TPM2 slot. The old slot is wiped
+# automatically during enrol, but if that wipe failed (credential unavailable,
+# older systemd) stale slots accumulate. This command finds all TPM2-type
+# slots in the LUKS header and removes every one except the highest-numbered
+# (most recently written), after confirming at least one healthy TPM2 slot
+# exists so the system can still auto-unlock.
+#
+# Safe to run at any time after a successful enroll-tpm2.
+cleanup_tpm2() {
+    if in_chroot; then
+        error_exit "cleanup-tpm2 must run on the live booted system, not inside a chroot"
+    fi
+
+    if [[ ! -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        error_exit "No LUKS mapper /dev/mapper/${ROOTLABEL} found — system does not appear to be encrypted"
+    fi
+
+    if ! command -v systemd-cryptenroll &>/dev/null; then
+        error_exit "systemd-cryptenroll not found — install systemd"
+    fi
+
+    local underlying
+    underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+        | sed -n 's/^ *device: //p' | tr -d '\n')
+    [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
+
+    # Collect all TPM2 slot numbers from the LUKS header
+    local -a tpm2_slots=()
+    local slot_num
+    while IFS= read -r slot_num; do
+        [[ -n "$slot_num" ]] && tpm2_slots+=("$slot_num")
+    done < <(cryptsetup luksDump "$underlying" 2>/dev/null \
+        | awk '
+            /^Tokens:/ { in_tokens=1 }
+            in_tokens && /^[[:space:]]+[0-9]+:/ { current=gensub(/^[[:space:]]+([0-9]+):.*/, "\1", 1) }
+            in_tokens && current && /systemd-tpm2|"type".*tpm2/ { print current; current="" }
+        ' | sort -n)
+
+    if [[ ${#tpm2_slots[@]} -eq 0 ]]; then
+        log "No TPM2 slots found in LUKS header — nothing to clean up"
+        return 0
+    fi
+
+    if [[ ${#tpm2_slots[@]} -eq 1 ]]; then
+        log "Only one TPM2 slot present (slot ${tpm2_slots[0]}) — nothing to clean up"
+        return 0
+    fi
+
+    log "Found ${#tpm2_slots[@]} TPM2 slots: ${tpm2_slots[*]}"
+
+    # Keep the highest-numbered slot (most recently enrolled), wipe the rest
+    local keep_slot="${tpm2_slots[-1]}"
+    log "Keeping slot ${keep_slot} (most recent) — wiping ${#tpm2_slots[@]}-1 stale slot(s)"
+
+    local keyfile="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
+    local wiped=0 failed=0
+
+    for slot_num in "${tpm2_slots[@]}"; do
+        [[ "$slot_num" == "$keep_slot" ]] && continue
+        log "Wiping stale TPM2 slot ${slot_num}..."
+        local wipe_ok=0
+        if [[ -f "$keyfile" ]]; then
+            cryptsetup luksKillSlot --key-file="$keyfile" "$underlying" "$slot_num" 2>/dev/null \
+                && wipe_ok=1
+        fi
+        if (( ! wipe_ok )); then
+            systemd-cryptenroll --wipe-slot="$slot_num" "$underlying" 2>/dev/null \
+                && wipe_ok=1
+        fi
+        if (( wipe_ok )); then
+            log "Slot ${slot_num} wiped"
+            (( wiped++ ))
+        else
+            log_warn "Could not wipe slot ${slot_num} — remove manually:"
+            log_warn "  cryptsetup luksKillSlot ${underlying} ${slot_num}"
+            (( failed++ ))
+        fi
+    done
+
+    if (( wiped > 0 )); then
+        log "${wiped} stale TPM2 slot(s) removed"
+    fi
+    if (( failed > 0 )); then
+        log_warn "${failed} slot(s) could not be removed automatically — see above for manual commands"
     fi
 }
 
@@ -699,8 +862,8 @@ generate_uki() {
     # Ensure keys exist — generate if missing
     ensure_mok_keys
 
-    # Ensure ESP is unmounted on any exit from this point
-    trap 'cleanup_esp' EXIT
+    # Ensure ESP is unmounted and any stale cmdline tmp file is cleaned up on exit
+    trap 'cleanup_esp; rm -f "${CMDLINE_FILE}.tmp"' EXIT
 
     # Ensure ESP is mounted before we start
     ensure_esp_mounted
@@ -720,17 +883,24 @@ generate_uki() {
     kernel_ver=$(get_kernel_version)
     log "Using kernel: $kernel_ver"
     local uki_path="$EFI_DIR/${OS_NAME}-${slot}.efi"
-    generate_cmdline "$slot"
+
+    # ensure_crypttab before generate_cmdline — crypttab must exist before
+    # dracut runs, and setting it up first keeps the logical order clear.
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        ensure_crypttab
+    fi
+
+    local cmdline_rc=0
+    generate_cmdline "$slot" || cmdline_rc=$?
+    if (( cmdline_rc == 2 )); then
+        log_warn "Cmdline generation fell back to existing file — UKI will be built with previous cmdline"
+    elif (( cmdline_rc != 0 )); then
+        error_exit "generate_cmdline failed unexpectedly (rc=${cmdline_rc})"
+    fi
     local kernel_cmdline
     kernel_cmdline=$(<"$CMDLINE_FILE")
     if [[ -z "$kernel_cmdline" ]]; then
         error_exit "Kernel command line is empty."
-    fi
-    # If the root device is encrypted, ensure /etc/crypttab exists before dracut.
-    # Without it dracut builds a UKI with no LUKS unlock support.
-    # We derive everything from the live mapping — no external service needed.
-    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
-        ensure_crypttab
     fi
 
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "$uki_path" || error_exit "dracut failed"
@@ -866,13 +1036,6 @@ enroll_tpm2() {
         log_warn "Consider enabling Secure Boot for maximum protection"
     fi
 
-    # Check if TPM2 is already enrolled — wipe old slot before re-enrolling
-    local wipe_flag=""
-    if systemd-cryptenroll "$underlying" 2>/dev/null | grep -q tpm2; then
-        log_warn "TPM2 slot already enrolled — wiping old slot before re-enrolling"
-        wipe_flag="--wipe-slot=tpm2"
-    fi
-
     log "Enrolling TPM2..."
     local keyfile="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
     if [[ -f "$keyfile" ]]; then
@@ -882,17 +1045,30 @@ enroll_tpm2() {
         systemd-cryptenroll \
             --tpm2-device=auto \
             --tpm2-pcrs="${pcrs}" \
-            ${wipe_flag:+"$wipe_flag"} \
             --unlock-key-file="$keyfile" \
             "$underlying" \
             || error_exit "TPM2 enrollment failed"
     else
-        # PIN system — LUKS passphrase was set at install, prompt interactively
+        # PIN system — LUKS passphrase was set at install, prompt interactively.
+        # Also ask whether to require a TPM2 PIN at boot. A PIN means the TPM
+        # will not unseal without user input even when PCRs match, giving a
+        # second factor. Without it, any boot on matching hardware auto-unlocks.
+        # Default is yes — the user already chose interactive unlock at install.
+        local tpm2_pin_flag=""
+        local use_tpm2_pin
+        read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin
+        use_tpm2_pin="${use_tpm2_pin:-N}"
+        if [[ "${use_tpm2_pin^^}" == "Y" ]]; then
+            tpm2_pin_flag="--tpm2-with-pin=yes"
+            log "TPM2 PIN will be required at boot"
+        else
+            log "TPM2 PIN not set — disk will unlock automatically on matching hardware"
+        fi
         log "PIN system detected — you will be prompted for your LUKS passphrase"
         systemd-cryptenroll \
             --tpm2-device=auto \
             --tpm2-pcrs="${pcrs}" \
-            ${wipe_flag:+"$wipe_flag"} \
+            ${tpm2_pin_flag:+"$tpm2_pin_flag"} \
             "$underlying" \
             || error_exit "TPM2 enrollment failed"
     fi
@@ -904,6 +1080,8 @@ enroll_tpm2() {
     log "  - Your LUKS passphrase remains valid as fallback"
     log "  - Re-enroll after firmware updates, Secure Boot changes, or MOK changes:"
     log "      gen-efi enroll-tpm2"
+    log "  - If re-enrolling, clean up stale slots afterwards:"
+    log "      gen-efi cleanup-tpm2"
     log "  - To remove TPM enrollment:"
     log "      systemd-cryptenroll --wipe-slot=tpm2 ${underlying}"
     log "  - Verify enrollment:"
@@ -924,12 +1102,16 @@ case "${1:-}" in
     cleanup-mok)
         cleanup_mok
         ;;
+    cleanup-tpm2)
+        cleanup_tpm2
+        ;;
     *)
         echo "Usage:"
         echo "  $0 configure <target_slot>"
         echo "  $0 enroll-mok"
         echo "  $0 enroll-tpm2"
         echo "  $0 cleanup-mok"
+        echo "  $0 cleanup-tpm2"
         exit 1
         ;;
 esac

@@ -1593,7 +1593,6 @@ EOF
 #####################################
 
 restore_candidate() {
-    trap - ERR
     trap - ERR EXIT
     set +e
 
@@ -2446,7 +2445,9 @@ deploy_update() {
         # Arm the emergency rollback trap now that CANDIDATE_SLOT and BACKUP_NAME
         # are both set and a real backup snapshot exists on disk.
         # Any subsequent die() or unhandled error will invoke restore_candidate.
+        # EXIT trap catches die() which calls exit 1 directly (ERR does not fire on exit).
         trap 'restore_candidate' ERR
+        trap '[[ $? -ne 0 ]] && restore_candidate' EXIT
     fi
 
     local temp="$MOUNT_DIR/temp_update"
@@ -2512,7 +2513,9 @@ finalize_update() {
     # scope, but ERR traps do not propagate across function call boundaries.
     # Without this, a UKI generation failure (or any die() below) would exit
     # without restoring @CANDIDATE_SLOT from its backup.
+    # EXIT trap catches die() which calls exit 1 directly (ERR does not fire on exit).
     trap 'restore_candidate' ERR
+    trap '[[ $? -ne 0 ]] && restore_candidate' EXIT
 
     verify_and_create_subvolumes || die "Subvolume verification failed"
     generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"

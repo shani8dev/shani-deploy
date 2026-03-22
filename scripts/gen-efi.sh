@@ -527,21 +527,21 @@ _get_mok_fingerprint() {
 _current_key_enrolled() {
     local mok_der="$1"
     [[ ! -f "$mok_der" ]] && return 1
-    mokutil --test-key "$mok_der" 2>/dev/null | grep -qi 'is already enrolled'
+    mokutil --test-key "$mok_der" 2>/dev/null | grep -qi 'is already enrolled' || return 1
 }
 
 # _has_old_enrolled_keys — return 0 if any enrolled key does NOT match MOK.der.
 _has_old_enrolled_keys() {
     local mok_der="$1"
     local local_fp
-    local_fp=$(_get_mok_fingerprint "$mok_der")
+    local_fp=$(_get_mok_fingerprint "$mok_der") || local_fp=""
     [[ -z "$local_fp" ]] && return 1
 
     # Parse all SHA1 fingerprints from enrolled list
     local enrolled_fps
     enrolled_fps=$(mokutil --list-enrolled 2>/dev/null \
         | grep -i 'SHA1 Fingerprint' \
-        | sed 's/.*: //' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+        | sed 's/.*: //' | tr -d ':' | tr '[:upper:]' '[:lower:]') || return 1
 
     while IFS= read -r fp; do
         [[ -z "$fp" ]] && continue
@@ -581,10 +581,10 @@ _stage_mok_enrollment() {
     local pending_fps
     pending_fps=$(mokutil --list-new 2>/dev/null \
         | grep -i 'SHA1 Fingerprint' \
-        | sed 's/.*: //' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+        | sed 's/.*: //' | tr -d ':' | tr '[:upper:]' '[:lower:]') || pending_fps=""
 
     local local_fp
-    local_fp=$(_get_mok_fingerprint "$mok_der")
+    local_fp=$(_get_mok_fingerprint "$mok_der") || local_fp=""
 
     if [[ -n "$local_fp" ]] && echo "$pending_fps" | grep -qx "$local_fp"; then
         # Correct key is already queued — just remind user
@@ -647,7 +647,7 @@ cleanup_tpm2() {
             /^Tokens:/ { in_tokens=1 }
             in_tokens && /^[[:space:]]+[0-9]+:/ { current=gensub(/^[[:space:]]+([0-9]+):.*/, "\1", 1) }
             in_tokens && current && /systemd-tpm2|"type".*tpm2/ { print current; current="" }
-        ' | sort -n)
+        ' 2>/dev/null | sort -n || true)
 
     if [[ ${#tpm2_slots[@]} -eq 0 ]]; then
         log "No TPM2 slots found in LUKS header — nothing to clean up"
@@ -725,9 +725,7 @@ cleanup_mok() {
     fi
 
     local local_fp
-    local_fp=$(_get_mok_fingerprint "$mok_der")
-
-    log "Staging deletion of old MOK keys..."
+    local_fp=$(_get_mok_fingerprint "$mok_der") || local_fp=""
 
     local deleted=0
 
@@ -910,7 +908,9 @@ generate_uki() {
     # enrollment automatically. Silent when already enrolled (common case).
     # Runs in chroot too — shani-deploy bind-mounts /sys so mokutil can reach
     # the live EFI variable store via /sys/firmware/efi/efivars.
-    _stage_mok_enrollment
+    # Non-fatal: UKI is already built and signed at this point; a mokutil
+    # failure (e.g. read-only efivars in chroot) must not fail the whole deploy.
+    _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — UKI was built and signed successfully"
 }
 
 
@@ -973,7 +973,7 @@ enroll_mok() {
     done
 
     # Stage MOK enrollment
-    _stage_mok_enrollment
+    _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — EFI binaries were re-signed successfully"
 }
 
 # enroll_tpm2 — enroll the TPM2 chip into the LUKS2 volume for automatic unlock.
@@ -1011,7 +1011,7 @@ enroll_tpm2() {
 
     # Verify TPM2 device is present
     log "Checking TPM2 device..."
-    if ! systemd-cryptenroll --tpm2-device=list 2>/dev/null | grep -q .; then
+    if ! { systemd-cryptenroll --tpm2-device=list 2>/dev/null || true; } | grep -q .; then
         error_exit "No TPM2 device found — ensure TPM 2.0 is enabled in BIOS/UEFI"
     fi
 

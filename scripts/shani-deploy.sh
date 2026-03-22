@@ -1540,7 +1540,9 @@ generate_uki() {
         result=1
     fi
 
-    trap - EXIT  # RETURN trap still fires; clear EXIT so it doesn't double-fire on normal exit
+    # Only clear EXIT trap on success — if chroot failed, leave EXIT armed so
+    # restore_candidate can still fire when die() calls exit 1 in the caller.
+    (( result == 0 )) && trap - EXIT
     return $result
 }
 

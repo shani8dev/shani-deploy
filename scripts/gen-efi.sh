@@ -913,6 +913,12 @@ generate_uki() {
     # Non-fatal: UKI is already built and signed at this point; a mokutil
     # failure (e.g. read-only efivars in chroot) must not fail the whole deploy.
     _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — UKI was built and signed successfully"
+
+    # Clear the EXIT trap before returning — uki_path is local and would be
+    # unbound when the trap fires on process exit. Call cleanup_esp explicitly
+    # here so the ESP is still unmounted if we mounted it.
+    trap - EXIT
+    cleanup_esp
 }
 
 

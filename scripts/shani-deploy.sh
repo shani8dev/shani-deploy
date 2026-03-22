@@ -1038,8 +1038,19 @@ verify_gpg() {
         fi
     fi
 
-    # Keyserver fallback — only if bundled key is missing or failed to import.
-    if (( ! key_imported )); then
+    # Keyserver fallback — triggered when:
+    #   (a) bundled key is missing or failed to import, OR
+    #   (b) bundled key imported but its fingerprint does not match GPG_KEY_ID.
+    #       This covers GPG key rotation: the running system still has the old
+    #       signing.asc but shani-deploy has been updated to expect the new key.
+    #       Without this check the old key imports fine (key_imported=1) and
+    #       keyservers are never tried, permanently blocking the transition update.
+    local fp_check
+    fp_check=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+    if (( ! key_imported )) || [[ "$fp_check" != "$GPG_KEY_ID" ]]; then
+        if [[ "$fp_check" != "$GPG_KEY_ID" ]] && (( key_imported )); then
+            log_warn "Bundled signing key does not match expected key ID — GPG key rotation in progress, fetching new key from keyservers"
+        fi
         local keyservers=(keys.openpgp.org keyserver.ubuntu.com pgp.mit.edu)
         for keyserver in "${keyservers[@]}"; do
             if gpg --batch --quiet --keyserver "$keyserver" --recv-keys "$GPG_KEY_ID" 2>/dev/null; then

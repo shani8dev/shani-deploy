@@ -130,7 +130,7 @@ persist_state() {
     {
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
-        declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE 2>/dev/null || true
+        declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
@@ -1758,15 +1758,11 @@ restore_candidate() {
                     log "UKI regenerated for @${CANDIDATE_SLOT} from restored subvolume"
                     _efi_ok=1
                 else
-                    log_warn "UKI regeneration failed — attempting to copy @${_rc_slot} UKI as fallback"
-                    if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${_rc_slot}.efi" \
-                          "$ESP/EFI/${OS_NAME}/${OS_NAME}-${CANDIDATE_SLOT}.efi" 2>/dev/null; then
-                        log_warn "Fallback EFI copy succeeded — @${CANDIDATE_SLOT} will boot with @${_rc_slot} kernel until next deploy"
-                        _efi_ok=1
-                    else
-                        log_error "EFI restore failed — @${CANDIDATE_SLOT} subvolume is restored but its EFI is broken"
-                        log_error "DO NOT reboot into @${CANDIDATE_SLOT} — run: shani-deploy --rollback"
-                    fi
+                    # generate_uki writes to a .tmp file and only mv into place on success.
+                    # A failure here means the existing EFI on ESP was NOT modified — it
+                    # still matches the restored subvolume (the pre-deploy state).
+                    log_warn "UKI regeneration failed — existing EFI on ESP was not modified and still matches @${CANDIDATE_SLOT}"
+                    _efi_ok=1
                 fi
             else
                 _rc_cleanup_temp
@@ -2000,15 +1996,11 @@ rollback_system() {
     if generate_uki "$failed_slot"; then
         _rb_efi_ok=1
     else
-        log_warn "UKI generation failed — attempting to copy @${booted} UKI as fallback"
-        if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
-              "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null; then
-            log_warn "Fallback EFI copy succeeded — @${failed_slot} will boot with @${booted} kernel"
-            _rb_efi_ok=1
-        else
-            log_error "EFI restore failed — @${failed_slot} subvolume is ready but its EFI is broken"
-            log_error "DO NOT reboot into @${failed_slot} — run: shani-deploy --rollback again after reboot"
-        fi
+        # generate_uki writes to a .tmp file and only mv into place on success.
+        # A failure here means the existing EFI on ESP was NOT modified — it
+        # still matches the restored subvolume (the pre-deploy state).
+        log_warn "UKI regeneration failed — existing EFI on ESP was not modified and still matches @${failed_slot}"
+        _rb_efi_ok=1
     fi
     if ! (( _rb_efi_ok )); then
         log_error "WARNING: rollback subvolume is ready but EFI could not be fixed"
@@ -2705,8 +2697,9 @@ finalize_update() {
 
     cleanup_downloads || log_verbose "Download cleanup warnings"
 
+    # Deploy is fully complete — do not re-arm restore_candidate.
+    # Any failure in the summary section must not trigger a rollback.
     set -e
-    trap 'restore_candidate' ERR
 
     local total_time
     total_time=$(( $(date +%s) - DEPLOYMENT_START_TIME ))

@@ -305,6 +305,8 @@ get_kernel_version() {
 
 generate_cmdline() {
     local slot="$1"
+    # Accept pre-detected LUKS UUID to stay consistent with ensure_crypttab.
+    local provided_luks_uuid="${2:-}"
     # Always regenerate — never reuse a cached file. The generation is fast
     # (one blkid call) and a stale file (e.g. after LUKS UUID change, swap
     # recreate, or keymap change) would silently produce a broken UKI.
@@ -325,23 +327,28 @@ generate_cmdline() {
     local rootdev encryption_params resume_uuid
 
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
-        local underlying
-        underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' | tr -d '\n')
-        if [[ -z "$underlying" ]]; then
-            if [[ -f "$CMDLINE_FILE" ]]; then
-                log_warn "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} — keeping existing cmdline file unchanged"
-                return 2
-            fi
-            error_exit "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} and no existing cmdline to fall back to"
-        fi
         local luks_uuid
-        luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
-        if [[ -z "$luks_uuid" ]]; then
-            if [[ -f "$CMDLINE_FILE" ]]; then
-                log_warn "Failed to retrieve LUKS UUID from ${underlying} — keeping existing cmdline file unchanged"
-                return 2
+        if [[ -n "$provided_luks_uuid" ]]; then
+            # UUID already detected upstream — no need to re-detect underlying device.
+            luks_uuid="$provided_luks_uuid"
+        else
+            local underlying
+            underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' | tr -d '\n')
+            if [[ -z "$underlying" ]]; then
+                if [[ -f "$CMDLINE_FILE" ]]; then
+                    log_warn "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} — keeping existing cmdline file unchanged"
+                    return 2
+                fi
+                error_exit "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} and no existing cmdline to fall back to"
             fi
-            error_exit "Failed to retrieve LUKS UUID from underlying device ${underlying} and no existing cmdline to fall back to"
+            luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
+            if [[ -z "$luks_uuid" ]]; then
+                if [[ -f "$CMDLINE_FILE" ]]; then
+                    log_warn "Failed to retrieve LUKS UUID from ${underlying} — keeping existing cmdline file unchanged"
+                    return 2
+                fi
+                error_exit "Failed to retrieve LUKS UUID from underlying device ${underlying} and no existing cmdline to fall back to"
+            fi
         fi
         rootdev="/dev/mapper/${ROOTLABEL}"
         encryption_params=" rd.luks.uuid=${luks_uuid} rd.luks.name=${luks_uuid}=${ROOTLABEL} rd.luks.options=${luks_uuid}=tpm2-device=auto"
@@ -419,14 +426,43 @@ generate_cmdline() {
 }
 
 ensure_crypttab() {
+    # Accept pre-detected UUID to avoid duplicate cryptsetup calls.
+    # If not passed (or empty), detect it here.
+    local provided_uuid="${1:-}"
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
         | sed -n 's/^ *device: //p' | tr -d '\n')
-    [[ -z "$underlying" ]] && error_exit "Could not determine underlying device for /dev/mapper/${ROOTLABEL}"
+    # _crypttab_trusted=1 means we cannot verify/correct the UUID but the
+    # existing crypttab entry is trusted (system booted from it). We still
+    # fall through to ensure dracut.conf.d is written — it may have been
+    # wiped along with /etc even though crypttab survived.
+    local _crypttab_trusted=0
 
     local luks_uuid
-    luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
-    [[ -z "$luks_uuid" ]] && error_exit "Could not retrieve LUKS UUID from $underlying"
+    if [[ -n "$provided_uuid" ]]; then
+        luks_uuid="$provided_uuid"
+    elif [[ -z "$underlying" ]]; then
+        # Cannot determine the block device.
+        if [[ -f /etc/crypttab ]] && \
+           awk -v l="${ROOTLABEL}" '$1==l {found=1} END {exit !found}' /etc/crypttab 2>/dev/null; then
+            log_warn "Could not determine underlying device — existing /etc/crypttab entry retained"
+            luks_uuid=""
+            _crypttab_trusted=1
+        else
+            error_exit "Could not determine underlying device for /dev/mapper/${ROOTLABEL}"
+        fi
+    else
+        luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
+        if [[ -z "$luks_uuid" ]]; then
+            if [[ -f /etc/crypttab ]] && \
+               awk -v l="${ROOTLABEL}" '$1==l && $2~/UUID=.+/ {found=1} END {exit !found}' /etc/crypttab 2>/dev/null; then
+                log_warn "Could not retrieve LUKS UUID — existing /etc/crypttab entry has a UUID, retaining it"
+                _crypttab_trusted=1
+            else
+                error_exit "Could not retrieve LUKS UUID from $underlying and no valid crypttab to fall back to"
+            fi
+        fi
+    fi
 
     local keyfile_dest="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
     local keyfile_opt="none"
@@ -435,22 +471,33 @@ ensure_crypttab() {
     # Rewrite only the UUID field if stale; preserve keyfile and options columns.
     # If the file exists but has no entry for ROOTLABEL (e.g. installed for a
     # different label), treat it as missing and append a correct entry.
-    if [[ -f /etc/crypttab ]]; then
-        local recorded_uuid
+    # Skip crypttab writes when _crypttab_trusted=1 (UUID unverifiable but
+    # existing entry was trusted) — but still fall through to dracut conf.
+    if (( _crypttab_trusted )); then
+        # Read keyfile field from trusted crypttab for dracut conf below
+        local existing_keyfile
+        existing_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || true)
+        if [[ -n "$existing_keyfile" && "$existing_keyfile" != "none" ]]; then
+            keyfile_opt="$existing_keyfile"
+        fi
+    elif [[ -f /etc/crypttab ]]; then
+        local entry_exists recorded_uuid
+        entry_exists=$(awk -v label="${ROOTLABEL}" '$1==label {print "yes"; exit}' /etc/crypttab 2>/dev/null || true)
         recorded_uuid=$(awk -v label="${ROOTLABEL}" '$1==label {print $2}' /etc/crypttab \
-            | sed 's/UUID=//' 2>/dev/null || true)
-        if [[ -z "$recorded_uuid" ]]; then
-            # No entry for our label — append one rather than rewriting the file
+            | sed 's/UUID=//' 2>/dev/null | head -1 || true)
+        if [[ -z "$entry_exists" ]]; then
+            # Truly no entry for our label — append one rather than rewriting the file
             log_warn "/etc/crypttab has no entry for ${ROOTLABEL} — appending"
             printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} none luks,discard" >> /etc/crypttab
             log "/etc/crypttab entry appended"
         elif [[ "$recorded_uuid" == "$luks_uuid" ]]; then
             log "/etc/crypttab UUID matches live device — ok"
         else
-            log_warn "/etc/crypttab has stale UUID (${recorded_uuid}) — updating to ${luks_uuid}"
+            # Entry exists but UUID is wrong, empty, or malformed — overwrite with correct entry
+            log_warn "/etc/crypttab has wrong/malformed UUID ('${recorded_uuid}') — correcting to ${luks_uuid}"
             local stale_keyfile stale_opts
-            stale_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || echo "none")
-            stale_opts=$(awk -v label="${ROOTLABEL}" '$1==label {print $4}' /etc/crypttab 2>/dev/null || echo "luks,discard")
+            stale_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null | head -1 || echo "none")
+            stale_opts=$(awk -v label="${ROOTLABEL}" '$1==label {print $4}' /etc/crypttab 2>/dev/null | head -1 || echo "luks,discard")
             # Use defaults if fields were empty
             [[ -z "$stale_keyfile" ]] && stale_keyfile="none"
             [[ -z "$stale_opts" ]] && stale_opts="luks,discard"
@@ -494,6 +541,8 @@ ensure_crypttab() {
     # /etc/dracut.conf.d/99-crypt-key.conf — always rewrite to stay in sync
     # with the current keyfile_opt. A one-time write risks drift if the system
     # migrates between keyfile and PIN/passphrase configurations.
+    # Matches the pattern used by configure.sh at install time: crypttab is
+    # included so dracut can handle unlock; keyfile is added when present.
     mkdir -p /etc/dracut.conf.d
     local install_items="/etc/crypttab"
     [[ "$keyfile_opt" != "none" ]] && install_items+=" ${keyfile_opt}"
@@ -883,14 +932,27 @@ generate_uki() {
     # and unmount ESP if we mounted it.
     trap 'cleanup_esp; rm -f "${CMDLINE_FILE}.tmp" "${uki_path}.tmp" "${uki_path}.tmp.signed.tmp" "${uki_path}.tmp.orig.tmp"' EXIT
 
-    # ensure_crypttab before generate_cmdline — crypttab must exist before
-    # dracut runs, and setting it up first keeps the logical order clear.
+    # Detect the LUKS UUID once and share it between ensure_crypttab and
+    # generate_cmdline so both use the identical value.
+    local shared_luks_uuid=""
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
-        ensure_crypttab
+        local _underlying
+        _underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+            | sed -n 's/^ *device: //p' | tr -d '\n')
+        if [[ -n "$_underlying" ]]; then
+            shared_luks_uuid=$(cryptsetup luksUUID "$_underlying" 2>/dev/null || true)
+        fi
+        [[ -z "$shared_luks_uuid" ]] && \
+            log_warn "Could not detect LUKS UUID — ensure_crypttab and generate_cmdline will handle fallback"
+        # ensure_crypttab before generate_cmdline — crypttab must exist in
+        # the initramfs. Always run it: even if UUID detection failed, it must
+        # ensure a valid crypttab exists (e.g. after /etc wipe). It handles
+        # its own fallback when UUID is empty.
+        ensure_crypttab "$shared_luks_uuid"
     fi
 
     local cmdline_rc=0
-    generate_cmdline "$slot" || cmdline_rc=$?
+    generate_cmdline "$slot" "$shared_luks_uuid" || cmdline_rc=$?
     if (( cmdline_rc == 2 )); then
         log_warn "Cmdline generation fell back to existing file — UKI will be built with previous cmdline"
     elif (( cmdline_rc != 0 )); then

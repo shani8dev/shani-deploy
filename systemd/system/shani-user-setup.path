@@ -1,0 +1,35 @@
+[Unit]
+Description=Watch for new users and skel changes
+After=etc.mount data.mount
+Requires=etc.mount data.mount
+
+[Path]
+# Watch the upper-layer passwd directly — inotify on the OverlayFS merged path
+# (/etc/passwd) is unreliable; writes go to the upper layer and events are not
+# consistently delivered to watchers on the merged path.
+# PathExists fires when the file is first created (copy-up on first useradd),
+# PathChanged fires on every subsequent write. Together they cover the full
+# lifecycle from an empty upper layer through all future user additions.
+PathExists=/data/overlay/etc/upper/passwd
+PathChanged=/data/overlay/etc/upper/passwd
+
+# /etc/skel lives on the read-only root — watch the merged path here since skel
+# changes only happen via a slot switch. After a slot switch shani-deploy writes
+# /data/user-setup-needed instead, so this is a belt-and-suspenders watch.
+PathModified=/etc/skel
+
+# Deploy marker — written by shani-deploy on every slot switch and by
+# configure.sh on first install. Fires the service even when the upper-layer
+# passwd hasn't changed (e.g. slot switch with updated skel/groups only).
+PathExists=/data/user-setup-needed
+
+Unit=shani-user-setup.service
+
+# Rate-limit: at most 3 triggers per 60s to prevent runaway loops.
+TriggerLimitIntervalSec=60s
+TriggerLimitBurst=3
+# MakeDirectory omitted — /etc/skel is on the read-only root; mkdir would fail
+# silently and may prevent the inotify watch from being set up at all.
+
+[Install]
+WantedBy=multi-user.target

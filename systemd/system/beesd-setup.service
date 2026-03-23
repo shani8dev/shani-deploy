@@ -1,0 +1,14 @@
+[Unit]
+Description=Bees BTRFS deduplication setup
+Documentation=https://github.com/Zygo/bees
+
+Requires=etc.mount
+After=etc.mount local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/beesd-setup
+
+[Install]
+WantedBy=multi-user.target

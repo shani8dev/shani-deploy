@@ -1486,9 +1486,11 @@ generate_uki() {
 
     log_verbose "Preparing chroot environment for @${slot}..."
     prepare_chroot "$slot"
-    # RETURN trap fires on normal function return; EXIT trap fires when die() calls exit 1.
-    # Both are needed — cleanup_chroot must run regardless of how we leave this function.
-    trap 'cleanup_chroot' RETURN EXIT
+    # Use RETURN-only trap for cleanup_chroot so the caller's EXIT trap
+    # (restore_candidate, armed by finalize_update/deploy_update) is never
+    # overwritten. Arming EXIT here would silently replace it with cleanup_chroot,
+    # causing restore_candidate to never fire on UKI failure.
+    trap 'cleanup_chroot' RETURN
 
     [[ "${DRY_RUN}" == "yes" ]] && return 0
 
@@ -1540,9 +1542,6 @@ generate_uki() {
         result=1
     fi
 
-    # Only clear EXIT trap on success — if chroot failed, leave EXIT armed so
-    # restore_candidate can still fire when die() calls exit 1 in the caller.
-    (( result == 0 )) && trap - EXIT
     return $result
 }
 
@@ -2631,17 +2630,17 @@ finalize_update() {
     log_section "Finalization"
     [[ "${DRY_RUN}" == "yes" ]] && return 0
 
-    # Arm emergency rollback trap here — deploy_update arms it inside its own
-    # scope, but ERR traps do not propagate across function call boundaries.
-    # Without this, a UKI generation failure (or any die() below) would exit
-    # without restoring @CANDIDATE_SLOT from its backup.
-    # EXIT trap catches die() which calls exit 1 directly (ERR does not fire on exit).
+    # Arm emergency rollback trap — ERR traps do not propagate across function
+    # call boundaries so finalize_update must re-arm after deploy_update returns.
+    # EXIT catches die() which calls exit 1 directly (ERR does not fire on exit).
+    # The three critical steps below also call restore_candidate explicitly so
+    # rollback is guaranteed even if the trap is displaced by a nested function.
     trap 'restore_candidate' ERR
     trap '[[ $? -ne 0 ]] && restore_candidate' EXIT
 
-    verify_and_create_subvolumes || die "Subvolume verification failed"
-    generate_uki "$CANDIDATE_SLOT" || die "UKI generation failed"
-    finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT" || die "Failed to update boot entries — ESP may not be accessible"
+    verify_and_create_subvolumes || { restore_candidate; return 1; }
+    generate_uki "$CANDIDATE_SLOT"  || { restore_candidate; return 1; }
+    finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT" || { restore_candidate; return 1; }
 
     mkdir -p /data
     echo "$CURRENT_SLOT" > /data/previous-slot || die "Failed to write previous-slot"

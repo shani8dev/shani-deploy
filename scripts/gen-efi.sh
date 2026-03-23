@@ -81,23 +81,37 @@ MOK_KEYS_GENERATED=0
 
 ensure_mok_keys() {
     if [[ -f "$MOK_KEY" && -f "$MOK_CRT" ]]; then
-        log "MOK keys present"
-        # Validate MOK.der — regenerate from MOK.crt if missing or corrupt.
-        # mokutil requires valid DER; a corrupt file produces:
-        #   "Abort!!! ... is not a valid x509 certificate in DER format"
-        local mok_der_path="/etc/secureboot/keys/MOK.der"
-        local der_valid=0
-        if [[ -f "$mok_der_path" ]]; then
-            openssl x509 -in "$mok_der_path" -inform DER -noout &>/dev/null && der_valid=1
+        # Validate that MOK.key and MOK.crt are a matching keypair.
+        # A mismatch (e.g. cert replaced without replacing the key, or vice versa)
+        # causes sbsign to fail deep inside dracut with an opaque OpenSSL error:
+        #   "key values mismatch" / "private key does not match certificate"
+        # Detect it here and regenerate so the error is caught early and clearly.
+        local key_pub cert_pub
+        key_pub=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
+        cert_pub=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
+        if [[ -z "$key_pub" || -z "$cert_pub" || "$key_pub" != "$cert_pub" ]]; then
+            log_warn "MOK.key and MOK.crt do not match (key=$key_pub cert=$cert_pub) — regenerating keypair"
+            rm -f "$MOK_KEY" "$MOK_CRT" /etc/secureboot/keys/MOK.der
+            # Fall through to the generation path below.
+        else
+            log "MOK keys present and keypair validated"
+            # Validate MOK.der — regenerate from MOK.crt if missing or corrupt.
+            # mokutil requires valid DER; a corrupt file produces:
+            #   "Abort!!! ... is not a valid x509 certificate in DER format"
+            local mok_der_path="/etc/secureboot/keys/MOK.der"
+            local der_valid=0
+            if [[ -f "$mok_der_path" ]]; then
+                openssl x509 -in "$mok_der_path" -inform DER -noout &>/dev/null && der_valid=1
+            fi
+            if (( ! der_valid )); then
+                log_warn "MOK.der missing or invalid — regenerating from MOK.crt"
+                openssl x509 -in "$MOK_CRT" -outform DER \
+                    -out "$mok_der_path" \
+                    || error_exit "Failed to regenerate MOK.der from MOK.crt"
+                log "MOK.der regenerated"
+            fi
+            return 0
         fi
-        if (( ! der_valid )); then
-            log_warn "MOK.der missing or invalid — regenerating from MOK.crt"
-            openssl x509 -in "$MOK_CRT" -outform DER \
-                -out "$mok_der_path" \
-                || error_exit "Failed to regenerate MOK.der from MOK.crt"
-            log "MOK.der regenerated"
-        fi
-        return 0
     fi
 
     # MOK.der is the public cert only — the private key is never stored in the
@@ -270,6 +284,16 @@ sign_efi_binary() {
     if sbverify --cert "$MOK_CRT" "$file" &>/dev/null 2>&1; then
         log "$(basename "$file") already signed with current key — skipping"
         return 0
+    fi
+
+    # Pre-flight: verify MOK.key and MOK.crt are a matching keypair before
+    # invoking sbsign. A mismatch produces an opaque OpenSSL error deep inside
+    # sbsign/dracut; catching it here gives an actionable message.
+    local _kp _cp
+    _kp=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
+    _cp=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
+    if [[ -z "$_kp" || -z "$_cp" || "$_kp" != "$_cp" ]]; then
+        error_exit "MOK.key and MOK.crt do not match — run: rm ${MOK_KEY} ${MOK_CRT} /etc/secureboot/keys/MOK.der && gen-efi configure <slot>"
     fi
 
     # Not signed with our key — sign it now.

@@ -281,6 +281,19 @@ declare -a _RECS=()
 _rec()        { _RECS+=("$*"); }
 _recs_reset() { _RECS=(); }
 
+# Convert kilobytes to a human-readable string (KB / MB / GB).
+# Usage: _kb_to_human <kb>
+_kb_to_human() {
+    local kb="$1"
+    if (( kb >= 1048576 )); then
+        printf "%d GB" $(( kb / 1048576 ))
+    elif (( kb >= 1024 )); then
+        printf "%d MB" $(( kb / 1024 ))
+    else
+        printf "%d KB" "$kb"
+    fi
+}
+
 # Print accumulated recommendations. Optional arg: empty-state message.
 # Usage: _recs_print "No issues found"   or   _recs_print
 _recs_print() {

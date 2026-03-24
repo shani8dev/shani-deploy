@@ -669,7 +669,11 @@ _section_boot_health() {
         _rec "Boot chain service(s) failed: $(_join "${chain_failed[@]}") — run: systemctl status <unit>"
     fi
     local overlay_boot_failed=()
-    for svc in etc-daemon-reload.service etc-start-services.service; do
+    # Check both new names (mount-and-reload, start-overlay-services) and legacy names
+    # (etc-daemon-reload, etc-start-services) for compatibility across versions.
+    for svc in mount-and-reload.service start-overlay-services.service \
+               etc-daemon-reload.service etc-start-services.service; do
+        systemctl cat "$svc" &>/dev/null 2>&1 || continue  # skip units that don't exist
         systemctl is-failed --quiet "$svc" 2>/dev/null && overlay_boot_failed+=("$svc")
     done
     if [[ ${#overlay_boot_failed[@]} -gt 0 ]]; then
@@ -2370,6 +2374,81 @@ _section_users() {
             else
             _row "homed"       "~~  not enabled — portable encrypted home directories"
         fi
+    fi
+
+
+    # ── /etc/shani-extra-groups (source of truth for user provisioning) ──────
+    if [[ ! -f /etc/shani-extra-groups ]]; then
+        _row "extra-groups" "--  /etc/shani-extra-groups absent — shani-user-setup falls back to built-in default"
+    fi
+
+    # ── SSH key permissions (per login user) ─────────────────────────────────
+    # shani-user-setup enforces these; health checks they weren't changed after the fact.
+    local _login_ssh_users=()
+    _get_login_users _login_ssh_users
+    local _ssh_bad=()
+    for _u in "${_login_ssh_users[@]}"; do
+        local _uhome; _uhome=$(getent passwd "$_u" 2>/dev/null | cut -d: -f6 || echo "")
+        [[ -d "${_uhome}/.ssh" ]] || continue
+        # Private keys: 600
+        while IFS= read -r _kf; do
+            local _m; _m=$(stat -c '%a' "$_kf" 2>/dev/null || echo "")
+            [[ "$_m" != "600" ]] && _ssh_bad+=("${_u}:$(basename "$_kf"):${_m}")
+        done < <(find "${_uhome}/.ssh" -maxdepth 1 -type f \
+            ! -name "*.pub" ! -name "authorized_keys" \
+            ! -name "known_hosts" ! -name "config" ! -name ".gitkeep" 2>/dev/null)
+        # authorized_keys + config: 600
+        for _sf in authorized_keys config; do
+            [[ -f "${_uhome}/.ssh/${_sf}" ]] || continue
+            local _m; _m=$(stat -c '%a' "${_uhome}/.ssh/${_sf}" 2>/dev/null || echo "")
+            [[ "$_m" != "600" ]] && _ssh_bad+=("${_u}:${_sf}:${_m}")
+        done
+        # known_hosts + .pub files: 644
+        while IFS= read -r _pf; do
+            local _m; _m=$(stat -c '%a' "$_pf" 2>/dev/null || echo "")
+            [[ "$_m" != "644" ]] && _ssh_bad+=("${_u}:$(basename "$_pf"):${_m}")
+        done < <(find "${_uhome}/.ssh" -maxdepth 1 -type f -name "*.pub" 2>/dev/null)
+        if [[ -f "${_uhome}/.ssh/known_hosts" ]]; then
+            local _m; _m=$(stat -c '%a' "${_uhome}/.ssh/known_hosts" 2>/dev/null || echo "")
+            [[ "$_m" != "644" ]] && _ssh_bad+=("${_u}:known_hosts:${_m}")
+        fi
+    done
+    if [[ ${#_ssh_bad[@]} -gt 0 ]]; then
+        _row "SSH key perms" "!   wrong modes: $(_join "${_ssh_bad[@]}")  (want: private=600 pub/known_hosts=644)"
+        _rec "SSH key permissions wrong — fix: chmod 600 ~/.ssh/id_* ~/.ssh/authorized_keys ~/.ssh/config; chmod 644 ~/.ssh/*.pub ~/.ssh/known_hosts"
+    elif [[ ${#_login_ssh_users[@]} -gt 0 ]]; then
+        _row "SSH key perms" "OK  all user .ssh key permissions correct"
+    fi
+
+    # ── GnuPG permissions (per login user) ───────────────────────────────────
+    local _gpg_bad=()
+    for _u in "${_login_ssh_users[@]}"; do
+        local _uhome; _uhome=$(getent passwd "$_u" 2>/dev/null | cut -d: -f6 || echo "")
+        [[ -d "${_uhome}/.gnupg" ]] || continue
+        # .gnupg itself and subdirs: 700
+        local _dm; _dm=$(stat -c '%a' "${_uhome}/.gnupg" 2>/dev/null || echo "")
+        [[ "$_dm" != "700" ]] && _gpg_bad+=("${_u}:.gnupg:${_dm}")
+        while IFS= read -r _gd; do
+            local _m; _m=$(stat -c '%a' "$_gd" 2>/dev/null || echo "")
+            [[ "$_m" != "700" ]] && _gpg_bad+=("${_u}:$(basename "$_gd")/:${_m}")
+        done < <(find "${_uhome}/.gnupg" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+        # Files: 600
+        while IFS= read -r _gf; do
+            [[ "$(basename "$_gf")" == ".gitkeep" ]] && continue
+            local _m; _m=$(stat -c '%a' "$_gf" 2>/dev/null || echo "")
+            [[ "$_m" != "600" ]] && _gpg_bad+=("${_u}:$(basename "$_gf"):${_m}")
+        done < <(find "${_uhome}/.gnupg" -maxdepth 1 -type f 2>/dev/null)
+    done
+    if [[ ${#_gpg_bad[@]} -gt 0 ]]; then
+        _row "GnuPG perms"  "!   wrong modes: $(_join "${_gpg_bad[@]}")  (want: dirs=700 files=600)"
+        _rec "GnuPG permissions wrong — fix: chmod 700 ~/.gnupg; chmod 600 ~/.gnupg/*"
+    elif [[ ${#_login_ssh_users[@]} -gt 0 ]]; then
+        local _has_gpg=0
+        for _u in "${_login_ssh_users[@]}"; do
+            local _uhome; _uhome=$(getent passwd "$_u" 2>/dev/null | cut -d: -f6 || echo "")
+            [[ -d "${_uhome}/.gnupg" ]] && { _has_gpg=1; break; }
+        done
+        (( _has_gpg )) && _row "GnuPG perms" "OK  all user .gnupg permissions correct"
     fi
 
     _optional_end
@@ -5358,10 +5437,31 @@ _section_units() {
     # Filter known transient oneshot units that legitimately enter failed state
     # (e.g. systemd-suspend.service fails after every suspend cycle by design)
     local _transient_ok="systemd-suspend.service|systemd-hibernate.service|systemd-hybrid-sleep.service|drkonqi-coredump-processor@.*\.service"
+    # snap-*.mount units are alias forms of var-lib-snapd-snap-*.mount.
+    # start-overlay-services intentionally skips them — they fail when the
+    # canonical mount is already active at the same path. Filter here to
+    # avoid false-positive failures when snapd is otherwise healthy.
     mapfile -t failed_units < <(
         systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
             | awk '{print $2}' | grep -v '^$' | grep '\.' \
-            | grep -vE "^(${_transient_ok})$" || true)
+            | grep -vE "^(${_transient_ok})$" \
+            | grep -vE "^snap-.*\.mount$" || true)
+    # Snap alias failures: report as info-only when canonical mounts are active.
+    local _snap_alias_failed=()
+    mapfile -t _snap_alias_failed < <(
+        systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
+            | awk '{print $2}' | grep -E "^snap-.*\.mount$" || true)
+    if [[ ${#_snap_alias_failed[@]} -gt 0 ]]; then
+        local _canonical_ok=0
+        systemctl list-units --state=active --no-legend --no-pager 2>/dev/null \
+            | awk '{print $1}' | grep -q '^var-lib-snapd-snap-' && _canonical_ok=1
+        if (( _canonical_ok )); then
+            _row2 "--  ${#_snap_alias_failed[@]} snap alias mount(s) failed (expected — canonical var-lib-snapd-snap-*.mount active)"
+        else
+            # Canonical mounts also not active — include as real failures
+            failed_units+=("${_snap_alias_failed[@]}")
+        fi
+    fi
 
     if [[ ${#failed_units[@]} -eq 0 ]]; then _row "Units"     "OK  no failed systemd units"
     else

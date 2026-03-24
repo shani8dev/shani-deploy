@@ -9,7 +9,6 @@
 
 set -uo pipefail   # -e intentionally omitted: one bad user must not abort the rest
 
-SKEL_DIR="/etc/skel"
 EXTRA_GROUPS_FILE="/etc/shani-extra-groups"
 
 EXTRA_GROUPS=""
@@ -46,8 +45,6 @@ fi
 # Hoist constant tool lookups — no point re-running these per user.
 ZSH_PATH=$(command -v zsh  2>/dev/null || true)
 BASH_PATH=$(command -v bash 2>/dev/null || true)
-HAS_RSYNC=$(command -v rsync              &>/dev/null && echo 1 || echo 0)
-HAS_XDG=$(command -v xdg-user-dirs-update &>/dev/null && echo 1 || echo 0)
 HAS_FLATPAK=$(command -v flatpak          &>/dev/null && echo 1 || echo 0)
 HAS_NIX=$(command -v nix-channel          &>/dev/null && echo 1 || echo 0)
 HAS_PODMAN=$(command -v podman            &>/dev/null && echo 1 || echo 0)
@@ -128,66 +125,10 @@ while IFS=: read -r username _ uid gid _ home shell; do
         fi
     fi
 
-    # ── Home directory ────────────────────────────────────────────────────────
-    # Note: install -d -m does NOT change permissions on an already-existing dir,
-    # so we always check and fix mode explicitly after ensuring the dir exists.
-    if [[ ! -d "$home" ]]; then
-        log "creating home directory $home for $username"
-        run mkdir -p "$home" \
-            || { warn "failed to create $home"; user_ok=0; }
-    fi
-    if [[ -d "$home" ]]; then
-        current_mode=$(stat -c %a "$home" 2>/dev/null)
-        if [[ "$current_mode" != "700" ]]; then
-            run chmod 700 "$home" || { warn "chmod failed for $home"; user_ok=0; }
-        fi
-    fi
-
-    # ── Skel sync ─────────────────────────────────────────────────────────────
-    # Always run — skel files may be updated by packages and should propagate.
-    # --update skips dest files newer than the source (user-modified copies),
-    # so only genuinely new or updated skel files are written.
-    # Ownership is fixed after copy — skel files are root-owned and the user
-    # must be able to modify or delete their own copies.
-    if [[ -d "$home" && -d "$SKEL_DIR" ]]; then
-        if [[ "$HAS_RSYNC" -eq 1 ]]; then
-            run rsync -a --update --chown="$uid:$gid" --exclude='.gitkeep' "$SKEL_DIR/" "$home/" \
-                || warn "rsync skel failed for $username"
-        else
-            # Fallback: recurse manually, mirroring rsync --update semantics.
-            while IFS= read -r item; do
-                [[ "$(basename "$item")" == ".gitkeep" ]] && continue
-                rel="${item#"$SKEL_DIR"/}"
-                dest="$home/$rel"
-                if [[ -d "$item" ]]; then
-                    if [[ ! -d "$dest" ]]; then
-                        run mkdir -p "$dest" \
-                            && run chown "$uid:$gid" "$dest" \
-                            || warn "mkdir skel dir $dest failed for $username"
-                    fi
-                else
-                    # Copy if missing or skel is newer; skip if dest is newer (user-modified).
-                    if [[ -e "$dest" ]]; then
-                        [[ "$item" -nt "$dest" ]] || continue
-                    fi
-                    run cp -a "$item" "$dest" \
-                        && run chown "$uid:$gid" "$dest" \
-                        || warn "cp skel $item failed for $username"
-                fi
-            done < <(find "$SKEL_DIR" -mindepth 1 ! -name '.gitkeep')
-        fi
-    fi
-
     # ── One-time bootstrap (stamp-guarded) ───────────────────────────────────
-    # XDG dirs, flatpak/nix/subuid/podman bootstrap are expensive to probe and
+    # Flatpak/nix/subuid/podman bootstrap are expensive to probe and
     # only ever needed once per user. Skip when stamp matches.
     if [[ "$_stamp_ok" -ne 1 ]]; then
-
-    # ── XDG user dirs ─────────────────────────────────────────────────────────
-    if [[ "$HAS_XDG" -eq 1 ]]; then
-        run runuser -u "$username" -- xdg-user-dirs-update 2>/dev/null \
-            || warn "xdg-user-dirs-update failed for $username"
-    fi
 
     # ── Flatpak user remote ───────────────────────────────────────────────────
     if [[ "$HAS_FLATPAK" -eq 1 ]]; then
@@ -265,86 +206,7 @@ while IFS=: read -r username _ uid gid _ home shell; do
 
     fi  # end stamp-guarded bootstrap
 
-    # ── Skel dir permissions ──────────────────────────────────────────────────
-    # Always run — user may have inadvertently changed modes on sensitive dirs.
-    for d in .ssh .gnupg .config/systemd/user .local/share/keyrings .local/share/zsh; do
-        [[ -d "$home/$d" ]] || continue
-        _cur=$(stat -c '%a %u %g' "$home/$d" 2>/dev/null)
-        [[ "$_cur" == "700 $uid $gid" ]] && continue
-        run chmod 700 "$home/$d" && run chown "$uid:$gid" "$home/$d" \
-            || warn "failed to fix permissions on $home/$d"
-    done
-
-    # ── SSH key permissions ───────────────────────────────────────────────────
-    # Always run — user may have copied keys with wrong modes.
-    if [[ -d "$home/.ssh" ]]; then
-        _fix_file() {
-            local f="$1" want_mode="$2"
-            local cur_mode cur_owner cur_group
-            cur_mode=$(stat -c %a "$f" 2>/dev/null)
-            cur_owner=$(stat -c %u "$f" 2>/dev/null)
-            cur_group=$(stat -c %g "$f" 2>/dev/null)
-            [[ "$cur_mode"  != "$want_mode" ]] && { run chmod "$want_mode" "$f" || warn "chmod $want_mode $f failed"; }
-            [[ "$cur_owner" != "$uid" || "$cur_group" != "$gid" ]] && { run chown "$uid:$gid" "$f" || warn "chown $f failed"; }
-        }
-
-        # Private keys — 600
-        while IFS= read -r keyfile; do
-            _fix_file "$keyfile" 600
-        done < <(find "$home/.ssh" -maxdepth 1 -type f \
-            ! -name "*.pub" \
-            ! -name "authorized_keys" \
-            ! -name "known_hosts" \
-            ! -name "config" \
-            ! -name ".gitkeep")
-
-        # Public keys — 644
-        while IFS= read -r pubfile; do
-            _fix_file "$pubfile" 644
-        done < <(find "$home/.ssh" -maxdepth 1 -type f -name "*.pub")
-
-        [[ -f "$home/.ssh/authorized_keys" ]] && _fix_file "$home/.ssh/authorized_keys" 600
-        [[ -f "$home/.ssh/known_hosts"     ]] && _fix_file "$home/.ssh/known_hosts"     644
-        [[ -f "$home/.ssh/config"          ]] && _fix_file "$home/.ssh/config"          600
-    fi
-
-    # ── GnuPG key permissions ─────────────────────────────────────────────────
-    # Always run — user may have imported new keys or changed modes.
-    if [[ -d "$home/.gnupg" ]]; then
-        while IFS= read -r f; do
-            [[ "$(basename "$f")" == ".gitkeep" ]] && continue
-            _fix_file "$f" 600
-        done < <(find "$home/.gnupg" -maxdepth 1 -type f)
-
-        while IFS= read -r d; do
-            _cur=$(stat -c '%a %u %g' "$d" 2>/dev/null)
-            [[ "$_cur" == "700 $uid $gid" ]] || {
-                run chmod 700 "$d" && run chown "$uid:$gid" "$d" \
-                    || warn "failed to fix permissions on $d"
-            }
-        done < <(find "$home/.gnupg" -mindepth 1 -maxdepth 1 -type d)
-
-        if [[ -d "$home/.gnupg/private-keys-v1.d" ]]; then
-            while IFS= read -r f; do
-                _fix_file "$f" 600
-            done < <(find "$home/.gnupg/private-keys-v1.d" -maxdepth 1 -type f)
-        fi
-    fi
-
-    # ── Fix ownership ─────────────────────────────────────────────────────────
-    # Only chown the home dir root itself — recursing into a large tree is
-    # expensive and almost never needed. Specific files (keys, skel items) are
-    # already chowned above where they're created or fixed.
-    if [[ -d "$home" ]]; then
-        current_owner=$(stat -c %u "$home" 2>/dev/null)
-        current_group=$(stat -c %g "$home" 2>/dev/null)
-        if [[ "$current_owner" != "$uid" || "$current_group" != "$gid" ]]; then
-            log "fixing ownership of $home root (was $current_owner:$current_group, want $uid:$gid)"
-            run chown "$uid:$gid" "$home" \
-                || { warn "chown failed for $home"; user_ok=0; }
-        fi
-    fi
-
+    if [[ "$user_ok" -eq 1 ]]; then
     if [[ "$user_ok" -eq 1 ]]; then
         processed+=("$username")
         # Write stamp so next run skips the slow steps.

@@ -77,7 +77,6 @@ HARD_WIPE="no"
 KEEP_DOWNLOADS="no"
 WIPE_HOME="no"
 SKIP_CONFIRM="no"
-RECOVERY_MODE="no"
 
 # Save original args before parsing — needed to re-exec with pkexec/sudo
 declare -a ORIGINAL_ARGS=("$@")
@@ -91,9 +90,6 @@ Usage: $(basename "$0") [OPTIONS]
   The system reboots automatically after the reset.
 
 Options:
-  --recovery         Reboot into the low-level recovery EFI (LUKS reset).
-                     Wipes @data at the Btrfs level — use when the OS is
-                     unbootable or /data is inaccessible.
   --hard             Wipe /data entirely instead of selectively.
                      Both modes produce the same end state; --hard also
                      removes any unknown files that accumulated in /data.
@@ -123,7 +119,6 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --recovery)         RECOVERY_MODE="yes";   shift ;;
         --hard)             HARD_WIPE="yes";       shift ;;
         --keep-downloads)   KEEP_DOWNLOADS="yes";  shift ;;
         --home)             WIPE_HOME="yes";        shift ;;
@@ -147,43 +142,6 @@ if [[ $(id -u) -ne 0 ]]; then
     else
         die "Must run as root."
     fi
-fi
-
-##############################################################################
-### Recovery mode — reboot into the reset EFI
-##############################################################################
-# --recovery bypasses the normal /data wipe entirely. Instead it uses
-# bootctl to set the recovery EFI as the one-time next boot entry, then
-# reboots. The recovery EFI handles unlocking LUKS and wiping @data itself.
-# Use this when the OS is still running but you want a clean low-level reset,
-# or to trigger it from a GUI/script without touching /data directly.
-
-if [[ "$RECOVERY_MODE" == "yes" ]]; then
-    readonly RECOVERY_EFI="${OS_NAME}-reset.efi"
-
-    if ! command -v bootctl &>/dev/null; then
-        die "--recovery requires bootctl (systemd-boot). Not found."
-    fi
-
-    # Verify the recovery EFI actually exists on the ESP before committing
-    ESP_PATH=$(bootctl --print-esp-path 2>/dev/null || echo "")
-    if [[ -z "$ESP_PATH" ]]; then
-        die "Could not determine ESP path from bootctl."
-    fi
-    if [[ ! -f "${ESP_PATH}/EFI/${OS_NAME}/${RECOVERY_EFI}" ]]; then
-        die "Recovery EFI not found at ${ESP_PATH}/EFI/${OS_NAME}/${RECOVERY_EFI}.\n" \
-            "Run: gen-efi generate-reset-efi"
-    fi
-
-    section "ShaniOS Recovery Boot"
-    log "Setting one-time boot entry: ${RECOVERY_EFI}"
-    bootctl set-oneshot "${RECOVERY_EFI}" \
-        || die "bootctl set-oneshot failed — cannot set recovery boot entry."
-
-    log "Rebooting into recovery in 3 seconds... (Ctrl-C to abort)"
-    sleep 3
-    systemctl reboot
-    exit 0
 fi
 
 ##############################################################################

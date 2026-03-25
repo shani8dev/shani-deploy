@@ -6,6 +6,8 @@
 #   ./gen-efi.sh enroll-mok               — stage MOK enrollment without rebuilding UKI
 #   ./gen-efi.sh enroll-tpm2              — enroll TPM2 for automatic LUKS unlock
 #   ./gen-efi.sh cleanup-mok             — remove old MOK keys after new key is confirmed
+#   ./gen-efi.sh cleanup-tpm2            — remove stale TPM2 LUKS slots after re-enrolment
+#   ./gen-efi.sh generate-reset-efi      — (re)build the factory-reset EFI boot entry
 #
 # ENHANCED:
 # - Validates target slot against booted slot
@@ -38,13 +40,14 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "generate-reset-efi" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
     echo "  $0 cleanup-tpm2              — remove stale TPM2 LUKS slots after re-enrolment"
+    echo "  $0 generate-reset-efi        — (re)build the factory-reset EFI boot entry"
     exit 1
 fi
 
@@ -923,6 +926,152 @@ update_bootloader() {
     [[ $updated -eq 1 ]] && log "Bootloader update complete" || log "All bootloader components up to date"
 }
 
+# generate_reset_efi — build a signed EFI binary that boots into a minimal
+# dracut initramfs and runs the ShaniOS factory reset as /init.
+#
+# The EFI is placed alongside the slot UKIs at EFI/shanios/ and registered
+# via a Type 1 loader entry (.conf). No EFI/Linux/ auto-discovery path is
+# used — that would cause systemd-boot to show the entry twice.
+#
+# Called automatically at the end of generate_uki, and available standalone:
+#   gen-efi generate-reset-efi
+generate_reset_efi() {
+    local reset_efi="${EFI_DIR}/${OS_NAME}-reset.efi"
+    local reset_entry="${ESP}/loader/entries/${OS_NAME}-reset.conf"
+
+    local kernel_ver
+    kernel_ver=$(get_kernel_version)
+
+    log "Building reset EFI (kernel: ${kernel_ver})"
+
+    local builddir
+    builddir=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '${builddir}'" RETURN
+
+    # ── /init script ──────────────────────────────────────────────────────────
+    # ROOTLABEL is substituted now (build time) so the embedded script always
+    # matches the label constant at the top of gen-efi.sh.
+    local init_script="${builddir}/init"
+    cat > "$init_script" <<INIT
+#!/bin/sh
+set -e
+echo "== ShaniOS Factory Reset =="
+mount -t proc     none /proc
+mount -t sysfs    none /sys
+mount -t devtmpfs none /dev 2>/dev/null || true
+
+ROOTLABEL="${ROOTLABEL}"
+DEV=""
+
+echo "Scanning for LUKS2 devices..."
+for dev in \$(blkid -t TYPE=crypto_LUKS -o device); do
+    echo ""
+    echo "------------------------------------"
+    echo "Device: \$dev"
+    echo "------------------------------------"
+    if cryptsetup luksOpen "\$dev" "\$ROOTLABEL"; then
+        mkdir -p /mnt
+        if mount -o subvolid=5 /dev/mapper/\$ROOTLABEL /mnt 2>/dev/null; then
+            if [ -d /mnt/@data ]; then
+                echo "Found ShaniOS root on \$dev"
+                DEV="/dev/mapper/\$ROOTLABEL"
+                break
+            fi
+            umount /mnt
+        fi
+        cryptsetup close "\$ROOTLABEL"
+        echo "Not the ShaniOS root, trying next..."
+    else
+        echo "Unlock failed for \$dev"
+    fi
+done
+
+if [ -z "\$DEV" ]; then
+    echo "ERROR: No valid ShaniOS root found"
+    sleep 5
+    reboot -f
+fi
+
+echo "Mounting Btrfs top-level..."
+mount -o subvolid=5 "\$DEV" /mnt
+
+if [ ! -d /mnt/@data ]; then
+    echo "ERROR: @data subvolume not found"
+    sleep 5
+    reboot -f
+fi
+
+echo "Deleting @data..."
+btrfs subvolume delete /mnt/@data || true
+echo "Recreating @data..."
+btrfs subvolume create /mnt/@data
+sync
+
+echo "Reset complete. Rebooting in 3 seconds..."
+sleep 3
+reboot -f
+INIT
+    chmod 0755 "$init_script"
+
+    # ── dracut --uefi ─────────────────────────────────────────────────────────
+    # --uefi                : produce a UKI (.efi) — initramfs + kernel + .osrel
+    #                         packed into a single PE binary, bootable by UEFI.
+    #                         dracut embeds /etc/os-release as .osrel automatically.
+    #                         The Type 1 .conf title= field overrides .osrel for
+    #                         display in the systemd-boot menu.
+    # --no-hostonly         : hardware-agnostic, works on any machine with this ESP
+    # --no-hostonly-cmdline : don't bake host cmdline into the image
+    # --add-drivers btrfs   : always include btrfs + dm-crypt
+    # --omit systemd*       : bare initramfs — our /init runs as PID 1, not systemd
+    # --modules "base bash" : minimal shell environment; system module dirs used
+    # --install             : pull in binaries + full lib dependency chain via ldd
+    # --include <s> <d>     : inject /init into initramfs root (runs as PID 1)
+    # --kernel-cmdline      : embedded cmdline baked into the UKI PE header
+    local tmp_efi="${builddir}/reset.efi"
+    dracut \
+        --force \
+        --uefi \
+        --no-hostonly \
+        --no-hostonly-cmdline \
+        --add-drivers "btrfs" \
+        --omit "systemd systemd-initrd dracut-systemd plymouth" \
+        --modules "base bash" \
+        --install "cryptsetup btrfs blkid mount umount sleep reboot sync" \
+        --include "$init_script" "/init" \
+        --kver "$kernel_ver" \
+        --kernel-cmdline "quiet rd.shell=0 rd.emergency=reboot" \
+        "$tmp_efi" \
+        || { log_warn "generate_reset_efi: dracut failed — skipping"; return 0; }
+
+    sign_efi_binary "$tmp_efi"
+
+    mkdir -p "$EFI_DIR"
+    mv "$tmp_efi" "$reset_efi" \
+        || { log_warn "generate_reset_efi: failed to move EFI into place"; return 0; }
+    log "Reset EFI written: ${reset_efi}"
+
+    # ── systemd-boot entry ────────────────────────────────────────────────────
+    # Hidden from the normal boot menu — reset must be an explicit action.
+    #
+    # To access it physically at boot:
+    #   1. Hold SPACE (or any key) during POST to open the systemd-boot menu
+    #   2. Press 'h' to reveal hidden entries
+    #   3. Select "ShaniOS Factory Reset"
+    #
+    # Or from the running OS:
+    #   systemctl reboot --boot-loader-entry=shanios-reset.conf
+    #
+    # The title includes the key hint so it's self-documenting when revealed.
+    mkdir -p "$(dirname "$reset_entry")"
+    cat > "$reset_entry" <<CONF
+title   ShaniOS Factory Reset  [hold SPACE at boot, then press h]
+efi     /EFI/${OS_NAME}/${OS_NAME}-reset.efi
+show    no
+CONF
+    log "Boot entry written (hidden, reveal with 'h' in boot menu): ${reset_entry}"
+}
+
 # generate_uki generates the UKI image for the given slot.
 generate_uki() {
     local slot="$1"
@@ -1000,6 +1149,10 @@ generate_uki() {
     # failure (e.g. read-only efivars in chroot) must not fail the whole deploy.
     _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — UKI was built and signed successfully"
 
+    # Build the reset EFI alongside the slot UKI so the boot menu always has
+    # an up-to-date factory-reset option. Non-fatal if dracut fails.
+    generate_reset_efi
+
     # Clear the EXIT trap before returning — uki_path is local and would be
     # unbound when the trap fires on process exit. Call cleanup_esp explicitly
     # here so the ESP is still unmounted if we mounted it.
@@ -1065,6 +1218,13 @@ enroll_mok() {
             ( sign_efi_binary "$uki" ) || log_warn "Failed to re-sign ${uki} — continuing"
         fi
     done
+
+    # Re-sign the reset EFI if present
+    local reset_efi="${EFI_DIR}/${OS_NAME}-reset.efi"
+    if [[ -f "$reset_efi" ]]; then
+        log "Re-signing ${reset_efi}"
+        ( sign_efi_binary "$reset_efi" ) || log_warn "Failed to re-sign ${reset_efi} — continuing"
+    fi
 
     # Stage MOK enrollment
     _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — EFI binaries were re-signed successfully"
@@ -1199,6 +1359,15 @@ case "${1:-}" in
     cleanup-tpm2)
         cleanup_tpm2
         ;;
+    generate-reset-efi)
+        ensure_mok_keys
+        ensure_esp_mounted
+        mkdir -p "$EFI_DIR"
+        trap 'cleanup_esp' EXIT
+        generate_reset_efi
+        trap - EXIT
+        cleanup_esp
+        ;;
     *)
         echo "Usage:"
         echo "  $0 configure <target_slot>"
@@ -1206,6 +1375,7 @@ case "${1:-}" in
         echo "  $0 enroll-tpm2"
         echo "  $0 cleanup-mok"
         echo "  $0 cleanup-tpm2"
+        echo "  $0 generate-reset-efi"
         exit 1
         ;;
 esac

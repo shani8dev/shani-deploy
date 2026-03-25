@@ -929,15 +929,15 @@ update_bootloader() {
 # generate_reset_efi — build a signed EFI binary that boots into a minimal
 # dracut initramfs and runs the ShaniOS factory reset as /init.
 #
-# The EFI is placed alongside the slot UKIs at EFI/shanios/ and registered
-# via a Type 1 loader entry (.conf). No EFI/Linux/ auto-discovery path is
-# used — that would cause systemd-boot to show the entry twice.
+# The EFI is placed at EFI/shanios/shanios-reset.efi but intentionally NOT
+# registered in loader/entries/ — it is invisible to systemd-boot entirely.
+# Trigger it explicitly from the running OS:
+#   sudo bootctl set-oneshot shanios-reset.efi && sudo systemctl reboot
 #
 # Called automatically at the end of generate_uki, and available standalone:
 #   gen-efi generate-reset-efi
 generate_reset_efi() {
     local reset_efi="${EFI_DIR}/${OS_NAME}-reset.efi"
-    local reset_entry="${ESP}/loader/entries/${OS_NAME}-reset.conf"
 
     local kernel_ver
     kernel_ver=$(get_kernel_version)
@@ -1052,24 +1052,17 @@ INIT
     log "Reset EFI written: ${reset_efi}"
 
     # ── systemd-boot entry ────────────────────────────────────────────────────
-    # Hidden from the normal boot menu — reset must be an explicit action.
+    # No .conf entry is written — keeping the reset EFI completely invisible to
+    # systemd-boot. There is no reliable cross-version field to hide an entry;
+    # the only guaranteed method is to not register it at all.
     #
-    # To access it physically at boot:
-    #   1. Hold SPACE (or any key) during POST to open the systemd-boot menu
-    #   2. Press 'h' to reveal hidden entries
-    #   3. Select "ShaniOS Factory Reset"
+    # To trigger a factory reset deliberately:
+    #   sudo bootctl set-oneshot ${OS_NAME}-reset.efi
+    #   sudo systemctl reboot
     #
-    # Or from the running OS:
-    #   systemctl reboot --boot-loader-entry=shanios-reset.conf
-    #
-    # The title includes the key hint so it's self-documenting when revealed.
-    mkdir -p "$(dirname "$reset_entry")"
-    cat > "$reset_entry" <<CONF
-title   ShaniOS Factory Reset  [hold SPACE at boot, then press h]
-efi     /EFI/${OS_NAME}/${OS_NAME}-reset.efi
-show    no
-CONF
-    log "Boot entry written (hidden, reveal with 'h' in boot menu): ${reset_entry}"
+    # Or wire it to a shani-reset --recovery command that calls the above.
+    log "Reset EFI ready (not registered in boot menu): ${reset_efi}"
+    log "Trigger with: bootctl set-oneshot ${OS_NAME}-reset.efi && systemctl reboot"
 }
 
 # generate_uki generates the UKI image for the given slot.

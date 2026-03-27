@@ -2479,15 +2479,12 @@ _section_groups() {
     local login_users=()
     _get_login_users login_users
 
-    local groups_missing=() groups_ok=0 groups_gid_wrong=()
+    local groups_missing=() groups_ok=0
     local membership_missing=()  # "user:group" pairs
     for grp in "${!STATIC_GIDS[@]}"; do
         local actual_gid; actual_gid=$(getent group "$grp" 2>/dev/null | cut -d: -f3 || echo "")
         if [[ -z "$actual_gid" ]]; then
             groups_missing+=("$grp")
-        elif [[ "$actual_gid" != "${STATIC_GIDS[$grp]}" ]]; then
-            groups_gid_wrong+=("${grp}(expected:${STATIC_GIDS[$grp]},actual:${actual_gid})")
-            groups_ok=$(( groups_ok + 1 ))  # group exists, just wrong GID
         else
             groups_ok=$(( groups_ok + 1 ))
         fi
@@ -2549,12 +2546,7 @@ _section_groups() {
             esac
         done
     fi
-    # GID mismatch — group exists but has wrong numeric ID; file permissions will be wrong
-    if [[ ${#groups_gid_wrong[@]} -gt 0 ]]; then
-        local _gw_str; _gw_str=$(IFS=' '; echo "${groups_gid_wrong[*]}")
-        _row "GID wrong"  "!!  GID mismatch: ${_gw_str} — file permissions may be broken"
-        _rec "System group GIDs don't match expected values — base image may be misconfigured"
-    fi
+
 
     if [[ ${#sys_missing[@]} -gt 0 ]]; then
         local _sm_str; _sm_str=$(IFS=' '; echo "${sys_missing[*]}")
@@ -5732,10 +5724,49 @@ _section_containers() {
         else
             _row "Podman"     "--  installed${podman_ver:+  v${podman_ver}}  socket inactive${rl_str}"
         fi
-        # Distrobox: depends on Podman — flag if installed but Podman socket is down
-        if command -v distrobox &>/dev/null && \
-           [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
-            _row2 "!   Distrobox installed but Podman socket not active — containers won't start"
+        # Distrobox: depends on Podman — show version, box list, and storage
+        if command -v distrobox &>/dev/null; then
+            local dbx_ver=""
+            dbx_ver=$(distrobox version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+            if [[ "$podman_sys_st" != "active" && "$podman_usr_st" != "active" ]]; then
+                _row "Distrobox"  "!   installed${dbx_ver:+  v${dbx_ver}} — Podman socket not active, containers won't start"
+            else
+                # List boxes — requires running as the caller user
+                local dbx_boxes=() dbx_running=0
+                if [[ -n "$_CALLER_USER" ]]; then
+                    local _dbx_raw=""
+                    _dbx_raw=$(sudo -u "$_CALLER_USER" distrobox list --no-color 2>/dev/null \
+                        | tail -n +2 | grep -v '^$' || true)
+                    if [[ -n "$_dbx_raw" ]]; then
+                        while IFS= read -r line; do
+                            local _bname _bstatus
+                            _bname=$(echo "$line"   | awk -F'|' '{gsub(/ /,""); print $2}' || true)
+                            _bstatus=$(echo "$line" | awk -F'|' '{gsub(/ /,""); print $4}' || true)
+                            [[ -n "$_bname" ]] && dbx_boxes+=("$_bname")
+                            echo "$_bstatus" | grep -qi "running" && dbx_running=$(( dbx_running + 1 ))
+                        done <<< "$_dbx_raw"
+                    fi
+                fi
+                local _dbx_count=${#dbx_boxes[@]}
+                if (( _dbx_count == 0 )); then
+                    _row "Distrobox"  "OK  installed${dbx_ver:+  v${dbx_ver}} — no boxes created"
+                elif (( dbx_running > 0 )); then
+                    _row "Distrobox"  "OK  ${_dbx_count} box(es)${dbx_ver:+  v${dbx_ver}}, ${dbx_running} running: $(IFS=' '; echo "${dbx_boxes[*]}")"
+                else
+                    _row "Distrobox"  "OK  ${_dbx_count} box(es)${dbx_ver:+  v${dbx_ver}} (none running): $(IFS=' '; echo "${dbx_boxes[*]}")"
+                fi
+                # Distrobox storage (rootless containers home dir)
+                if [[ -n "$_CALLER_USER" ]]; then
+                    local _user_home; _user_home=$(getent passwd "$_CALLER_USER" 2>/dev/null | cut -d: -f6 || echo "")
+                    if [[ -n "$_user_home" ]]; then
+                        local _dbx_mb=""
+                        _dbx_mb=$(du -sm "${_user_home}/.local/share/containers/storage" 2>/dev/null | awk '{print $1}' || echo "")
+                        if [[ "$_dbx_mb" =~ ^[0-9]+$ ]] && (( _dbx_mb > 1024 )); then
+                            _row2 "--  distrobox storage (${_CALLER_USER}): $(_mb_to_human "$_dbx_mb")"
+                        fi
+                    fi
+                fi
+            fi
         fi
         # System image/volume storage — always show size
         local podman_img_mb podman_vol_mb
@@ -6401,6 +6432,55 @@ _section_firmware() {
             _row "passim"      "~~  not enabled — local LAN update cache: systemctl enable --now passim"
         fi
     fi
+}
+
+_section_backup_tools() {
+    _head "Backup Tools"
+    # ── rclone ───────────────────────────────────────────────────────────────
+    if command -v rclone &>/dev/null; then
+        local rclone_ver=""
+        rclone_ver=$(rclone version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        # Count configured remotes
+        local rclone_remotes=() rclone_cfg=""
+        if [[ -n "$_CALLER_USER" ]]; then
+            local _ruser_home; _ruser_home=$(getent passwd "$_CALLER_USER" 2>/dev/null | cut -d: -f6 || echo "")
+            rclone_cfg="${_ruser_home}/.config/rclone/rclone.conf"
+        fi
+        [[ -z "$rclone_cfg" || ! -f "$rclone_cfg" ]] && rclone_cfg="/root/.config/rclone/rclone.conf"
+        if [[ -f "$rclone_cfg" ]]; then
+            while IFS= read -r line; do
+                [[ "$line" =~ ^\[([^]]+)\]$ ]] && rclone_remotes+=("${BASH_REMATCH[1]}")
+            done < "$rclone_cfg"
+        fi
+        local _rc_count=${#rclone_remotes[@]}
+        if (( _rc_count == 0 )); then
+            _row "rclone"     "OK  installed${rclone_ver:+  v${rclone_ver}} — no remotes configured"
+        else
+            _row "rclone"     "OK  installed${rclone_ver:+  v${rclone_ver}} — ${_rc_count} remote(s): $(IFS=' '; echo "${rclone_remotes[*]}")"
+        fi
+        # Check for rclone mount units
+        local _rc_mounts=0
+        _rc_mounts=$(systemctl list-units 'rclone@*.service' --no-legend --no-pager 2>/dev/null \
+            | grep -c 'running' | tr -d '[:space:]' || echo "0")
+        [[ "$_rc_mounts" =~ ^[0-9]+$ ]] && (( _rc_mounts > 0 )) && _row2 "--  ${_rc_mounts} rclone mount(s) active"
+    fi
+    # ── restic ───────────────────────────────────────────────────────────────
+    if command -v restic &>/dev/null; then
+        local restic_ver=""
+        restic_ver=$(restic version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+        _row "restic"     "OK  installed${restic_ver:+  v${restic_ver}}"
+        # Check for restic timer/service units
+        local _res_timer_count=0
+        _res_timer_count=$(systemctl list-timers 'restic*' --no-legend --no-pager 2>/dev/null \
+            | grep -c 'restic' | tr -d '[:space:]' || echo "0")
+        [[ "$_res_timer_count" =~ ^[0-9]+$ ]] || _res_timer_count=0
+        if (( _res_timer_count > 0 )); then
+            _row2 "--  ${_res_timer_count} scheduled backup timer(s) active"
+        else
+            _row2 "--  no scheduled restic timers found — consider automating backups"
+        fi
+    fi
+    # Silent when neither is installed — not required
 }
 
 _section_monitoring() {
@@ -7107,8 +7187,40 @@ _section_system_health() {
     fi
     local _entropy=""
     _entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null | tr -d '[:space:]' || echo "")
-    if [[ "$_entropy" =~ ^[0-9]+$ ]] && (( _entropy < 256 )); then
-        _row "Entropy"    "!   ${_entropy} bits — low (may stall crypto on older kernels)"
+    if [[ "$_entropy" =~ ^[0-9]+$ ]]; then
+        # Detect entropy daemons
+        local _have_haveged=0 _have_rngd=0 _have_jitter=0
+        systemctl is-active --quiet haveged 2>/dev/null   && _have_haveged=1
+        systemctl is-active --quiet rngd 2>/dev/null      && _have_rngd=1
+        systemctl is-active --quiet jitterentropy-rngd 2>/dev/null && _have_jitter=1
+        command -v haveged &>/dev/null && ! systemctl cat haveged &>/dev/null 2>&1 \
+            && _have_haveged=1   # installed but not via systemd unit
+        local _entropy_src=""
+        (( _have_haveged )) && _entropy_src+=" haveged"
+        (( _have_rngd    )) && _entropy_src+=" rngd"
+        (( _have_jitter  )) && _entropy_src+=" jitterentropy-rngd"
+        # Modern kernels (5.6+) use RDRAND/RDSEED via krng — always adequate
+        local _kern_maj _kern_min
+        _kern_maj=$(uname -r | cut -d. -f1 || echo "0")
+        _kern_min=$(uname -r | cut -d. -f2 | grep -oE '^[0-9]+' || echo "0")
+        local _krng_ok=0
+        { (( _kern_maj > 5 )) || { (( _kern_maj == 5 )) && (( _kern_min >= 6 )); }; } && _krng_ok=1
+        if (( _entropy < 256 )); then
+            if (( _have_haveged || _have_rngd || _have_jitter )); then
+                _row "Entropy"    "OK  ${_entropy} bits (low pool, but entropy daemon active:${_entropy_src})"
+            elif (( _krng_ok )); then
+                _row "Entropy"    "OK  ${_entropy} bits (kernel CRNG handles this on Linux ≥5.6)"
+            else
+                _row "Entropy"    "!   ${_entropy} bits — low (may stall crypto); install haveged or rng-tools"
+                _rec "Entropy pool low (${_entropy} bits) — install: dnf install haveged && systemctl enable --now haveged"
+            fi
+        else
+            if (( _have_haveged || _have_rngd || _have_jitter )); then
+                _row "Entropy"    "OK  ${_entropy} bits, daemon active:${_entropy_src}"
+            else
+                _row "Entropy"    "OK  ${_entropy} bits"
+            fi
+        fi
     fi
 
     # Zombie processes — defunct children whose parent hasn't called wait().
@@ -7319,6 +7431,7 @@ system_info() {
     _section_audio_display
     _section_printing
     _section_package_managers
+    _section_backup_tools
     _section_containers
     _section_virtualization
     _section_monitoring
@@ -8117,6 +8230,7 @@ packages_report() {
     _focused_header "ShaniOS Package Report"
 
     _section_package_managers
+    _section_backup_tools
     _section_containers
     _section_virtualization
     _section_monitoring

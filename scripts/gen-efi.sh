@@ -452,138 +452,82 @@ generate_cmdline() {
 }
 
 ensure_crypttab() {
-    # Accept pre-detected UUID to avoid duplicate cryptsetup calls.
-    # If not passed (or empty), detect it here.
+    # Passphrase-only system — no keyfile, no ESP key recovery.
+    # Credential field in crypttab is always 'none'; passphrase is the LUKS
+    # fallback at all times. TPM2 auto-unlock is an additive post-install
+    # enrollment via 'gen-efi enroll-tpm2' and requires no entry here.
+    #
+    # UUID resolution priority:
+    #   1. provided_uuid  — passed from generate_uki() to avoid duplicate calls
+    #   2. cryptsetup status + luksUUID — live device, most authoritative
+    #   3. existing /etc/crypttab UUID — last resort for chroot environments
+    #      where the device path returned by cryptsetup status is inaccessible
+    #      to luksUUID inside the chroot (path exists on host, not in chroot ns)
     local provided_uuid="${1:-}"
-    local underlying
-    underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-        | sed -n 's/^ *device: //p' | tr -d '\n')
-    # _crypttab_trusted=1 means we cannot verify/correct the UUID but the
-    # existing crypttab entry is trusted (system booted from it). We still
-    # fall through to ensure dracut.conf.d is written — it may have been
-    # wiped along with /etc even though crypttab survived.
+    local luks_uuid=""
     local _crypttab_trusted=0
 
-    local luks_uuid
     if [[ -n "$provided_uuid" ]]; then
         luks_uuid="$provided_uuid"
-    elif [[ -z "$underlying" ]]; then
-        # Cannot determine the block device.
-        if [[ -f /etc/crypttab ]] && \
-           awk -v l="${ROOTLABEL}" '$1==l {found=1} END {exit !found}' /etc/crypttab 2>/dev/null; then
-            log_warn "Could not determine underlying device — existing /etc/crypttab entry retained"
-            luks_uuid=""
-            _crypttab_trusted=1
-        else
-            error_exit "Could not determine underlying device for /dev/mapper/${ROOTLABEL}"
-        fi
     else
-        luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
+        local underlying
+        underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+            | sed -n 's/^ *device: //p' | tr -d '\n')
+        if [[ -n "$underlying" ]]; then
+            luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
+        fi
+        # Chroot fallback — read UUID from existing crypttab when device
+        # detection fails. Only trust it if the entry already has a UUID.
         if [[ -z "$luks_uuid" ]]; then
             if [[ -f /etc/crypttab ]] && \
-               awk -v l="${ROOTLABEL}" '$1==l && $2~/UUID=.+/ {found=1} END {exit !found}' /etc/crypttab 2>/dev/null; then
-                log_warn "Could not retrieve LUKS UUID — existing /etc/crypttab entry has a UUID, retaining it"
+               awk -v l="${ROOTLABEL}" '$1==l && $2~/UUID=.+/ {found=1} END {exit !found}' \
+               /etc/crypttab 2>/dev/null; then
+                log_warn "Could not detect LUKS UUID from device — existing /etc/crypttab entry retained"
                 _crypttab_trusted=1
             else
-                error_exit "Could not retrieve LUKS UUID from $underlying and no valid crypttab to fall back to"
+                error_exit "Could not determine LUKS UUID for /dev/mapper/${ROOTLABEL} and no valid /etc/crypttab to fall back to"
             fi
         fi
     fi
 
-    local keyfile_dest="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
-    local keyfile_opt="none"
-
-    # /etc/crypttab — validate UUID matches live device even if file exists.
-    # Rewrite only the UUID field if stale; preserve keyfile and options columns.
-    # If the file exists but has no entry for ROOTLABEL (e.g. installed for a
-    # different label), treat it as missing and append a correct entry.
-    # Skip crypttab writes when _crypttab_trusted=1 (UUID unverifiable but
-    # existing entry was trusted) — but still fall through to dracut conf.
+    # /etc/crypttab — write or correct. Always 'none' for credential field.
     if (( _crypttab_trusted )); then
-        # Read keyfile field from trusted crypttab for dracut conf below
-        local existing_keyfile
-        existing_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || true)
-        if [[ -n "$existing_keyfile" && "$existing_keyfile" != "none" ]]; then
-            keyfile_opt="$existing_keyfile"
-        fi
+        log "/etc/crypttab entry trusted (UUID unverifiable in this environment) — skipping rewrite"
     elif [[ -f /etc/crypttab ]]; then
         local entry_exists recorded_uuid
-        entry_exists=$(awk -v label="${ROOTLABEL}" '$1==label {print "yes"; exit}' /etc/crypttab 2>/dev/null || true)
-        recorded_uuid=$(awk -v label="${ROOTLABEL}" '$1==label {print $2}' /etc/crypttab \
-            | sed 's/UUID=//' 2>/dev/null | head -1 || true)
+        entry_exists=$(awk -v l="${ROOTLABEL}" '$1==l {print "yes"; exit}' /etc/crypttab 2>/dev/null || true)
+        recorded_uuid=$(awk -v l="${ROOTLABEL}" '$1==l {gsub(/UUID=/, "", $2); print $2; exit}' \
+            /etc/crypttab 2>/dev/null || true)
         if [[ -z "$entry_exists" ]]; then
-            # Truly no entry for our label — append one rather than rewriting the file
             log_warn "/etc/crypttab has no entry for ${ROOTLABEL} — appending"
             printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} none luks,discard" >> /etc/crypttab
             log "/etc/crypttab entry appended"
         elif [[ "$recorded_uuid" == "$luks_uuid" ]]; then
             log "/etc/crypttab UUID matches live device — ok"
         else
-            # Entry exists but UUID is wrong, empty, or malformed — overwrite with correct entry
-            log_warn "/etc/crypttab has wrong/malformed UUID ('${recorded_uuid}') — correcting to ${luks_uuid}"
-            local stale_keyfile stale_opts
-            stale_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null | head -1 || echo "none")
-            stale_opts=$(awk -v label="${ROOTLABEL}" '$1==label {print $4}' /etc/crypttab 2>/dev/null | head -1 || echo "luks,discard")
-            # Use defaults if fields were empty
-            [[ -z "$stale_keyfile" ]] && stale_keyfile="none"
-            [[ -z "$stale_opts" ]] && stale_opts="luks,discard"
-            printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} ${stale_keyfile} ${stale_opts}" > /etc/crypttab
-            log "/etc/crypttab UUID corrected"
-        fi
-        # Read keyfile field (post any correction) for dracut conf consistency below
-        local existing_keyfile
-        existing_keyfile=$(awk -v label="${ROOTLABEL}" '$1==label {print $3}' /etc/crypttab 2>/dev/null || true)
-        if [[ -n "$existing_keyfile" && "$existing_keyfile" != "none" ]]; then
-            keyfile_opt="$existing_keyfile"
+            log_warn "/etc/crypttab UUID stale ('${recorded_uuid}') — correcting to ${luks_uuid}"
+            printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} none luks,discard" > /etc/crypttab
+            chmod 0644 /etc/crypttab
+            log "/etc/crypttab corrected"
         fi
     else
-        # Detect keyfile from disk — keyfile systems vs PIN/passphrase systems
-        if [[ -f "$keyfile_dest" ]]; then
-            log "Keyfile present at ${keyfile_dest}"
-            keyfile_opt="$keyfile_dest"
-        elif [[ -f "${ESP}/crypto_keyfile.bin" ]]; then
-            log "Recovering keyfile from ESP"
-            mkdir -p "$(dirname "$keyfile_dest")"
-            cp "${ESP}/crypto_keyfile.bin" "$keyfile_dest"
-            chmod 0400 "$keyfile_dest"
-            if cryptsetup open --test-passphrase --key-file="$keyfile_dest" "$underlying" &>/dev/null; then
-                keyfile_opt="$keyfile_dest"
-                log "Keyfile recovered and verified against LUKS volume"
-            else
-                log_warn "Recovered keyfile from ESP does NOT unlock ${underlying} — discarding, falling back to passphrase"
-                rm -f "$keyfile_dest"
-                keyfile_opt="none"
-            fi
-        else
-            log "No keyfile found — PIN/passphrase system, crypttab will use 'none'"
-        fi
-
-        local entry="${ROOTLABEL} UUID=${luks_uuid} ${keyfile_opt} luks,discard"
-        printf '%s\n' "$entry" > /etc/crypttab
+        printf '%s\n' "${ROOTLABEL} UUID=${luks_uuid} none luks,discard" > /etc/crypttab
         chmod 0644 /etc/crypttab
-        log "/etc/crypttab written: ${entry}"
+        log "/etc/crypttab written (UUID=${luks_uuid})"
     fi
 
-    # /etc/dracut.conf.d/99-crypt-key.conf — always rewrite to stay in sync
-    # with the current keyfile_opt. A one-time write risks drift if the system
-    # migrates between keyfile and PIN/passphrase configurations.
-    # Matches the pattern used by configure.sh at install time: crypttab is
-    # included so dracut can handle unlock; keyfile is added when present.
-    mkdir -p /etc/dracut.conf.d
-    local install_items="/etc/crypttab"
-    [[ "$keyfile_opt" != "none" ]] && install_items+=" ${keyfile_opt}"
-    local expected_conf
-    expected_conf="install_items+=\" ${install_items} \""
+    # /etc/dracut.conf.d/99-crypt-key.conf — only /etc/crypttab in initramfs.
+    # No keyfile; dracut prompts for passphrase if TPM2 seal is broken.
+    local expected_conf='install_items+=" /etc/crypttab "'
     local current_conf=""
     [[ -f /etc/dracut.conf.d/99-crypt-key.conf ]] && \
-        current_conf=$(cat /etc/dracut.conf.d/99-crypt-key.conf 2>/dev/null | tr -s ' ' | tr -d '\n')
-    # Normalise expected the same way so trailing newline from printf does not
-    # cause a false mismatch on every run.
-    local expected_conf_norm
-    expected_conf_norm=$(printf '%s' "$expected_conf" | tr -s ' ' | tr -d '\n')
-    if [[ "$current_conf" != "$expected_conf_norm" ]]; then
+        current_conf=$(tr -s ' ' < /etc/dracut.conf.d/99-crypt-key.conf | tr -d '\n')
+    local expected_norm
+    expected_norm=$(printf '%s' "$expected_conf" | tr -s ' ' | tr -d '\n')
+    if [[ "$current_conf" != "$expected_norm" ]]; then
+        mkdir -p /etc/dracut.conf.d
         printf '%s\n' "$expected_conf" > /etc/dracut.conf.d/99-crypt-key.conf
-        log "dracut crypt config updated (install_items: ${install_items})"
+        log "dracut crypt config written (install_items: /etc/crypttab)"
     else
         log "dracut crypt config up to date"
     fi
@@ -740,21 +684,16 @@ cleanup_tpm2() {
     local keep_slot="${tpm2_slots[-1]}"
     log "Keeping slot ${keep_slot} (most recent) — wiping ${#tpm2_slots[@]}-1 stale slot(s)"
 
-    local keyfile="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
     local wiped=0 failed=0
 
     for slot_num in "${tpm2_slots[@]}"; do
         [[ "$slot_num" == "$keep_slot" ]] && continue
         log "Wiping stale TPM2 slot ${slot_num}..."
         local wipe_ok=0
-        if [[ -f "$keyfile" ]]; then
-            cryptsetup luksKillSlot --key-file="$keyfile" "$underlying" "$slot_num" 2>/dev/null \
-                && wipe_ok=1
-        fi
-        if (( ! wipe_ok )); then
-            systemd-cryptenroll --wipe-slot="$slot_num" "$underlying" 2>/dev/null \
-                && wipe_ok=1
-        fi
+        # Passphrase-only system — wipe via systemd-cryptenroll which will
+        # prompt for the LUKS passphrase to authorize the slot removal.
+        systemd-cryptenroll --wipe-slot="$slot_num" "$underlying" 2>/dev/null \
+            && wipe_ok=1
         if (( wipe_ok )); then
             log "Slot ${slot_num} wiped"
             (( wiped++ ))
@@ -960,6 +899,14 @@ generate_uki() {
 
     # Detect the LUKS UUID once and share it between ensure_crypttab and
     # generate_cmdline so both use the identical value.
+    #
+    # Resolution priority:
+    #   1. Live device via cryptsetup status + luksUUID — most authoritative.
+    #   2. /etc/crypttab UUID field — chroot fallback: cryptsetup status inside
+    #      a chroot returns the host device path (e.g. /dev/sda3) which is not
+    #      accessible to luksUUID inside the chroot namespace. The crypttab
+    #      written by configure.sh at install time and persisted in the overlay
+    #      is the ground truth in this case.
     local shared_luks_uuid=""
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
         local _underlying
@@ -968,8 +915,19 @@ generate_uki() {
         if [[ -n "$_underlying" ]]; then
             shared_luks_uuid=$(cryptsetup luksUUID "$_underlying" 2>/dev/null || true)
         fi
+
+        # Chroot fallback: if luksUUID failed, read from existing crypttab.
+        if [[ -z "$shared_luks_uuid" && -f /etc/crypttab ]]; then
+            shared_luks_uuid=$(awk -v l="$ROOTLABEL" \
+                '$1==l { gsub(/UUID=/, "", $2); print $2; exit }' \
+                /etc/crypttab 2>/dev/null || true)
+            [[ -n "$shared_luks_uuid" ]] && \
+                log "LUKS UUID sourced from /etc/crypttab fallback: $shared_luks_uuid"
+        fi
+
         [[ -z "$shared_luks_uuid" ]] && \
-            log_warn "Could not detect LUKS UUID — ensure_crypttab and generate_cmdline will handle fallback"
+            log_warn "Could not detect LUKS UUID — ensure_crypttab will handle fallback"
+
         # ensure_crypttab before generate_cmdline — crypttab must exist in
         # the initramfs. Always run it: even if UUID detection failed, it must
         # ensure a valid crypttab exists (e.g. after /etc wipe). It handles
@@ -1136,41 +1094,27 @@ enroll_tpm2() {
     fi
 
     log "Enrolling TPM2..."
-    local keyfile="/etc/cryptsetup-keys.d/${ROOTLABEL}.bin"
-    if [[ -f "$keyfile" ]]; then
-        # Keyfile-based system (no PIN set at install) — must unlock via keyfile
-        # since no passphrase was set. The keyfile is the only non-TPM credential.
-        log "Keyfile system detected — unlocking via ${keyfile}"
-        systemd-cryptenroll \
-            --tpm2-device=auto \
-            --tpm2-pcrs="${pcrs}" \
-            --unlock-key-file="$keyfile" \
-            "$underlying" \
-            || error_exit "TPM2 enrollment failed"
+    # Passphrase-only system — always prompt interactively.
+    # Also ask whether to require a TPM2 PIN at boot. A PIN means the TPM
+    # will not unseal without user input even when PCRs match, giving a
+    # second factor. Without it, any boot on matching hardware auto-unlocks.
+    local tpm2_pin_flag=""
+    local use_tpm2_pin
+    read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin
+    use_tpm2_pin="${use_tpm2_pin:-N}"
+    if [[ "${use_tpm2_pin^^}" == "Y" ]]; then
+        tpm2_pin_flag="--tpm2-with-pin=yes"
+        log "TPM2 PIN will be required at boot"
     else
-        # PIN system — LUKS passphrase was set at install, prompt interactively.
-        # Also ask whether to require a TPM2 PIN at boot. A PIN means the TPM
-        # will not unseal without user input even when PCRs match, giving a
-        # second factor. Without it, any boot on matching hardware auto-unlocks.
-        # Default is yes — the user already chose interactive unlock at install.
-        local tpm2_pin_flag=""
-        local use_tpm2_pin
-        read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin
-        use_tpm2_pin="${use_tpm2_pin:-N}"
-        if [[ "${use_tpm2_pin^^}" == "Y" ]]; then
-            tpm2_pin_flag="--tpm2-with-pin=yes"
-            log "TPM2 PIN will be required at boot"
-        else
-            log "TPM2 PIN not set — disk will unlock automatically on matching hardware"
-        fi
-        log "PIN system detected — you will be prompted for your LUKS passphrase"
-        systemd-cryptenroll \
-            --tpm2-device=auto \
-            --tpm2-pcrs="${pcrs}" \
-            ${tpm2_pin_flag:+"$tpm2_pin_flag"} \
-            "$underlying" \
-            || error_exit "TPM2 enrollment failed"
+        log "TPM2 PIN not set — disk will unlock automatically on matching hardware"
     fi
+    log "You will be prompted for your LUKS passphrase"
+    systemd-cryptenroll \
+        --tpm2-device=auto \
+        --tpm2-pcrs="${pcrs}" \
+        ${tpm2_pin_flag:+"$tpm2_pin_flag"} \
+        "$underlying" \
+        || error_exit "TPM2 enrollment failed"
 
     log "TPM2 enrolled successfully with PCR policy: ${pcrs}"
     log "The disk will unlock automatically on next boot"

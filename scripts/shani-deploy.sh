@@ -93,7 +93,7 @@ declare -g SKIP_SELF_UPDATE="${SKIP_SELF_UPDATE:-no}"
 declare -g SELF_UPDATE_DONE="${SELF_UPDATE_DONE:-}"
 declare -g UPDATE_GENEFI="${UPDATE_GENEFI:-no}"
 declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
-declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-}"
+declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-$(date +%s)}"
 declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
@@ -125,7 +125,7 @@ trap cleanup_state EXIT
 
 persist_state() {
     local state_file
-    state_file=$(mktemp /run/shanios_deploy_state.XXXX)
+    state_file=$(mktemp /run/shanios_deploy_state.XXXXXX)
     chmod 600 "$state_file"
     {
         declare -p LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT 2>/dev/null || true
@@ -1471,7 +1471,7 @@ cleanup_chroot() {
     # Unmount static dirs in reverse order
     local -a static_reversed=()
     for d in "${CHROOT_STATIC_DIRS[@]}"; do static_reversed=("$d" "${static_reversed[@]}"); done
-    for d in "${static_reversed[@]}"; do safe_umount "$MOUNT_DIR/$d"; done
+    for d in "${static_reversed[@]}"; do safe_umount "$MOUNT_DIR/$d" || umount -R -l "$MOUNT_DIR/$d" 2>/dev/null || true; done
     safe_umount "$MOUNT_DIR/boot/efi"
     safe_umount "$MOUNT_DIR"
 

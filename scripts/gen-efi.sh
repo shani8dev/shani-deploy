@@ -39,7 +39,7 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" ]] then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
@@ -274,6 +274,7 @@ cleanup_esp() {
     if [[ $ESP_WAS_UNMOUNTED -eq 1 ]]; then
         log "Unmounting ESP..."
         umount "$ESP" 2>/dev/null || log "WARNING: Could not unmount ESP"
+        ESP_WAS_UNMOUNTED=0
     fi
 }
 
@@ -1069,6 +1070,9 @@ enroll_mok() {
 
     # Stage MOK enrollment
     _stage_mok_enrollment || log_warn "MOK enrollment staging encountered an issue — EFI binaries were re-signed successfully"
+
+    trap - EXIT
+    cleanup_esp
 }
 
 # enroll_tpm2 — enroll the TPM2 chip into the LUKS2 volume for automatic unlock.

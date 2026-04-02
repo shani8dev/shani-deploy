@@ -91,13 +91,13 @@ while IFS=: read -r username _ uid gid _ home shell; do
 
     # ── Group membership ──────────────────────────────────────────────────────
     missing=()
-    for group in "${WANTED_GROUPS[@]}"; do
+    for group in "${WANTED_GROUPS[@]+"${WANTED_GROUPS[@]}"}"; do
         getent group "$group" &>/dev/null || continue
         id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "$group" || missing+=("$group")
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        joined=$(printf '%s,' "${missing[@]}")
+        joined=$(printf '%s,' "${missing[@]+"${missing[@]}"}")
         joined="${joined%,}"
         log "adding $username to: $joined"
         run usermod -aG "$joined" "$username" || { warn "usermod -aG failed for $username"; user_ok=0; }
@@ -206,7 +206,6 @@ while IFS=: read -r username _ uid gid _ home shell; do
 
     fi  # end stamp-guarded bootstrap
 
-    if [[ "$user_ok" -eq 1 ]]; then
     if [[ "$user_ok" -eq 1 ]]; then
         processed+=("$username")
         # Write stamp so next run skips the slow steps.

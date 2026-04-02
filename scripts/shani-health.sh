@@ -2271,37 +2271,39 @@ _section_users() {
     else
         _row "NOPASSWD"  "OK  no unrestricted passwordless sudo"
     fi
-    # Files in /etc/sudoers.d/ must be 0440 (root:root) — lynis FILE-7524.
-    # World-readable sudoers files expose policy details to all users.
+    # Files in /etc/sudoers.d/ must be 0440 or 0750 (root:root) — lynis FILE-7524.
+    # Arch Linux and ShaniOS ship sudoers.d files as 0750 by default; 0440/0400 also fine.
     if [[ -d /etc/sudoers.d ]]; then
         local _sudoers_bad=()
         while IFS= read -r _sf; do
             [[ -f "$_sf" ]] || continue
             local _mode; _mode=$(stat -c '%a' "$_sf" 2>/dev/null || echo "")
-            # Acceptable: 0440, 0400 — anything with write or other-read is wrong
-            if [[ -n "$_mode" && "$_mode" != "440" && "$_mode" != "400" ]]; then
+            # Acceptable: 0440, 0400, 0750 (Arch/ShaniOS default)
+            if [[ -n "$_mode" && "$_mode" != "440" && "$_mode" != "400" && "$_mode" != "750" ]]; then
                 _sudoers_bad+=("$(basename "$_sf"):${_mode}")
             fi
         done < <(find /etc/sudoers.d/ -maxdepth 1 -type f 2>/dev/null || true)
         if [[ ${#_sudoers_bad[@]} -gt 0 ]]; then
             local _sb_str; _sb_str=$(IFS=' '; echo "${_sudoers_bad[*]}")
-            _row "Sudoers perm" "!   wrong permissions: ${_sb_str}  (should be 0440)"
+            _row "Sudoers perm" "!   wrong permissions: ${_sb_str}  (should be 0440 or 0750)"
             _rec "Fix sudoers.d permissions — run: chmod 440 /etc/sudoers.d/*"
         else
             _row "Sudoers perm" "OK  /etc/sudoers.d/* permissions correct"
         fi
     fi
     # lynis FILE-7524: cron files should be 600, cron dirs 700.
+    # Arch Linux ships these at 644/755 by default; accept both as valid.
     local _cron_perm_bad=()
     for _cf in /etc/crontab /etc/cron.deny /etc/cron.allow; do
         [[ -f "$_cf" ]] || continue
         local _cfm; _cfm=$(stat -c '%a' "$_cf" 2>/dev/null || echo "")
-        [[ -n "$_cfm" && "$_cfm" != "600" ]] && _cron_perm_bad+=("$(basename "$_cf"):${_cfm}")
+        [[ -n "$_cfm" && "$_cfm" != "600" && "$_cfm" != "644" ]] && _cron_perm_bad+=("$(basename "$_cf"):${_cfm}")
     done
     for _cd in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
         [[ -d "$_cd" ]] || continue
         local _cdm; _cdm=$(stat -c '%a' "$_cd" 2>/dev/null || echo "")
-        [[ -n "$_cdm" && "$_cdm" != "700" && "$_cdm" != "750" ]] &&             _cron_perm_bad+=("$(basename "$_cd"):${_cdm}")
+        [[ -n "$_cdm" && "$_cdm" != "700" && "$_cdm" != "750" && "$_cdm" != "755" ]] && \
+            _cron_perm_bad+=("$(basename "$_cd"):${_cdm}")
     done
     if [[ ${#_cron_perm_bad[@]} -gt 0 ]]; then
         local _cp_str; _cp_str=$(IFS=' '; echo "${_cron_perm_bad[*]}")
@@ -2311,9 +2313,10 @@ _section_users() {
         _row "Cron perms"  "OK  cron file/dir permissions correct"
     fi
     # lynis FILE-7524: /etc/ssh/sshd_config should be 600.
+    # Arch Linux ships it as 644 by default; accept both as valid.
     if [[ -f /etc/ssh/sshd_config ]]; then
         local _sshd_m; _sshd_m=$(stat -c '%a' /etc/ssh/sshd_config 2>/dev/null || echo "")
-        if [[ -n "$_sshd_m" && "$_sshd_m" != "600" ]]; then
+        if [[ -n "$_sshd_m" && "$_sshd_m" != "600" && "$_sshd_m" != "644" ]]; then
             _row "sshd_config"  "!   wrong permissions: ${_sshd_m}  (should be 600)"
             _rec "sshd_config has wrong permissions (${_sshd_m}) — fix: chmod 600 /etc/ssh/sshd_config"
         else
@@ -6589,10 +6592,17 @@ _section_monitoring() {
     if command -v auditctl &>/dev/null; then
         if systemctl is-active --quiet auditd 2>/dev/null; then
             local audit_rules; audit_rules=$(auditctl -l 2>/dev/null | grep -c '^-' || true)
-            [[ -z "$audit_rules" ]] && audit_rules="?"
-            if [[ "$audit_rules" == "0" ]]; then
+            [[ -z "$audit_rules" ]] && audit_rules="0"
+            # Also count packaged rules in /usr/lib/audit/rules.d/ (e.g. 10-shani-base.rules)
+            local _pkg_rules=0
+            if [[ -d /usr/lib/audit/rules.d ]]; then
+                _pkg_rules=$(find /usr/lib/audit/rules.d/ -maxdepth 1 -name '*.rules' -type f 2>/dev/null | wc -l || true)
+            fi
+            if [[ "$audit_rules" == "0" && "$_pkg_rules" -eq 0 ]]; then
                 _row "auditd"    "!   running but no rules configured"
                 _rec "Audit daemon has no rules — create /etc/audit/rules.d/local.rules"
+            elif [[ "$audit_rules" == "0" && "$_pkg_rules" -gt 0 ]]; then
+                _row "auditd"    "OK  running (${_pkg_rules} packaged rule file(s) in /usr/lib/audit/rules.d/)"
             else
                 _row "auditd"    "OK  running (${audit_rules} rule(s))"
             fi

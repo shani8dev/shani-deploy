@@ -7,9 +7,11 @@ Requires=etc.mount data.mount
 # Watch the upper-layer passwd directly — inotify on the OverlayFS merged path
 # (/etc/passwd) is unreliable; writes go to the upper layer and events are not
 # consistently delivered to watchers on the merged path.
-# PathExists fires when the file is first created (copy-up on first useradd),
+# PathExists fires once when the file is first created (copy-up on first useradd).
 # PathChanged fires on every subsequent write. Together they cover the full
 # lifecycle from an empty upper layer through all future user additions.
+# Note: inotify on the upper layer itself has been tested and is reliable on
+# this system; PathChanged is the workhorse for ongoing useradd events.
 PathExists=/data/overlay/etc/upper/passwd
 PathChanged=/data/overlay/etc/upper/passwd
 

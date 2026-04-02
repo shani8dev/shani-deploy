@@ -6,13 +6,13 @@ Description=Sync groups, shell, and skel for all regular users
 #   - /etc/skel is modified (skel update via slot switch)
 #
 # ConditionPathExists with | prefix = OR logic.
-# The service runs if either the deploy marker OR the extra-groups file exists.
-# The deploy marker is written by configure.sh on install and by shani-deploy on
-# every slot switch — it is the single signal that setup is needed.
+# The service runs only when the deploy marker exists — written by configure.sh
+# on first install and by shani-deploy on every slot switch.
+# The .path unit handles all other triggers (passwd change, skel change).
 ConditionPathExists=|/data/user-setup-needed
-ConditionPathExists=|/etc/shani-extra-groups
 
 # Wants= (not Requires=) so a missing accounts-daemon does not block user setup.
+# Listed in After= as well so we don't race it when it is present.
 Wants=accounts-daemon.service
 After=accounts-daemon.service etc.mount data.mount
 # Both mounts are hard requirements — /etc overlay must be active so passwd and

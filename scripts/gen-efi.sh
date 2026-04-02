@@ -359,7 +359,8 @@ generate_cmdline() {
             luks_uuid="$provided_luks_uuid"
         else
             local underlying
-            underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: //p' | tr -d '\n')
+            underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: *//p' | tr -d '
+' | xargs | awk '{print $NF}')
             if [[ -z "$underlying" ]]; then
                 if [[ -f "$CMDLINE_FILE" ]]; then
                     log_warn "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} — keeping existing cmdline file unchanged"
@@ -472,7 +473,8 @@ ensure_crypttab() {
     else
         local underlying
         underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-            | sed -n 's/^ *device: //p' | tr -d '\n')
+            | sed -n 's/^ *device: *//p' | tr -d '
+' | xargs | awk '{print $NF}')
         if [[ -n "$underlying" ]]; then
             luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
         fi
@@ -653,7 +655,8 @@ cleanup_tpm2() {
 
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-        | sed -n 's/^ *device: //p' | tr -d '\n')
+        | sed -n 's/^ *device: *//p' | tr -d '
+' | xargs | awk '{print $NF}')
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
 
     # Collect all TPM2 slot numbers from the LUKS header
@@ -911,7 +914,8 @@ generate_uki() {
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
         local _underlying
         _underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-            | sed -n 's/^ *device: //p' | tr -d '\n')
+            | sed -n 's/^ *device: *//p' | tr -d '
+' | xargs | awk '{print $NF}')
         if [[ -n "$_underlying" ]]; then
             shared_luks_uuid=$(cryptsetup luksUUID "$_underlying" 2>/dev/null || true)
         fi
@@ -1075,9 +1079,26 @@ enroll_tpm2() {
     # Derive the underlying LUKS block device
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
-        | sed -n 's/^ *device: //p' | tr -d '\n')
+        | sed -n 's/^ *device: *//p' | tr -d '
+' | xargs | awk '{print $NF}')
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
     log "LUKS device: ${underlying}"
+
+    # Check LUKS KDF — argon2id is required for good security.
+    # pbkdf2 (the old default) is orders of magnitude weaker against GPU brute-force.
+    # Warn and advise conversion; do not block enrollment since the passphrase slot
+    # still works and the user may convert separately.
+    local kdf
+    kdf=$(cryptsetup luksDump "$underlying" 2>/dev/null         | awk '/^\s+PBKDF:/ {print $2; exit}')
+    if [[ -z "$kdf" ]]; then
+        log_warn "LUKS KDF is unknown — could not parse luksDump output"
+        log_warn "Verify with: cryptsetup luksDump ${underlying} | grep PBKDF"
+    elif [[ "$kdf" != "argon2id" ]]; then
+        log_warn "LUKS KDF is ${kdf} (argon2id preferred) — re-encrypt passphrase slot for stronger brute-force resistance:"
+        log_warn "  cryptsetup luksConvertKey --pbkdf argon2id ${underlying}"
+    else
+        log "LUKS KDF: ${kdf} ✓"
+    fi
 
     # Choose PCR policy based on Secure Boot state
     local pcrs

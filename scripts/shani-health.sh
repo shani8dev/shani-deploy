@@ -69,6 +69,7 @@ _require_root() {
             "XAUTHORITY=${XAUTHORITY:-}" \
             "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" \
             "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}" \
+            "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}" \
             "SHANI_CALLER_USER=${caller_user}" \
             "$self" "${ORIGINAL_ARGS[@]}"
     elif command -v sudo &>/dev/null; then
@@ -667,7 +668,8 @@ _section_os_slots() {
     fi
 
     # Previous slot — what was booted before the last deploy/rollback
-    local _prev_slot=$(cat "$DATA_PREV_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
+    local _prev_slot
+    _prev_slot=$(cat "$DATA_PREV_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
     [[ -n "$_prev_slot" ]] && _row "Previous"  "--  @${_prev_slot}"
 }
 
@@ -8598,13 +8600,14 @@ main() {
             --security)         MODE="security";     shift ;;
             --journal)
                 MODE="journal"
-                if [[ -n "${2:-}" && "${2:-}" =~ ^(crit|err|warning)$ ]]; then
-                    JOURNAL_LEVEL="$2"; shift 2
-                    # optional: --journal err -1h  (since as third arg)
-                    [[ -n "${2:-}" && "${2:-}" =~ ^- && "${2:-}" != --* ]] && JOURNAL_SINCE="$2"; shift
-                elif [[ -n "${2:-}" && "${2:-}" != -* ]]; then JOURNAL_SINCE="$2"; shift 2
-                else
-                    shift
+                shift
+                # optional level arg
+                if [[ -n "${1:-}" && "${1:-}" =~ ^(crit|err|warning)$ ]]; then
+                    JOURNAL_LEVEL="$1"; shift
+                fi
+                # optional trailing time arg: --journal [level] -1h
+                if [[ -n "${1:-}" && "${1:-}" =~ ^- && "${1:-}" != --* ]]; then
+                    JOURNAL_SINCE="$1"; shift
                 fi ;;
             --since)
                 if [[ -n "${2:-}" ]]; then JOURNAL_SINCE="$2"; shift 2

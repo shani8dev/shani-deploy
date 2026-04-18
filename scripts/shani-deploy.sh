@@ -1091,7 +1091,12 @@ check_root() {
         local self
         self=$(readlink -f "$0")
         if command -v pkexec &>/dev/null; then
-            exec pkexec "$self" "${ORIGINAL_ARGS[@]}"
+            exec pkexec env \
+                "DISPLAY=${DISPLAY:-}" \
+                "XAUTHORITY=${XAUTHORITY:-}" \
+                "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" \
+                "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}" \
+                "$self" "${ORIGINAL_ARGS[@]}"
         elif command -v sudo &>/dev/null; then
             exec sudo "$self" "${ORIGINAL_ARGS[@]}"
         else

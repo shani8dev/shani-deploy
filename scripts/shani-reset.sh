@@ -136,7 +136,13 @@ done
 if [[ $(id -u) -ne 0 ]]; then
     self=$(readlink -f "$0")
     if command -v pkexec &>/dev/null; then
-        exec pkexec "$self" "${ORIGINAL_ARGS[@]}"
+        exec pkexec env \
+            "DISPLAY=${DISPLAY:-}" \
+            "XAUTHORITY=${XAUTHORITY:-}" \
+            "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" \
+            "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}" \
+            "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}" \
+            "$self" "${ORIGINAL_ARGS[@]}"
     elif command -v sudo &>/dev/null; then
         exec sudo "$self" "${ORIGINAL_ARGS[@]}"
     else
@@ -275,18 +281,17 @@ else
 
     log "Wiping persistent service state (/data/varlib)..."
     if [[ -d "${DATA_DIR}/varlib" ]]; then
-        # -mindepth 3: delete files/dirs inside service dirs (e.g. /data/varlib/NM/file)
-        # but preserve the service dirs themselves (e.g. /data/varlib/NetworkManager/)
-        # so bind mount targets still exist on next boot.
-        # Also remove any plain files at depth 2 (stale state files directly in varlib/).
-        run find "${DATA_DIR}/varlib" -mindepth 3 -delete 2>/dev/null || true
+        # -depth ensures we delete children before parents so non-empty dirs
+        # are removed correctly. -mindepth 3 preserves the service dirs
+        # themselves (bind mount targets) while clearing their contents.
+        run find "${DATA_DIR}/varlib" -mindepth 3 -depth -delete 2>/dev/null || true
         run find "${DATA_DIR}/varlib" -mindepth 2 -maxdepth 2 -type f -delete 2>/dev/null || true
         log_ok "  /data/varlib/* cleared (service directories preserved for bind mounts)"
     fi
 
     log "Wiping job scheduler spools (/data/varspool)..."
     if [[ -d "${DATA_DIR}/varspool" ]]; then
-        run find "${DATA_DIR}/varspool" -mindepth 3 -delete 2>/dev/null || true
+        run find "${DATA_DIR}/varspool" -mindepth 3 -depth -delete 2>/dev/null || true
         run find "${DATA_DIR}/varspool" -mindepth 2 -maxdepth 2 -type f -delete 2>/dev/null || true
         log_ok "  /data/varspool/* cleared (spool directories preserved)"
     fi

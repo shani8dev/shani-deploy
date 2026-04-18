@@ -274,6 +274,28 @@ _find_terminal() {
         xfce4-terminal konsole lxterminal mate-terminal deepin-terminal
         terminator xterm urxvt st)
 
+    # Session-native terminal hint: prefer the terminal that matches the
+    # running desktop environment so Wayland/X11 display env is already set.
+    # KONSOLE_VERSION is set inside any Konsole window; VTE_VERSION inside any
+    # VTE-based terminal (gnome-terminal, kgx, tilix, xfce4-terminal, …).
+    local desktop="${XDG_CURRENT_DESKTOP:-}"
+    local session_hint=""
+    if [[ -n "${KONSOLE_VERSION:-}" ]] && command -v konsole &>/dev/null; then
+        session_hint="konsole"
+    elif [[ -n "${VTE_VERSION:-}" ]]; then
+        # Identify which VTE terminal is actually running
+        for vte_term in kgx gnome-terminal tilix xfce4-terminal mate-terminal; do
+            command -v "$vte_term" &>/dev/null && { session_hint="$vte_term"; break; }
+        done
+    elif [[ "$desktop" == *KDE* ]] && command -v konsole &>/dev/null; then
+        session_hint="konsole"
+    elif [[ "$desktop" == *GNOME* ]] && command -v kgx &>/dev/null; then
+        session_hint="kgx"
+    elif [[ "$desktop" == *GNOME* ]] && command -v gnome-terminal &>/dev/null; then
+        session_hint="gnome-terminal"
+    fi
+    [[ -n "$session_hint" ]] && { echo "$session_hint"; return 0; }
+
     # Env vars — strip path prefix, validate against allowlist only
     for var in TERMINAL TERMINAL_EMULATOR COLORTERM TERM_PROGRAM; do
         local emu="${!var:-}"
@@ -297,9 +319,15 @@ _build_terminal_args() {
     shift 3
     local -a cmd=("$@")
     case "$terminal" in
-        gnome-terminal|kgx|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
+        gnome-terminal|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
             _arr=("$terminal" "--title=$title" "--" "${cmd[@]}") ;;
-        konsole|alacritty)
+        # kgx (GNOME Console) does not support --title; use -e / -- for the command.
+        kgx)
+            _arr=("$terminal" "--" "${cmd[@]}") ;;
+        # konsole: --noclose keeps the window open on exit so errors are visible.
+        konsole)
+            _arr=("$terminal" "--title" "$title" "--noclose" "-e" "${cmd[@]}") ;;
+        alacritty)
             _arr=("$terminal" "--title" "$title" "-e" "${cmd[@]}") ;;
         kitty|foot)
             _arr=("$terminal" "--title=$title" "${cmd[@]}") ;;
@@ -320,13 +348,22 @@ _build_terminal_args() {
 
 _build_pkexec_env() {
     # Usage: _build_pkexec_env <nameref_array>
+    # pkexec strips almost all environment variables, so we re-inject the ones
+    # required for display servers and terminal emulators:
+    #   DISPLAY / XAUTHORITY      — X11 terminals
+    #   WAYLAND_DISPLAY           — Wayland terminals (kgx, konsole on KDE Wayland, foot, …)
+    #   XDG_RUNTIME_DIR           — required by ALL Wayland clients to locate the
+    #                               compositor socket; without it kgx/konsole fail
+    #                               to open with "cannot open display" or similar.
     local -n _pe="$1"
-    local display_env xauth_env wayland_display
+    local display_env xauth_env wayland_display runtime_dir
     display_env=$(printf '%s'     "${DISPLAY:-:0}"                   | tr -cd '[:alnum:]:._-/')
     xauth_env=$(printf '%s'       "${XAUTHORITY:-$HOME/.Xauthority}" | tr -cd '[:alnum:]/_.-')
     wayland_display=$(printf '%s' "${WAYLAND_DISPLAY:-}"             | tr -cd '[:alnum:]/_.-')
+    runtime_dir=$(printf '%s'     "${XDG_RUNTIME_DIR:-}"             | tr -cd '[:alnum:]/_.-')
     _pe=(pkexec env "DISPLAY=$display_env" "XAUTHORITY=$xauth_env")
     [[ -n "$wayland_display" ]] && _pe+=("WAYLAND_DISPLAY=$wayland_display")
+    [[ -n "$runtime_dir"     ]] && _pe+=("XDG_RUNTIME_DIR=$runtime_dir")
 }
 
 #####################################
@@ -397,7 +434,7 @@ _run_rollback() {
     log "Launching rollback"
 
     if ! TERMINAL=$(_find_terminal); then
-        err "No terminal emulator found — install gnome-terminal, alacritty, kitty, or xterm"
+        err "No terminal emulator found — install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm"
     fi
 
     local -a pkexec_args
@@ -408,6 +445,7 @@ _run_rollback() {
 
     local -a terminal_args
     _build_terminal_args "$TERMINAL" "$title" terminal_args "${pkexec_args[@]}"
+    log "Launching rollback: ${terminal_args[*]}"
     "${terminal_args[@]}"
 }
 
@@ -634,8 +672,9 @@ _check_network() {
     for u in "${urls[@]}"; do
         curl -fsSL --connect-timeout 5 --max-time 10 --head "$u" &>/dev/null && { log "Network OK"; return 0; }
     done
-    nslookup google.com &>/dev/null || dig +short google.com &>/dev/null || \
-        host google.com &>/dev/null && { log "Network OK via DNS"; return 0; }
+    nslookup google.com &>/dev/null && { log "Network OK via DNS"; return 0; }
+    dig +short google.com &>/dev/null && { log "Network OK via DNS"; return 0; }
+    host google.com &>/dev/null     && { log "Network OK via DNS"; return 0; }
     log "No network connectivity"
     return 1
 }
@@ -787,7 +826,7 @@ _run_update_check() {
     log "User approved update — launching shani-deploy"
 
     if ! TERMINAL=$(_find_terminal); then
-        err "No terminal found. Install gnome-terminal, alacritty, kitty, or xterm."
+        err "No terminal found. Install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm."
     fi
     log "Terminal: $TERMINAL"
 
@@ -802,6 +841,7 @@ _run_update_check() {
     local -a terminal_args
     _build_terminal_args "$TERMINAL" "Shani OS Update" terminal_args "${pkexec_args[@]}"
 
+    log "Launching: ${terminal_args[*]}"
     "${terminal_args[@]}"
     local exit_code=$?
 

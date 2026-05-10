@@ -1,6 +1,10 @@
 [Unit]
 Description=Update Flatpak (System)
-# Remove network-online.target dependency
+# Runs only via flatpak-update-system.timer (OnBootSec=15min).
+# After=network-online.target ensures network is routable before attempting
+# Flathub metadata fetch — avoids silent failure on slow-connect boots.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -10,3 +14,6 @@ IOSchedulingPriority=7
 
 ExecStart=/usr/bin/flatpak update --noninteractive --assumeyes --system
 ExecStartPost=/usr/bin/flatpak uninstall --unused --delete-data --noninteractive --assumeyes --system
+
+# No [Install] — activated exclusively by flatpak-update-system.timer.
+# Do not enable this service directly; enable the timer instead.

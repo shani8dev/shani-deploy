@@ -1,5 +1,12 @@
+# Install to: /etc/systemd/user/flatpak-update-user.service
+# (NOT /etc/systemd/system/ — this is a user-scope unit)
 [Unit]
 Description=Update Flatpak (User)
+# Runs only via flatpak-update-user.timer in the user session.
+# After=graphical-session.target ensures the user session is active so
+# flatpak --user has access to $HOME and the user D-Bus.
+After=graphical-session-pre.target
+Wants=graphical-session-pre.target
 
 [Service]
 Type=oneshot
@@ -9,3 +16,5 @@ IOSchedulingPriority=7
 
 ExecStart=/usr/bin/flatpak update --noninteractive --assumeyes --user
 ExecStartPost=/usr/bin/flatpak uninstall --unused --delete-data --noninteractive --assumeyes --user
+
+# No [Install] — activated exclusively by flatpak-update-user.timer.

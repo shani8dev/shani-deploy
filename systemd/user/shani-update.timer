@@ -4,7 +4,8 @@ Description=Run Shani OS Update Check every 2 hours
 [Timer]
 OnBootSec=15min
 OnUnitActiveSec=2h
+Persistent=true
 Unit=shani-update.service
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

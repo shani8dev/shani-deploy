@@ -1,7 +1,9 @@
 [Unit]
 Description=Watch for new users and skel changes
-After=etc.mount data.mount
-Requires=etc.mount data.mount
+# /etc is mounted by dracut pre-pivot hook before systemd PID 1 starts.
+# No etc.mount unit exists — the overlay is guaranteed live at this point.
+After=data.mount
+Requires=data.mount
 
 [Path]
 # Watch the upper-layer passwd directly — inotify on the OverlayFS merged path
@@ -10,8 +12,6 @@ Requires=etc.mount data.mount
 # PathExists fires once when the file is first created (copy-up on first useradd).
 # PathChanged fires on every subsequent write. Together they cover the full
 # lifecycle from an empty upper layer through all future user additions.
-# Note: inotify on the upper layer itself has been tested and is reliable on
-# this system; PathChanged is the workhorse for ongoing useradd events.
 PathExists=/data/overlay/etc/upper/passwd
 PathChanged=/data/overlay/etc/upper/passwd
 
@@ -30,8 +30,6 @@ Unit=shani-user-setup.service
 # Rate-limit: at most 3 triggers per 60s to prevent runaway loops.
 TriggerLimitIntervalSec=60s
 TriggerLimitBurst=3
-# MakeDirectory omitted — /etc/skel is on the read-only root; mkdir would fail
-# silently and may prevent the inotify watch from being set up at all.
 
 [Install]
 WantedBy=multi-user.target

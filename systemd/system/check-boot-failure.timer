@@ -1,6 +1,12 @@
 [Unit]
 Description=Run Boot Failure Check 15 Minutes After Boot
 DefaultDependencies=no
+# Explicit Conflicts= restores what DefaultDependencies=no removed,
+# preventing spurious timer activation during early shutdown.
+# After=time-sync.target intentionally omitted: OnBootSec is wall-clock based
+# and needs no time sync. Including it would block the timer in emergency.target
+# where time-sync.target may never be reached.
+Conflicts=shutdown.target
 
 [Timer]
 OnBootSec=15m

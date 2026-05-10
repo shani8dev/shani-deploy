@@ -1,6 +1,7 @@
 [Unit]
 Description=Bless Current Boot - Shani OS Boot Counting
 After=multi-user.target data.mount mark-boot-success.service
+Wants=mark-boot-success.service
 Wants=data.mount
 # Only bless the boot after mark-boot-success has confirmed the system reached
 # multi-user.target and written /data/boot-ok. This ensures the systemd-boot

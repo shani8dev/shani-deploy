@@ -1,3 +1,5 @@
+# Install to: /etc/systemd/user/flatpak-update-user.timer
+# (NOT /etc/systemd/system/ — this is a user-scope timer)
 [Unit]
 Description=Periodic Flatpak Update (User)
 

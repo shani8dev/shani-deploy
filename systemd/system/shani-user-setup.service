@@ -5,20 +5,26 @@ Description=Sync groups, shell, and skel for all regular users
 #   - /data/user-setup-needed exists (first install or slot switch via shani-deploy)
 #   - /etc/skel is modified (skel update via slot switch)
 #
-# ConditionPathExists with | prefix = OR logic.
-# The service runs only when the deploy marker exists — written by configure.sh
-# on first install and by shani-deploy on every slot switch.
-# The .path unit handles all other triggers (passwd change, skel change).
+# /etc is mounted by dracut pre-pivot hook (shanios-overlay-etc.sh) before
+# systemd PID 1 starts. No etc.mount unit exists — the overlay is live at boot.
+# ConditionPathIsMountPoint=/etc guards against the rare case the overlay failed.
+#
+# Condition* with | prefix = OR logic among | conditions (AND with non-| ones).
+# Service runs if:
+#   (/data/user-setup-needed exists OR /data/overlay/etc/upper/passwd exists)
+#   AND /etc is a mountpoint
+# This covers both triggers:
+#   - deploy marker: slot switch / first install (shani-deploy writes the marker)
+#   - passwd upper layer: user added at runtime (useradd copies up /etc/passwd)
 ConditionPathExists=|/data/user-setup-needed
+ConditionPathExists=|/data/overlay/etc/upper/passwd
+ConditionPathIsMountPoint=/etc
 
 # Wants= (not Requires=) so a missing accounts-daemon does not block user setup.
-# Listed in After= as well so we don't race it when it is present.
 Wants=accounts-daemon.service
-After=accounts-daemon.service etc.mount data.mount
-# Both mounts are hard requirements — /etc overlay must be active so passwd and
-# shani-extra-groups are readable, and /data must be mounted to read/clear the
-# user-setup-needed marker.
-Requires=etc.mount data.mount
+After=accounts-daemon.service data.mount
+# data.mount is a hard requirement — needed to read/clear the user-setup-needed marker.
+Requires=data.mount
 
 [Service]
 Type=oneshot
@@ -28,8 +34,5 @@ ExecStart=/usr/local/bin/shani-user-setup
 # new user is added (via passwd change) or shani-deploy writes the marker again.
 ExecStartPost=-/bin/rm -f /data/user-setup-needed
 TimeoutStartSec=120s
-RemainAfterExit=yes
 
-# No [Install] section — this service is activated exclusively by
-# shani-user-setup.path, never directly by multi-user.target. Installing it
-# directly would race against data.mount and etc.mount at boot.
+# No [Install] — activated exclusively by shani-user-setup.path.

@@ -7,8 +7,6 @@ DefaultDependencies=no
 # failure is visible in the journal rather than silently undetected.
 Requires=data.mount
 After=data.mount
-Wants=data.mount
-Before=local-fs.target
 
 [Service]
 Type=oneshot
@@ -18,4 +16,3 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=local-fs.target
-

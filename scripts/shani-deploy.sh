@@ -95,6 +95,11 @@ declare -g UPDATE_GENEFI="${UPDATE_GENEFI:-no}"
 declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
 declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-$(date +%s)}"
 declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
+# Auto-reboot: the system reboots automatically this many seconds after a
+# successful deployment (skipped in --dry-run). Override by exporting
+# AUTO_REBOOT_DELAY, or disable entirely with AUTO_REBOOT=no.
+declare -g AUTO_REBOOT="${AUTO_REBOOT:-yes}"
+declare -g AUTO_REBOOT_DELAY="${AUTO_REBOOT_DELAY:-60}"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 # CHROOT_STATIC_DIRS are bind-mounted from the live system into the candidate
@@ -134,6 +139,7 @@ persist_state() {
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
+        declare -p AUTO_REBOOT AUTO_REBOOT_DELAY 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
@@ -379,6 +385,18 @@ get_booted_subvol() {
 
 btrfs_subvol_exists() {
     btrfs subvolume show "$1" &>/dev/null
+}
+
+# btrfs_sync — wait for background subvolume deletions to fully complete.
+# `btrfs subvolume delete` only removes the directory entry immediately; the
+# actual extent/data cleanup happens asynchronously. Call this after deleting
+# subvolumes and before relying on the freed space (check_space), before
+# unmounting $MOUNT_DIR, or before any operation that re-lists subvolumes and
+# should not see stale/half-deleted entries.
+btrfs_sync() {
+    local mnt="${1:-$MOUNT_DIR}"
+    btrfs subvolume sync "$mnt" 2>/dev/null || \
+        log_warn "btrfs subvolume sync failed on ${mnt} — deletion cleanup may still be pending"
 }
 
 get_btrfs_available_mb() {
@@ -1290,6 +1308,8 @@ cleanup_old_backups() {
         fi
     done
 
+    btrfs_sync "$MOUNT_DIR"
+
     set -e
     return 0
 }
@@ -1711,6 +1731,7 @@ restore_candidate() {
             btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
         btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
             btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+        btrfs_sync "$MOUNT_DIR"
     }
 
     if [[ -n "$BACKUP_NAME" ]] && btrfs_subvol_exists "$MOUNT_DIR/@${BACKUP_NAME}"; then
@@ -1819,6 +1840,7 @@ restore_candidate() {
         fi
     fi
 
+    is_mounted "$MOUNT_DIR" && btrfs_sync "$MOUNT_DIR"
     umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
     rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
@@ -1928,6 +1950,7 @@ rollback_system() {
             btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
         btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
             btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+        btrfs_sync "$MOUNT_DIR"
 
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
 
@@ -1990,6 +2013,7 @@ rollback_system() {
         btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
     btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
         btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+    btrfs_sync "$MOUNT_DIR"
 
     # Write slot markers before unmount.
     echo "$booted"      > "$MOUNT_DIR/@data/current-slot"
@@ -2580,6 +2604,7 @@ deploy_update() {
         log_verbose "Removing leftover temp_update subvolume from previous run..."
         btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
         btrfs subvolume delete "$temp" 2>/dev/null
+        btrfs_sync "$MOUNT_DIR"
     fi
 
     log "Creating extraction workspace..."
@@ -2596,6 +2621,7 @@ deploy_update() {
                 pv -p -t -e -r -b | btrfs receive "$temp" || {
                 btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
                 btrfs subvolume delete "$temp" 2>/dev/null
+                btrfs_sync "$MOUNT_DIR"
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
             }
@@ -2604,6 +2630,7 @@ deploy_update() {
                 btrfs receive "$temp" || {
                 btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
                 btrfs subvolume delete "$temp" 2>/dev/null
+                btrfs_sync "$MOUNT_DIR"
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
             }
@@ -2616,6 +2643,7 @@ deploy_update() {
         CANDIDATE_MODIFIED="yes"
         run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
         run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+        btrfs_sync "$MOUNT_DIR"
     fi
 
     log_verbose "Replacing @${CANDIDATE_SLOT} with extracted snapshot..."
@@ -2626,6 +2654,7 @@ deploy_update() {
     btrfs_subvol_exists "$temp/shanios_base" && \
         { btrfs subvolume delete "$temp/shanios_base" 2>/dev/null || log_warn "Could not delete temp_update/shanios_base — will be cleaned on next deploy"; }
     btrfs subvolume delete "$temp" 2>/dev/null || log_warn "Could not delete temp_update — will be cleaned on next deploy"
+    btrfs_sync "$MOUNT_DIR"
 
     [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"
     log_success "Image deployed to @${CANDIDATE_SLOT} (v${REMOTE_VERSION}) — pending finalization"
@@ -2720,6 +2749,50 @@ finalize_update() {
     # Desktop notification is handled by shani-update which reads the
     # reboot-needed marker above — pkexec strips DISPLAY so notify-send here
     # would silently fail.
+
+    schedule_reboot_timer
+}
+
+#####################################
+### Post-Deploy Reboot Timer      ###
+#####################################
+
+# schedule_reboot_timer — arm a one-shot systemd transient timer that reboots
+# the machine after a successful deployment. Runs by default (AUTO_REBOOT=yes),
+# and is skipped entirely in --dry-run. The timer runs as its own unit outside
+# this script's process tree, so it survives even if the shell exits, but it
+# can still be cancelled by the user right up until it fires.
+schedule_reboot_timer() {
+    [[ "${AUTO_REBOOT}" == "yes" ]] || return 0
+
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[DRY-RUN] Would schedule automatic reboot in ${AUTO_REBOOT_DELAY}s"
+        return 0
+    fi
+
+    if ! command -v systemd-run &>/dev/null; then
+        log_warn "systemd-run not found — cannot schedule automatic reboot; please reboot manually"
+        return 1
+    fi
+
+    if ! [[ "${AUTO_REBOOT_DELAY}" =~ ^[0-9]+$ ]]; then
+        log_warn "Invalid --auto-reboot delay '${AUTO_REBOOT_DELAY}' — must be a whole number of seconds; skipping auto-reboot"
+        return 1
+    fi
+
+    # Clear out any previously armed timer from an earlier run so delays don't stack.
+    systemctl stop shanios-auto-reboot.timer &>/dev/null || true
+
+    if systemd-run --unit=shanios-auto-reboot \
+        --on-active="${AUTO_REBOOT_DELAY}" \
+        --description="ShaniOS scheduled reboot after successful deployment" \
+        systemctl reboot &>/dev/null; then
+        log_success "Automatic reboot armed — system will reboot in $(format_duration "$AUTO_REBOOT_DELAY")"
+        log "To cancel: systemctl stop shanios-auto-reboot.timer"
+    else
+        log_warn "Failed to schedule automatic reboot — please reboot manually"
+        return 1
+    fi
 }
 
 #####################################
@@ -2764,6 +2837,12 @@ Options:
   --set-channel           permanently set channel in /etc/shani-channel (latest|stable)
   --skip-self-update      Skip auto-update of shani-deploy
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
+
+Note: after a successful deployment the system reboots automatically after
+${AUTO_REBOOT_DELAY:-60}s. Cancel a pending reboot with:
+  systemctl stop shanios-auto-reboot.timer
+Disable auto-reboot entirely by running with AUTO_REBOOT=no, e.g.:
+  AUTO_REBOOT=no $0 [OPTIONS]
 EOF
 }
 

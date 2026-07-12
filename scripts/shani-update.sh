@@ -319,24 +319,59 @@ _build_terminal_args() {
     shift 3
     local -a cmd=("$@")
     case "$terminal" in
-        gnome-terminal|tilix|xfce4-terminal|lxterminal|mate-terminal|deepin-terminal)
+        # gnome-terminal: modern (non-deprecated) syntax is `--title=X -- CMD...`.
+        # -e/-x are deprecated in favor of --. Ref: gnome-terminal(1).
+        gnome-terminal)
             _arr=("$terminal" "--title=$title" "--" "${cmd[@]}") ;;
-        # kgx (GNOME Console) does not support --title; use -e / -- for the command.
+        # kgx (GNOME Console) intentionally dropped window titling. Its man
+        # page documents -e/--command as the execution flag; "--" is not
+        # documented anywhere for kgx (unlike gnome-terminal), and
+        # xdg-terminal-exec — the freedesktop.org reference implementation
+        # for this exact problem — defaults kgx to -e with no override entry.
+        # Ref: manpages.debian.org/.../gnome-console/kgx.1.en.html
         kgx)
-            _arr=("$terminal" "--" "${cmd[@]}") ;;
-        # konsole: --noclose keeps the window open on exit so errors are visible.
+            _arr=("$terminal" "-e" "${cmd[@]}") ;;
+        # konsole: modern (KF6) konsole no longer documents a top-level --title
+        # option — title is set via the `-p tabtitle=` profile property instead.
+        # -e must be the last option, as it consumes all following arguments.
+        # Ref: docs.kde.org/stable_kf6/en/konsole/konsole/command-line-options.html
         konsole)
-            _arr=("$terminal" "--title" "$title" "--noclose" "-e" "${cmd[@]}") ;;
+            _arr=("$terminal" "-p" "tabtitle=$title" "--noclose" "-e" "${cmd[@]}") ;;
         alacritty)
             _arr=("$terminal" "--title" "$title" "-e" "${cmd[@]}") ;;
         kitty|foot)
             _arr=("$terminal" "--title=$title" "${cmd[@]}") ;;
+        # wezterm has no CLI flag for the window *title* (that's normally set
+        # via shell/OSC sequences); --class only sets the WM class/app-id, so
+        # we use it purely for window-manager grouping, not as a title stand-in.
         wezterm)
-            _arr=("$terminal" "start" "--class" "$title" "${cmd[@]}") ;;
+            _arr=("$terminal" "start" "--class" "shani-update" "${cmd[@]}") ;;
         terminator)
             _arr=("$terminal" "--title=$title" "-x" "${cmd[@]}") ;;
         xterm|urxvt|st)
             _arr=("$terminal" "-T" "$title" "-e" "${cmd[@]}") ;;
+        # tilix: -e/--command must be the last parameter (consumes remainder).
+        # Ref: tilix(1) — "this parameter must be the last parameter."
+        tilix)
+            _arr=("$terminal" "--title=$title" "-e" "${cmd[@]}") ;;
+        # xfce4-terminal: does NOT understand a bare `--` terminator like
+        # gnome-terminal. Use -x/--execute to consume the remaining argv.
+        # Ref: docs.xfce.org/apps/xfce4-terminal/command-line
+        xfce4-terminal)
+            _arr=("$terminal" "--title=$title" "-x" "${cmd[@]}") ;;
+        # lxterminal: -e/--command must be the last option (no `--` support).
+        # Ref: lxterminal(1)
+        lxterminal)
+            _arr=("$terminal" "--title=$title" "-e" "${cmd[@]}") ;;
+        # mate-terminal: forked from an older gnome-terminal and kept -x/--execute
+        # ("remainder of the command line"); it does not support `--`.
+        # Ref: mate-terminal(1)
+        mate-terminal)
+            _arr=("$terminal" "--title=$title" "-x" "${cmd[@]}") ;;
+        # deepin-terminal: no documented --title flag and no `--` support, so we
+        # skip the title entirely rather than pass an option it may reject.
+        deepin-terminal)
+            _arr=("$terminal" "-e" "${cmd[@]}") ;;
         *)
             _arr=("$terminal" "-e" "${cmd[@]}") ;;
     esac

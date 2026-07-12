@@ -12,6 +12,12 @@
 #   shani-update --channel CHAN   Update channel: stable|latest (default: stable)
 #   shani-update --verbose        Verbose output from shani-deploy
 #   shani-update --dry-run        Simulate without changes
+#   shani-update --cleanup        Passthrough: shani-deploy --cleanup
+#   shani-update --optimize       Passthrough: shani-deploy --optimize (manual dedup)
+#   shani-update --set-channel CHAN   Passthrough: shani-deploy --set-channel (persist channel)
+#   shani-update --skip-self-update   Passthrough: shani-deploy --skip-self-update on install
+#   shani-update --update-genefi      Passthrough: shani-deploy --update-genefi on install
+#   shani-update --health [ARGS...]   Passthrough to shani-health (report/diagnostics tool)
 #   shani-update
 #
 # Install: /usr/local/bin/shani-update
@@ -25,15 +31,20 @@ IFS=$'\n\t'
 ### Constants                     ###
 #####################################
 
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 readonly OS_NAME="shanios"
 readonly DEPLOY_BIN="/usr/local/bin/shani-deploy"
+readonly HEALTH_BIN="/usr/local/bin/shani-health"
 readonly DEFER_DELAY=86400
 readonly UPDATE_CHANNEL_DEFAULT="stable"
 readonly BASE_URL="https://sourceforge.net/projects/shanios/files"
 readonly R2_BASE_URL="https://downloads.shani.dev"
 readonly LOCAL_VERSION_FILE="/etc/shani-version"
 readonly LOCAL_PROFILE_FILE="/etc/shani-profile"
+# Same file shani-deploy --set-channel writes to. Must be consulted here too,
+# or shani-update can check one channel while shani-deploy (which resolves
+# CLI arg > this file > "stable") deploys a different one.
+readonly CHANNEL_FILE="/etc/shani-channel"
 readonly CURRENT_SLOT_FILE="/data/current-slot"
 readonly BOOT_FAILURE_FILE="/data/boot_failure"
 readonly BOOT_HARD_FAILURE_FILE="/data/boot_hard_failure"
@@ -41,6 +52,9 @@ readonly BOOT_OK_FILE="/data/boot-ok"
 # Matches shani-deploy's path — /run is tmpfs so the file auto-clears on reboot.
 readonly REBOOT_NEEDED_FILE="/run/shanios/reboot-needed"
 readonly LOG_TAG="shani-update"
+# shani-deploy's own log — separate file, written as root. Read-only viewer
+# access from the dashboard; falls back to pkexec if not world-readable.
+readonly DEPLOY_LOG="/var/log/shanios-deploy.log"
 readonly NETWORK_TIMEOUT=30
 readonly CURL_RETRIES=3
 readonly CURL_RETRY_DELAY=5
@@ -57,17 +71,22 @@ readonly LOG_FILE="$LOG_DIR/shani-update.log"
 # In interactive mode LOG_DIR is an acceptable fallback.
 readonly LOCK_FILE="${XDG_RUNTIME_DIR:-$LOG_DIR}/shani-update.lock"
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 #####################################
 ### Global State                  ###
 #####################################
 
-MODE="interactive"          # interactive | startup | rollback
+MODE="interactive"          # interactive | startup | rollback | cleanup | optimize | set-channel | health
 FORCE_UPDATE="no"
 DEPLOY_CHANNEL="$UPDATE_CHANNEL_DEFAULT"
+CHANNEL_FROM_CLI="no"       # set to "yes" once -t/--channel is parsed on the command line
 VERBOSE_DEPLOY="no"
 DRY_RUN_DEPLOY="no"
+SKIP_SELF_UPDATE="no"       # passed through as shani-deploy --skip-self-update
+UPDATE_GENEFI="no"          # passed through as shani-deploy --update-genefi
+SET_CHANNEL_VALUE=""        # channel arg for MODE=set-channel
+HEALTH_ARGS=()               # remaining argv forwarded verbatim to shani-health
 
 LOCAL_VERSION=""
 LOCAL_PROFILE=""
@@ -116,19 +135,19 @@ err() {
 
 _acquire_lock() {
     if ! mkdir "$LOCK_FILE" 2>/dev/null; then
-        if [[ -f "$LOCK_FILE/pid" ]]; then
-            local pid
-            pid=$(cat "$LOCK_FILE/pid" 2>/dev/null || echo "")
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                echo "Another instance is already running (PID: $pid)" >&2
-                exit 1
-            fi
-            log "Removing stale lock"
-            rm -rf "$LOCK_FILE"
-            mkdir "$LOCK_FILE" || { echo "Failed to acquire lock" >&2; exit 1; }
-        else
-            echo "Failed to acquire lock" >&2; exit 1
+        # A lock dir with no pid file (e.g. a crash between mkdir and writing
+        # the pid) is just as stale as one whose owning process has died —
+        # treat both the same way instead of exiting forever on every future
+        # run until someone manually removes the directory.
+        local pid=""
+        [[ -f "$LOCK_FILE/pid" ]] && pid=$(cat "$LOCK_FILE/pid" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Another instance is already running (PID: $pid)" >&2
+            exit 1
         fi
+        log "Removing stale lock"
+        rm -rf "$LOCK_FILE"
+        mkdir "$LOCK_FILE" || { echo "Failed to acquire lock" >&2; exit 1; }
     fi
     echo $$ > "$LOCK_FILE/pid"
 }
@@ -210,8 +229,21 @@ _check_fallback_boot() {
         return 1
     }
 
-    [[ ! -f "$BOOT_FAILURE_FILE" ]] && {
+    [[ ! -f "$BOOT_FAILURE_FILE" && ! -f "${BOOT_FAILURE_FILE}.acked" ]] && {
         log "Slot mismatch but no failure file — nothing to act on"
+        return 1
+    }
+
+    # Already acknowledged earlier this boot (user previously saw the dialog
+    # and declined, or a prior run in this same session already processed
+    # it). Don't re-prompt — but the slot mismatch here is a *known,
+    # already-failed* slot, not a freshly booted candidate update. Flag it
+    # so _check_candidate_boot() doesn't mistake the still-failed slot for
+    # a new deployment being tested (which would offer to "roll back" the
+    # currently-running, healthy fallback slot instead).
+    [[ ! -f "$BOOT_FAILURE_FILE" && -f "${BOOT_FAILURE_FILE}.acked" ]] && {
+        log "Failure for @${CURRENT_SLOT} already acknowledged this boot — skipping re-prompt"
+        FALLBACK_DETECTED=1
         return 1
     }
 
@@ -416,8 +448,13 @@ show_dialog() {
         local -a backends=()
         [[ "$session" == "wayland" ]] && backends=("wayland" "x11" "") || backends=("x11" "wayland" "")
         for backend in "${backends[@]}"; do
-            local -a yad_cmd=()
-            [[ -n "$backend" ]] && yad_cmd=(env "GDK_BACKEND=$backend")
+            # LC_ALL/LANGUAGE=C: force GTK's error strings to English so the
+            # failure-pattern regex below matches reliably. Without this, a
+            # non-English locale would translate "cannot open display" etc.,
+            # the regex would never match, and a failed backend would be
+            # mistaken for a real user Cancel on every non-English system.
+            local -a yad_cmd=(env "LC_ALL=C" "LANGUAGE=C")
+            [[ -n "$backend" ]] && yad_cmd+=("GDK_BACKEND=$backend")
             yad_cmd+=(yad
                 --title="$title"
                 --window-icon="$icon"
@@ -435,8 +472,41 @@ show_dialog() {
                 --button="${cancel_label}:1"
             )
             [[ $timeout -gt 0 ]] && yad_cmd+=(--timeout="$timeout" --timeout-indicator=bottom)
-            "${yad_cmd[@]}" 2>/dev/null
-            local rc=$?
+
+            # Capture stderr (discard stdout) instead of throwing it away.
+            # A backend that can't open a display fails fast with GTK's
+            # generic exit code 1 — the exact same code yad uses for a
+            # real user Cancel. Without stderr there is no way to tell
+            # "no dialog was ever shown" apart from "user declined", so
+            # the wayland/x11 fallback below would never actually run.
+            #
+            # Also time the call: a human can't see, read, and dismiss a
+            # dialog in under ~300ms, so an instant rc=1 with no stderr at
+            # all (some backend failures exit silently) is still treated as
+            # a failed backend rather than a genuine Cancel.
+            local yad_err start_ns end_ns elapsed_ms=-1 rc=0
+            start_ns=$(date +%s%N 2>/dev/null)
+            yad_err=$("${yad_cmd[@]}" 2>&1 >/dev/null) || rc=$?
+            end_ns=$(date +%s%N 2>/dev/null)
+            [[ "$start_ns" =~ ^[0-9]+$ && "$end_ns" =~ ^[0-9]+$ ]] && \
+                elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+            local backend_failed=0
+            if [[ $rc -eq 1 ]]; then
+                if [[ -n "$yad_err" ]] && grep -qiE \
+                    'cannot open display|failed to open display|no protocol specified|could not connect|gdk_display|unable to init server|wayland display|not a wayland compositor|no such display' \
+                    <<< "$yad_err"; then
+                    backend_failed=1
+                elif [[ -z "$yad_err" && $elapsed_ms -ge 0 && $elapsed_ms -lt 300 ]]; then
+                    backend_failed=1
+                fi
+            fi
+
+            if (( backend_failed )); then
+                warn "yad backend '${backend:-default}' failed to initialize (${elapsed_ms}ms${yad_err:+: ${yad_err:0:200}}) — trying next"
+                continue
+            fi
+
             [[ $rc -eq 0 ]]   && return 0
             [[ $rc -eq 1 ]]   && return 1
             [[ $rc -eq 70 ]]  && return 1
@@ -461,12 +531,33 @@ show_dialog() {
 }
 
 #####################################
-### Rollback                      ###
+### Deploy Launcher                ###
 #####################################
 
-_run_rollback() {
-    local title="${1:-Shani OS — Rollback}"
-    log "Launching rollback"
+# _build_install_args OUT_ARRAY_NAME — builds the shani-deploy flag list for
+# an install/update run from the current FORCE_UPDATE/DEPLOY_CHANNEL/
+# VERBOSE_DEPLOY/DRY_RUN_DEPLOY/SKIP_SELF_UPDATE/UPDATE_GENEFI state. Shared
+# by the automatic flow and the dashboard's Install dialog so there is one
+# place that knows how these map to shani-deploy's actual CLI flags.
+_build_install_args() {
+    local -n _out="$1"
+    _out=()
+    [[ "$FORCE_UPDATE"      == "yes" ]] && _out+=(--force)
+    [[ "$DEPLOY_CHANNEL"    != "$UPDATE_CHANNEL_DEFAULT" ]] && _out+=(--channel "$DEPLOY_CHANNEL")
+    [[ "$VERBOSE_DEPLOY"    == "yes" ]] && _out+=(--verbose)
+    [[ "$DRY_RUN_DEPLOY"    == "yes" ]] && _out+=(--dry-run)
+    [[ "$SKIP_SELF_UPDATE"  == "yes" ]] && _out+=(--skip-self-update)
+    [[ "$UPDATE_GENEFI"     == "yes" ]] && _out+=(--update-genefi)
+}
+
+# _launch_deploy TITLE ARG [ARG...]
+# Opens a terminal running `pkexec shani-deploy ARG...`, giving the user full
+# visibility into (and Ctrl+C control over) whatever shani-deploy is doing.
+# Shared by rollback, install, cleanup, optimize, and channel changes so
+# there's exactly one code path that builds the pkexec/terminal invocation.
+_launch_deploy() {
+    local title="$1"; shift
+    log "Launching: $DEPLOY_BIN $*"
 
     if ! TERMINAL=$(_find_terminal); then
         err "No terminal emulator found — install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm"
@@ -474,23 +565,57 @@ _run_rollback() {
 
     local -a pkexec_args
     _build_pkexec_env pkexec_args
-    pkexec_args+=("$DEPLOY_BIN" --rollback)
-    [[ "$VERBOSE_DEPLOY" == "yes" ]] && pkexec_args+=(--verbose)
-    [[ "$DRY_RUN_DEPLOY" == "yes" ]] && pkexec_args+=(--dry-run)
+    pkexec_args+=("$DEPLOY_BIN" "$@")
 
     local -a terminal_args
     _build_terminal_args "$TERMINAL" "$title" terminal_args "${pkexec_args[@]}"
-    log "Launching rollback: ${terminal_args[*]}"
+    log "Launching: ${terminal_args[*]}"
     "${terminal_args[@]}"
 }
+
+# _launch_health TITLE [ARG...]
+# Opens a terminal running `shani-health ARG...`. Unlike _launch_deploy this
+# does NOT wrap the command in pkexec — shani-health re-execs itself via
+# pkexec/sudo internally (see its _require_root) so wrapping it here would
+# just prompt for privileges twice.
+_launch_health() {
+    local title="$1"; shift
+    log "Launching: $HEALTH_BIN $*"
+
+    if ! TERMINAL=$(_find_terminal); then
+        err "No terminal emulator found — install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm"
+    fi
+
+    local -a cmd_args=("$HEALTH_BIN" "$@")
+    local -a terminal_args
+    _build_terminal_args "$TERMINAL" "$title" terminal_args "${cmd_args[@]}"
+    log "Launching: ${terminal_args[*]}"
+    "${terminal_args[@]}"
+}
+
+#####################################
+### Rollback                      ###
+#####################################
+
+_run_rollback() {
+    local title="${1:-Shani OS — Rollback}"
+    log "Launching rollback"
+
+    local -a extra=(--rollback)
+    [[ "$VERBOSE_DEPLOY" == "yes" ]] && extra+=(--verbose)
+    [[ "$DRY_RUN_DEPLOY" == "yes" ]] && extra+=(--dry-run)
+
+    _launch_deploy "$title" "${extra[@]}"
+}
+
 
 _post_rollback_dialog() {
     local text
     text=$(printf 'Rollback completed.\n\n<b>@%s</b> has been restored.\n\nRestart now to boot back into <b>@%s</b>.' \
         "${FAILED_SLOT:-inactive}" "${BOOTED_SLOT:-current}")
 
-    show_dialog "Shani OS — Rollback Complete" "$text" "Restart Now" "Restart Later" 300 "system-reboot"
-    local rc=$?
+    local rc=0
+    show_dialog "Shani OS — Rollback Complete" "$text" "Restart Now" "Restart Later" 300 "system-reboot" || rc=$?
 
     if [[ $rc -eq 0 ]]; then
         log "Restarting after rollback"
@@ -531,8 +656,8 @@ _handle_fallback_boot() {
             "$FAILED_SLOT" "$BOOTED_SLOT" "$FAILED_SLOT")
     fi
 
-    show_dialog "$title" "$text" "Roll Back Now" "Ignore" 120 "dialog-warning"
-    local rc=$?
+    local rc=0
+    show_dialog "$title" "$text" "Roll Back Now" "Ignore" 120 "dialog-warning" || rc=$?
 
     if [[ $rc -eq 2 ]]; then
         # No GUI — console or notify
@@ -593,8 +718,8 @@ _handle_candidate_boot() {
     text=$(printf "You're running the newly updated system (<b>@%s</b>).\n\nIf everything looks good, no action needed.\nIf something is broken, roll back to <b>@%s</b> now." \
         "$candidate" "$CURRENT_SLOT")
 
-    show_dialog "Shani OS — Testing New System" "$text" "Roll Back Now" "Keep Testing" 0 "system-reboot"
-    local rc=$?
+    local rc=0
+    show_dialog "Shani OS — Testing New System" "$text" "Roll Back Now" "Keep Testing" 0 "system-reboot" || rc=$?
 
     if [[ $rc -eq 0 ]]; then
         log "User requested rollback from candidate boot @${candidate}"
@@ -646,8 +771,8 @@ _handle_reboot_needed() {
     local text
     text=$(printf 'Shani OS has been updated to <b>v%s</b>.\n\nRestart now to boot into the updated system.\nYou can continue using your current session and restart later.' "$ver")
 
-    show_dialog "Shani OS — Restart Required" "$text" "Restart Now" "Restart Later" 300 "system-reboot"
-    local rc=$?
+    local rc=0
+    show_dialog "Shani OS — Restart Required" "$text" "Restart Now" "Restart Later" 300 "system-reboot" || rc=$?
 
     if [[ $rc -eq 0 ]]; then
         log "User chose to restart now after update to v${ver}"
@@ -767,6 +892,40 @@ _is_update_needed() {
 }
 
 #####################################
+### Channel Resolution            ###
+#####################################
+
+_validate_channel() {
+    case "$1" in
+        stable|latest) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Resolve DEPLOY_CHANNEL exactly the way shani-deploy resolves UPDATE_CHANNEL:
+#   CLI flag (already validated at parse time) > $CHANNEL_FILE > "stable".
+# Without this, shani-update could check the stable manifest while a later
+# `shani-deploy` invocation (launched with no --channel flag) silently reads
+# a persisted "latest" setting from $CHANNEL_FILE and deploys that instead —
+# showing the user one version and installing another.
+_resolve_channel() {
+    [[ "$CHANNEL_FROM_CLI" == "yes" ]] && return 0
+
+    if [[ -r "$CHANNEL_FILE" ]]; then
+        local file_channel
+        file_channel=$(head -n1 "$CHANNEL_FILE" 2>/dev/null | tr -d '[:space:]')
+        if _validate_channel "$file_channel"; then
+            DEPLOY_CHANNEL="$file_channel"
+            log "Channel source: $CHANNEL_FILE ($DEPLOY_CHANNEL)"
+            return 0
+        elif [[ -n "$file_channel" ]]; then
+            warn "Invalid channel '$file_channel' in $CHANNEL_FILE — using default: $UPDATE_CHANNEL_DEFAULT"
+        fi
+    fi
+    log "Channel source: default ($DEPLOY_CHANNEL)"
+}
+
+#####################################
 ### Update Flow                   ###
 #####################################
 
@@ -778,8 +937,8 @@ _decide_action() {
         "$current" "$remote")
 
     log "Session: ${XDG_SESSION_TYPE:-unknown} (${XDG_CURRENT_DESKTOP:-unknown})"
-    show_dialog "Shani OS — Update Available" "$text" "Install Now" "Remind Me Later" 120
-    local rc=$?
+    local rc=0
+    show_dialog "Shani OS — Update Available" "$text" "Install Now" "Remind Me Later" 120 || rc=$?
 
     [[ $rc -eq 0 ]] && { log "User chose to install"; return 0; }
     [[ $rc -eq 1 ]] && { log "User chose to postpone"; return 1; }
@@ -805,40 +964,74 @@ _decide_action() {
     return 1
 }
 
-_run_update_check() {
+_read_local_info() {
     LOCAL_VERSION=$(_read_file_or_default "$LOCAL_VERSION_FILE" "19700101" "0-9")
-    LOCAL_PROFILE=$(_read_file_or_default "$LOCAL_PROFILE_FILE" "default"  "A-Za-z")
+    # Charset must match shani-deploy's `tr -cd 'a-z0-9_-' < /etc/shani-profile`
+    # exactly — a narrower filter here would silently mangle any profile name
+    # containing a digit, hyphen, or underscore (e.g. "kde6", "gnome-de"),
+    # breaking the update-URL path and the local/remote profile comparison.
+    LOCAL_PROFILE=$(_read_file_or_default "$LOCAL_PROFILE_FILE" "default"  "a-z0-9_-")
     _validate_version "$LOCAL_VERSION" || { warn "Corrupted version — treating as outdated"; LOCAL_VERSION="19700101"; }
     log "Local: v${LOCAL_VERSION}-${LOCAL_PROFILE}"
+}
 
-    _check_network || {
+# _fetch_and_compare — read local version/profile, fetch the remote manifest,
+# and compare. Sets LOCAL_VERSION/LOCAL_PROFILE/REMOTE_VERSION/REMOTE_PROFILE.
+# Unlike _run_update_check, this NEVER calls err()/_cleanup_and_exit — it
+# returns a status so callers (the unattended --startup flow via
+# _run_update_check, and the interactive dashboard) can each decide what to
+# do with a failure instead of always killing the whole process.
+#   0 = update available   1 = already up to date
+#   2 = no network          3 = fetch/parse error
+_fetch_and_compare() {
+    _read_local_info
+
+    if ! _check_network; then
         warn "No internet — retrying in 30s..."
         sleep 30
-        _check_network || err "No internet connection after retry"
+        _check_network || { warn "No internet connection after retry"; return 2; }
         log "Connection restored"
-    }
+    fi
 
     local channel_url="$BASE_URL/$LOCAL_PROFILE/$DEPLOY_CHANNEL.txt"
     local r2_url="$R2_BASE_URL/$LOCAL_PROFILE/$DEPLOY_CHANNEL.txt"
     local remote_image
     # Try R2 first (same priority as shani-deploy), fall back to SourceForge.
     remote_image=$(_fetch_remote_info "$r2_url") || \
-    remote_image=$(_fetch_remote_info "$channel_url") || \
-        err "Unable to fetch update info from server"
+    remote_image=$(_fetch_remote_info "$channel_url") || {
+        warn "Unable to fetch update info from server"
+        return 3
+    }
 
-    if [[ "$remote_image" =~ ^shanios-([0-9]{8})-([A-Za-z]+)\.zst$ ]]; then
+    if [[ "$remote_image" =~ ^shanios-([0-9]{8})-([a-z0-9_-]+)\.zst$ ]]; then
         REMOTE_VERSION="${BASH_REMATCH[1]}"
         REMOTE_PROFILE="${BASH_REMATCH[2]}"
-        _validate_version "$REMOTE_VERSION" || err "Invalid remote version: $REMOTE_VERSION"
+        if ! _validate_version "$REMOTE_VERSION"; then
+            warn "Invalid remote version: $REMOTE_VERSION"
+            return 3
+        fi
     else
-        err "Unexpected server response: '$remote_image'"
+        warn "Unexpected server response: '$remote_image'"
+        return 3
     fi
     log "Remote: v${REMOTE_VERSION}-${REMOTE_PROFILE}"
 
-    _is_update_needed "$LOCAL_VERSION" "$LOCAL_PROFILE" "$REMOTE_VERSION" "$REMOTE_PROFILE" || {
-        log "System is up to date"
-        _cleanup_and_exit 0
-    }
+    if _is_update_needed "$LOCAL_VERSION" "$LOCAL_PROFILE" "$REMOTE_VERSION" "$REMOTE_PROFILE"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+_run_update_check() {
+    local rc=0
+    _fetch_and_compare || rc=$?
+
+    case $rc in
+        2) err "No internet connection after retry" ;;
+        3) err "Unable to fetch update info from server" ;;
+        1) log "System is up to date"; _cleanup_and_exit 0 ;;
+    esac
 
     _decide_action || {
         log "Update postponed — scheduling reminder"
@@ -847,7 +1040,8 @@ _run_update_check() {
             # so they don't accumulate across multiple defer sessions.
             systemctl --user stop "${LOG_TAG}-defer-"*.timer 2>/dev/null || true
             systemctl --user reset-failed "${LOG_TAG}-defer-"*.timer 2>/dev/null || true
-            local unit="${LOG_TAG}-defer-$(date +%s)-$$"
+            local unit
+            unit="${LOG_TAG}-defer-$(date +%s)-$$"
             systemd-run --user \
                 --unit="$unit" \
                 --description="Deferred Shani OS update reminder" \
@@ -860,25 +1054,10 @@ _run_update_check() {
 
     log "User approved update — launching shani-deploy"
 
-    if ! TERMINAL=$(_find_terminal); then
-        err "No terminal found. Install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm."
-    fi
-    log "Terminal: $TERMINAL"
-
-    local -a pkexec_args
-    _build_pkexec_env pkexec_args
-    pkexec_args+=("$DEPLOY_BIN")
-    [[ "$FORCE_UPDATE"   == "yes" ]] && pkexec_args+=(--force)
-    [[ "$DEPLOY_CHANNEL" != "$UPDATE_CHANNEL_DEFAULT" ]] && pkexec_args+=(--channel "$DEPLOY_CHANNEL")
-    [[ "$VERBOSE_DEPLOY" == "yes" ]] && pkexec_args+=(--verbose)
-    [[ "$DRY_RUN_DEPLOY" == "yes" ]] && pkexec_args+=(--dry-run)
-
-    local -a terminal_args
-    _build_terminal_args "$TERMINAL" "Shani OS Update" terminal_args "${pkexec_args[@]}"
-
-    log "Launching: ${terminal_args[*]}"
-    "${terminal_args[@]}"
-    local exit_code=$?
+    local -a install_args
+    _build_install_args install_args
+    local exit_code=0
+    _launch_deploy "Shani OS Update" "${install_args[@]}" || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
         log "Update completed successfully — reboot-needed marker will surface restart dialog"
@@ -904,9 +1083,29 @@ main() {
             --startup)          MODE="startup";       shift ;;
             -r|--rollback)      MODE="rollback";      shift ;;
             -f|--force)         FORCE_UPDATE="yes";   shift ;;
-            -t|--channel)       DEPLOY_CHANNEL="$2";  shift 2 ;;
+            -t|--channel)
+                [[ $# -ge 2 ]] || { echo "Option $1 requires an argument (stable|latest)" >&2; exit 1; }
+                _validate_channel "$2" || { echo "Invalid channel '$2' — must be 'stable' or 'latest'" >&2; exit 1; }
+                DEPLOY_CHANNEL="$2"
+                CHANNEL_FROM_CLI="yes"
+                shift 2 ;;
             -v|--verbose)       VERBOSE_DEPLOY="yes"; shift ;;
             -d|--dry-run)       DRY_RUN_DEPLOY="yes"; shift ;;
+            -c|--cleanup)       MODE="cleanup";       shift ;;
+            -o|--optimize)      MODE="optimize";      shift ;;
+            --set-channel)
+                [[ $# -ge 2 ]] || { echo "Option $1 requires an argument (stable|latest)" >&2; exit 1; }
+                _validate_channel "$2" || { echo "Invalid channel '$2' — must be 'stable' or 'latest'" >&2; exit 1; }
+                MODE="set-channel"
+                SET_CHANNEL_VALUE="$2"
+                shift 2 ;;
+            --skip-self-update) SKIP_SELF_UPDATE="yes"; shift ;;
+            --update-genefi)    UPDATE_GENEFI="yes";  shift ;;
+            --health)
+                MODE="health"
+                shift
+                HEALTH_ARGS=("$@")
+                break ;;
             -h|--help)
                 cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
@@ -918,6 +1117,13 @@ Options:
   -t, --channel CHAN  Update channel: stable|latest  (default: $UPDATE_CHANNEL_DEFAULT)
   -v, --verbose       Verbose output from shani-deploy
   -d, --dry-run       Simulate deployment without changes
+  -c, --cleanup       Passthrough: shani-deploy --cleanup (manual backup/download cleanup)
+  -o, --optimize      Passthrough: shani-deploy --optimize (manual Btrfs dedup)
+  --set-channel CHAN  Passthrough: shani-deploy --set-channel (persist channel to $CHANNEL_FILE)
+  --skip-self-update  On install, passed through as shani-deploy --skip-self-update
+  --update-genefi     On install, passed through as shani-deploy --update-genefi
+  --health [ARGS...]  Passthrough to shani-health (e.g. --health --security). Consumes
+                      all remaining arguments — must be last on the command line.
   -h, --help          Show this help
 
 Autostart:  Exec=shani-update --startup
@@ -929,9 +1135,11 @@ EOF
 
     log "shani-update v${SCRIPT_VERSION} mode=${MODE}"
 
-    # storage-info / info / fix-security: no lock needed, just pass through to shani-deploy
+    # cleanup / optimize / set-channel / health: dispatched below, after the lock
+    # is acquired (they run shani-deploy or shani-health directly and exit).
 
     _validate_environment
+    _resolve_channel
 
     # ── Startup mode ─────────────────────────────────────────────────────────
     if [[ "$MODE" == "startup" ]]; then
@@ -961,6 +1169,15 @@ EOF
         log "=== Startup: checking fallback boot ==="
         if _check_fallback_boot; then
             _handle_fallback_boot
+        fi
+        if (( FALLBACK_DETECTED )); then
+            # Already acknowledged earlier this boot (see _check_fallback_boot).
+            # The slot mismatch is still unresolved — running shani-deploy now
+            # would just hit the same mismatch and exit 0, which we'd wrongly
+            # log as "update completed successfully". Stop here; the user
+            # needs to reboot or run --rollback first.
+            log "Fallback already acknowledged this boot — nothing more to do until reboot or rollback"
+            _cleanup_and_exit 0
         fi
 
         log "=== Startup: checking reboot needed ==="
@@ -999,10 +1216,57 @@ EOF
         fi
     fi
 
+    # ── Cleanup / Optimize passthrough ────────────────────────────────────────
+    if [[ "$MODE" == "cleanup" || "$MODE" == "optimize" ]]; then
+        log "=== ${MODE} ==="
+        local -a extra=()
+        [[ "$MODE" == "cleanup"  ]] && extra+=(--cleanup)
+        [[ "$MODE" == "optimize" ]] && extra+=(--optimize)
+        [[ "$VERBOSE_DEPLOY" == "yes" ]] && extra+=(--verbose)
+        [[ "$DRY_RUN_DEPLOY" == "yes" ]] && extra+=(--dry-run)
+        local title="Shani OS — Cleanup"
+        [[ "$MODE" == "optimize" ]] && title="Shani OS — Storage Optimize"
+        if _launch_deploy "$title" "${extra[@]}"; then
+            log "${MODE} completed"
+            _cleanup_and_exit 0
+        else
+            log "ERROR: ${MODE} failed"
+            _cleanup_and_exit 1
+        fi
+    fi
+
+    # ── Set-channel passthrough ───────────────────────────────────────────────
+    if [[ "$MODE" == "set-channel" ]]; then
+        log "=== Set channel: $SET_CHANNEL_VALUE ==="
+        if _launch_deploy "Shani OS — Set Channel" --set-channel "$SET_CHANNEL_VALUE"; then
+            log "Channel set to $SET_CHANNEL_VALUE"
+            _cleanup_and_exit 0
+        else
+            log "ERROR: Failed to set channel"
+            _cleanup_and_exit 1
+        fi
+    fi
+
+    # ── Health passthrough ────────────────────────────────────────────────────
+    if [[ "$MODE" == "health" ]]; then
+        log "=== Health passthrough: ${HEALTH_ARGS[*]:-(default report)} ==="
+        [[ -x "$HEALTH_BIN" ]] || err "shani-health not found or not executable at $HEALTH_BIN"
+        if _launch_health "Shani OS — Health" "${HEALTH_ARGS[@]}"; then
+            _cleanup_and_exit 0
+        else
+            log "ERROR: shani-health exited with an error"
+            _cleanup_and_exit 1
+        fi
+    fi
+
     # ── Interactive update mode ───────────────────────────────────────────────
     log "=== Interactive: checking fallback boot ==="
     if _check_fallback_boot; then
         _handle_fallback_boot
+    fi
+    if (( FALLBACK_DETECTED )); then
+        log "Fallback already acknowledged this boot — nothing more to do until reboot or rollback"
+        _cleanup_and_exit 0
     fi
 
     log "=== Interactive: checking reboot needed ==="

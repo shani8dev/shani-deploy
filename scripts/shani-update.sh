@@ -14,6 +14,7 @@
 #   shani-update --dry-run        Simulate without changes
 #   shani-update --cleanup        Passthrough: shani-deploy --cleanup
 #   shani-update --optimize       Passthrough: shani-deploy --optimize (manual dedup)
+#   shani-update --download-only  Passthrough: shani-deploy --download-only (fetch+verify, no deploy)
 #   shani-update --set-channel CHAN   Passthrough: shani-deploy --set-channel (persist channel)
 #   shani-update --skip-self-update   Passthrough: shani-deploy --skip-self-update on install
 #   shani-update --update-genefi      Passthrough: shani-deploy --update-genefi on install
@@ -77,7 +78,7 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 ### Global State                  ###
 #####################################
 
-MODE="interactive"          # interactive | startup | rollback | cleanup | optimize | set-channel | health
+MODE="interactive"          # interactive | startup | rollback | cleanup | optimize | download-only | set-channel | health
 FORCE_UPDATE="no"
 DEPLOY_CHANNEL="$UPDATE_CHANNEL_DEFAULT"
 CHANNEL_FROM_CLI="no"       # set to "yes" once -t/--channel is parsed on the command line
@@ -431,6 +432,7 @@ _build_pkexec_env() {
     _pe=(pkexec env "DISPLAY=$display_env" "XAUTHORITY=$xauth_env")
     [[ -n "$wayland_display" ]] && _pe+=("WAYLAND_DISPLAY=$wayland_display")
     [[ -n "$runtime_dir"     ]] && _pe+=("XDG_RUNTIME_DIR=$runtime_dir")
+    return 0
 }
 
 #####################################
@@ -548,6 +550,7 @@ _build_install_args() {
     [[ "$DRY_RUN_DEPLOY"    == "yes" ]] && _out+=(--dry-run)
     [[ "$SKIP_SELF_UPDATE"  == "yes" ]] && _out+=(--skip-self-update)
     [[ "$UPDATE_GENEFI"     == "yes" ]] && _out+=(--update-genefi)
+    return 0
 }
 
 # _launch_deploy TITLE ARG [ARG...]
@@ -1093,6 +1096,7 @@ main() {
             -d|--dry-run)       DRY_RUN_DEPLOY="yes"; shift ;;
             -c|--cleanup)       MODE="cleanup";       shift ;;
             -o|--optimize)      MODE="optimize";      shift ;;
+            --download-only)    MODE="download-only"; shift ;;
             --set-channel)
                 [[ $# -ge 2 ]] || { echo "Option $1 requires an argument (stable|latest)" >&2; exit 1; }
                 _validate_channel "$2" || { echo "Invalid channel '$2' — must be 'stable' or 'latest'" >&2; exit 1; }
@@ -1119,6 +1123,7 @@ Options:
   -d, --dry-run       Simulate deployment without changes
   -c, --cleanup       Passthrough: shani-deploy --cleanup (manual backup/download cleanup)
   -o, --optimize      Passthrough: shani-deploy --optimize (manual Btrfs dedup)
+  --download-only     Passthrough: shani-deploy --download-only (fetch+verify update image, no deploy)
   --set-channel CHAN  Passthrough: shani-deploy --set-channel (persist channel to $CHANNEL_FILE)
   --skip-self-update  On install, passed through as shani-deploy --skip-self-update
   --update-genefi     On install, passed through as shani-deploy --update-genefi
@@ -1135,7 +1140,7 @@ EOF
 
     log "shani-update v${SCRIPT_VERSION} mode=${MODE}"
 
-    # cleanup / optimize / set-channel / health: dispatched below, after the lock
+    # cleanup / optimize / download-only / set-channel / health: dispatched below, after the lock
     # is acquired (they run shani-deploy or shani-health directly and exit).
 
     _validate_environment
@@ -1231,6 +1236,23 @@ EOF
             _cleanup_and_exit 0
         else
             log "ERROR: ${MODE} failed"
+            _cleanup_and_exit 1
+        fi
+    fi
+
+    # ── Download-only passthrough ─────────────────────────────────────────────
+    if [[ "$MODE" == "download-only" ]]; then
+        log "=== download-only ==="
+        local -a extra=(--download-only)
+        [[ "$FORCE_UPDATE"   == "yes" ]] && extra+=(--force)
+        [[ "$DEPLOY_CHANNEL" != "$UPDATE_CHANNEL_DEFAULT" ]] && extra+=(--channel "$DEPLOY_CHANNEL")
+        [[ "$VERBOSE_DEPLOY" == "yes" ]] && extra+=(--verbose)
+        [[ "$DRY_RUN_DEPLOY" == "yes" ]] && extra+=(--dry-run)
+        if _launch_deploy "Shani OS — Download Update" "${extra[@]}"; then
+            log "download-only completed"
+            _cleanup_and_exit 0
+        else
+            log "ERROR: download-only failed"
             _cleanup_and_exit 1
         fi
     fi

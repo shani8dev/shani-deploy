@@ -11,6 +11,7 @@
 #   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
 #   -t, --channel <chan>    Update channel: latest|stable (default: stable)
 #   -f, --force             Deploy even if version matches or boot mismatch
+#   --download-only         Fetch and verify the update image, then exit without deploying
 #   -d, --dry-run           Simulate without changes
 #   -v, --verbose           Detailed output
 #   --skip-self-update      Skip script auto-update
@@ -93,6 +94,7 @@ declare -g SKIP_SELF_UPDATE="${SKIP_SELF_UPDATE:-no}"
 declare -g SELF_UPDATE_DONE="${SELF_UPDATE_DONE:-}"
 declare -g UPDATE_GENEFI="${UPDATE_GENEFI:-no}"
 declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
+declare -g DOWNLOAD_ONLY="${DOWNLOAD_ONLY:-no}"
 declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-$(date +%s)}"
 declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
 # Auto-reboot: the system reboots automatically this many seconds after a
@@ -125,6 +127,7 @@ STATE_DIR=""
 
 cleanup_state() {
     [[ -n "${STATE_DIR:-}" && -d "${STATE_DIR}" ]] && rm -rf "${STATE_DIR}"
+    return 0
 }
 trap cleanup_state EXIT
 
@@ -137,7 +140,7 @@ persist_state() {
         declare -p REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE 2>/dev/null || true
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
-        declare -p FORCE_UPDATE 2>/dev/null || true
+        declare -p FORCE_UPDATE DOWNLOAD_ONLY 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
         declare -p AUTO_REBOOT AUTO_REBOOT_DELAY 2>/dev/null || true
     } > "$state_file"
@@ -2832,6 +2835,7 @@ Options:
   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
   -t, --channel <chan>    Update channel (latest|stable)
   -f, --force             Deploy even if version matches or boot mismatch
+  --download-only         Fetch and verify the update image, then exit without deploying
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
   --set-channel           permanently set channel in /etc/shani-channel (latest|stable)
@@ -2862,6 +2866,7 @@ main() {
                 shift 2 ;;
             -t|--channel) UPDATE_CHANNEL="$2"; shift 2 ;;
             -f|--force) FORCE_UPDATE="yes"; shift ;;
+            --download-only) DOWNLOAD_ONLY="yes"; shift ;;
             -d|--dry-run) DRY_RUN="yes"; shift ;;
             -v|--verbose) VERBOSE="yes"; shift ;;
             --skip-self-update) SKIP_SELF_UPDATE="yes"; shift ;;
@@ -2870,6 +2875,12 @@ main() {
             *) die "Invalid option: $1" ;;
         esac
     done
+
+    if [[ "$DOWNLOAD_ONLY" == "yes" ]]; then
+        if [[ "$ROLLBACK" == "yes" || "$CLEANUP" == "yes" || "$STORAGE_OPTIMIZE" == "yes" || "$SET_CHANNEL" == "yes" ]]; then
+            die "--download-only cannot be combined with --rollback, --cleanup, --optimize, or --set-channel"
+        fi
+    fi
 
     check_root
     [[ "${DRY_RUN}" == "yes" ]] && log_warn "[DRY-RUN] Simulation mode active — no changes will be made to the system"
@@ -2949,6 +2960,13 @@ main() {
     fi
 
     download_update || die "Download failed"
+
+    if [[ "$DOWNLOAD_ONLY" == "yes" ]]; then
+        log_success "Download-only mode: image v${REMOTE_VERSION} fetched and verified — skipping deployment"
+        log "Run without --download-only to deploy the cached image"
+        exit 0
+    fi
+
     deploy_update || die "Deployment failed"
     if [[ -f "$DEPLOY_PENDING" ]]; then
         finalize_update

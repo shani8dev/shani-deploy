@@ -441,6 +441,14 @@ _build_pkexec_env() {
 
 # show_dialog TITLE TEXT OK_LABEL CANCEL_LABEL [TIMEOUT [ICON]]
 # Returns: 0=confirmed  1=cancelled/timeout/closed  2=no GUI
+#
+# All yad flags below are validated against the "General options" section of
+# yad(1) (Arch package extra/yad, https://man.archlinux.org/man/yad.1.en) —
+# i.e. the options valid on yad's default question/button dialog. Notably:
+#   --wrap is a "Text info options" flag (only valid with --text-info) and
+#   is NOT a general option; passing it here caused some yad builds to
+#   reject the whole invocation. --text-width is the general-options
+#   equivalent — it caps the text width in characters before GTK wraps it.
 show_dialog() {
     local title="$1" text="$2" ok_label="${3:-OK}" cancel_label="${4:-Cancel}"
     local timeout="${5:-120}" icon="${6:-software-update-available}"
@@ -464,7 +472,7 @@ show_dialog() {
                 --image-on-top
                 --text="$text"
                 --text-align=center
-                --wrap
+                --text-width=60
                 --width=480
                 --borders=12
                 --center

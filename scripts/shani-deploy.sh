@@ -65,6 +65,7 @@ readonly BOOT_HARD_FAILURE_FILE="/data/boot_hard_failure"
 # /run is tmpfs — cleared automatically on every reboot, so no manual cleanup needed.
 # Written world-readable so shani-update (running as a normal user) can read it.
 readonly REBOOT_NEEDED_FILE="/run/shanios/reboot-needed"
+readonly LOCK_FILE="/run/shanios-deploy.lock"
 readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 readonly CHANNEL_FILE="/etc/shani-channel"
@@ -102,6 +103,10 @@ declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
 # AUTO_REBOOT_DELAY, or disable entirely with AUTO_REBOOT=no.
 declare -g AUTO_REBOOT="${AUTO_REBOOT:-yes}"
 declare -g AUTO_REBOOT_DELAY="${AUTO_REBOOT_DELAY:-60}"
+# Set once acquire_deploy_lock() succeeds; exported so it survives this
+# script's self-exec (self_update/inhibit_system/check_root's pkexec
+# re-invocation) and tells a re-exec'd instance not to re-flock the same file.
+declare -g LOCK_ACQUIRED="${LOCK_ACQUIRED:-}"
 
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 # CHROOT_STATIC_DIRS are bind-mounted from the live system into the candidate
@@ -143,6 +148,7 @@ persist_state() {
         declare -p FORCE_UPDATE DOWNLOAD_ONLY 2>/dev/null || true
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
         declare -p AUTO_REBOOT AUTO_REBOOT_DELAY 2>/dev/null || true
+        declare -p LOCK_ACQUIRED 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
@@ -1127,6 +1133,26 @@ check_root() {
     # Now confirmed root — safe to create state dir under /run
     STATE_DIR=$(mktemp -d /run/shanios-deploy-state.XXXXXX)
     export STATE_DIR
+}
+
+# Serializes shani-deploy invocations so a fleet timer, cron entry, and a
+# manual run can't race on the same staging subvolume/downloads dir. Held via
+# an flock'd file descriptor rather than a PID file so the lock survives this
+# script's own self-exec (self_update/inhibit_system both exec(3) a new
+# process image, and bash file descriptors are not close-on-exec by default).
+# LOCK_ACQUIRED is exported once the lock is taken so a re-exec'd instance
+# recognizes it already owns it and skips reacquiring — a fresh open()+flock()
+# on the same path from the same process tree would otherwise fail, since
+# flock ownership is per open-file-description, not per process.
+acquire_deploy_lock() {
+    [[ -n "$LOCK_ACQUIRED" ]] && { log_verbose "Deployment lock already held by this process tree"; return 0; }
+
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+    exec {SHANIOS_LOCK_FD}>"$LOCK_FILE" || die "Cannot open lock file: $LOCK_FILE"
+    flock -n "$SHANIOS_LOCK_FD" || \
+        die "Another shani-deploy is already running (lock: $LOCK_FILE)"
+    export LOCK_ACQUIRED=1
+    log_verbose "Acquired deployment lock ($LOCK_FILE)"
 }
 
 check_internet() {
@@ -2883,6 +2909,7 @@ main() {
     fi
 
     check_root
+    acquire_deploy_lock
     [[ "${DRY_RUN}" == "yes" ]] && log_warn "[DRY-RUN] Simulation mode active — no changes will be made to the system"
 
     if [[ "$SET_CHANNEL" == "yes" ]]; then

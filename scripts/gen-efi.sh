@@ -7,6 +7,7 @@
 #   ./gen-efi.sh enroll-tpm2              — enroll TPM2 for automatic LUKS unlock
 #   ./gen-efi.sh cleanup-mok             — remove old MOK keys after new key is confirmed
 #   ./gen-efi.sh cleanup-tpm2            — remove stale TPM2 LUKS slots after re-enrolment
+#   ./gen-efi.sh remove-tpm2             — fully disable TPM2 auto-unlock (all slots)
 #
 # ENHANCED:
 # - Validates target slot against booted slot
@@ -39,13 +40,14 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
     echo "  $0 cleanup-tpm2              — remove stale TPM2 LUKS slots after re-enrolment"
+    echo "  $0 remove-tpm2               — fully disable TPM2 auto-unlock (wipes all TPM2 slots)"
     exit 1
 fi
 
@@ -715,6 +717,68 @@ cleanup_tpm2() {
     fi
 }
 
+# remove_tpm2 — fully disable TPM2 auto-unlock by wiping every TPM2-backed
+# LUKS slot, not just stale ones. Unlike cleanup_tpm2 (which keeps the newest
+# slot so auto-unlock keeps working after re-enrollment), this is for a user
+# who wants to go back to passphrase-only unlock entirely.
+#
+# Refuses to run if no passphrase slot would be left — wiping every unlock
+# method would make the disk permanently inaccessible.
+remove_tpm2() {
+    if in_chroot; then
+        error_exit "remove-tpm2 must run on the live booted system, not inside a chroot"
+    fi
+
+    if [[ ! -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        error_exit "No LUKS mapper /dev/mapper/${ROOTLABEL} found — system does not appear to be encrypted"
+    fi
+
+    if ! command -v systemd-cryptenroll &>/dev/null; then
+        error_exit "systemd-cryptenroll not found — install systemd"
+    fi
+
+    local underlying
+    underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+        | sed -n 's/^ *device: *//p' | tr -d '
+' | xargs | awk '{print $NF}')
+    [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
+
+    # systemd-cryptenroll's own slot listing (SLOT/TYPE columns) is the
+    # authoritative source for slot type — more reliable than hand-parsing
+    # `cryptsetup luksDump` token entries, whose token index does not
+    # necessarily match the keyslot index it's bound to.
+    local slot_table
+    slot_table=$(systemd-cryptenroll "$underlying" 2>/dev/null) \
+        || error_exit "Could not list LUKS slots on ${underlying}"
+
+    local tpm2_count non_tpm2_count
+    tpm2_count=$(awk 'NR>1 && $2=="tpm2" {c++} END{print c+0}' <<< "$slot_table")
+    non_tpm2_count=$(awk 'NR>1 && $2!="tpm2" {c++} END{print c+0}' <<< "$slot_table")
+
+    if [[ "$tpm2_count" -eq 0 ]]; then
+        log "No TPM2 slots enrolled — nothing to remove"
+        return 0
+    fi
+
+    if [[ "$non_tpm2_count" -eq 0 ]]; then
+        error_exit "Refusing to remove TPM2 — it is the only enrolled unlock method. Add a passphrase slot first: systemd-cryptenroll --password ${underlying}"
+    fi
+
+    log "Found ${tpm2_count} TPM2 slot(s); ${non_tpm2_count} other slot(s) (e.g. passphrase) will remain"
+    local confirm
+    read -r -p "This permanently disables TPM2 auto-unlock — you will need to enter a passphrase on every boot. Continue? [y/N]: " confirm
+    if [[ "${confirm,,}" != y* ]]; then
+        log "Cancelled — no changes made"
+        return 0
+    fi
+
+    log "Removing all TPM2 slots (you will be prompted for your LUKS passphrase to authorize)..."
+    systemd-cryptenroll --wipe-slot=tpm2 "$underlying" \
+        || error_exit "Failed to wipe TPM2 slots"
+
+    log "TPM2 auto-unlock removed — the disk now requires a passphrase at every boot"
+}
+
 # cleanup_mok — delete enrolled MOK keys that don't match the current MOK.der.
 #
 # Safe to run only AFTER the new key has been confirmed enrolled in firmware.
@@ -1146,8 +1210,8 @@ enroll_tpm2() {
     log "      gen-efi enroll-tpm2"
     log "  - If re-enrolling, clean up stale slots afterwards:"
     log "      gen-efi cleanup-tpm2"
-    log "  - To remove TPM enrollment:"
-    log "      systemd-cryptenroll --wipe-slot=tpm2 ${underlying}"
+    log "  - To remove TPM enrollment entirely:"
+    log "      gen-efi remove-tpm2"
     log "  - Verify enrollment:"
     log "      cryptsetup luksDump ${underlying} | grep systemd-tpm2"
 }
@@ -1169,6 +1233,9 @@ case "${1:-}" in
     cleanup-tpm2)
         cleanup_tpm2
         ;;
+    remove-tpm2)
+        remove_tpm2
+        ;;
     *)
         echo "Usage:"
         echo "  $0 configure <target_slot>"
@@ -1176,6 +1243,7 @@ case "${1:-}" in
         echo "  $0 enroll-tpm2"
         echo "  $0 cleanup-mok"
         echo "  $0 cleanup-tpm2"
+        echo "  $0 remove-tpm2"
         exit 1
         ;;
 esac

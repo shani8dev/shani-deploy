@@ -2378,6 +2378,64 @@ fetch_update() {
     return 0
 }
 
+#####################################
+### Differential Download (zsync2)###
+#####################################
+
+# try_zsync2_download ZSYNC_URL OUTPUT_PATH
+#
+# Attempts to reconstruct OUTPUT_PATH by fetching only the blocks that
+# differ from a local seed file, via zsync2's control-file protocol. The
+# seed is any other shanios-*.zst already sitting in DOWNLOAD_DIR — normally
+# the previous cycle's image, which cleanup_downloads() deliberately keeps
+# around as the single most-recent download.
+#
+# This is purely an optimization layered on top of the existing pipeline,
+# not a trusted alternative to it: zsync2 is an experimental, upstream-alpha
+# tool, so ANY failure here — missing binary, no local seed, timeout,
+# non-zero exit, empty output — just returns 1 and the caller falls straight
+# through to the normal full-download loop. Whatever ends up at OUTPUT_PATH,
+# whether reconstructed by zsync2 or fetched whole by aria2c/wget/curl, still
+# goes through the exact same unconditional SHA256 + GPG verification
+# afterward — this function is never allowed to be the thing that decides a
+# file is trustworthy.
+try_zsync2_download() {
+    local zsync_url="$1" output="$2"
+
+    command -v zsync2 &>/dev/null || { log_verbose "zsync2 not installed — skipping differential attempt"; return 1; }
+
+    local -a seed_args=()
+    local seed
+    while IFS= read -r seed; do
+        [[ -n "$seed" && -s "$seed" ]] && seed_args+=(--seed-file "$seed")
+    done < <(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" \
+        ! -name "$(basename "$output")" 2>/dev/null)
+
+    if [[ ${#seed_args[@]} -eq 0 ]]; then
+        log_verbose "zsync2: no local seed image found in ${DOWNLOAD_DIR} — skipping differential attempt"
+        return 1
+    fi
+
+    log "Attempting differential download via zsync2 (seed: $(basename "${seed_args[1]}"))..."
+    local tmp_output="${output}.zsync2.tmp"
+    rm -f "$tmp_output"
+
+    # --force-update: skip zsync2's own "check for changes" pass and go
+    # straight to seeding + fetch — we already know a new version exists
+    # (that's why download_update was called at all), and without this flag
+    # zsync2 can exit 0 without ever writing OUTPUT_PATH.
+    if timeout 3600 zsync2 --force-update "${seed_args[@]}" --output "$tmp_output" "$zsync_url" \
+        && [[ -s "$tmp_output" ]]; then
+        mv "$tmp_output" "$output"
+        log_success "zsync2 differential download complete: $(format_bytes "$(get_file_size "$output")")"
+        return 0
+    fi
+
+    log_verbose "zsync2 attempt did not produce a complete file — falling back to full download"
+    rm -f "$tmp_output"
+    return 1
+}
+
 download_update() {
     log_section "Download Phase"
 
@@ -2471,6 +2529,16 @@ download_update() {
     local global_attempt=0
     local max_global_attempts=5
     local current_mirror="$mirror_url"
+
+    # Try a differential fetch before the full-download loop. Only makes
+    # sense against R2 — the .zsync control file's embedded target URL is
+    # always R2 (see build-base-image.sh), so attempting this while falling
+    # back to the SourceForge mirror would just fail identically for a
+    # worse reason. Skipped entirely if a download for this exact image is
+    # already partially in flight — resuming that takes priority.
+    if (( use_r2 )) && [[ ! -f "$image" ]]; then
+        try_zsync2_download "${r2_image_url}.zsync" "$image" && download_success=1
+    fi
 
     while (( download_success == 0 && global_attempt < max_global_attempts )); do
         global_attempt=$((global_attempt + 1))

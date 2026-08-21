@@ -1345,6 +1345,46 @@ _section_immutability() {
             _rec "${abin_dir}/pacman did not block -Sy — verify the wrapper script wasn't reverted or corrupted"
         fi
     fi
+
+    # The [shani] repo's signatures only mean something if pacman's keyring
+    # actually trusts the signing key and SigLevel isn't silently weakened —
+    # exactly the failure mode a broken `pacman-key --populate shani` (a real
+    # shani-keyring bug, fixed 2026-08) would have caused: packages would
+    # still install, just without real signature verification.
+    local shani_key="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
+    if command -v pacman-key &>/dev/null; then
+        if pacman-key --list-sigs "$shani_key" &>/dev/null; then
+            _row "Shani keyring" "OK  signing key trusted in pacman's keyring"
+        else
+            _row "Shani keyring" "!!  signing key NOT found in pacman's keyring"
+            _rec "Shani signing key not trusted — run: pacman-key --populate shani"
+        fi
+    else
+        _row "Shani keyring" "--  pacman-key not available — cannot verify"
+    fi
+
+    if [[ -f /etc/pacman.conf ]]; then
+        if grep -q '^\[shani\]' /etc/pacman.conf; then
+            # Effective SigLevel: the repo's own line if it overrides the
+            # default, else whatever [options] sets globally.
+            local shani_siglevel
+            shani_siglevel=$(awk '/^\[shani\]/{f=1;next} /^\[/{f=0} f && /^SigLevel/{print; exit}' /etc/pacman.conf || true)
+            if [[ -z "$shani_siglevel" ]]; then
+                shani_siglevel=$(awk '/^\[options\]/{f=1;next} /^\[/{f=0} f && /^SigLevel/{print; exit}' /etc/pacman.conf || true)
+            fi
+            if echo "$shani_siglevel" | grep -qE 'Never|TrustAll'; then
+                _row2 "!   [shani] SigLevel weakened: ${shani_siglevel:-unknown} — signatures not enforced"
+                _rec "pacman.conf's [shani] SigLevel is weakened (${shani_siglevel}) — package signatures aren't verified"
+            elif echo "$shani_siglevel" | grep -q 'Required'; then
+                _row2 "--  [shani] SigLevel: ${shani_siglevel#*= }"
+            else
+                _row2 "!   [shani] SigLevel unclear or missing: ${shani_siglevel:-none found}"
+            fi
+        else
+            _row2 "!   [shani] repo not found in /etc/pacman.conf"
+            _rec "[shani] repository missing from pacman.conf — package updates from the Shani repo unavailable"
+        fi
+    fi
 }
 
 # uki_booted_bad_ref and hibernate_stale are passed by name (printf -v trick)

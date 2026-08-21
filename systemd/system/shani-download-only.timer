@@ -1,0 +1,19 @@
+[Unit]
+Description=Periodic pre-fetch of the next Shani OS update
+# Disabled by default. shani-download-only.service is idempotent — if the
+# current image is already cached and verified, download_update() returns
+# immediately — so enabling this on a fleet just means updates arrive
+# pre-staged ahead of whatever maintenance window later runs the real
+# `shani-deploy`, instead of downloading at deploy time.
+#
+# Enable explicitly with: systemctl enable --now shani-download-only.timer
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=1d
+RandomizedDelaySec=2h
+Persistent=true
+Unit=shani-download-only.service
+
+[Install]
+WantedBy=timers.target

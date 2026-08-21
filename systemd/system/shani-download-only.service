@@ -1,0 +1,20 @@
+[Unit]
+Description=Pre-fetch and verify the next Shani OS update (no deploy)
+# Runs only via shani-download-only.timer, which is NOT enabled by default —
+# see shani-download-only.timer's own comment. Downloads and SHA256/GPG-
+# verifies the update image ahead of time so a later `shani-deploy` run (or
+# a maintenance-window timer) deploys an already-cached, already-verified
+# image instead of downloading it then.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+ExecStart=/usr/local/bin/shani-deploy --download-only
+
+# No [Install] — activated exclusively by shani-download-only.timer.
+# Do not enable this service directly; enable the timer instead.

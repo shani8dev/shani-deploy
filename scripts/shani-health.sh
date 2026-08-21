@@ -7503,6 +7503,7 @@ security_report() {
 
     _focused_header "ShaniOS Security Report"
 
+    _section_immutability
     _section_secureboot         "$booted" uki_booted_bad "$hibernate_stale"
     _section_kernel_security    "$sb_active"
     _section_encryption
@@ -7534,6 +7535,7 @@ system_info() {
     _section_tpm2
     _section_security_services
     _section_security_audit
+    _section_krb5
     _section_users
     _section_groups
     _section_hardware
@@ -8365,6 +8367,7 @@ boot_report() {
     _section_deployment
     _section_update_tools
     _section_data_state
+    _section_immutability
     _section_secureboot        "$booted" uki_booted_bad "$hibernate_stale"
 
     _focused_summary
@@ -8695,13 +8698,13 @@ Options:
   --clean-logs [DAYS]     Clean old app logs from /var/log (default: keep last 30 days)
   --verify                Deep integrity check: UKI sigs, Btrfs scrub, immutability
   --json                  With --verify: also print a machine-readable JSON summary to stdout
-  --security              Security report: boot chain, encryption, services, users, Kerberos
+  --security              Security report: boot chain, immutability, encryption, services, users, Kerberos
   --journal [level]       Show journal entries (level: crit, err, warning — default: crit)
   --since TIME            Limit journal output to entries since TIME (e.g. -1h, -2d, '2026-01-01')
   -s, --storage-info      Btrfs storage analysis: subvolume sizes, compression, snapshots
   --history [N]           Last N deploy/rollback events from log (default: 50)
   --clear-boot-failure    Clear a stale boot failure marker (when current boot is healthy)
-  --boot                  Boot report: slots, entries, deployment, UKI, network
+  --boot                  Boot report: slots, entries, deployment, immutability, UKI
   --network               Network report: NM, DNS, VPN, firewall, SSH, servers
   --hardware              Hardware report: CPU, disk, SMART, temps, battery, firmware
   --packages              Package report: flatpak, snap, nix, containers, virtualisation

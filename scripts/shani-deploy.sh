@@ -2955,10 +2955,13 @@ main() {
             -c|--cleanup) CLEANUP="yes"; shift ;;
             -o|--optimize) STORAGE_OPTIMIZE="yes"; shift ;;
             --set-channel)
+                [[ $# -ge 2 ]] || die "Missing argument for --set-channel (expected 'stable' or 'latest')"
                 SET_CHANNEL="yes"
-                SET_CHANNEL_VAL="${2:-}"
+                SET_CHANNEL_VAL="$2"
                 shift 2 ;;
-            -t|--channel) UPDATE_CHANNEL="$2"; shift 2 ;;
+            -t|--channel)
+                [[ $# -ge 2 ]] || die "Missing argument for $1 (expected 'stable' or 'latest')"
+                UPDATE_CHANNEL="$2"; shift 2 ;;
             -f|--force) FORCE_UPDATE="yes"; shift ;;
             --download-only) DOWNLOAD_ONLY="yes"; shift ;;
             -d|--dry-run) DRY_RUN="yes"; shift ;;

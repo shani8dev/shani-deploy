@@ -582,18 +582,18 @@ _section_os_slots() {
         fi
     fi
 
-    # Live keymap (what localectl reports as currently active, not just the UKI param)
+    # Live keymap (what localectl reports as currently active) vs. what's
+    # configured in vconsole.conf — sourced independently so drift between
+    # the two is actually detectable (localectl status only reflects the
+    # live value, not the on-disk config).
     local live_keymap="" vconsole_km=""
     if command -v localectl &>/dev/null; then
         local _lctl_os; _lctl_os=$(localectl status 2>/dev/null || echo "")
         live_keymap=$(echo "$_lctl_os" \
             | awk -F': ' '/VC Keymap/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "")
-        vconsole_km=$(echo "$_lctl_os" \
-            | awk -F': +' '/VC Keymap:/{print $2}' | tr -d '[:space:]' || echo "")
     fi
-    [[ -z "$vconsole_km" ]] && \
-        vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
-            | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+    vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null \
+        | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
     if [[ -n "$live_keymap" && -n "$vconsole_km" && "$live_keymap" != "$vconsole_km" ]]; then
         _row "Keymap"      "!   live='${live_keymap}' but vconsole.conf='${vconsole_km}' — run: localectl set-keymap ${vconsole_km}"
         _rec "Live keymap '${live_keymap}' differs from vconsole.conf '${vconsole_km}' — run: localectl set-keymap ${vconsole_km}"
@@ -766,9 +766,9 @@ _section_boot_health() {
     local dracut_mod="/usr/lib/dracut/modules.d/99shanios"
     if [[ -d "$dracut_mod" ]]; then
         local mod_files; mod_files=$(ls "$dracut_mod"/*.sh 2>/dev/null | wc -l || echo "0")
-        if (( mod_files >= 2 )); then _row "Dracut mod"  "OK  99shanios module installed (${mod_files} hooks)"
+        if (( mod_files >= 4 )); then _row "Dracut mod"  "OK  99shanios module installed (${mod_files} hooks)"
         else
-            _row "Dracut mod"  "!   99shanios module incomplete (${mod_files}/3 files)"
+            _row "Dracut mod"  "!   99shanios module incomplete (${mod_files}/4 files)"
             _rec "dracut 99shanios module incomplete — reinstall ShaniOS dracut hooks"
         fi
     else
@@ -964,7 +964,7 @@ _section_deployment() {
         for slot in blue green; do
             local cf="/etc/kernel/install_cmdline_${slot}"
             local content; content=$(cat "$cf" 2>/dev/null || echo "")
-            ! echo "$content" | grep -q "subvol=@${slot}[,\ ]" && cmdline_wrong+=("${slot}(missing subvol=@${slot})")
+            ! echo "$content" | grep -qE "subvol=@${slot}([, ]|\$)" && cmdline_wrong+=("${slot}(missing subvol=@${slot})")
         done
         if [[ ${#cmdline_wrong[@]} -gt 0 ]]; then
             local _cw_str; _cw_str=$(IFS=' '; echo "${cmdline_wrong[*]}")

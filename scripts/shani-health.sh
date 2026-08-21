@@ -1291,6 +1291,60 @@ _section_immutability() {
         _row "Subvolumes"  "!!  not mounted: $(_join "${sv_missing[@]}")"
         _rec "Btrfs subvolumes not mounted ($(_join "${sv_missing[@]}")) — check: systemctl status shanios-tmpfiles-data.service && findmnt -t btrfs"
     fi
+
+    # /usr/abin/{pacman,useradd,adduser} block write operations on the
+    # read-only root and merge extra groups into new accounts. They only do
+    # anything if /usr/abin actually precedes /usr/bin in PATH (via
+    # /etc/profile.d/abin.sh for shells, /etc/sudoers.d/path's secure_path
+    # for sudo) — a PATH regression here is silent: pacman -S would just
+    # reach the real binary instead of being blocked, with no symptom until
+    # someone actually tries to write to the immutable root.
+    local abin_dir="/usr/abin"
+    local -a abin_wrappers=(pacman useradd adduser)
+    local abin_missing=()
+    for w in "${abin_wrappers[@]}"; do
+        [[ -x "${abin_dir}/${w}" ]] || abin_missing+=("$w")
+    done
+    if [[ ${#abin_missing[@]} -gt 0 ]]; then
+        _row "Abin wrappers" "!!  missing/not executable: $(_join "${abin_missing[@]}")"
+        _rec "Reinstall shani-install-media overlay — ${abin_dir} wrapper(s) missing: $(_join "${abin_missing[@]}")"
+    else
+        local resolved_pacman
+        resolved_pacman=$(PATH="${abin_dir}:${PATH}" command -v pacman 2>/dev/null || echo "")
+        if [[ "$resolved_pacman" == "${abin_dir}/pacman" ]]; then
+            _row "Abin wrappers" "OK  present and take PATH precedence"
+        else
+            _row "Abin wrappers" "!!  present but shell PATH resolves to '${resolved_pacman:-none}' instead"
+            _rec "PATH does not prioritize ${abin_dir} for shells — check /etc/profile.d/abin.sh"
+        fi
+
+        local secure_path
+        secure_path=$(grep -rhoE '^[[:space:]]*Defaults[[:space:]]+secure_path[[:space:]]*=[[:space:]]*"[^"]*"' \
+            /etc/sudoers /etc/sudoers.d/* 2>/dev/null \
+            | grep -oE '"[^"]*"' | tr -d '"' | head -1 || echo "")
+        if [[ -n "$secure_path" ]]; then
+            if [[ "${secure_path%%:*}" == "$abin_dir" ]]; then
+                _row2 "--  sudo secure_path prioritizes ${abin_dir}"
+            else
+                _row2 "!   sudo secure_path does not lead with ${abin_dir} (${secure_path})"
+                _rec "sudo's secure_path doesn't lead with ${abin_dir} — sudo pacman/useradd would bypass the wrapper"
+            fi
+        else
+            _row2 "--  no sudoers secure_path override found (sudo pacman/useradd may bypass the wrapper)"
+        fi
+
+        # Functional check, not just presence: does the wrapper actually
+        # block a write operation? -Sy never reaches the real pacman if the
+        # wrapper's own logic is intact, so this is safe to run for real.
+        local pacman_block_out
+        pacman_block_out=$("${abin_dir}/pacman" -Sy 2>&1 || true)
+        if echo "$pacman_block_out" | grep -q "not permitted"; then
+            _row2 "--  pacman wrapper functionally blocks write operations"
+        else
+            _row2 "!   pacman wrapper did not block a -Sy call"
+            _rec "${abin_dir}/pacman did not block -Sy — verify the wrapper script wasn't reverted or corrupted"
+        fi
+    fi
 }
 
 # uki_booted_bad_ref and hibernate_stale are passed by name (printf -v trick)

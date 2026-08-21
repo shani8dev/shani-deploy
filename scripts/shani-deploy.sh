@@ -98,10 +98,13 @@ declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
 declare -g DOWNLOAD_ONLY="${DOWNLOAD_ONLY:-no}"
 declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-$(date +%s)}"
 declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
-# Auto-reboot: the system reboots automatically this many seconds after a
-# successful deployment (skipped in --dry-run). Override by exporting
-# AUTO_REBOOT_DELAY, or disable entirely with AUTO_REBOOT=no.
-declare -g AUTO_REBOOT="${AUTO_REBOOT:-yes}"
+# Auto-reboot: opt-in. The new slot is fully deployed and bootable the
+# moment this script finishes — nothing about the deployed state depends on
+# rebooting promptly, so by default the reboot is left to the user's own
+# convenience. Enable it with AUTO_REBOOT=yes (reboots this many seconds
+# after a successful deployment, skipped in --dry-run); override the delay
+# with AUTO_REBOOT_DELAY.
+declare -g AUTO_REBOOT="${AUTO_REBOOT:-no}"
 declare -g AUTO_REBOOT_DELAY="${AUTO_REBOOT_DELAY:-60}"
 # Set once acquire_deploy_lock() succeeds; exported so it survives this
 # script's self-exec (self_update/inhibit_system/check_root's pkexec
@@ -2904,10 +2907,12 @@ finalize_update() {
 #####################################
 
 # schedule_reboot_timer — arm a one-shot systemd transient timer that reboots
-# the machine after a successful deployment. Runs by default (AUTO_REBOOT=yes),
-# and is skipped entirely in --dry-run. The timer runs as its own unit outside
-# this script's process tree, so it survives even if the shell exits, but it
-# can still be cancelled by the user right up until it fires.
+# the machine after a successful deployment. Opt-in (AUTO_REBOOT=yes; the
+# default is no — the deployed slot is fully ready immediately, rebooting
+# promptly isn't required for correctness), and skipped entirely in
+# --dry-run. The timer runs as its own unit outside this script's process
+# tree, so it survives even if the shell exits, but it can still be
+# cancelled by the user right up until it fires.
 schedule_reboot_timer() {
     [[ "${AUTO_REBOOT}" == "yes" ]] || return 0
 
@@ -2985,11 +2990,14 @@ Options:
   --skip-self-update      Skip auto-update of shani-deploy
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
 
-Note: after a successful deployment the system reboots automatically after
-${AUTO_REBOOT_DELAY:-60}s. Cancel a pending reboot with:
+Note: the new slot is fully deployed and bootable as soon as this script
+finishes — rebooting promptly is not required. By default the system does
+NOT reboot automatically; reboot whenever convenient to switch into it.
+To opt into an automatic reboot ${AUTO_REBOOT_DELAY:-60}s after a successful
+deployment instead, run with AUTO_REBOOT=yes, e.g.:
+  AUTO_REBOOT=yes $0 [OPTIONS]
+Cancel a pending auto-reboot with:
   systemctl stop shanios-auto-reboot.timer
-Disable auto-reboot entirely by running with AUTO_REBOOT=no, e.g.:
-  AUTO_REBOOT=no $0 [OPTIONS]
 EOF
 }
 

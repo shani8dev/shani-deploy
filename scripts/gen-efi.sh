@@ -876,6 +876,12 @@ update_bootloader() {
     local mmx64_dst="${ESP}/EFI/BOOT/mmx64.efi"
     local updated=0
 
+    # Normally already there (bootctl install / the original os-installer run
+    # created it), but don't assume it — a wiped/replaced/freshly-initialized
+    # ESP has no EFI/BOOT at all, and every cp below would otherwise fail with
+    # a raw "No such file or directory" instead of just creating it.
+    mkdir -p "${ESP}/EFI/BOOT"
+
     # shim (BOOTX64.EFI) — Microsoft-signed, never re-signed by us
     if [[ -f "$shim_src" ]]; then
         local shim_needs_copy=0

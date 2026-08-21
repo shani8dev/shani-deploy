@@ -267,15 +267,22 @@ if [[ "$HARD_WIPE" == "yes" ]]; then
 else
     # ── Soft wipe: selectively clear state directories ─────────────────────────
 
+    # 2>/dev/null || true on every rm below, matching the run find/mkdir calls
+    # elsewhere in this script: ${DATA_DIR}/overlay/etc/upper is the LIVE
+    # overlayfs upper layer backing the running system's /etc while this
+    # script executes as root -- deleting it out from under an active mount
+    # can transiently fail (busy/EIO on a whiteout char-device), and an
+    # unguarded failure here aborts via set -e mid-wipe with no diagnostic,
+    # leaving /etc cleared but /var/varlib/varspool/markers never touched.
     log "Wiping /etc overlay upper layer..."
-    run rm -rf "${DATA_DIR}/overlay/etc/upper"
-    run rm -rf "${DATA_DIR}/overlay/etc/work"
+    run rm -rf "${DATA_DIR}/overlay/etc/upper" 2>/dev/null || true
+    run rm -rf "${DATA_DIR}/overlay/etc/work"  2>/dev/null || true
     run mkdir -p "${DATA_DIR}/overlay/etc/upper" "${DATA_DIR}/overlay/etc/work" 2>/dev/null || true
     log_ok "  /data/overlay/etc cleared"
 
     log "Wiping /var overlay upper layer (if used)..."
-    run rm -rf "${DATA_DIR}/overlay/var/upper"
-    run rm -rf "${DATA_DIR}/overlay/var/work"
+    run rm -rf "${DATA_DIR}/overlay/var/upper" 2>/dev/null || true
+    run rm -rf "${DATA_DIR}/overlay/var/work"  2>/dev/null || true
     run mkdir -p "${DATA_DIR}/overlay/var/upper" "${DATA_DIR}/overlay/var/work" 2>/dev/null || true
     log_ok "  /data/overlay/var cleared"
 
@@ -303,12 +310,13 @@ else
         "${DATA_DIR}/boot_failure" \
         "${DATA_DIR}/boot_failure.acked" \
         "${DATA_DIR}/boot_hard_failure" \
-        "${DATA_DIR}/deployment_pending"
+        "${DATA_DIR}/deployment_pending" \
+        2>/dev/null || true
     log_ok "  Boot markers cleared"
 
     if [[ "$KEEP_DOWNLOADS" == "no" ]]; then
         log "Wiping cached downloads (/data/downloads)..."
-        run rm -rf "${DATA_DIR}/downloads"
+        run rm -rf "${DATA_DIR}/downloads" 2>/dev/null || true
         run mkdir -p "${DATA_DIR}/downloads" 2>/dev/null || true
         log_ok "  /data/downloads cleared"
     else

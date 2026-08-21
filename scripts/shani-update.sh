@@ -642,7 +642,15 @@ _post_rollback_dialog() {
             notify-send -u low -i system-reboot \
                 "Shani OS — Restart When Ready" \
                 "Rollback complete. Restart when convenient." 2>/dev/null || true
+        # || true: this is the function's last statement, so its own exit
+        # status (nonzero whenever stdout isn't a tty -- the normal case for
+        # every non-interactive/autostart caller) becomes _post_rollback_dialog's
+        # return value. All three call sites invoke it bare, immediately
+        # followed by _cleanup_and_exit 0 -- currently masked only because the
+        # EXIT trap happens to also call _cleanup_and_exit on abort, but that's
+        # an accident, not a guarantee, the moment either call site changes.
         [[ -t 1 ]] && printf '\n✓ Rollback complete. Restart your system when ready.\n\n'
+        true
     fi
 }
 

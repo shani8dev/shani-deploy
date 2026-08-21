@@ -89,9 +89,13 @@ ensure_mok_keys() {
         # causes sbsign to fail deep inside dracut with an opaque OpenSSL error:
         #   "key values mismatch" / "private key does not match certificate"
         # Detect it here and regenerate so the error is caught early and clearly.
+        # || true on both: this whole block exists to detect a corrupt/
+        # unparseable MOK_KEY or MOK_CRT -- exactly when openssl itself fails
+        # and pipefail would otherwise abort the bare assignment before the
+        # mismatch check below ever runs.
         local key_pub cert_pub
-        key_pub=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
-        cert_pub=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
+        key_pub=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}') || true
+        cert_pub=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}') || true
         if [[ -z "$key_pub" || -z "$cert_pub" || "$key_pub" != "$cert_pub" ]]; then
             log_warn "MOK.key and MOK.crt do not match (key=$key_pub cert=$cert_pub) — regenerating keypair"
             rm -f "$MOK_KEY" "$MOK_CRT" /etc/secureboot/keys/MOK.der
@@ -217,7 +221,10 @@ get_booted_subvol() {
     rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
     subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
     subvol="${subvol#@}"
-    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    # || true: this is the last member of the && list, so its own failure is
+    # NOT exempt from set -e -- would crash here instead of reaching the
+    # error_exit two lines below that's meant to handle exactly this case.
+    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}') || true
     if [[ -z "$subvol" ]]; then
         error_exit "Cannot detect booted subvolume — /proc/cmdline has no subvol= and btrfs get-default returned nothing."
     fi
@@ -293,9 +300,12 @@ sign_efi_binary() {
     # Pre-flight: verify MOK.key and MOK.crt are a matching keypair before
     # invoking sbsign. A mismatch produces an opaque OpenSSL error deep inside
     # sbsign/dracut; catching it here gives an actionable message.
+    # || true on both: same reasoning as ensure_mok_keys() -- a corrupt/
+    # unparseable key or cert must reach the error_exit below, not crash
+    # this bare assignment via pipefail first.
     local _kp _cp
-    _kp=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
-    _cp=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}')
+    _kp=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}') || true
+    _cp=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}') || true
     if [[ -z "$_kp" || -z "$_cp" || "$_kp" != "$_cp" ]]; then
         error_exit "MOK.key and MOK.crt do not match — run: rm ${MOK_KEY} ${MOK_CRT} /etc/secureboot/keys/MOK.der && gen-efi configure <slot>"
     fi
@@ -323,8 +333,11 @@ sign_efi_binary() {
 
 get_kernel_version() {
     local kernel_ver
+    # || true: pipefail means grep finding nothing (empty/missing modules dir)
+    # makes this whole bare assignment abort under set -e -- bypassing the
+    # error_exit right below that exists specifically to handle that case.
     kernel_ver=$(find /usr/lib/modules/ -maxdepth 1 -mindepth 1 -type d \
-        2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^/]*$' | sort -V | tail -n 1)
+        2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^/]*$' | sort -V | tail -n 1) || true
     if [[ -z "$kernel_ver" ]]; then
         error_exit "No valid kernel version found in /usr/lib/modules/"
     fi
@@ -362,7 +375,7 @@ generate_cmdline() {
         else
             local underlying
             underlying=$(cryptsetup status /dev/mapper/"${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: *//p' | tr -d '
-' | xargs | awk '{print $NF}')
+' | xargs | awk '{print $NF}') || true
             if [[ -z "$underlying" ]]; then
                 if [[ -f "$CMDLINE_FILE" ]]; then
                     log_warn "Could not determine underlying block device for /dev/mapper/${ROOTLABEL} — keeping existing cmdline file unchanged"
@@ -476,7 +489,7 @@ ensure_crypttab() {
         local underlying
         underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
             | sed -n 's/^ *device: *//p' | tr -d '
-' | xargs | awk '{print $NF}')
+' | xargs | awk '{print $NF}') || true
         if [[ -n "$underlying" ]]; then
             luks_uuid=$(cryptsetup luksUUID "$underlying" 2>/dev/null || true)
         fi
@@ -658,7 +671,7 @@ cleanup_tpm2() {
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
         | sed -n 's/^ *device: *//p' | tr -d '
-' | xargs | awk '{print $NF}')
+' | xargs | awk '{print $NF}') || true
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
 
     # Collect all TPM2 slot numbers from the LUKS header
@@ -740,7 +753,7 @@ remove_tpm2() {
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
         | sed -n 's/^ *device: *//p' | tr -d '
-' | xargs | awk '{print $NF}')
+' | xargs | awk '{print $NF}') || true
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
 
     # systemd-cryptenroll's own slot listing (SLOT/TYPE columns) is the
@@ -766,7 +779,9 @@ remove_tpm2() {
 
     log "Found ${tpm2_count} TPM2 slot(s); ${non_tpm2_count} other slot(s) (e.g. passphrase) will remain"
     local confirm
-    read -r -p "This permanently disables TPM2 auto-unlock — you will need to enter a passphrase on every boot. Continue? [y/N]: " confirm
+    # || confirm="": read exits nonzero on EOF (non-interactive invocation,
+    # stdin redirected from /dev/null) -- a normal, non-error condition here.
+    read -r -p "This permanently disables TPM2 auto-unlock — you will need to enter a passphrase on every boot. Continue? [y/N]: " confirm || confirm=""
     if [[ "${confirm,,}" != y* ]]; then
         log "Cancelled — no changes made"
         return 0
@@ -985,7 +1000,7 @@ generate_uki() {
         local _underlying
         _underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
             | sed -n 's/^ *device: *//p' | tr -d '
-' | xargs | awk '{print $NF}')
+' | xargs | awk '{print $NF}') || true
         if [[ -n "$_underlying" ]]; then
             shared_luks_uuid=$(cryptsetup luksUUID "$_underlying" 2>/dev/null || true)
         fi
@@ -1150,7 +1165,7 @@ enroll_tpm2() {
     local underlying
     underlying=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
         | sed -n 's/^ *device: *//p' | tr -d '
-' | xargs | awk '{print $NF}')
+' | xargs | awk '{print $NF}') || true
     [[ -z "$underlying" ]] && error_exit "Could not determine underlying LUKS device for /dev/mapper/${ROOTLABEL}"
     log "LUKS device: ${underlying}"
 
@@ -1158,8 +1173,11 @@ enroll_tpm2() {
     # pbkdf2 (the old default) is orders of magnitude weaker against GPU brute-force.
     # Warn and advise conversion; do not block enrollment since the passphrase slot
     # still works and the user may convert separately.
+    # || true: the surrounding code is explicitly "warn and continue" (see
+    # comment above) -- a bare luksDump failure must not defeat that intent
+    # by crashing the whole script via set -e instead.
     local kdf
-    kdf=$(cryptsetup luksDump "$underlying" 2>/dev/null         | awk '/^\s+PBKDF:/ {print $2; exit}')
+    kdf=$(cryptsetup luksDump "$underlying" 2>/dev/null         | awk '/^\s+PBKDF:/ {print $2; exit}') || true
     if [[ -z "$kdf" ]]; then
         log_warn "LUKS KDF is unknown — could not parse luksDump output"
         log_warn "Verify with: cryptsetup luksDump ${underlying} | grep PBKDF"
@@ -1191,7 +1209,8 @@ enroll_tpm2() {
     # second factor. Without it, any boot on matching hardware auto-unlocks.
     local tpm2_pin_flag=""
     local use_tpm2_pin
-    read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin
+    # || use_tpm2_pin="": same EOF reasoning as remove_tpm2()'s confirm read.
+    read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin || use_tpm2_pin=""
     use_tpm2_pin="${use_tpm2_pin:-N}"
     if [[ "${use_tpm2_pin^^}" == "Y" ]]; then
         tpm2_pin_flag="--tpm2-with-pin=yes"

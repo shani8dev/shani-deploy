@@ -462,7 +462,7 @@ btrfs_subvolume_delete_safe() {
 
 get_btrfs_available_mb() {
     local bytes
-    bytes=$(btrfs filesystem usage -b "$1" 2>/dev/null | awk '/Free \(estimated\):/ {gsub(/[^0-9]/,"",$3); print $3}')
+    bytes=$(btrfs filesystem usage -b "$1" 2>/dev/null | awk '/Free \(estimated\):/ {gsub(/[^0-9]/,"",$3); print $3}') || true
     if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
         echo "$((bytes / 1024 / 1024))"
     else
@@ -1078,9 +1078,9 @@ verify_sha256() {
     log_verbose "Verifying SHA256 checksum..."
 
     local expected
-    expected=$(awk '{print $1}' "$sha_file" 2>/dev/null | head -1 | tr -d '[:space:]')
+    expected=$(awk '{print $1}' "$sha_file" 2>/dev/null | head -1 | tr -d '[:space:]') || true
     local actual
-    actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')
+    actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]') || true
 
     [[ -z "$expected" || -z "$actual" ]] && { log_error "Could not read checksums for verification"; return 1; }
 
@@ -1127,7 +1127,12 @@ verify_gpg() {
     #       Without this check the old key imports fine (key_imported=1) and
     #       keyservers are never tried, permanently blocking the transition update.
     local fp_check
-    fp_check=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+    # || true: gpg exits nonzero ("No public key") whenever GPG_KEY_ID isn't
+    # in this fresh GNUPGHOME yet -- exactly the case the `if` right below
+    # exists to handle (bundled key missing/failed to import). Without the
+    # guard, pipefail turns that into a bare-assignment abort under set -e,
+    # crashing image verification before the keyserver fallback ever runs.
+    fp_check=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}') || true
     if (( ! key_imported )) || [[ "$fp_check" != "$GPG_KEY_ID" ]]; then
         if [[ "$fp_check" != "$GPG_KEY_ID" ]] && (( key_imported )); then
             log_warn "Bundled signing key does not match expected key ID — GPG key rotation in progress, fetching new key from keyservers"
@@ -1144,7 +1149,11 @@ verify_gpg() {
     fi
 
     local fp
-    fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+    # || true: same reasoning as fp_check above -- if none of the keyserver
+    # fallbacks succeeded (offline/firewalled), gpg still exits nonzero here,
+    # and this bare assignment must not crash past the log_warn already
+    # issued above for that case.
+    fp=$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}') || true
     if [[ "$fp" == "$GPG_KEY_ID" ]] && gpg --batch --verify "$sig" "$file" 2>/dev/null; then
         log_success "GPG signature verified"
         result=0
@@ -1438,6 +1447,11 @@ cleanup_downloads() {
     (( count > 0 )) && log "Cleaned $count old download file(s) from ${DOWNLOAD_DIR}"
     (( count == 0 )) && log_verbose "No old downloads to clean in ${DOWNLOAD_DIR}"
     (( protected > 0 )) && log_verbose "Protected $protected current file(s)"
+    # Explicit return: the last statement above is a bare `(( )) && action`,
+    # which is the function's return value when called bare. protected == 0
+    # is a normal outcome (first run, right after a fresh cleanup) and must
+    # not look like a function failure to a caller that isn't guarding it.
+    return 0
 }
 
 
@@ -2298,7 +2312,7 @@ validate_boot() {
     local booted
     booted=$(get_booted_subvol)
 
-    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]')
+    CURRENT_SLOT=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]') || true
 
     if [[ ! "$CURRENT_SLOT" =~ ^(blue|green)$ ]]; then
         log_warn "Slot marker is invalid or missing — using live boot slot @${booted}"
@@ -2751,8 +2765,14 @@ deploy_update() {
     local temp="$MOUNT_DIR/temp_update"
     if btrfs_subvol_exists "$temp"; then
         log_verbose "Removing leftover temp_update subvolume from previous run..."
-        btrfs_subvol_exists "$temp/shanios_base" && btrfs_subvolume_delete_safe "$temp/shanios_base"
-        btrfs_subvolume_delete_safe "$temp"
+        # || log_warn, not bare: btrfs_subvolume_delete_safe propagates a real
+        # delete failure (busy subvolume, bees race, I/O hiccup), and being the
+        # final member of its && list (or a bare statement) it is NOT exempt
+        # from set -e -- an unguarded failure here would abort before the
+        # extraction workspace is even created, with no diagnostic.
+        btrfs_subvol_exists "$temp/shanios_base" && \
+            { btrfs_subvolume_delete_safe "$temp/shanios_base" || log_warn "Could not delete leftover temp_update/shanios_base — will be cleaned on next deploy"; }
+        btrfs_subvolume_delete_safe "$temp" || log_warn "Could not delete leftover temp_update — will be cleaned on next deploy"
         btrfs_sync "$MOUNT_DIR"
     fi
 
@@ -2768,8 +2788,11 @@ deploy_update() {
         if (( HAS_PV )); then
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 pv -p -t -e -r -b | btrfs receive "$temp" || {
-                btrfs_subvol_exists "$temp/shanios_base" && btrfs_subvolume_delete_safe "$temp/shanios_base"
-                btrfs_subvolume_delete_safe "$temp"
+                # || true: already in the extraction-failure cleanup path (about
+                # to die() with a clear message below) -- a cleanup failure here
+                # must not silently abort via set -e before that message runs.
+                btrfs_subvol_exists "$temp/shanios_base" && { btrfs_subvolume_delete_safe "$temp/shanios_base" || true; }
+                btrfs_subvolume_delete_safe "$temp" || true
                 btrfs_sync "$MOUNT_DIR"
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
@@ -2777,8 +2800,11 @@ deploy_update() {
         else
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 btrfs receive "$temp" || {
-                btrfs_subvol_exists "$temp/shanios_base" && btrfs_subvolume_delete_safe "$temp/shanios_base"
-                btrfs_subvolume_delete_safe "$temp"
+                # || true: already in the extraction-failure cleanup path (about
+                # to die() with a clear message below) -- a cleanup failure here
+                # must not silently abort via set -e before that message runs.
+                btrfs_subvol_exists "$temp/shanios_base" && { btrfs_subvolume_delete_safe "$temp/shanios_base" || true; }
+                btrfs_subvolume_delete_safe "$temp" || true
                 btrfs_sync "$MOUNT_DIR"
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
@@ -2863,7 +2889,16 @@ finalize_update() {
     fi
     log_verbose "user-setup-needed marker written — shani-user-setup will run after reboot"
 
+    # Both traps armed at the top of this function must be cleared together:
+    # the EXIT trap re-runs restore_candidate on ANY nonzero exit from this
+    # point on, including a bare failing command under `set -e` (e.g.
+    # schedule_reboot_timer() legitimately returning 1 when AUTO_REBOOT is
+    # misconfigured) that has nothing to do with the deploy itself. Past this
+    # point the deploy has already succeeded (slot markers flipped above) --
+    # rolling back here would delete the just-deployed candidate while the
+    # markers still claim it's current, a broken, unbootable-looking state.
     trap - ERR
+    trap - EXIT
     set +e
 
     # Ensure clean mount state before maintenance

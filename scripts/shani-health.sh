@@ -1369,7 +1369,7 @@ _section_secureboot() {
     fi
 
     local mok_count
-    mok_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || echo "0")
+    mok_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || true)
     local mok_der_check="/etc/secureboot/keys/MOK.der"
 
     # Compute local MOK.der fingerprint once — used for enrolled and pending checks
@@ -1610,7 +1610,7 @@ _section_encryption() {
         _row "KDF"   "!   ${kdf:-unknown}  (argon2id recommended)"
         _rec "LUKS KDF is ${kdf:-unknown} (argon2id preferred) — re-encrypt: cryptsetup luksConvertKey --pbkdf argon2id ${underlying}"
     fi
-    local slot_count; slot_count=$(echo "$dump" | grep -c 'Key Slot [0-9]*: ENABLED' 2>/dev/null || echo "")
+    local slot_count; slot_count=$(echo "$dump" | grep -c 'Key Slot [0-9]*: ENABLED' 2>/dev/null || true)
     [[ "$slot_count" =~ ^[0-9]+$ ]] && (( slot_count >= 1 )) && _row "Key slots" "OK  ${slot_count} active slot(s)"
     if [[ -f /etc/crypttab ]]; then
         local ct_entry; ct_entry=$(grep "^${ROOTLABEL}\b" /etc/crypttab 2>/dev/null | head -1 || echo "")
@@ -1706,7 +1706,7 @@ _section_security_services() {
     # AppArmor denial count this boot — non-zero means a process is being blocked
     local _aa_journal
     _aa_journal=$(journalctl -k -b 0 --no-pager -q 2>/dev/null | grep 'apparmor.*DENIED' || true)
-    local aa_denials; aa_denials=$(echo "$_aa_journal" | grep -c . 2>/dev/null || echo "0")
+    local aa_denials; aa_denials=$(echo "$_aa_journal" | grep -c . 2>/dev/null || true)
     [[ "$aa_denials" =~ ^[0-9]+$ ]] || aa_denials=0
     if (( aa_denials > 0 )); then
         _row "AA denials" "!   ${aa_denials} DENIED event(s) this boot"
@@ -1735,7 +1735,7 @@ _section_security_services() {
         _row "Firewall"   "OK  active (ufw)"
     elif systemctl is-active --quiet nftables 2>/dev/null; then
         local _nft_rules=""
-        _nft_rules=$(nft list ruleset 2>/dev/null | grep -c 'chain' || echo "")
+        _nft_rules=$(nft list ruleset 2>/dev/null | grep -c 'chain' || true)
         _row "Firewall"   "OK  active (nftables${_nft_rules:+, ${_nft_rules} chain(s)})"
     elif command -v ufw &>/dev/null; then
         _row "Firewall"   "!!  ufw installed but not active"
@@ -1831,7 +1831,7 @@ _section_security_services() {
 
         local _fido_devs=""
         if command -v fido2-token &>/dev/null; then
-            _fido_devs=$(fido2-token -L 2>/dev/null | grep -c '/dev/' || echo "0")
+            _fido_devs=$(fido2-token -L 2>/dev/null | grep -c '/dev/' || true)
             [[ "$_fido_devs" =~ ^[0-9]+$ ]] || _fido_devs=0
         fi
 
@@ -1979,8 +1979,8 @@ _section_security_audit() {
                 | cut -d= -f2- | tr -d '\r' | head -1 || echo "")
             lynis_score=$(grep '^hardening_index=' "$lynis_report" 2>/dev/null \
                 | cut -d= -f2 | tr -d '[:space:]' | head -1 || echo "")
-            lynis_warnings=$(grep -c '^warning\[\]=' "$lynis_report" 2>/dev/null || echo "0")
-            lynis_suggestions=$(grep -c '^suggestion\[\]=' "$lynis_report" 2>/dev/null || echo "0")
+            lynis_warnings=$(grep -c '^warning\[\]=' "$lynis_report" 2>/dev/null || true)
+            lynis_suggestions=$(grep -c '^suggestion\[\]=' "$lynis_report" 2>/dev/null || true)
             [[ "$lynis_warnings"    =~ ^[0-9]+$ ]] || lynis_warnings=0
             [[ "$lynis_suggestions" =~ ^[0-9]+$ ]] || lynis_suggestions=0
         fi
@@ -2075,7 +2075,7 @@ _section_security_audit() {
                     rkh_last=$(date -d "$_rkh_raw_date" '+%Y-%m-%d' 2>/dev/null || echo "")
                 fi
             fi
-            rkh_warnings=$(grep -c 'Warning:' "$rkh_log" 2>/dev/null || echo "0")
+            rkh_warnings=$(grep -c 'Warning:' "$rkh_log" 2>/dev/null || true)
         fi
         if [[ -n "$rkh_last" ]]; then
             local rkh_age_days=$(( ( $(date +%s) - $(date -d "$rkh_last" +%s 2>/dev/null || echo 0) ) / 86400 ))
@@ -2218,7 +2218,7 @@ _section_krb5() {
         if [[ -f /etc/krb5.keytab ]]; then
             local _kt_perms; _kt_perms=$(stat -c '%a' /etc/krb5.keytab 2>/dev/null || echo "")
             local _kt_principals; _kt_principals=$(klist -kt /etc/krb5.keytab 2>/dev/null \
-                | grep -c '@' || echo "0")
+                | grep -c '@' || true)
             if [[ "$_kt_perms" != "600" && "$_kt_perms" != "400" ]]; then
                 _row "keytab"    "!   /etc/krb5.keytab permissions ${_kt_perms} — should be 600"
                 _rec "Fix keytab permissions: chmod 600 /etc/krb5.keytab"
@@ -2440,7 +2440,7 @@ _section_users() {
     if systemctl cat systemd-homed &>/dev/null 2>&1; then
         if systemctl is-active --quiet systemd-homed 2>/dev/null; then
             local _homed_users=""
-            _homed_users=$(homectl list 2>/dev/null | grep -c '^' || echo "")
+            _homed_users=$(homectl list 2>/dev/null | grep -c '^' || true)
             _row "homed"       "OK  running${_homed_users:+  (${_homed_users} user(s))}"
         elif systemctl is-enabled --quiet systemd-homed 2>/dev/null; then
             _row "homed"       "!!  enabled but not running — homed users cannot log in"
@@ -2681,7 +2681,7 @@ _section_hardware() {
     local cpu_model cpu_cores cpu_arch cpu_flags
     cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null \
         | cut -d: -f2 | sed 's/^ *//' | sed 's/  */ /g' || echo "unknown")
-    cpu_cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "?")
+    cpu_cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || true)
     cpu_arch=$(uname -m 2>/dev/null || echo "?")
     cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null \
         | cut -d: -f2 | tr -s ' ' | tr -d '\n' | sed 's/^ //' || echo "")
@@ -2746,7 +2746,7 @@ _section_hardware() {
     fi
     # Only relevant when multiple GPUs are present (discrete + integrated)
     if command -v switcherooctl &>/dev/null; then
-        local gpu_count; gpu_count=$(switcherooctl list 2>/dev/null | grep -c '^GPU' || echo "0")
+        local gpu_count; gpu_count=$(switcherooctl list 2>/dev/null | grep -c '^GPU' || true)
         if [[ "$gpu_count" =~ ^[0-9]+$ ]] && (( gpu_count >= 2 )); then
             if systemctl is-active --quiet switcheroo-control 2>/dev/null; then
                 _row "GPU switch"  "OK  switcheroo-control active (${gpu_count} GPUs)"
@@ -2948,7 +2948,7 @@ _section_hardware() {
     if _svc_present ratbagd; then
         if systemctl is-active --quiet ratbagd 2>/dev/null; then
             local _rb_devs=""
-            _rb_devs=$(ratbagctl list 2>/dev/null | grep -c '.' || echo "")
+            _rb_devs=$(ratbagctl list 2>/dev/null | grep -c '.' || true)
             _row "ratbagd"     "OK  running${_rb_devs:+  (${_rb_devs} supported device(s))}"
         elif systemctl is-enabled --quiet ratbagd 2>/dev/null; then
             _row "ratbagd"     ">>  enabled (idle — activates on supported device connect)"
@@ -2970,7 +2970,7 @@ _section_hardware() {
         fi
         if systemctl is-active --quiet lircd 2>/dev/null; then
             local _lirc_remotes=""
-            _lirc_remotes=$(irsend LIST "" "" 2>/dev/null | grep -c '.' || echo "")
+            _lirc_remotes=$(irsend LIST "" "" 2>/dev/null | grep -c '.' || true)
             _row "lircd"        "OK  running${_lirc_remotes:+  (${_lirc_remotes} remote(s))}"
         elif systemctl is-enabled --quiet lircd 2>/dev/null; then
             _row "lircd"        "!   enabled but not running"
@@ -3069,8 +3069,8 @@ _section_hardware() {
             if [[ "$bolt_st" == "active" ]]; then
                 local bolt_enrolled="" bolt_connected=""
                 if command -v boltctl &>/dev/null; then
-                    bolt_enrolled=$(timeout 5 boltctl list 2>/dev/null | grep -c 'status:' || echo "")
-                    bolt_connected=$(timeout 5 boltctl list 2>/dev/null | grep -c 'connected' || echo "")
+                    bolt_enrolled=$(timeout 5 boltctl list 2>/dev/null | grep -c 'status:' || true)
+                    bolt_connected=$(timeout 5 boltctl list 2>/dev/null | grep -c 'connected' || true)
                 fi
                 _row "Thunderbolt" "OK  bolt active${bolt_enrolled:+  (${bolt_enrolled} device(s) enrolled${bolt_connected:+, ${bolt_connected} connected})}"
             elif [[ "$bolt_en" == "enabled" ]]; then
@@ -3366,7 +3366,7 @@ _section_disk() {
     fi
     # Only relevant when /proc/mdstat shows active arrays.
     if [[ -f /proc/mdstat ]] && grep -q '^md[0-9]' /proc/mdstat 2>/dev/null; then
-        local _md_arrays=$(grep -c '^md[0-9]' /proc/mdstat 2>/dev/null || echo "0")
+        local _md_arrays=$(grep -c '^md[0-9]' /proc/mdstat 2>/dev/null || true)
         if systemctl is-active --quiet mdmonitor 2>/dev/null; then
             _row "mdmonitor"   "OK  running  (${_md_arrays} array(s))"
         elif systemctl is-enabled --quiet mdmonitor 2>/dev/null; then
@@ -3429,7 +3429,7 @@ _section_disk() {
     # notifications. Only relevant when NVDIMM namespaces are present.
     if _svc_present ndctl-monitor; then
         local _ndctl_ns=""
-        _ndctl_ns=$(ndctl list -N 2>/dev/null | grep -c '"dev"' || echo "0")
+        _ndctl_ns=$(ndctl list -N 2>/dev/null | grep -c '"dev"' || true)
         if [[ "$_ndctl_ns" =~ ^[0-9]+$ ]] && (( _ndctl_ns > 0 )); then
             if systemctl is-active --quiet ndctl-monitor 2>/dev/null; then
                 _row "ndctl-mon"   "OK  running  (${_ndctl_ns} namespace(s))"
@@ -3445,7 +3445,7 @@ _section_disk() {
     # when CXL devices are present.
     if _svc_present cxl-monitor; then
         local _cxl_devs=""
-        _cxl_devs=$(cxl list -M 2>/dev/null | grep -c '"memdev"' || echo "0")
+        _cxl_devs=$(cxl list -M 2>/dev/null | grep -c '"memdev"' || true)
         if [[ "$_cxl_devs" =~ ^[0-9]+$ ]] && (( _cxl_devs > 0 )); then
             if systemctl is-active --quiet cxl-monitor 2>/dev/null; then
                 _row "cxl-monitor"  "OK  running  (${_cxl_devs} CXL device(s))"
@@ -3962,7 +3962,7 @@ _section_servers() {
             local rsyncd_st; rsyncd_st=$(systemctl is-active rsyncd 2>/dev/null || echo "inactive")
             if [[ "$rsyncd_st" == "active" ]]; then
                 local mod_count
-                mod_count=$(grep -c '^\[' /etc/rsyncd.conf 2>/dev/null || echo "?")
+                mod_count=$(grep -c '^\[' /etc/rsyncd.conf 2>/dev/null || true)
                 _row "rsyncd"      "OK  running  (${mod_count} module(s))"
                 # Warn if any module allows anonymous writes (grep whole file — no -A needed)
                 if grep -q 'read only *= *\(false\|no\)' /etc/rsyncd.conf 2>/dev/null; then
@@ -4274,7 +4274,7 @@ _section_servers() {
         if [[ -f /etc/exports ]] && grep -qv '^[[:space:]]*#' /etc/exports 2>/dev/null; then
             if systemctl is-active --quiet nfs-server 2>/dev/null; then
                 local export_count
-                export_count=$(grep -cv '^[[:space:]]*#\|^[[:space:]]*$' /etc/exports 2>/dev/null || echo "?")
+                export_count=$(grep -cv '^[[:space:]]*#\|^[[:space:]]*$' /etc/exports 2>/dev/null || true)
                 _row "NFS"        "OK  nfs-server running  (${export_count} export(s))"
                 if command -v rpcbind &>/dev/null && \
                    ! systemctl is-active --quiet rpcbind 2>/dev/null; then
@@ -4323,7 +4323,7 @@ _section_servers() {
             local nbd_st; nbd_st=$(systemctl is-active nbd-server 2>/dev/null || echo "inactive")
             if [[ "$nbd_st" == "active" ]]; then
                 local nbd_exports
-                nbd_exports=$(grep -c '^\[' /etc/nbd-server/config 2>/dev/null || echo "?")
+                nbd_exports=$(grep -c '^\[' /etc/nbd-server/config 2>/dev/null || true)
                 _row "nbd-server"  "OK  running  (${nbd_exports} export(s))"
             elif systemctl is-enabled --quiet nbd-server 2>/dev/null; then
                 _row "nbd-server"  "!   enabled but not running"
@@ -5012,7 +5012,7 @@ _section_network() {
     if _svc_present iwd; then
         if systemctl is-active --quiet iwd 2>/dev/null; then
             local _iwd_nets=""
-            _iwd_nets=$(iwctl station list 2>/dev/null | grep -c 'connected' || echo "")
+            _iwd_nets=$(iwctl station list 2>/dev/null | grep -c 'connected' || true)
             _row "iwd"         "OK  running${_iwd_nets:+  (${_iwd_nets} connected)}"
             # Warn if wpa_supplicant is also active — they conflict
             if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
@@ -5245,7 +5245,7 @@ _section_network() {
         fi
         if (( _swan_active )); then
             local _swan_conns=""
-            _swan_conns=$(swanctl --list-conns 2>/dev/null | grep -c ':' || echo "")
+            _swan_conns=$(swanctl --list-conns 2>/dev/null | grep -c ':' || true)
             _row "strongSwan" "OK  running${_swan_conns:+  (${_swan_conns} connection(s))}"
         elif [[ -n "$_swan_unit" ]] && systemctl is-enabled --quiet "$_swan_unit" 2>/dev/null; then
             _nm_vpn_conflict "strongSwan" "${_swan_unit}" "strongswan"
@@ -5472,7 +5472,7 @@ _section_audio_display() {
     if _svc_present colord; then
         if systemctl is-active --quiet colord 2>/dev/null; then
             local _icc_count=""
-            _icc_count=$(colormgr get-profiles 2>/dev/null | grep -c 'Profile ID' || echo "")
+            _icc_count=$(colormgr get-profiles 2>/dev/null | grep -c 'Profile ID' || true)
             _row "colord"       "OK  running${_icc_count:+  (${_icc_count} profile(s))}"
         elif systemctl is-enabled --quiet colord 2>/dev/null; then
             _row "colord"       ">>  enabled (idle — starts on demand via D-Bus)"
@@ -5485,7 +5485,7 @@ _section_audio_display() {
     if _svc_present ddcutil-service; then
         if systemctl is-active --quiet ddcutil-service 2>/dev/null; then
             local _ddc_monitors=""
-            _ddc_monitors=$(ddcutil detect --brief 2>/dev/null | grep -c '^Display' || echo "")
+            _ddc_monitors=$(ddcutil detect --brief 2>/dev/null | grep -c '^Display' || true)
             _row "ddcutil"     "OK  ddcutil-service running${_ddc_monitors:+  (${_ddc_monitors} monitor(s))}"
         elif systemctl is-enabled --quiet ddcutil-service 2>/dev/null; then
             _row "ddcutil"     "!   enabled but not running"
@@ -5570,7 +5570,7 @@ _section_package_managers() {
         local flatpak_usr; flatpak_usr=$(_sysd_user is-enabled flatpak-update-user.timer 2>/dev/null || echo "disabled")
         local flatpak_apps flatpak_remotes flatpak_mb
         flatpak_apps=$(timeout 5 flatpak list --app --columns=application 2>/dev/null | wc -l || echo "?")
-        flatpak_remotes=$(flatpak remotes 2>/dev/null | grep -c '.' || echo "0")
+        flatpak_remotes=$(flatpak remotes 2>/dev/null | grep -c '.' || true)
         flatpak_mb=$(du -sm /var/lib/flatpak 2>/dev/null | awk '{print $1}' || echo "")
         local fp_sz_str=""
         [[ "$flatpak_mb" =~ ^[0-9]+$ ]] && fp_sz_str=", $(_mb_to_human "$flatpak_mb")"
@@ -5650,7 +5650,7 @@ _section_package_managers() {
         local nix_gen_count=""
         local _nix_prof="/nix/var/nix/profiles"
         if [[ -d "$_nix_prof" ]]; then
-            nix_gen_count=$(ls "$_nix_prof" 2>/dev/null | grep -cE '^system-[0-9]+-link$' || echo "")
+            nix_gen_count=$(ls "$_nix_prof" 2>/dev/null | grep -cE '^system-[0-9]+-link$' || true)
         fi
         local nix_sz_str=""
         [[ "$nix_store_mb" =~ ^[0-9]+$ ]] && nix_sz_str=", $(_mb_to_human "$nix_store_mb")"
@@ -5989,9 +5989,9 @@ _section_containers() {
                 local _mc_raw=""
                 _mc_raw=$(timeout 5 machinectl list --no-legend 2>/dev/null || echo "")
                 local _mc_count=0
-                [[ -n "$_mc_raw" ]] && _mc_count=$(echo "$_mc_raw" | grep -c . || echo 0)
+                [[ -n "$_mc_raw" ]] && _mc_count=$(echo "$_mc_raw" | grep -c . || true)
                 local _mc_running=0
-                _mc_running=$(echo "$_mc_raw" | grep -c running 2>/dev/null || echo 0)
+                _mc_running=$(echo "$_mc_raw" | grep -c running 2>/dev/null || true)
                 # Total disk usage of machines dir
                 local nspawn_mb=""
                 nspawn_mb=$(du -sm "$machines_dir" 2>/dev/null | awk '{print $1}' || echo "")
@@ -6530,7 +6530,7 @@ _section_backup_tools() {
         # Check for rclone mount units
         local _rc_mounts=0
         _rc_mounts=$(systemctl list-units 'rclone@*.service' --no-legend --no-pager 2>/dev/null \
-            | grep -c 'running' | tr -d '[:space:]' || echo "0")
+            | grep -c 'running' | tr -d '[:space:]' || true)
         [[ "$_rc_mounts" =~ ^[0-9]+$ ]] && (( _rc_mounts > 0 )) && _row2 "--  ${_rc_mounts} rclone mount(s) active"
     fi
     # ── restic ───────────────────────────────────────────────────────────────
@@ -6541,7 +6541,7 @@ _section_backup_tools() {
         # Check for restic timer/service units
         local _res_timer_count=0
         _res_timer_count=$(systemctl list-timers 'restic*' --no-legend --no-pager 2>/dev/null \
-            | grep -c 'restic' | tr -d '[:space:]' || echo "0")
+            | grep -c 'restic' | tr -d '[:space:]' || true)
         [[ "$_res_timer_count" =~ ^[0-9]+$ ]] || _res_timer_count=0
         if (( _res_timer_count > 0 )); then
             _row2 "--  ${_res_timer_count} scheduled backup timer(s) active"
@@ -6635,7 +6635,7 @@ _section_monitoring() {
     if _svc_present cronie; then
         if systemctl is-active --quiet cronie 2>/dev/null; then
             local _cron_jobs=""
-            _cron_jobs=$(crontab -l 2>/dev/null | grep -cvE '^[[:space:]]*#|^[[:space:]]*$' || echo "")
+            _cron_jobs=$(crontab -l 2>/dev/null | grep -cvE '^[[:space:]]*#|^[[:space:]]*$' || true)
             _row "cronie"      "OK  running${_cron_jobs:+  (${_cron_jobs} root crontab job(s))}"
         elif systemctl is-enabled --quiet cronie 2>/dev/null; then
             _row "cronie"      "!   enabled but not running — cron jobs not executing"
@@ -7011,7 +7011,7 @@ _section_coredump() {
     # Recent core dumps this boot
     local coredump_count=0
     if command -v coredumpctl &>/dev/null; then
-        coredump_count=$(coredumpctl list --no-pager -q 2>/dev/null | grep -c '' || echo "0")
+        coredump_count=$(coredumpctl list --no-pager -q 2>/dev/null | grep -c '' || true)
         coredump_count=$(echo "${coredump_count:-0}" | tr -d '[:space:]')
         [[ "$coredump_count" =~ ^[0-9]+$ ]] || coredump_count=0
         if (( coredump_count > 0 )); then
@@ -7090,11 +7090,11 @@ _section_system_health() {
         if [[ -n "$_since_ts" ]]; then
             # Filter out the trailing "btmp begins..." summary line and blank lines
             _lastb_count=$(lastb -s "$_since_ts" 2>/dev/null \
-                | grep -cvE '^$|^btmp begins' || echo "0")
+                | grep -cvE '^$|^btmp begins' || true)
         else
             # Fallback: count all entries (no since filter)
             _lastb_count=$(lastb 2>/dev/null \
-                | grep -cvE '^$|^btmp begins' || echo "0")
+                | grep -cvE '^$|^btmp begins' || true)
         fi
         _lastb_count=$(echo "${_lastb_count:-0}" | tr -d '[:space:]')
         [[ "$_lastb_count" =~ ^[0-9]+$ ]] || _lastb_count=0
@@ -7108,7 +7108,7 @@ _section_system_health() {
     fi
     # loginctl list-sessions columns: SESSION  UID  USER  SEAT  TTY
     if command -v loginctl &>/dev/null; then
-        local _sessions=$(loginctl list-sessions --no-legend 2>/dev/null | grep -c '.' || echo "0")
+        local _sessions=$(loginctl list-sessions --no-legend 2>/dev/null | grep -c '.' || true)
         _sessions=$(echo "${_sessions:-0}" | tr -d '[:space:]')
         [[ "$_sessions" =~ ^[0-9]+$ ]] || _sessions=0
         if (( _sessions > 0 )); then
@@ -7183,11 +7183,11 @@ _section_system_health() {
     _kjournal=$(journalctl -k -b 0 --no-pager -q 2>/dev/null || true)
     local oom_kernel oom_oomd oom_total
     oom_kernel=$(echo "$_kjournal" \
-        | grep -c 'Out of memory\|oom_kill_process\|Killed process' 2>/dev/null || echo "0")
+        | grep -c 'Out of memory\|oom_kill_process\|Killed process' 2>/dev/null || true)
     oom_kernel=$(echo "${oom_kernel:-0}" | tr -d '[:space:]')
     [[ "$oom_kernel" =~ ^[0-9]+$ ]] || oom_kernel=0
     oom_oomd=$(journalctl -b 0 --no-pager -q -u systemd-oomd 2>/dev/null \
-        | grep -c 'Killed\|killed' 2>/dev/null || echo "0")
+        | grep -c 'Killed\|killed' 2>/dev/null || true)
     oom_oomd=$(echo "${oom_oomd:-0}" | tr -d '[:space:]')
     [[ "$oom_oomd" =~ ^[0-9]+$ ]] || oom_oomd=0
     oom_total=$(( oom_kernel + oom_oomd ))
@@ -7302,7 +7302,7 @@ _section_system_health() {
     # Zombie processes — defunct children whose parent hasn't called wait().
     # A handful is normal (transient), but accumulation indicates stuck service parents.
     local _zombie_count=0
-    _zombie_count=$(ps -eo stat= 2>/dev/null | grep -c '^Z' || echo "0")
+    _zombie_count=$(ps -eo stat= 2>/dev/null | grep -c '^Z' || true)
     _zombie_count=$(echo "${_zombie_count:-0}" | tr -d '[:space:]')
     [[ "$_zombie_count" =~ ^[0-9]+$ ]] || _zombie_count=0
     if (( _zombie_count >= 10 )); then
@@ -7714,8 +7714,9 @@ verify_system() {
     # /etc must have an overlay mount
     local etc_fstype; etc_fstype=$(findmnt -n -o FSTYPE /etc 2>/dev/null || echo "")
     if [[ "$etc_fstype" == "overlay" ]]; then
-        local etc_files; etc_files=$(find /etc/. -maxdepth 0 -newer /etc/../usr 2>/dev/null | wc -l || echo "?")
-        _check_pass "immutability_etc_overlay" "/etc: overlay active"
+        local etc_upper="/data/overlay/etc/upper" etc_files=0
+        [[ -d "$etc_upper" ]] && etc_files=$(find "$etc_upper" -mindepth 1 2>/dev/null | wc -l || echo "0")
+        _check_pass "immutability_etc_overlay" "/etc: overlay active (${etc_files} file(s) modified vs base)"
     else
         _check_fail "immutability_etc_overlay" "/etc: overlay NOT mounted (fstype: ${etc_fstype:-none}) — /etc is from read-only root"
     fi
@@ -7825,7 +7826,7 @@ show_journal() {
     # Cache kernel journal once — reused for AA and OOM sections below
     local _jklog
     _jklog=$(journalctl -k "${since_args[@]}" --no-pager -q 2>/dev/null || true)
-    local aa_count=$(echo "$_jklog" | grep -c 'apparmor.*DENIED' || echo "0")
+    local aa_count=$(echo "$_jklog" | grep -c 'apparmor.*DENIED' || true)
     if [[ "$aa_count" =~ ^[0-9]+$ ]] && (( aa_count > 0 )); then
         _row "Denials"  "!   ${aa_count} total"
         echo ""
@@ -7842,11 +7843,11 @@ show_journal() {
     _head "OOM Events"
     local oom_count oom_oomd_count
     oom_count=$(echo "$_jklog" \
-        | grep -c 'Out of memory\|oom_kill_process\|Killed process' 2>/dev/null || echo "0")
+        | grep -c 'Out of memory\|oom_kill_process\|Killed process' 2>/dev/null || true)
     oom_count=$(echo "${oom_count:-0}" | tr -d '[:space:]')
     [[ "$oom_count" =~ ^[0-9]+$ ]] || oom_count=0
     oom_oomd_count=$(journalctl "${since_args[@]}" --no-pager -q -u systemd-oomd 2>/dev/null \
-        | grep -c 'Killed\|killed' 2>/dev/null || echo "0")
+        | grep -c 'Killed\|killed' 2>/dev/null || true)
     oom_oomd_count=$(echo "${oom_oomd_count:-0}" | tr -d '[:space:]')
     [[ "$oom_oomd_count" =~ ^[0-9]+$ ]] || oom_oomd_count=0
     local oom_total_j=$(( oom_count + oom_oomd_count ))
@@ -8161,7 +8162,7 @@ analyze_storage() {
     # Nix store
     if findmnt -n /nix &>/dev/null; then
         local nix_mb; nix_mb=$(du -sm /nix/store 2>/dev/null | awk '{print $1}' || echo "")
-        local nix_gen; nix_gen=$(ls /nix/var/nix/profiles 2>/dev/null | grep -cE '^system-[0-9]+-link$' || echo "")
+        local nix_gen; nix_gen=$(ls /nix/var/nix/profiles 2>/dev/null | grep -cE '^system-[0-9]+-link$' || true)
         local nix_str=""
         [[ "$nix_gen" =~ ^[0-9]+$ ]] && (( nix_gen > 0 )) && nix_str=", ${nix_gen} generation(s)"
         if [[ "$nix_mb" =~ ^[0-9]+$ ]]; then
@@ -8547,7 +8548,7 @@ clean_logs() {
 
     done < <(find "$log_dir" \
         \( -name "*.gz" -o -name "*.bz2" -o -name "*.xz" -o -name "*.zst" \
-           -o -name "*.[0-9]" -o -name "*.[0-9][0-9]" \) \
+           -o -name "*.[0-9]" -o -name "*.[0-9][0-9]" -o -name "*.[0-9][0-9][0-9]" \) \
         -not -path "*/journal/*" \
         -mtime +"$keep_days" \
         -type f 2>/dev/null | sort || true)
@@ -8626,7 +8627,7 @@ clean_logs() {
             _cl_remove "$f"
         done < <(find "$_svclog_dir" \
             \( -name "*.gz" -o -name "*.bz2" -o -name "*.xz" -o -name "*.zst" \
-               -o -name "*.[0-9]" -o -name "*.[0-9][0-9]" \) \
+               -o -name "*.[0-9]" -o -name "*.[0-9][0-9]" -o -name "*.[0-9][0-9][0-9]" \) \
             -type f -mtime +"$keep_days" 2>/dev/null | sort || true)
     done
 

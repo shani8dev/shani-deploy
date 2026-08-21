@@ -6426,7 +6426,11 @@ _section_firmware() {
 
     local fw_out; fw_out=$(timeout 15 fwupdmgr get-updates --offline 2>/dev/null || true)
     if echo "$fw_out" | grep -q 'GUID\|Version'; then
-        local n; n=$(echo "$fw_out" | grep -c 'GUID' || echo "1")
+        # grep -c already prints a valid count ("0" on no matches) to stdout
+        # even though it exits 1 in that case — `|| true` (not `|| echo "1"`)
+        # avoids tripping set -e without appending extra text after the "0"
+        # grep already emitted, which would otherwise garble $n into "0\n1".
+        local n; n=$(echo "$fw_out" | grep -c 'GUID' || true)
         _row "Updates"   "!   ${n} update(s) available — run: fwupdmgr update"
         _rec "${n} firmware update(s) available — run: fwupdmgr update"
     else

@@ -5604,11 +5604,16 @@ _section_package_managers() {
         [[ "$nix_gen_count" =~ ^[0-9]+$ ]] && (( nix_gen_count > 0 )) && \
             nix_gen_str=", ${nix_gen_count} generation(s)"
 
+        # Declared here (not inside the nix-daemon.socket branch below) since
+        # it's also read unconditionally after that if/else — under set -u,
+        # taking the "socket not active" branch would otherwise leave it
+        # unbound and abort the whole script.
+        local _nix_user="$_CALLER_USER"
+
         if systemctl is-active --quiet nix-daemon.socket 2>/dev/null; then
             local nix_ver=""
             nix_ver=$(nix --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
             local nix_channels=""
-            local _nix_user="$_CALLER_USER"
             if [[ -n "$_nix_user" ]]; then
                 nix_channels=$(timeout 5 runuser -u "$_nix_user" -- nix-channel --list 2>/dev/null | wc -l || echo "")
             fi

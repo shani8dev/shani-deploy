@@ -10,6 +10,7 @@
 #   shani-health --hardware          Hardware report: CPU, disk, SMART, temps, firmware
 #   shani-health --packages          Package report: flatpak, snap, nix, containers
 #   shani-health --verify            Deep integrity check: UKI sigs + Btrfs scrub
+#   shani-health --verify --json     Same, plus a machine-readable JSON summary on stdout
 #   shani-health --history [N]       Last N deploy/rollback events (default: 50)
 #   shani-health --storage-info      Btrfs storage analysis (native, no shani-deploy needed)
 #   shani-health --journal [level]   Show journal entries (crit/err/warning)
@@ -7483,7 +7484,59 @@ clear_boot_failure() {
     fi
 }
 
+# ── Structured check recording for `--verify --json` ────────────────────────
+# verify_system() is the one report mode designed for automation (its exit
+# code is already 0/1 on pass/fail) — these helpers let it also emit a
+# machine-readable summary without touching how any other report section
+# works. They record to _CHECK_RESULTS and ALSO still call the normal
+# _log_ok/_log_err/_log_warn, so human-readable output is unchanged whether
+# or not --json was passed.
+_CHECK_RESULTS=()
+
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+# _check_pass/_check_fail/_check_warn NAME MESSAGE
+# NAME is a short stable identifier (e.g. "uki_signature_blue") — the thing
+# a JSON consumer should key on; MESSAGE is the same human text already
+# passed to _log_ok/_log_err/_log_warn elsewhere in this file.
+# _check_fail relies on bash's dynamic scoping to increment the caller's
+# local `errors` counter directly — this file has no other errors variable
+# in scope wherever these are called.
+_check_pass() { local name="$1" msg="$2"; _log_ok "$msg";   _CHECK_RESULTS+=("${name}|pass|${msg}"); }
+_check_warn() { local name="$1" msg="$2"; _log_warn "$msg"; _CHECK_RESULTS+=("${name}|warn|${msg}"); }
+_check_fail() {
+    local name="$1" msg="$2"
+    _log_err "$msg"
+    _CHECK_RESULTS+=("${name}|fail|${msg}")
+    errors=$(( errors + 1 ))
+}
+
+# _print_verify_json TOTAL_ERRORS — emits the accumulated _CHECK_RESULTS as
+# JSON on stdout. Human-readable output from _log_* always goes to stderr
+# (see the _log_* definitions near the top of this file), so piping stdout
+# alone gives a clean machine-readable result even though the normal
+# colored report still prints as usual.
+_print_verify_json() {
+    local total_errors="$1"
+    local out="{\"ok\":$( (( total_errors == 0 )) && echo true || echo false ),\"errors\":${total_errors},\"checks\":["
+    local first=1 entry name status msg
+    for entry in "${_CHECK_RESULTS[@]}"; do
+        IFS='|' read -r name status msg <<< "$entry"
+        (( first )) || out+=","
+        first=0
+        out+="{\"name\":\"$(_json_escape "$name")\",\"status\":\"${status}\",\"message\":\"$(_json_escape "$msg")\"}"
+    done
+    out+="]}"
+    echo "$out"
+}
+
 verify_system() {
+    local json_output="${1:-no}"
     _log_section "System Integrity Verification"
     local errors=0
     local _esp_mounted=0   # shared across both ESP access windows in this function
@@ -7499,11 +7552,11 @@ verify_system() {
         for slot in blue green; do
             local uki="$ESP/EFI/${OS_NAME}/${OS_NAME}-${slot}.efi"
             if [[ ! -f "$uki" ]]; then
-                _log_err "UKI missing: ${uki}"; errors=$(( errors + 1 ))
-            elif sbverify --cert "$mok_crt" "$uki" &>/dev/null 2>&1; then _log_ok "UKI valid:   @${slot}"
+                _check_fail "uki_signature_${slot}" "UKI missing: ${uki}"
+            elif sbverify --cert "$mok_crt" "$uki" &>/dev/null 2>&1; then
+                _check_pass "uki_signature_${slot}" "UKI valid:   @${slot}"
             else
-                _log_err "UKI INVALID: @${slot}"
-                errors=$(( errors + 1 ))
+                _check_fail "uki_signature_${slot}" "UKI INVALID: @${slot}"
             fi
         done
     fi
@@ -7514,14 +7567,13 @@ verify_system() {
     _log "Checking Btrfs data integrity (scrub both slots)..."
     local mnt_tmp; mnt_tmp=$(mktemp -d /run/shanios-verify.XXXXXX)
     if ! mount -o subvolid=5,ro "$ROOT_DEV" "$mnt_tmp" 2>/dev/null; then
-        _log_err "Cannot mount filesystem root — skipping Btrfs check"
+        _check_fail "btrfs_scrub" "Cannot mount filesystem root — skipping Btrfs check"
         rmdir "$mnt_tmp" 2>/dev/null || true
-        errors=$(( errors + 1 ))
     else
         for slot in blue green; do
             local subvol="$mnt_tmp/@${slot}"
             if [[ ! -d "$subvol" ]]; then
-                _log_warn "@${slot} not found on disk — skipping"
+                _check_warn "btrfs_scrub_${slot}" "@${slot} not found on disk — skipping"
                 continue
             fi
             if btrfs scrub start -Br "$subvol" &>/dev/null 2>&1; then
@@ -7531,17 +7583,18 @@ verify_system() {
                 ce=$(echo "$sc_out" | awk '/csum_errors:/{print $2}'      | head -1 || echo "0")
                 co=$(echo "$sc_out" | awk '/corrected_errors:/{print $2}' | head -1 || echo "0")
                 if [[ "${re:-0}" != "0" || "${ce:-0}" != "0" || "${co:-0}" != "0" ]]; then
-                    _log_err "Btrfs errors on @${slot}: read=${re} csum=${ce} corrected=${co}"
-                    errors=$(( errors + 1 ))
+                    _check_fail "btrfs_scrub_${slot}" "Btrfs errors on @${slot}: read=${re} csum=${ce} corrected=${co}"
                 else
-                    _log_ok "Btrfs clean: @${slot}"
+                    _check_pass "btrfs_scrub_${slot}" "Btrfs clean: @${slot}"
                 fi
             else
                 local last; last=$(btrfs scrub status / 2>/dev/null \
                     | awk '/Status:/{print $2}' | head -1 || echo "")
-                [[ "$last" == "finished" ]] \
-                    && _log "@${slot}: live scrub unavailable (mounted) — last run clean" \
-                    || _log_warn "@${slot}: cannot scrub live fs — run: btrfs scrub start /"
+                if [[ "$last" == "finished" ]]; then
+                    _log "@${slot}: live scrub unavailable (mounted) — last run clean"
+                else
+                    _check_warn "btrfs_scrub_${slot}" "@${slot}: cannot scrub live fs — run: btrfs scrub start /"
+                fi
             fi
         done
         umount "$mnt_tmp" 2>/dev/null || true
@@ -7554,10 +7607,9 @@ verify_system() {
     local current; current=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
     local booted;  booted=$(_get_booted_subvol)
     if [[ ! "$current" =~ ^(blue|green)$ ]]; then
-        _log_err "current-slot invalid or missing: '${current}'"
-        errors=$(( errors + 1 ))
+        _check_fail "slot_markers" "current-slot invalid or missing: '${current}'"
     else
-        _log_ok "Markers OK:  current=@${current}  booted=@${booted}"
+        _check_pass "slot_markers" "Markers OK:  current=@${current}  booted=@${booted}"
     fi
 
     # Boot entry consistency
@@ -7570,13 +7622,13 @@ verify_system() {
         def_entry=$(grep '^default' "$loader_conf" | awk '{print $2}' || echo "")
         # shellcheck disable=SC2086
         resolved=$(ls "$ESP/loader/entries/"${def_entry} 2>/dev/null | head -1 || echo "")
-        if [[ -n "$resolved" ]]; then _log_ok "Boot entry OK: '${def_entry}' -> $(basename "$resolved")"
+        if [[ -n "$resolved" ]]; then
+            _check_pass "boot_entry" "Boot entry OK: '${def_entry}' -> $(basename "$resolved")"
         else
-            _log_err "Boot entry '${def_entry}' matches no file in loader/entries/"
-            errors=$(( errors + 1 ))
+            _check_fail "boot_entry" "Boot entry '${def_entry}' matches no file in loader/entries/"
         fi
     else
-        _log_warn "loader.conf not found — cannot verify boot entries"
+        _check_warn "boot_entry" "loader.conf not found — cannot verify boot entries"
     fi
     _esp_umount
 
@@ -7585,34 +7637,33 @@ verify_system() {
     _log "Checking system immutability..."
     # Root must be read-only
     if findmnt -n -o OPTIONS / 2>/dev/null | grep -q '\bro\b'; then
-        _log_ok "Root (/): read-only"
+        _check_pass "immutability_root_ro" "Root (/): read-only"
     else
-        _log_err "Root (/): WRITABLE — immutability compromised"
-        errors=$(( errors + 1 ))
+        _check_fail "immutability_root_ro" "Root (/): WRITABLE — immutability compromised"
     fi
     # /var must be tmpfs
     local var_fstype; var_fstype=$(findmnt -n -o FSTYPE /var 2>/dev/null || echo "")
-    if [[ "$var_fstype" == "tmpfs" ]]; then _log_ok "/var: tmpfs (volatile)"
+    if [[ "$var_fstype" == "tmpfs" ]]; then
+        _check_pass "immutability_var_tmpfs" "/var: tmpfs (volatile)"
     else
-        _log_warn "/var: not tmpfs (${var_fstype:-unknown}) — volatile state may not be enforced"
+        _check_warn "immutability_var_tmpfs" "/var: not tmpfs (${var_fstype:-unknown}) — volatile state may not be enforced"
     fi
     # /etc must have an overlay mount
     local etc_fstype; etc_fstype=$(findmnt -n -o FSTYPE /etc 2>/dev/null || echo "")
     if [[ "$etc_fstype" == "overlay" ]]; then
         local etc_files; etc_files=$(find /etc/. -maxdepth 0 -newer /etc/../usr 2>/dev/null | wc -l || echo "?")
-        _log_ok "/etc: overlay active"
+        _check_pass "immutability_etc_overlay" "/etc: overlay active"
     else
-        _log_err "/etc: overlay NOT mounted (fstype: ${etc_fstype:-none}) — /etc is from read-only root"
-        errors=$(( errors + 1 ))
+        _check_fail "immutability_etc_overlay" "/etc: overlay NOT mounted (fstype: ${etc_fstype:-none}) — /etc is from read-only root"
     fi
     # Critical subvolumes must be mounted
-    local sv_errors=0
     for sv in data nix home containers; do
         local mp="/$sv"
         [[ "$sv" == "containers" ]] && mp="/var/lib/containers"
-        if findmnt -n "$mp" &>/dev/null; then _log_ok "@${sv}: mounted at ${mp}"
+        if findmnt -n "$mp" &>/dev/null; then
+            _check_pass "subvol_mounted_${sv}" "@${sv}: mounted at ${mp}"
         else
-            _log_warn "@${sv}: not mounted at ${mp} (may not be installed)"
+            _check_warn "subvol_mounted_${sv}" "@${sv}: not mounted at ${mp} (may not be installed)"
         fi
     done
 
@@ -7622,6 +7673,10 @@ verify_system() {
         _log_err "Verification found ${errors} issue(s)"
     fi
     echo ""
+
+    if [[ "$json_output" == "yes" ]]; then
+        _print_verify_json "$errors"
+    fi
     return $(( errors > 0 ? 1 : 0 ))
 }
 
@@ -8535,6 +8590,7 @@ Options:
   -i, --info              Alias for full system status report
   --clean-logs [DAYS]     Clean old app logs from /var/log (default: keep last 30 days)
   --verify                Deep integrity check: UKI sigs, Btrfs scrub, immutability
+  --json                  With --verify: also print a machine-readable JSON summary to stdout
   --security              Security report: boot chain, encryption, services, users, Kerberos
   --journal [level]       Show journal entries (level: crit, err, warning — default: crit)
   --since TIME            Limit journal output to entries since TIME (e.g. -1h, -2d, '2026-01-01')
@@ -8564,6 +8620,7 @@ Examples:
   shani-health --since -2d --journal warning  Warnings in the last 2 days
   shani-health --storage-info         Btrfs subvolume + compression analysis
   shani-health --verify               Deep integrity check (runs scrub — takes time)
+  shani-health --verify --json | jq   Deep integrity check, machine-readable summary
   shani-health --history 100          Last 100 deploy events
   shani-health --export-logs ~/       Bundle diagnostics to home dir
 
@@ -8584,6 +8641,7 @@ main() {
     local JOURNAL_LEVEL="crit"
     local JOURNAL_SINCE=""
     local CLEAN_LOGS_DAYS=30
+    local JSON_OUTPUT="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -8596,6 +8654,7 @@ main() {
                     shift
                 fi ;;
             --verify)           MODE="verify";       shift ;;
+            --json)             JSON_OUTPUT="yes";   shift ;;
             -s|--storage-info)  MODE="storage-info"; shift ;;
             --security)         MODE="security";     shift ;;
             --journal)
@@ -8636,12 +8695,16 @@ main() {
         esac
     done
 
+    if [[ "$JSON_OUTPUT" == "yes" && "$MODE" != "verify" ]]; then
+        _log_warn "--json only has an effect together with --verify — ignoring"
+    fi
+
     _require_root
 
     case "$MODE" in
         info)                system_info ;;
         clean-logs)          clean_logs "$CLEAN_LOGS_DAYS" ;;
-        verify)              verify_system; exit $? ;;
+        verify)              verify_system "$JSON_OUTPUT"; exit $? ;;
         security)            security_report ;;
         journal)             show_journal "$JOURNAL_LEVEL" "$JOURNAL_SINCE" ;;
         history)             show_history "$HISTORY_LINES" ;;

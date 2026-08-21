@@ -11,8 +11,29 @@ ConditionPathExists=/data/boot-ok
 
 [Service]
 Type=oneshot
-ExecStart=bootctl set-good
-SuccessExitStatus=0 1
+# `bootctl set-good` is not a real bootctl verb — bootctl has never supported
+# it (confirmed against systemd 261: "Unknown command verb 'set-good'.",
+# exit 1). The SuccessExitStatus=0 1 below silently swallowed that failure,
+# so this unit has never actually reset the systemd-boot tries counter on any
+# boot. The real mechanism for exactly this purpose already ships as part of
+# systemd itself (see systemd-bless-boot.service(8)/systemd-bless-boot(1)).
+#
+# Even with the right command, don't expect this to visibly do anything on
+# current systemd: verified live under a real UEFI boot (qemu+OVMF) that
+# systemd-boot never renames a +tries_left-tries_done loader entry or sets
+# LoaderBootCountPath at all on systemd 261, so systemd-bless-boot correctly
+# reports "Not booted with boot counting in effect" regardless of this fix.
+# This matches a known, open, unfixed upstream regression introduced in
+# systemd-boot 259 (only 257 and earlier are confirmed working):
+# https://github.com/systemd/systemd/issues/40405
+# The fix above is still correct and necessary — it makes this unit do the
+# right thing the moment upstream's regression is resolved, instead of
+# silently no-op'ing forever via a command that was never valid in the first
+# place. ShaniOS's actual rollback safety does not depend on this: the
+# primary mechanism is the boot_in_progress/boot_failure marker pair
+# (mark-boot-success.service, check-boot-failure.service), which is fully
+# independent of systemd-boot's native tries counter.
+ExecStart=/usr/lib/systemd/systemd-bless-boot good
 RemainAfterExit=yes
 
 [Install]

@@ -408,6 +408,55 @@ btrfs_sync() {
         log_warn "btrfs subvolume sync failed on ${mnt} — deletion cleanup may still be pending"
 }
 
+
+# bees continuously deduplicates identical extents across every subvolume on
+# the filesystem — including blue/green and backup snapshots — and picks
+# whichever one it scans first as the extent's canonical copy. That choice is
+# unknowable and irrelevant to us; what matters is that deleting a subvolume
+# that bees has deduped against races bees' own LOGICAL_INO/dedupe ioctls on
+# the same shared extents, which is a documented, still-unfixed kernel hang
+# (the add_all_parents infinite loop — see Zygo/bees docs/btrfs-kernel.md).
+# bees' own docs recommend stopping it before other operations that touch
+# many shared-extent refcounts at once (e.g. a full balance); subvolume
+# deletion is the same risk class. _bees_pause/_bees_resume are idempotent
+# (safe to call from multiple nested code paths — e.g. a deploy failing
+# mid-deletion and falling into restore_candidate, which deletes more
+# subvolumes of its own) and only touch the service if it was actually
+# running, so a system without bees installed is unaffected.
+_bees_pause() {
+    [[ "${_BEES_PAUSED:-0}" == "1" ]] && return 0
+    _BEES_SERVICE=""
+    local uuid
+    uuid=$(findmnt -no UUID "$MOUNT_DIR" 2>/dev/null) || return 0
+    [[ -n "$uuid" ]] || return 0
+    _BEES_SERVICE="beesd@${uuid}.service"
+    systemctl is-active --quiet "$_BEES_SERVICE" 2>/dev/null || return 0
+    log_verbose "Pausing ${_BEES_SERVICE} before subvolume deletion"
+    if systemctl stop "$_BEES_SERVICE" 2>/dev/null; then
+        _BEES_PAUSED=1
+    else
+        log_warn "Failed to stop ${_BEES_SERVICE} — proceeding with deletion anyway"
+    fi
+}
+
+_bees_resume() {
+    [[ "${_BEES_PAUSED:-0}" == "1" ]] || return 0
+    log_verbose "Resuming ${_BEES_SERVICE}"
+    systemctl start "$_BEES_SERVICE" 2>/dev/null || log_warn "Failed to restart ${_BEES_SERVICE}"
+    _BEES_PAUSED=0
+}
+
+# Drop-in replacement for `btrfs subvolume delete` that pauses bees for the
+# duration (see _bees_pause above). Matches the existing call sites' style:
+# suppresses btrfs's own output, preserves the exit code for && / || / if.
+btrfs_subvolume_delete_safe() {
+    _bees_pause
+    btrfs subvolume delete "$@" &>/dev/null
+    local rc=$?
+    _bees_resume
+    return $rc
+}
+
 get_btrfs_available_mb() {
     local bytes
     bytes=$(btrfs filesystem usage -b "$1" 2>/dev/null | awk '/Free \(estimated\):/ {gsub(/[^0-9]/,"",$3); print $3}')
@@ -1328,7 +1377,7 @@ cleanup_old_backups() {
 
                 [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would delete: ${backup}"; continue; }
                 btrfs property set -f -ts "$MOUNT_DIR/${backup}" ro false 2>/dev/null || true
-                if btrfs subvolume delete "$MOUNT_DIR/${backup}" &>/dev/null; then
+                if btrfs_subvolume_delete_safe "$MOUNT_DIR/${backup}"; then
                     log_success "Deleted: ${backup}"
                 else
                     log_warn "Failed to delete: ${backup}"
@@ -1757,9 +1806,9 @@ restore_candidate() {
     # holds $MOUNT_DIR mounted at subvolid=5 before unmounting.
     _rc_cleanup_temp() {
         btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
-            btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
+            btrfs_subvolume_delete_safe "$MOUNT_DIR/temp_update/shanios_base" || true
         btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
-            btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+            btrfs_subvolume_delete_safe "$MOUNT_DIR/temp_update" || true
         btrfs_sync "$MOUNT_DIR"
     }
 
@@ -1771,7 +1820,7 @@ restore_candidate() {
             log "Skipping subvolume restore — @${CANDIDATE_SLOT} was not modified (backup is identical)"
             _rc_cleanup_temp
             btrfs property set -f -ts "$MOUNT_DIR/@${BACKUP_NAME}" ro false 2>/dev/null || true
-            btrfs subvolume delete "$MOUNT_DIR/@${BACKUP_NAME}" 2>/dev/null && \
+            btrfs_subvolume_delete_safe "$MOUNT_DIR/@${BACKUP_NAME}" && \
                 log "Deleted unused backup @${BACKUP_NAME} (candidate was not modified)"
             echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
             echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
@@ -1793,7 +1842,7 @@ restore_candidate() {
             log "Restoring @${CANDIDATE_SLOT} from backup @${BACKUP_NAME}..."
             if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
-                btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null
+                btrfs_subvolume_delete_safe "$MOUNT_DIR/@${CANDIDATE_SLOT}"
             else
                 log_warn "@${CANDIDATE_SLOT} does not exist, restoring directly from backup without delete"
             fi
@@ -1831,7 +1880,7 @@ restore_candidate() {
            btrfs_subvol_exists "$MOUNT_DIR/@${CURRENT_SLOT}"; then
             if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false 2>/dev/null
-                btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null || true
+                btrfs_subvolume_delete_safe "$MOUNT_DIR/@${CANDIDATE_SLOT}" || true
             fi
             if btrfs subvolume snapshot "$MOUNT_DIR/@${CURRENT_SLOT}" "$MOUNT_DIR/@${CANDIDATE_SLOT}" 2>/dev/null; then
                 btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true 2>/dev/null
@@ -1966,7 +2015,7 @@ rollback_system() {
                 die "SAFETY ABORT: @${failed_slot} is the currently booted slot — refusing to touch it"
             fi
             btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false 2>/dev/null
-            btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}" 2>/dev/null || true
+            btrfs_subvolume_delete_safe "$MOUNT_DIR/@${failed_slot}" || true
         fi
 
         run_cmd btrfs subvolume snapshot "$MOUNT_DIR/@${booted}" "$MOUNT_DIR/@${failed_slot}"
@@ -1976,9 +2025,9 @@ rollback_system() {
         echo "$failed_slot"  > "$MOUNT_DIR/@data/previous-slot"
 
         btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
-            btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
+            btrfs_subvolume_delete_safe "$MOUNT_DIR/temp_update/shanios_base" || true
         btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
-            btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+            btrfs_subvolume_delete_safe "$MOUNT_DIR/temp_update" || true
         btrfs_sync "$MOUNT_DIR"
 
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
@@ -2030,7 +2079,7 @@ rollback_system() {
 
     if btrfs_subvol_exists "$MOUNT_DIR/@${failed_slot}"; then
         run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${failed_slot}" ro false
-        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${failed_slot}"
+        run_cmd btrfs_subvolume_delete_safe "$MOUNT_DIR/@${failed_slot}"
     else
         log_warn "@${failed_slot} does not exist — restoring directly from backup without delete"
     fi
@@ -2039,9 +2088,9 @@ rollback_system() {
     log_success "Restored @${failed_slot} from @${BACKUP_NAME}"
 
     btrfs_subvol_exists "$MOUNT_DIR/temp_update/shanios_base" && \
-        btrfs subvolume delete "$MOUNT_DIR/temp_update/shanios_base" 2>/dev/null || true
+        btrfs_subvolume_delete_safe "$MOUNT_DIR/temp_update/shanios_base" || true
     btrfs_subvol_exists "$MOUNT_DIR/temp_update" && \
-        btrfs subvolume delete "$MOUNT_DIR/temp_update" 2>/dev/null || true
+        btrfs_subvolume_delete_safe "$MOUNT_DIR/temp_update" || true
     btrfs_sync "$MOUNT_DIR"
 
     # Write slot markers before unmount.
@@ -2699,8 +2748,8 @@ deploy_update() {
     local temp="$MOUNT_DIR/temp_update"
     if btrfs_subvol_exists "$temp"; then
         log_verbose "Removing leftover temp_update subvolume from previous run..."
-        btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
-        btrfs subvolume delete "$temp" 2>/dev/null
+        btrfs_subvol_exists "$temp/shanios_base" && btrfs_subvolume_delete_safe "$temp/shanios_base"
+        btrfs_subvolume_delete_safe "$temp"
         btrfs_sync "$MOUNT_DIR"
     fi
 
@@ -2716,8 +2765,8 @@ deploy_update() {
         if (( HAS_PV )); then
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 pv -p -t -e -r -b | btrfs receive "$temp" || {
-                btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
-                btrfs subvolume delete "$temp" 2>/dev/null
+                btrfs_subvol_exists "$temp/shanios_base" && btrfs_subvolume_delete_safe "$temp/shanios_base"
+                btrfs_subvolume_delete_safe "$temp"
                 btrfs_sync "$MOUNT_DIR"
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
@@ -2725,8 +2774,8 @@ deploy_update() {
         else
             timeout "$EXTRACTION_TIMEOUT" zstd -d --long=31 -T0 "$DOWNLOAD_DIR/$IMAGE_NAME" -c | \
                 btrfs receive "$temp" || {
-                btrfs_subvol_exists "$temp/shanios_base" && btrfs subvolume delete "$temp/shanios_base" 2>/dev/null
-                btrfs subvolume delete "$temp" 2>/dev/null
+                btrfs_subvol_exists "$temp/shanios_base" && btrfs_subvolume_delete_safe "$temp/shanios_base"
+                btrfs_subvolume_delete_safe "$temp"
                 btrfs_sync "$MOUNT_DIR"
                 safe_umount "$MOUNT_DIR"
                 die "Extraction failed or timed out (limit: ${EXTRACTION_TIMEOUT}s) — image may be corrupt, try re-downloading"
@@ -2739,7 +2788,7 @@ deploy_update() {
     if btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         CANDIDATE_MODIFIED="yes"
         run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro false
-        run_cmd btrfs subvolume delete "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+        run_cmd btrfs_subvolume_delete_safe "$MOUNT_DIR/@${CANDIDATE_SLOT}"
         btrfs_sync "$MOUNT_DIR"
     fi
 
@@ -2749,8 +2798,8 @@ deploy_update() {
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
 
     btrfs_subvol_exists "$temp/shanios_base" && \
-        { btrfs subvolume delete "$temp/shanios_base" 2>/dev/null || log_warn "Could not delete temp_update/shanios_base — will be cleaned on next deploy"; }
-    btrfs subvolume delete "$temp" 2>/dev/null || log_warn "Could not delete temp_update — will be cleaned on next deploy"
+        { btrfs_subvolume_delete_safe "$temp/shanios_base" || log_warn "Could not delete temp_update/shanios_base — will be cleaned on next deploy"; }
+    btrfs_subvolume_delete_safe "$temp" || log_warn "Could not delete temp_update — will be cleaned on next deploy"
     btrfs_sync "$MOUNT_DIR"
 
     [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"

@@ -777,7 +777,7 @@ _section_boot_health() {
     fi
     # Fires OnBootSec=15m; ConditionPathExists=/data/boot_in_progress — only runs
     # if boot_in_progress still exists at 15min, meaning mark-boot-success never ran
-    local cbf_enabled; cbf_enabled=$(systemctl is-enabled check-boot-failure.timer 2>/dev/null || echo "disabled")
+    local cbf_enabled; cbf_enabled=$(systemctl is-enabled check-boot-failure.timer 2>/dev/null) || true; cbf_enabled="${cbf_enabled:-disabled}"
     # Note: this timer fires OnBootSec=15m then goes inactive — is-active=inactive is normal.
     # Only check is-enabled (must be enabled) and is-failed (must not have errored).
     if [[ "$cbf_enabled" == "disabled" || "$cbf_enabled" == "missing" || "$cbf_enabled" == "not-found" ]]; then
@@ -1157,8 +1157,8 @@ _section_data_state() {
         _rec "shanios-tmpfiles-data.service failed — run: systemctl restart shanios-tmpfiles-data.service"
     elif [[ "$tmpfiles_res" == "success" ]]; then _row "tmpfiles"   "OK  shanios-tmpfiles-data ran successfully"
     fi
-    local usp_st; usp_st=$(systemctl is-active shani-user-setup.path 2>/dev/null || echo "inactive")
-    local usp_en; usp_en=$(systemctl is-enabled shani-user-setup.path 2>/dev/null || echo "disabled")
+    local usp_st; usp_st=$(systemctl is-active shani-user-setup.path 2>/dev/null) || true; usp_st="${usp_st:-inactive}"
+    local usp_en; usp_en=$(systemctl is-enabled shani-user-setup.path 2>/dev/null) || true; usp_en="${usp_en:-disabled}"
     if [[ "$usp_st" == "active" ]]; then
         _row "User watcher" "OK  shani-user-setup.path active"
     elif [[ "$usp_en" == "enabled" || "$usp_en" == "static" ]]; then
@@ -1921,7 +1921,7 @@ _section_security_services() {
     fi
     # pcscd is needed for PIV smart cards and PIV-mode YubiKeys (GPG, SSH certs).
     # FIDO2/U2F mode does NOT require pcscd — libfido2 talks to hidraw directly.
-    local pcsc_en; pcsc_en=$(systemctl is-enabled pcscd.socket 2>/dev/null || echo "")
+    local pcsc_en; pcsc_en=$(systemctl is-enabled pcscd.socket 2>/dev/null) || true; pcsc_en="${pcsc_en:-}"
     if [[ "$pcsc_en" == "enabled" || "$pcsc_en" == "static" ]]; then
         _row "pcscd"      "OK  socket enabled  (PIV smart cards / YubiKey PIV)"
     elif [[ -n "$pcsc_en" ]]; then
@@ -2007,7 +2007,7 @@ _section_security_audit() {
         # Check timer status first
         local lynis_timer_active=0
         local lynis_next=""
-        local _lynis_timer_en; _lynis_timer_en=$(systemctl is-enabled lynis.timer 2>/dev/null || echo "disabled")
+        local _lynis_timer_en; _lynis_timer_en=$(systemctl is-enabled lynis.timer 2>/dev/null) || true; _lynis_timer_en="${_lynis_timer_en:-disabled}"
         if [[ "$_lynis_timer_en" == "enabled" || "$_lynis_timer_en" == "static" ]]; then
             lynis_timer_active=1
             lynis_next=$(_timer_next_fmt lynis.timer)
@@ -2941,8 +2941,8 @@ _section_hardware() {
         fi
     fi
     if [[ -d /sys/class/bluetooth ]] || systemctl cat bluetooth.service &>/dev/null 2>&1; then
-        local bt_st; bt_st=$(systemctl is-active bluetooth.service 2>/dev/null || echo "inactive")
-        local bt_en; bt_en=$(systemctl is-enabled bluetooth.service 2>/dev/null || echo "disabled")
+        local bt_st; bt_st=$(systemctl is-active bluetooth.service 2>/dev/null) || true; bt_st="${bt_st:-inactive}"
+        local bt_en; bt_en=$(systemctl is-enabled bluetooth.service 2>/dev/null) || true; bt_en="${bt_en:-disabled}"
         local bt_hw=0; [[ -d /sys/class/bluetooth ]] && bt_hw=1
         if [[ "$bt_st" == "active" ]]; then
             _row "Bluetooth"  "OK  bluetooth.service active"
@@ -3104,8 +3104,8 @@ _section_hardware() {
     if [[ -d /sys/bus/thunderbolt ]] && \
        [[ $(ls /sys/bus/thunderbolt/devices/ 2>/dev/null | wc -l) -gt 0 ]]; then
         if _svc_present bolt; then
-            local bolt_st; bolt_st=$(systemctl is-active bolt 2>/dev/null || echo "inactive")
-            local bolt_en; bolt_en=$(systemctl is-enabled bolt 2>/dev/null || echo "disabled")
+            local bolt_st; bolt_st=$(systemctl is-active bolt 2>/dev/null) || true; bolt_st="${bolt_st:-inactive}"
+            local bolt_en; bolt_en=$(systemctl is-enabled bolt 2>/dev/null) || true; bolt_en="${bolt_en:-disabled}"
             if [[ "$bolt_st" == "active" ]]; then
                 local bolt_enrolled="" bolt_connected=""
                 if command -v boltctl &>/dev/null; then
@@ -3569,8 +3569,8 @@ _stor_check_bees() {
     fi
     local bees_unit="beesd@${bees_uuid}"
     local bees_conf="/etc/bees/${bees_uuid}.conf"
-    local bees_st;  bees_st=$(systemctl is-active  "$bees_unit" 2>/dev/null | tr -d '[:space:]' || echo "inactive")
-    local bees_en;  bees_en=$(systemctl is-enabled "$bees_unit" 2>/dev/null | tr -d '[:space:]' || echo "disabled")
+    local bees_st;  bees_st=$(systemctl is-active  "$bees_unit" 2>/dev/null | tr -d '[:space:]' ) || true; bees_st="${bees_st:-inactive}"
+    local bees_en;  bees_en=$(systemctl is-enabled "$bees_unit" 2>/dev/null | tr -d '[:space:]' ) || true; bees_en="${bees_en:-disabled}"
     local bees_short="${bees_uuid:0:8}…"
     if [[ "$bees_st" == "active" ]]; then
         local bees_dedup=""
@@ -3614,7 +3614,7 @@ _section_storage() {
     scrub_st=$(btrfs scrub status / 2>/dev/null || true)
     scrub_res=$(echo "$scrub_st" | awk '/Status:/{print $2}' | head -1 || echo "")
     local scrub_timer_state
-    scrub_timer_state=$(systemctl is-enabled btrfs-scrub.timer 2>/dev/null || echo "disabled")
+    scrub_timer_state=$(systemctl is-enabled btrfs-scrub.timer 2>/dev/null) || true; scrub_timer_state="${scrub_timer_state:-disabled}"
 
     if [[ "$scrub_timer_state" == "enabled" || "$scrub_timer_state" == "static" ]]; then
         local scrub_next_fmt; scrub_next_fmt=$(_timer_next_fmt btrfs-scrub.timer)
@@ -3647,7 +3647,7 @@ _section_storage() {
     for name in balance defrag trim; do
         local unit="btrfs-${name}.timer"
         local _t_active=0; systemctl is-active --quiet "$unit" 2>/dev/null && _t_active=1
-        local _t_state; _t_state=$(systemctl is-enabled "$unit" 2>/dev/null || echo "disabled")
+        local _t_state; _t_state=$(systemctl is-enabled "$unit" 2>/dev/null) || true; _t_state="${_t_state:-disabled}"
         if (( _t_active )) || [[ "$_t_state" == "enabled" || "$_t_state" == "static" ]]; then
             t_ok+=("$name")
         else
@@ -3689,13 +3689,13 @@ _section_storage() {
         _row "Balance"     "--  no balance recorded (run: btrfs balance start -dusage=5 / )"
     fi
     if systemctl cat fstrim.timer &>/dev/null 2>&1; then
-        local _ft_en; _ft_en=$(systemctl is-enabled fstrim.timer 2>/dev/null || echo "disabled")
+        local _ft_en; _ft_en=$(systemctl is-enabled fstrim.timer 2>/dev/null) || true; _ft_en="${_ft_en:-disabled}"
         if [[ "$_ft_en" == "enabled" || "$_ft_en" == "static" ]]; then
             local _ft_fmt; _ft_fmt=$(_timer_next_fmt fstrim.timer)
             _row "fstrim"      "OK  timer enabled${_ft_fmt:+  (next: ${_ft_fmt})}"
         else
             # Check if btrfs-trim.timer covers this (Btrfs-specific TRIM, different from fstrim.timer)
-            local _btrfs_trim_en; _btrfs_trim_en=$(systemctl is-enabled btrfs-trim.timer 2>/dev/null || echo "disabled")
+            local _btrfs_trim_en; _btrfs_trim_en=$(systemctl is-enabled btrfs-trim.timer 2>/dev/null) || true; _btrfs_trim_en="${_btrfs_trim_en:-disabled}"
             if [[ "$_btrfs_trim_en" == "enabled" || "$_btrfs_trim_en" == "static" ]]; then
                 _row "fstrim"  "--  fstrim.timer not enabled (btrfs-trim.timer enabled — Btrfs TRIM covered)"
             else
@@ -3797,7 +3797,7 @@ _section_battery() {
 _section_printing() {
     _head "Printing & Scanning"
     if getent group cups &>/dev/null; then
-        local cups_st; cups_st=$(systemctl is-active cups.socket 2>/dev/null || echo "inactive")
+        local cups_st; cups_st=$(systemctl is-active cups.socket 2>/dev/null) || true; cups_st="${cups_st:-inactive}"
         if [[ "$cups_st" == "active" ]]; then
             _row "CUPS"      "OK  cups.socket active"
         elif systemctl is-enabled cups.service &>/dev/null 2>&1 || \
@@ -3837,7 +3837,7 @@ _section_printing() {
     # Socket-activated — is-active is always inactive between scan jobs; check
     # is-enabled instead. If not enabled, all scanning silently fails.
     if command -v sane-find-scanner &>/dev/null || [[ -f /etc/sane.d/dll.conf ]]; then
-        local saned_en; saned_en=$(systemctl is-enabled saned.socket 2>/dev/null || echo "disabled")
+        local saned_en; saned_en=$(systemctl is-enabled saned.socket 2>/dev/null) || true; saned_en="${saned_en:-disabled}"
         if [[ "$saned_en" == "enabled" || "$saned_en" == "static" ]]; then
             _row "SANE"       "OK  saned.socket enabled"
         else
@@ -3999,7 +3999,7 @@ _section_servers() {
             done < /etc/rsyncd.conf
         fi
         if (( _rsyncd_cfg )); then
-            local rsyncd_st; rsyncd_st=$(systemctl is-active rsyncd 2>/dev/null || echo "inactive")
+            local rsyncd_st; rsyncd_st=$(systemctl is-active rsyncd 2>/dev/null) || true; rsyncd_st="${rsyncd_st:-inactive}"
             if [[ "$rsyncd_st" == "active" ]]; then
                 local mod_count
                 mod_count=$(grep -c '^\[' /etc/rsyncd.conf 2>/dev/null || true)
@@ -4245,8 +4245,14 @@ _section_servers() {
     if _svc_present smb; then
         if [[ -f /etc/samba/smb.conf ]] && \
            grep -E '^\[' /etc/samba/smb.conf 2>/dev/null | grep -qvE '^\[(global|homes|printers|print\$)\]'; then
-            local smbd_st; smbd_st=$(systemctl is-active smb 2>/dev/null || \
-                                      systemctl is-active smbd 2>/dev/null || echo "inactive")
+            # systemctl is-active always prints a real status (even "inactive"
+            # for a unit that doesn't exist), so chaining these with || like
+            # the old code did would run every fallback unconditionally and
+            # concatenate their output instead of trying "smb" then falling
+            # back to "smbd" only when needed.
+            local smbd_st; smbd_st=$(systemctl is-active smb 2>/dev/null) || true
+            [[ "$smbd_st" == "active" ]] || { smbd_st=$(systemctl is-active smbd 2>/dev/null) || true; }
+            smbd_st="${smbd_st:-inactive}"
             if [[ "$smbd_st" == "active" ]]; then
                 _row "Samba"      "OK  smbd running"
             elif systemctl is-enabled --quiet smb 2>/dev/null || \
@@ -4360,7 +4366,7 @@ _section_servers() {
     if _svc_present nbd-server; then
         if [[ -f /etc/nbd-server/config ]] && \
            grep -E '^\[' /etc/nbd-server/config 2>/dev/null | grep -qvE '^\[generic\]'; then
-            local nbd_st; nbd_st=$(systemctl is-active nbd-server 2>/dev/null || echo "inactive")
+            local nbd_st; nbd_st=$(systemctl is-active nbd-server 2>/dev/null) || true; nbd_st="${nbd_st:-inactive}"
             if [[ "$nbd_st" == "active" ]]; then
                 local nbd_exports
                 nbd_exports=$(grep -c '^\[' /etc/nbd-server/config 2>/dev/null || true)
@@ -4699,7 +4705,7 @@ _section_performance() {
     elif (( acpufreq_active )); then
         _row "Power"  "--  auto-cpufreq active (note: conflicts with power-profiles-daemon)"
     elif command -v power-profiles-daemon &>/dev/null; then
-        local ppd_en; ppd_en=$(systemctl is-enabled power-profiles-daemon 2>/dev/null | tr -d '[:space:]' || echo "disabled")
+        local ppd_en; ppd_en=$(systemctl is-enabled power-profiles-daemon 2>/dev/null | tr -d '[:space:]' ) || true; ppd_en="${ppd_en:-disabled}"
         _row "Power"  "!   power-profiles-daemon installed but not running (${ppd_en})"
         _rec "power-profiles-daemon not active — run: systemctl enable --now power-profiles-daemon  [auto]"
     elif (( bat_present )); then
@@ -5396,7 +5402,7 @@ _section_network() {
 
 _section_audio_display() {
     _head "Audio & Display"
-    local rtkit_st; rtkit_st=$(systemctl is-active rtkit-daemon 2>/dev/null || echo "inactive")
+    local rtkit_st; rtkit_st=$(systemctl is-active rtkit-daemon 2>/dev/null) || true; rtkit_st="${rtkit_st:-inactive}"
     if [[ "$rtkit_st" == "active" ]]; then
         _row "rtkit"     "OK  running"
     elif command -v pipewire &>/dev/null || command -v pulseaudio &>/dev/null; then
@@ -5606,7 +5612,7 @@ _section_units() {
 _section_package_managers() {
     _head "Package Managers"
     if command -v flatpak &>/dev/null; then
-        local flatpak_sys; flatpak_sys=$(systemctl is-enabled flatpak-update-system.timer 2>/dev/null || echo "disabled")
+        local flatpak_sys; flatpak_sys=$(systemctl is-enabled flatpak-update-system.timer 2>/dev/null) || true; flatpak_sys="${flatpak_sys:-disabled}"
         local flatpak_usr; flatpak_usr=$(_sysd_user is-enabled flatpak-update-user.timer 2>/dev/null || echo "disabled")
         local flatpak_apps flatpak_remotes flatpak_mb
         flatpak_apps=$(timeout 5 flatpak list --app --columns=application 2>/dev/null | wc -l || echo "?")
@@ -5640,8 +5646,8 @@ _section_package_managers() {
         fi
     fi
     if findmnt -n /var/lib/snapd &>/dev/null; then
-        local snapd_sock; snapd_sock=$(systemctl is-active snapd.socket 2>/dev/null || echo "inactive")
-        local snapd_aa;   snapd_aa=$(systemctl is-active snapd.apparmor.service 2>/dev/null || echo "inactive")
+        local snapd_sock; snapd_sock=$(systemctl is-active snapd.socket 2>/dev/null) || true; snapd_sock="${snapd_sock:-inactive}"
+        local snapd_aa;   snapd_aa=$(systemctl is-active snapd.apparmor.service 2>/dev/null) || true; snapd_aa="${snapd_aa:-inactive}"
         local snap_count=""
         if [[ "$snapd_sock" == "active" ]] && command -v snap &>/dev/null; then
             snap_count=$(timeout 5 snap list 2>/dev/null | tail -n +2 | wc -l || echo "")
@@ -5751,7 +5757,7 @@ _section_package_managers() {
     fi
     if _svc_present man-db.timer; then
         local _mandb_active=0; systemctl is-active --quiet man-db.timer 2>/dev/null && _mandb_active=1
-        local _mandb_en; _mandb_en=$(systemctl is-enabled man-db.timer 2>/dev/null || echo "disabled")
+        local _mandb_en; _mandb_en=$(systemctl is-enabled man-db.timer 2>/dev/null) || true; _mandb_en="${_mandb_en:-disabled}"
         if (( _mandb_active )) || [[ "$_mandb_en" == "enabled" || "$_mandb_en" == "static" ]]; then
             _row "man-db"      "OK  cache rebuild timer active"
         else
@@ -5760,7 +5766,7 @@ _section_package_managers() {
     fi
     if _svc_present plocate-updatedb.timer; then
         local _pl_active=0; systemctl is-active --quiet plocate-updatedb.timer 2>/dev/null && _pl_active=1
-        local _pl_en; _pl_en=$(systemctl is-enabled plocate-updatedb.timer 2>/dev/null || echo "disabled")
+        local _pl_en; _pl_en=$(systemctl is-enabled plocate-updatedb.timer 2>/dev/null) || true; _pl_en="${_pl_en:-disabled}"
         if (( _pl_active )) || [[ "$_pl_en" == "enabled" || "$_pl_en" == "static" ]]; then
             local _pl_last=""
             _pl_last=$(systemctl show plocate-updatedb.service \
@@ -5786,7 +5792,7 @@ _section_package_managers() {
     fi
     _optional_begin
     if _svc_present reflector; then
-        local _ref_en; _ref_en=$(systemctl is-enabled reflector.timer 2>/dev/null || echo "disabled")
+        local _ref_en; _ref_en=$(systemctl is-enabled reflector.timer 2>/dev/null) || true; _ref_en="${_ref_en:-disabled}"
         if [[ "$_ref_en" == "enabled" || "$_ref_en" == "static" ]]; then
             _row "reflector"   "OK  mirror update timer active"
         else
@@ -5808,7 +5814,7 @@ _section_containers() {
     _head "Containers"
     if command -v podman &>/dev/null; then
         local podman_sys_st podman_usr_st podman_ver=""
-        podman_sys_st=$(systemctl is-active podman.socket 2>/dev/null || echo "inactive")
+        podman_sys_st=$(systemctl is-active podman.socket 2>/dev/null) || true; podman_sys_st="${podman_sys_st:-inactive}"
         podman_usr_st=$(_sysd_user is-active podman.socket 2>/dev/null || echo "inactive")
         podman_ver=$(podman --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
         # Rootless capable: needs unprivileged userns + subuid
@@ -5970,7 +5976,7 @@ _section_containers() {
         fi
     fi
     if (( ! _is_podman_docker )) && { _svc_present docker; }; then
-        local docker_st; docker_st=$(systemctl is-active docker 2>/dev/null || echo "inactive")
+        local docker_st; docker_st=$(systemctl is-active docker 2>/dev/null) || true; docker_st="${docker_st:-inactive}"
         local docker_ver; docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
         if [[ "$docker_st" == "active" ]]; then
             local docker_running=""
@@ -6001,7 +6007,7 @@ _section_containers() {
         fi
     fi
     if findmnt -n /var/lib/waydroid &>/dev/null; then
-        local waydroid_st; waydroid_st=$(systemctl is-active waydroid-container 2>/dev/null || echo "inactive")
+        local waydroid_st; waydroid_st=$(systemctl is-active waydroid-container 2>/dev/null) || true; waydroid_st="${waydroid_st:-inactive}"
         local waydroid_mb=$(du -sm /var/lib/waydroid 2>/dev/null | awk '{print $1}' || echo "")
         local wd_sz_str=""
         [[ "$waydroid_mb" =~ ^[0-9]+$ ]] && wd_sz_str="  ($(_mb_to_human "$waydroid_mb"))"
@@ -6023,7 +6029,7 @@ _section_containers() {
         systemctl list-units 'systemd-nspawn@*.service' --no-legend --no-pager 2>/dev/null \
             | grep -q . && has_machines=1
         if (( has_machines )); then
-            local machined_st; machined_st=$(systemctl is-active systemd-machined 2>/dev/null || echo "inactive")
+            local machined_st; machined_st=$(systemctl is-active systemd-machined 2>/dev/null) || true; machined_st="${machined_st:-inactive}"
             if [[ "$machined_st" == "active" ]]; then
                 # Gather per-machine info: name, state, IP, OS
                 local _mc_raw=""
@@ -6280,7 +6286,7 @@ _section_virtualization() {
 
             # libvirt-guests — saves/restores VMs on host shutdown
             if systemctl cat libvirt-guests.service &>/dev/null 2>&1; then
-                local lg_en; lg_en=$(systemctl is-enabled libvirt-guests.service 2>/dev/null || echo "disabled")
+                local lg_en; lg_en=$(systemctl is-enabled libvirt-guests.service 2>/dev/null) || true; lg_en="${lg_en:-disabled}"
                 if [[ "$lg_en" == "enabled" ]]; then
                     _row "virt-guests" "OK  enabled (VMs saved/restored on host shutdown)"
                 else
@@ -6501,7 +6507,7 @@ _section_firmware() {
 
     # fwupd.service — D-Bus activated so inactive between calls is normal;
     # only flag if not enabled or in failed state.
-    local fwupd_en; fwupd_en=$(systemctl is-enabled fwupd.service 2>/dev/null || echo "disabled")
+    local fwupd_en; fwupd_en=$(systemctl is-enabled fwupd.service 2>/dev/null) || true; fwupd_en="${fwupd_en:-disabled}"
     if [[ "$fwupd_en" == "enabled" || "$fwupd_en" == "static" ]]; then
         if systemctl is-failed --quiet fwupd.service 2>/dev/null; then
             _row "fwupd svc"  "!!  fwupd.service failed — firmware updates broken"
@@ -6512,7 +6518,7 @@ _section_firmware() {
     fi
 
     # fwupd-refresh.timer — must be enabled for automatic firmware update checks
-    local refresh_timer; refresh_timer=$(systemctl is-enabled fwupd-refresh.timer 2>/dev/null || echo "disabled")
+    local refresh_timer; refresh_timer=$(systemctl is-enabled fwupd-refresh.timer 2>/dev/null) || true; refresh_timer="${refresh_timer:-disabled}"
     if [[ "$refresh_timer" == "enabled" || "$refresh_timer" == "static" ]]; then _row "fwupd tmr"  "OK  fwupd-refresh.timer enabled"
     else
         _row "fwupd tmr"  "!!  fwupd-refresh.timer not enabled — firmware checks won't run automatically"
@@ -6531,7 +6537,7 @@ _section_firmware() {
         _row "Updates"   "OK  up to date (cached)"
     fi
     if _svc_present passim; then
-        local _passim_en=$(systemctl is-enabled passim 2>/dev/null || echo "disabled")
+        local _passim_en=$(systemctl is-enabled passim 2>/dev/null) || true; _passim_en="${_passim_en:-disabled}"
         if systemctl is-active --quiet passim 2>/dev/null; then
             _row "passim"      "OK  running (local update cache active)"
         elif [[ "$_passim_en" == "static" ]]; then
@@ -6632,9 +6638,9 @@ _section_monitoring() {
     # service + collect + summary timers all needed for sar/iostat history.
     if _svc_present sysstat.service; then
         local _ss_svc _ss_collect _ss_summary
-        _ss_svc=$(systemctl is-active sysstat.service 2>/dev/null || echo "inactive")
-        _ss_collect=$(systemctl is-enabled sysstat-collect.timer 2>/dev/null || echo "disabled")
-        _ss_summary=$(systemctl is-enabled sysstat-summary.timer 2>/dev/null || echo "disabled")
+        _ss_svc=$(systemctl is-active sysstat.service 2>/dev/null) || true; _ss_svc="${_ss_svc:-inactive}"
+        _ss_collect=$(systemctl is-enabled sysstat-collect.timer 2>/dev/null) || true; _ss_collect="${_ss_collect:-disabled}"
+        _ss_summary=$(systemctl is-enabled sysstat-summary.timer 2>/dev/null) || true; _ss_summary="${_ss_summary:-disabled}"
         local _ss_collect_ok=0 _ss_summary_ok=0
         [[ "$_ss_collect" == "enabled" || "$_ss_collect" == "static" ]] && _ss_collect_ok=1
         [[ "$_ss_summary" == "enabled" || "$_ss_summary" == "static" ]] && _ss_summary_ok=1
@@ -6657,7 +6663,7 @@ _section_monitoring() {
     # Without it, logs grow unbounded. Only the timer needs to be active.
     if _svc_present logrotate; then
         local _lr_active=0; systemctl is-active --quiet logrotate.timer 2>/dev/null && _lr_active=1
-        local _lr_en; _lr_en=$(systemctl is-enabled logrotate.timer 2>/dev/null || echo "disabled")
+        local _lr_en; _lr_en=$(systemctl is-enabled logrotate.timer 2>/dev/null) || true; _lr_en="${_lr_en:-disabled}"
         local _lr_enabled=0
         [[ "$_lr_en" == "enabled" || "$_lr_en" == "static" ]] && _lr_enabled=1
         if (( _lr_active || _lr_enabled )); then
@@ -6686,7 +6692,7 @@ _section_monitoring() {
     # Purges stale sockets, old locks, and cruft from /tmp, /var/tmp, /run.
     if systemctl cat systemd-tmpfiles-clean.timer &>/dev/null 2>&1; then
         local _tfc_active=0; systemctl is-active --quiet systemd-tmpfiles-clean.timer 2>/dev/null && _tfc_active=1
-        local _tfc_en; _tfc_en=$(systemctl is-enabled systemd-tmpfiles-clean.timer 2>/dev/null || echo "disabled")
+        local _tfc_en; _tfc_en=$(systemctl is-enabled systemd-tmpfiles-clean.timer 2>/dev/null) || true; _tfc_en="${_tfc_en:-disabled}"
         if (( _tfc_active )) || [[ "$_tfc_en" == "enabled" || "$_tfc_en" == "static" ]]; then
             _row "tmpfiles"    "OK  cleanup timer active"
         else
@@ -6713,7 +6719,7 @@ _section_monitoring() {
                 _row "auditd"    "OK  running (${audit_rules} rule(s))"
             fi
         else
-            local audit_en; audit_en=$(systemctl is-enabled auditd 2>/dev/null || echo "disabled")
+            local audit_en; audit_en=$(systemctl is-enabled auditd 2>/dev/null) || true; audit_en="${audit_en:-disabled}"
             if [[ "$audit_en" == "enabled" ]]; then _row "auditd"    "!   enabled but not running"
                     else
                 _row "auditd"    "~~  not enabled"
@@ -6725,7 +6731,7 @@ _section_monitoring() {
         td_out=$(timedatectl show 2>/dev/null || true)
         ntp_active=$(echo "$td_out" | awk -F= '/^NTP=/{print $2}'             | tr -d '[:space:]')
         ntp_synced=$(echo "$td_out" | awk -F= '/^NTPSynchronized=/{print $2}' | tr -d '[:space:]')
-        tsync=$(systemctl is-active systemd-timesyncd 2>/dev/null || echo "inactive")
+        tsync=$(systemctl is-active systemd-timesyncd 2>/dev/null) || true; tsync="${tsync:-inactive}"
         if [[ "$ntp_synced" == "yes" && "$tsync" == "active" ]]; then
             local _ntp_server="" _ntp_offset=""
             _ntp_server=$(timedatectl timesync-status 2>/dev/null \
@@ -6832,7 +6838,7 @@ _section_monitoring() {
     # journal-upload pushes local logs to a remote collector.
     for _jfwd_unit in systemd-journal-remote systemd-journal-upload; do
         if systemctl cat "${_jfwd_unit}" &>/dev/null 2>&1; then
-            local _jfwd_en=$(systemctl is-enabled "${_jfwd_unit}" 2>/dev/null || echo "disabled")
+            local _jfwd_en=$(systemctl is-enabled "${_jfwd_unit}" 2>/dev/null) || true; _jfwd_en="${_jfwd_en:-disabled}"
             if systemctl is-active --quiet "${_jfwd_unit}" 2>/dev/null; then
                 _row "${_jfwd_unit##*-}"  "OK  ${_jfwd_unit} running"
             elif [[ "$_jfwd_en" == "static" ]]; then
@@ -7015,7 +7021,7 @@ _section_coredump() {
 
     # Is systemd-coredump installed and the socket present?
     if systemctl cat systemd-coredump.socket &>/dev/null 2>&1; then
-        local _cd_en; _cd_en=$(systemctl is-enabled systemd-coredump.socket 2>/dev/null || echo "")
+        local _cd_en; _cd_en=$(systemctl is-enabled systemd-coredump.socket 2>/dev/null) || true; _cd_en="${_cd_en:-}"
         local _cd_failed=0
         systemctl is-failed --quiet systemd-coredump.socket 2>/dev/null && _cd_failed=1
         if (( _cd_failed )); then
@@ -7087,7 +7093,7 @@ _section_system_health() {
     fi
     if systemctl is-active --quiet systemd-logind 2>/dev/null; then _row "logind"       "OK  running"
     else
-        local _logind_en; _logind_en=$(systemctl is-enabled systemd-logind 2>/dev/null || echo "")
+        local _logind_en; _logind_en=$(systemctl is-enabled systemd-logind 2>/dev/null) || true; _logind_en="${_logind_en:-}"
         if [[ "$_logind_en" == "enabled" || "$_logind_en" == "static" ]]; then
             _row "logind"   "!!  not running — session/seat management broken"
         else
@@ -7503,16 +7509,16 @@ security_report() {
 
     _focused_header "ShaniOS Security Report"
 
-    _section_immutability
+    _section_immutability || true
     _section_secureboot         "$booted" uki_booted_bad "$hibernate_stale"
     _section_kernel_security    "$sb_active"
-    _section_encryption
+    _section_encryption || true
     _section_tpm2
-    _section_security_services
-    _section_security_audit
+    _section_security_services || true
+    _section_security_audit || true
     _section_krb5
-    _section_users
-    _section_groups
+    _section_users || true
+    _section_groups || true
 
     _recs_print "No security issues found"
     _esp_umount
@@ -7523,40 +7529,40 @@ system_info() {
 
     _focused_header "ShaniOS System Status"
     _section_os_slots           "$booted"
-    _section_boot_health
-    _section_boot_entries
-    _section_deployment
-    _section_update_tools
-    _section_data_state
-    _section_immutability
+    _section_boot_health || true
+    _section_boot_entries || true
+    _section_deployment || true
+    _section_update_tools || true
+    _section_data_state || true
+    _section_immutability || true
     _section_secureboot         "$booted" uki_booted_bad "$hibernate_stale"
     _section_kernel_security    "$sb_active"
-    _section_encryption
+    _section_encryption || true
     _section_tpm2
-    _section_security_services
-    _section_security_audit
+    _section_security_services || true
+    _section_security_audit || true
     _section_krb5
-    _section_users
-    _section_groups
-    _section_hardware
+    _section_users || true
+    _section_groups || true
+    _section_hardware || true
     _section_disk               "$booted" hibernate_stale "$uki_booted_bad"
-    _section_battery
-    _section_storage
-    _section_firmware
-    _section_performance
-    _section_network
-    _section_servers
-    _section_audio_display
-    _section_printing
-    _section_package_managers
-    _section_backup_tools
-    _section_containers
-    _section_virtualization
-    _section_monitoring
-    _section_runtime_health
-    _section_units
-    _section_coredump
-    _section_system_health
+    _section_battery || true
+    _section_storage || true
+    _section_firmware || true
+    _section_performance || true
+    _section_network || true
+    _section_servers || true
+    _section_audio_display || true
+    _section_printing || true
+    _section_package_managers || true
+    _section_backup_tools || true
+    _section_containers || true
+    _section_virtualization || true
+    _section_monitoring || true
+    _section_runtime_health || true
+    _section_units || true
+    _section_coredump || true
+    _section_system_health || true
 
     _recs_print "All checks passed — no issues found"
     _esp_umount
@@ -8059,7 +8065,7 @@ analyze_storage() {
     local scrub_st scrub_res
     scrub_st=$(btrfs scrub status / 2>/dev/null || true)
     scrub_res=$(echo "$scrub_st" | awk '/Status:/{print $2}' | head -1 || echo "")
-    local scrub_timer; scrub_timer=$(systemctl is-enabled btrfs-scrub.timer 2>/dev/null || echo "disabled")
+    local scrub_timer; scrub_timer=$(systemctl is-enabled btrfs-scrub.timer 2>/dev/null) || true; scrub_timer="${scrub_timer:-disabled}"
     if [[ "$scrub_timer" == "enabled" || "$scrub_timer" == "static" ]]; then _row "Scrub tmr"  "OK  enabled"
     else
         _row "Scrub tmr"  "!!  btrfs-scrub.timer not enabled"
@@ -8085,7 +8091,7 @@ analyze_storage() {
     local t_ok=() t_bad=()
     for name in balance defrag trim; do
         local _t_act=0; systemctl is-active --quiet "btrfs-${name}.timer" 2>/dev/null && _t_act=1
-        local _t_st; _t_st=$(systemctl is-enabled "btrfs-${name}.timer" 2>/dev/null || echo "disabled")
+        local _t_st; _t_st=$(systemctl is-enabled "btrfs-${name}.timer" 2>/dev/null) || true; _t_st="${_t_st:-disabled}"
         if (( _t_act )) || [[ "$_t_st" == "enabled" || "$_t_st" == "static" ]]; then
             t_ok+=("$name")
         else
@@ -8362,12 +8368,12 @@ boot_report() {
     _focused_header "ShaniOS Boot Report"
 
     _section_os_slots          "$booted"
-    _section_boot_health
-    _section_boot_entries
-    _section_deployment
-    _section_update_tools
-    _section_data_state
-    _section_immutability
+    _section_boot_health || true
+    _section_boot_entries || true
+    _section_deployment || true
+    _section_update_tools || true
+    _section_data_state || true
+    _section_immutability || true
     _section_secureboot        "$booted" uki_booted_bad "$hibernate_stale"
 
     _focused_summary
@@ -8378,8 +8384,8 @@ network_report() {
     _recs_reset
     _focused_header "ShaniOS Network Report"
 
-    _section_network
-    _section_servers
+    _section_network || true
+    _section_servers || true
 
     _focused_summary
 }
@@ -8389,11 +8395,11 @@ hardware_report() {
 
     _focused_header "ShaniOS Hardware Report"
 
-    _section_hardware
+    _section_hardware || true
     _section_disk              "$booted" hibernate_stale "$uki_booted_bad"
-    _section_battery
-    _section_storage
-    _section_firmware
+    _section_battery || true
+    _section_storage || true
+    _section_firmware || true
 
     _focused_summary
     _esp_umount
@@ -8403,11 +8409,11 @@ packages_report() {
     _recs_reset
     _focused_header "ShaniOS Package Report"
 
-    _section_package_managers
-    _section_backup_tools
-    _section_containers
-    _section_virtualization
-    _section_monitoring
+    _section_package_managers || true
+    _section_backup_tools || true
+    _section_containers || true
+    _section_virtualization || true
+    _section_monitoring || true
 
     _focused_summary
 }

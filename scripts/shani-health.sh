@@ -137,6 +137,115 @@ _row() {
         *)    coloured="$val" ;;  # no prefix recognised — pass through verbatim
     esac
     printf "    ${_C_BOLD}%-12s${_C_RESET}  %b\n" "$key" "$coloured"
+
+    # Record for structured output (JSON/Nagios/Prometheus)
+    _record_check "$key" "$prefix" "$rest"
+}
+
+# Continuation line — indented to align under the value column
+_row2() {
+    local text="$1"
+    # Colour-map leading sigils in continuation lines too
+    local prefix="${text%%  *}"
+    local rest="${text#*  }"
+    local coloured
+    case "$prefix" in
+        "!!")  coloured="${_C_RED}${_SYM_ERR}${_C_RESET}  ${rest}" ;;
+        "!")   coloured="${_C_YELLOW}${_SYM_WARN}${_C_RESET}  ${rest}" ;;
+        "--")  coloured="${_C_DIM}${_SYM_INFO}${_C_RESET}  ${rest}" ;;
+        "~~")  coloured="${_C_CYAN}${_SYM_IDLE}${_C_RESET}  ${rest}" ;;
+        ">>")  coloured="${_C_GREEN}${_C_DIM}${_SYM_READY}${_C_RESET}  ${rest}" ;;
+        "->")  coloured="${_C_CYAN}${_SYM_SPIN}${_C_RESET}  ${rest}" ;;
+        *)     coloured="$text" ;;
+    esac
+    printf "    %-14s%b\n" "" "$coloured"
+
+    # Record for structured output
+    _record_check "row2" "$prefix" "$rest"
+}
+
+# Generic check recording for structured output (JSON/Nagios/Prometheus)
+# Called by _row and _row2 to accumulate results
+_REPORT_RESULTS=()
+_RECORD_SECTION=""
+_record_check() {
+    local key="$1" prefix="$2" rest="$3"
+    local status
+    case "$prefix" in
+        OK)   status="ok" ;;
+        !!)   status="critical" ;;
+        "!")  status="warning" ;;
+        "--") status="info" ;;
+        "~~") status="idle" ;;
+        ">>") status="ready" ;;
+        "->") status="pending" ;;
+        *)    status="unknown" ;;
+    esac
+    # Store: section|key|status|message
+    _REPORT_RESULTS+=("${_RECORD_SECTION}|${key}|${status}|${rest}")
+}
+
+# Set current section for recording
+_set_section() {
+    _RECORD_SECTION="$1"
+}
+
+# Emit accumulated results as JSON
+_print_json() {
+    local out="{\"timestamp\":\"$(date -Iseconds)\",\"checks\":["
+    local first=1 entry section key status msg
+    for entry in "${_REPORT_RESULTS[@]}"; do
+        IFS='|' read -r section key status msg <<< "$entry"
+        (( first )) || out+=","
+        first=0
+        out+="{\"section\":\"$(_json_escape "$section")\",\"key\":\"$(_json_escape "$key")\",\"status\":\"${status}\",\"message\":\"$(_json_escape "$msg")\"}"
+    done
+    out+="]}"
+    echo "$out"
+}
+
+# Emit accumulated results as Nagios-compatible output
+_print_nagios() {
+    local exit_code=0
+    local first=1 entry section key status msg
+    for entry in "${_REPORT_RESULTS[@]}"; do
+        IFS='|' read -r section key status msg <<< "$entry"
+        case "$status" in
+            critical) exit_code=2 ;;
+            warning)  [[ $exit_code -lt 1 ]] && exit_code=1 ;;
+        esac
+        # Nagios format: SERVICE - STATUS: MESSAGE | PERFDATA
+        printf "%s - %s: %s\n" "$(_nagios_escape "$section $key")" "$(_nagios_escape "$status")" "$(_nagios_escape "$msg")"
+    done
+    exit $exit_code
+}
+
+# Emit accumulated results as Prometheus text format
+_print_prometheus() {
+    local entry section key status msg
+    local -A gauge_map=([ok]=1 [critical]=2 [warning]=1 [info]=0 [idle]=0 [ready]=1 [pending]=1 [unknown]=0)
+    for entry in "${_REPORT_RESULTS[@]}"; do
+        IFS='|' read -r section key status msg <<< "$entry"
+        local val=${gauge_map[$status]:-0}
+        # Sanitize label names for Prometheus
+        local safe_section="${section//[^a-zA-Z0-9_]/_}"
+        local safe_key="${key//[^a-zA-Z0-9_]/_}"
+        printf 'shani_health_check{section="%s",key="%s",status="%s"} %d\n' "$safe_section" "$safe_key" "$status" "$val"
+    done
+}
+
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+_nagios_escape() {
+    local s="$1"
+    s="${s//|/ }"
+    s="${s//;/ }"
+    printf '%s' "$s"
 }
 
 # Continuation line — indented to align under the value column
@@ -7519,6 +7628,8 @@ security_report() {
     _section_krb5
     _section_users || true
     _section_groups || true
+    _check_ssh_hardening
+    _check_auto_updates
 
     _recs_print "No security issues found"
     _esp_umount
@@ -7549,6 +7660,7 @@ system_info() {
     _section_battery || true
     _section_storage || true
     _section_firmware || true
+    _check_firmware_updates
     _section_performance || true
     _section_network || true
     _section_servers || true
@@ -7604,11 +7716,220 @@ clear_boot_failure() {
 # or not --json was passed.
 _CHECK_RESULTS=()
 
-_json_escape() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    printf '%s' "$s"
+# Trend data for historical comparison
+_PREV_RESULTS=()
+
+_load_trend() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    mapfile -t _PREV_RESULTS < "$file" 2>/dev/null || true
+}
+
+_save_trend() {
+    local file="$1"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || true
+    printf '%s\n' "${_REPORT_RESULTS[@]}" > "$file" 2>/dev/null || true
+}
+
+# Check for firmware updates via fwupdmgr
+_check_firmware_updates() {
+    _set_section "firmware"
+    if command -v fwupdmgr &>/dev/null; then
+        local updates
+        updates=$(fwupdmgr get-updates 2>/dev/null | grep -c "Update available" || echo "0")
+        if (( updates > 0 )); then
+            _row "fwupdmgr" "!   ${updates} firmware update(s) available"
+            _rec "Run: fwupdmgr update"
+        else
+            _row "fwupdmgr" "OK  no firmware updates"
+        fi
+    else
+        _row "fwupdmgr" "--  not installed"
+    fi
+}
+
+# Check SSH hardening
+_check_ssh_hardening() {
+    _set_section "ssh"
+    local sshd_config="/etc/ssh/sshd_config"
+    [[ -f "$sshd_config" ]] || { _row "sshd_config" "!!  not found"; return; }
+
+    local issues=0
+    # PermitRootLogin
+    local prl
+    prl=$(grep -i '^PermitRootLogin' "$sshd_config" | awk '{print $2}' | tr -d '[:space:]' || echo "yes")
+    if [[ "${prl,,}" != "no" && "${prl,,}" != "prohibit-password" && "${prl,,}" != "without-password" ]]; then
+        _row "PermitRootLogin" "!!  set to '${prl}' (should be 'no' or 'prohibit-password')"
+        _rec "Set PermitRootLogin no in $sshd_config"
+        ((issues++))
+    else
+        _row "PermitRootLogin" "OK  ${prl}"
+    fi
+
+    # PasswordAuthentication
+    local pa
+    pa=$(grep -i '^PasswordAuthentication' "$sshd_config" | awk '{print $2}' | tr -d '[:space:]' || echo "yes")
+    if [[ "${pa,,}" != "no" ]]; then
+        _row "PasswordAuth" "!!  enabled (should be 'no')"
+        _rec "Set PasswordAuthentication no in $sshd_config"
+        ((issues++))
+    else
+        _row "PasswordAuth" "OK  disabled"
+    fi
+
+    # PubkeyAuthentication
+    local pka
+    pka=$(grep -i '^PubkeyAuthentication' "$sshd_config" | awk '{print $2}' | tr -d '[:space:]' || echo "yes")
+    if [[ "${pka,,}" != "yes" ]]; then
+        _row "PubkeyAuth" "!!  disabled (should be 'yes')"
+        _rec "Set PubkeyAuthentication yes in $sshd_config"
+        ((issues++))
+    else
+        _row "PubkeyAuth" "OK  enabled"
+    fi
+
+    # MaxAuthTries
+    local mat
+    mat=$(grep -i '^MaxAuthTries' "$sshd_config" | awk '{print $2}' | tr -d '[:space:]' || echo "6")
+    if (( mat > 3 )); then
+        _row "MaxAuthTries" "!   set to ${mat} (recommend <= 3)"
+        _rec "Set MaxAuthTries 3 in $sshd_config"
+    else
+        _row "MaxAuthTries" "OK  ${mat}"
+    fi
+
+    # ClientAliveInterval (keepalive)
+    local cai
+    cai=$(grep -i '^ClientAliveInterval' "$sshd_config" | awk '{print $2}' | tr -d '[:space:]' || echo "0")
+    if (( cai == 0 )); then
+        _row "ClientAlive" "!   no keepalive (recommend 300)"
+        _rec "Set ClientAliveInterval 300 in $sshd_config"
+    else
+        _row "ClientAlive" "OK  ${cai}s"
+    fi
+
+    if (( issues == 0 )); then
+        _row "SSH Hardening" "OK  all checks passed"
+    fi
+}
+
+# Check auto-update configuration
+_check_auto_updates() {
+    _set_section "updates"
+    local issues=0
+
+    # Check for unattended-upgrades / pacman-auto-update
+    if systemctl cat unattended-upgrades.service &>/dev/null; then
+        if systemctl is-enabled --quiet unattended-upgrades.service; then
+            _row "unattended-upgrades" "OK  enabled"
+        else
+            _row "unattended-upgrades" "!   installed but disabled"
+            _rec "Enable: systemctl enable --now unattended-upgrades"
+            ((issues++))
+        fi
+    elif systemctl cat pacman-auto-update.service &>/dev/null; then
+        if systemctl is-enabled --quiet pacman-auto-update.service; then
+            _row "pacman-auto-update" "OK  enabled"
+        else
+            _row "pacman-auto-update" "!   installed but disabled"
+            _rec "Enable: systemctl enable --now pacman-auto-update"
+            ((issues++))
+        fi
+    elif systemctl cat shani-update.timer &>/dev/null; then
+        if systemctl is-enabled --quiet shani-update.timer; then
+            _row "shani-update" "OK  timer enabled"
+        else
+            _row "shani-update" "!   timer disabled"
+            _rec "Enable: systemctl enable --now shani-update.timer"
+            ((issues++))
+        fi
+    else
+        _row "Auto-updates" "!!  no auto-update mechanism detected"
+        _rec "Install and enable unattended-upgrades, pacman-auto-update, or shani-update.timer"
+        ((issues++))
+    fi
+
+    # Check pacman refresh timer
+    if systemctl is-enabled --quiet pacman-db-refresh.timer 2>/dev/null; then
+        _row "pacman-db-refresh" "OK  enabled"
+    else
+        _row "pacman-db-refresh" "!   timer disabled"
+        _rec "Enable: systemctl enable --now pacman-db-refresh.timer"
+    fi
+
+    # Check for pending updates
+    if command -v checkupdates &>/dev/null; then
+        local pending
+        pending=$(checkupdates 2>/dev/null | wc -l || echo "0")
+        if (( pending > 0 )); then
+            _row "Pending Updates" "!   ${pending} package(s) available"
+            _rec "Run: pacman -Syu"
+        else
+            _row "Pending Updates" "OK  system up to date"
+        fi
+    fi
+
+    if (( issues == 0 )); then
+        _row "Auto-Updates" "OK  all checks passed"
+    fi
+}
+
+# Auto-fix safe issues (--fix mode)
+_fix_issues() {
+    [[ "$FIX_MODE" == "yes" ]] || return 0
+    _log_section "Auto-Fix Mode"
+
+    # Fix: enable shani-update.timer if disabled
+    if systemctl cat shani-update.timer &>/dev/null && ! systemctl is-enabled --quiet shani-update.timer; then
+        _log "Enabling shani-update.timer..."
+        systemctl enable --now shani-update.timer 2>/dev/null && _log_ok "Enabled shani-update.timer" || _log_warn "Failed to enable shani-update.timer"
+    fi
+
+    # Fix: enable pacman-db-refresh.timer if disabled
+    if systemctl cat pacman-db-refresh.timer &>/dev/null && ! systemctl is-enabled --quiet pacman-db-refresh.timer; then
+        _log "Enabling pacman-db-refresh.timer..."
+        systemctl enable --now pacman-db-refresh.timer 2>/dev/null && _log_ok "Enabled pacman-db-refresh.timer" || _log_warn "Failed to enable pacman-db-refresh.timer"
+    fi
+
+    # Fix: enable check-boot-failure.timer if disabled
+    if systemctl cat check-boot-failure.timer &>/dev/null && ! systemctl is-enabled --quiet check-boot-failure.timer; then
+        _log "Enabling check-boot-failure.timer..."
+        systemctl enable --now check-boot-failure.timer 2>/dev/null && _log_ok "Enabled check-boot-failure.timer" || _log_warn "Failed to enable check-boot-failure.timer"
+    fi
+
+    # Fix: enable btrfs maintenance timers if disabled
+    for timer in btrfs-scrub.timer btrfs-balance.timer btrfs-trim.timer; do
+        if systemctl cat "$timer" &>/dev/null && ! systemctl is-enabled --quiet "$timer"; then
+            _log "Enabling $timer..."
+            systemctl enable --now "$timer" 2>/dev/null && _log_ok "Enabled $timer" || _log_warn "Failed to enable $timer"
+        fi
+    done
+
+    # Fix: enable beesd if available and not running
+    local uuid
+    uuid=$(blkid -s UUID -o value "/dev/disk/by-label/${ROOTLABEL}" 2>/dev/null || true)
+    if [[ -n "$uuid" ]] && systemctl cat "beesd@${uuid}.service" &>/dev/null && ! systemctl is-active --quiet "beesd@${uuid}.service"; then
+        _log "Starting beesd@${uuid}.service..."
+        systemctl start "beesd@${uuid}.service" 2>/dev/null && _log_ok "Started beesd@${uuid}.service" || _log_warn "Failed to start beesd@${uuid}.service"
+    fi
+
+    # Fix: enable firewalld if not running
+    if systemctl cat firewalld.service &>/dev/null && ! systemctl is-active --quiet firewalld.service; then
+        _log "Starting firewalld..."
+        systemctl start firewalld 2>/dev/null && _log_ok "Started firewalld" || _log_warn "Failed to start firewalld"
+    fi
+
+    # Fix: set keymap if live != vconsole.conf
+    local live_keymap="" vconsole_km=""
+    if command -v localectl &>/dev/null; then
+        local _lctl_os; _lctl_os=$(localectl status 2>/dev/null || echo "")
+        live_keymap=$(echo "$_lctl_os" | awk -F': ' '/VC Keymap/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "")
+    fi
+    vconsole_km=$(grep -E '^KEYMAP=' /etc/vconsole.conf 2>/dev/null | cut -d= -f2 | tr -d "\"'" | tr -cd 'A-Za-z0-9._-' || echo "")
+    if [[ -n "$live_keymap" && -n "$vconsole_km" && "$live_keymap" != "$vconsole_km" ]]; then
+        _log "Syncing live keymap to vconsole.conf..."
+        localectl set-keymap "$vconsole_km" 2>/dev/null && _log_ok "Keymap synced" || _log_warn "Failed to sync keymap"
+    fi
 }
 
 # _check_pass/_check_fail/_check_warn NAME MESSAGE
@@ -8704,6 +9025,9 @@ Options:
   --clean-logs [DAYS]     Clean old app logs from /var/log (default: keep last 30 days)
   --verify                Deep integrity check: UKI sigs, Btrfs scrub, immutability
   --json                  With --verify: also print a machine-readable JSON summary to stdout
+  --nagios                Output in Nagios-compatible format (exit code: 0=OK, 1=WARN, 2=CRIT)
+  --prometheus            Output in Prometheus text format (for scraping)
+  --fix                   Auto-remediate safe issues (enable timers, start services, sync keymap)
   --security              Security report: boot chain, immutability, encryption, services, users, Kerberos
   --journal [level]       Show journal entries (level: crit, err, warning — default: crit)
   --since TIME            Limit journal output to entries since TIME (e.g. -1h, -2d, '2026-01-01')
@@ -8734,6 +9058,9 @@ Examples:
   shani-health --storage-info         Btrfs subvolume + compression analysis
   shani-health --verify               Deep integrity check (runs scrub — takes time)
   shani-health --verify --json | jq   Deep integrity check, machine-readable summary
+  shani-health --security --nagios    Security check for Nagios monitoring
+  shani-health --info --prometheus    Full report in Prometheus format
+  shani-health --fix                  Auto-fix safe issues (enable timers, services)
   shani-health --history 100          Last 100 deploy events
   shani-health --export-logs ~/       Bundle diagnostics to home dir
 
@@ -8755,6 +9082,10 @@ main() {
     local JOURNAL_SINCE=""
     local CLEAN_LOGS_DAYS=30
     local JSON_OUTPUT="no"
+    local NAGIOS_OUTPUT="no"
+    local PROMETHEUS_OUTPUT="no"
+    local FIX_MODE="no"
+    local TREND_FILE="/var/lib/shani-health/trend.json"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -8768,6 +9099,9 @@ main() {
                 fi ;;
             --verify)           MODE="verify";       shift ;;
             --json)             JSON_OUTPUT="yes";   shift ;;
+            --nagios)           NAGIOS_OUTPUT="yes"; shift ;;
+            --prometheus)       PROMETHEUS_OUTPUT="yes"; shift ;;
+            --fix)              FIX_MODE="yes";      shift ;;
             -s|--storage-info)  MODE="storage-info"; shift ;;
             --security)         MODE="security";     shift ;;
             --journal)
@@ -8808,11 +9142,21 @@ main() {
         esac
     done
 
-    if [[ "$JSON_OUTPUT" == "yes" && "$MODE" != "verify" ]]; then
-        _log_warn "--json only has an effect together with --verify — ignoring"
+    # Validate output format combinations
+    local format_count=0
+    [[ "$JSON_OUTPUT" == "yes" ]] && ((format_count++))
+    [[ "$NAGIOS_OUTPUT" == "yes" ]] && ((format_count++))
+    [[ "$PROMETHEUS_OUTPUT" == "yes" ]] && ((format_count++))
+    if [[ $format_count -gt 1 ]]; then
+        _die "Only one of --json, --nagios, --prometheus can be used at a time"
     fi
 
     _require_root
+
+    # Load previous trend data for comparison
+    if [[ -f "$TREND_FILE" ]]; then
+        _load_trend "$TREND_FILE"
+    fi
 
     case "$MODE" in
         info)                system_info ;;
@@ -8829,6 +9173,21 @@ main() {
         clear-boot-failure)  clear_boot_failure ;;
         export-logs)         export_logs "$EXPORT_DIR" ;;
     esac
+
+    # Save trend data for next run
+    _save_trend "$TREND_FILE"
+
+    # Emit structured output if requested
+    if [[ "$JSON_OUTPUT" == "yes" ]]; then
+        _print_json
+    elif [[ "$NAGIOS_OUTPUT" == "yes" ]]; then
+        _print_nagios
+    elif [[ "$PROMETHEUS_OUTPUT" == "yes" ]]; then
+        _print_prometheus
+    fi
+
+    # Run auto-fix if requested
+    _fix_issues
 }
 
 main "$@"

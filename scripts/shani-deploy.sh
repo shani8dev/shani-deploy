@@ -111,6 +111,10 @@ declare -g AUTO_REBOOT_DELAY="${AUTO_REBOOT_DELAY:-60}"
 # re-invocation) and tells a re-exec'd instance not to re-flock the same file.
 declare -g LOCK_ACQUIRED="${LOCK_ACQUIRED:-}"
 
+# Counter for nested _bees_pause/_bees_resume calls — only stops bees on first
+# pause and restores on last resume.
+declare -g _BEES_PAUSE_COUNT=0
+
 readonly CHROOT_BIND_DIRS=(/dev /proc /sys /run /tmp)
 # CHROOT_STATIC_DIRS are bind-mounted from the live system into the candidate
 # slot chroot so gen-efi can access:
@@ -152,6 +156,7 @@ persist_state() {
         declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
         declare -p AUTO_REBOOT AUTO_REBOOT_DELAY 2>/dev/null || true
         declare -p LOCK_ACQUIRED 2>/dev/null || true
+        declare -p _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE 2>/dev/null || true
     } > "$state_file"
     export SHANIOS_DEPLOY_STATE_FILE="$state_file"
 }
@@ -421,20 +426,18 @@ btrfs_sync() {
 # (the add_all_parents infinite loop — see Zygo/bees docs/btrfs-kernel.md).
 # bees' own docs recommend stopping it before other operations that touch
 # many shared-extent refcounts at once (e.g. a full balance); subvolume
-# deletion is the same risk class. _bees_pause/_bees_resume are idempotent
-# (safe to call from multiple nested code paths — e.g. a deploy failing
-# mid-deletion and falling into restore_candidate, which deletes more
-# subvolumes of its own) and only touch the service if it was actually
-# running, so a system without bees installed is unaffected.
+# deletion is the same risk class. _bees_pause/_bees_resume use a counter
+# so nested calls (e.g. deploy -> restore_candidate -> more deletions) don't
+# resume bees prematurely. Only touch the service if it was actually running.
 _bees_pause() {
-    [[ "${_BEES_PAUSED:-0}" == "1" ]] && return 0
+    (( _BEES_PAUSE_COUNT++ == 0 )) || return 0
     _BEES_SERVICE=""
     local uuid
     uuid=$(findmnt -no UUID "$MOUNT_DIR" 2>/dev/null) || return 0
     [[ -n "$uuid" ]] || return 0
     _BEES_SERVICE="beesd@${uuid}.service"
     systemctl is-active --quiet "$_BEES_SERVICE" 2>/dev/null || return 0
-    log_verbose "Pausing ${_BEES_SERVICE} before subvolume deletion"
+    log_verbose "Pausing ${_BEES_SERVICE} before subvolume deletion (depth ${_BEES_PAUSE_COUNT})"
     if systemctl stop "$_BEES_SERVICE" 2>/dev/null; then
         _BEES_PAUSED=1
     else
@@ -443,6 +446,8 @@ _bees_pause() {
 }
 
 _bees_resume() {
+    (( _BEES_PAUSE_COUNT > 0 )) || return 0
+    (( --_BEES_PAUSE_COUNT == 0 )) || return 0
     [[ "${_BEES_PAUSED:-0}" == "1" ]] || return 0
     log_verbose "Resuming ${_BEES_SERVICE}"
     systemctl start "$_BEES_SERVICE" 2>/dev/null || log_warn "Failed to restart ${_BEES_SERVICE}"
@@ -1289,6 +1294,8 @@ self_update() {
                 log_success "Script updated — re-executing with new version..."
                 # Clean up STATE_DIR before exec — EXIT trap won't fire after exec
                 cleanup_state
+                # Preserve LOCK_ACQUIRED so re-exec'd process knows it holds the lock
+                export LOCK_ACQUIRED=1
                 if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
                     exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
                 else
@@ -1332,6 +1339,8 @@ inhibit_system() {
     local state_env=()
     [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && \
         state_env=(env "SHANIOS_DEPLOY_STATE_FILE=$SHANIOS_DEPLOY_STATE_FILE")
+    # Preserve LOCK_ACQUIRED so re-exec'd process knows it holds the lock
+    [[ -n "${LOCK_ACQUIRED:-}" ]] && state_env+=("LOCK_ACQUIRED=1")
 
     local _inhibit_opts=(
         --what=idle:sleep:shutdown:handle-power-key:handle-suspend-key:handle-hibernate-key:handle-lid-switch
@@ -2144,6 +2153,255 @@ rollback_system() {
     log "  Restored slot:     @${failed_slot} (ready for next deploy)"
     log "  Please reboot — the system will boot into @${booted}"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+#####################################
+### Verify Existing Deployment    ###
+#####################################
+
+verify_existing_deployment() {
+    log_section "Verify Existing Deployment"
+    check_root
+
+    local booted current_slot candidate_slot version profile channel
+    booted=$(get_booted_subvol)
+    current_slot=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    candidate_slot=$(cat "$DATA_PREV_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    version=$(cat /etc/shani-version 2>/dev/null || echo "unknown")
+    profile=$(cat /etc/shani-profile 2>/dev/null || echo "unknown")
+    channel=$(cat "$CHANNEL_FILE" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+
+    _row "Booted Slot"   "--  @${booted}"
+    _row "Current Slot"  "--  @${current_slot}"
+    _row "Candidate Slot" "--  @${candidate_slot}"
+    _row "Version"       "--  v${version}"
+    _row "Profile"       "--  ${profile}"
+    _row "Channel"       "--  ${channel}"
+
+    local issues=0
+
+    # Check slot consistency
+    if [[ "$booted" != "$current_slot" ]]; then
+        _row "Slot Check"    "!!  booted (@${booted}) != current-slot (@${current_slot})"
+        _rec "Slot mismatch detected — run: shani-deploy --rollback"
+        ((issues++))
+    else
+        _row "Slot Check"    "OK  booted slot matches current-slot"
+    fi
+
+    # Check UKI signatures
+    local esp_mounted=0
+    if ! mountpoint -q "$ESP" 2>/dev/null; then
+        if mount LABEL=shani_boot "$ESP" 2>/dev/null; then
+            esp_mounted=1
+        fi
+    fi
+
+    local uki_booted="$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi"
+    local uki_candidate="$ESP/EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi"
+
+    if [[ -f "$uki_booted" ]] && sbverify --cert /etc/secureboot/keys/MOK.crt "$uki_booted" &>/dev/null; then
+        _row "UKI Booted"    "OK  signature valid"
+    else
+        _row "UKI Booted"    "!!  missing or invalid signature"
+        ((issues++))
+    fi
+
+    if [[ -f "$uki_candidate" ]] && sbverify --cert /etc/secureboot/keys/MOK.crt "$uki_candidate" &>/dev/null; then
+        _row "UKI Candidate" "OK  signature valid"
+    else
+        _row "UKI Candidate" "!!  missing or invalid signature"
+        ((issues++))
+    fi
+
+    # Check boot entries
+    if mountpoint -q "$ESP" 2>/dev/null; then
+        local loader_conf="$ESP/loader/loader.conf"
+        if [[ -f "$loader_conf" ]]; then
+            local default_entry=$(grep '^default ' "$loader_conf" 2>/dev/null | awk '{print $2}' || echo "")
+            if [[ -n "$default_entry" ]] && echo "$default_entry" | grep -qiE "(^|[-_])${current_slot}([-_+.]|$)"; then
+                _row "Boot Default"  "OK  points to @${current_slot}"
+            else
+                _row "Boot Default"  "!!  default entry mismatch"
+                ((issues++))
+            fi
+        fi
+    fi
+
+    if [[ $esp_mounted -eq 1 ]]; then
+        umount "$ESP" 2>/dev/null || true
+    fi
+
+    # Check for pending deployment
+    if [[ -f "$DEPLOY_PENDING" ]]; then
+        _row "Deploy State"  "!   deployment_pending flag exists"
+        ((issues++))
+    else
+        _row "Deploy State"  "OK  no pending deployment"
+    fi
+
+    # Check reboot needed
+    if [[ -f "$REBOOT_NEEDED_FILE" ]]; then
+        local ver
+        ver=$(cat "$REBOOT_NEEDED_FILE" 2>/dev/null | tr -cd '0-9A-Za-z.-' | head -c 32)
+        _row "Reboot Status" "!   reboot needed for v${ver}"
+    else
+        _row "Reboot Status" "OK  no pending reboot"
+    fi
+
+    # Check backup availability
+    mkdir -p "$MOUNT_DIR"
+    if mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        local _svol_list
+        _svol_list=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null || echo "")
+        for slot in blue green; do
+            local has_backup
+            has_backup=$(echo "$_svol_list" | awk -v s="${slot}_backup_" '$NF ~ s {print $NF; exit}' || echo "")
+            if [[ -n "$has_backup" ]]; then
+                local bk_created
+                bk_created=$(btrfs subvolume show "$MOUNT_DIR/@${has_backup}" 2>/dev/null | awk -F'\t' '/Creation time:/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || true)
+                _row "Backup @${slot}" "OK  ${has_backup} (created: ${bk_created:-unknown})"
+            else
+                _row "Backup @${slot}" "!!  no backup snapshot available"
+                ((issues++))
+            fi
+        done
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    else
+        _row "Backups"       "!   could not mount root filesystem to check"
+    fi
+
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        log_success "All verification checks passed"
+        return 0
+    else
+        log_error "Verification found $issues issue(s)"
+        return 1
+    fi
+}
+
+#####################################
+### List Backups                  ###
+#####################################
+
+list_backups() {
+    log_section "Available Rollback Backups"
+    check_root
+
+    mkdir -p "$MOUNT_DIR"
+    if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        die "Could not mount root filesystem"
+    fi
+
+    local _svol_list
+    _svol_list=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null || echo "")
+
+    for slot in blue green; do
+        log "Slot: @${slot}"
+        local found=0
+        while IFS= read -r backup; do
+            [[ -z "$backup" ]] && continue
+            [[ "$backup" =~ ^@${slot}_backup_[0-9]{10,14}$ ]] || continue
+            found=1
+            local bk_path="$MOUNT_DIR/${backup}"
+            local bk_created bk_size
+            bk_created=$(btrfs subvolume show "$MOUNT_DIR/${backup}" 2>/dev/null | awk -F'\t' '/Creation time:/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "unknown")
+            if [[ -d "$bk_path" ]]; then
+                bk_size=$(du -sh "$bk_path" 2>/dev/null | awk '{print $1}' || echo "?")
+            else
+                bk_size="?"
+            fi
+            printf "  └─ %s  (created: %s, size: %s)\n" "${backup#@}" "$bk_created" "$bk_size"
+        done < <(echo "$_svol_list" | awk -v s="${slot}_backup_" '$NF ~ s {print $NF}' | sort)
+
+        if [[ $found -eq 0 ]]; then
+            log "  (no backups found)"
+        fi
+    done
+
+    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+    return 0
+}
+
+#####################################
+### Channel Status                ###
+#####################################
+
+channel_status() {
+    log_section "Channel Status"
+    check_tools
+    check_internet
+
+    local channel="${UPDATE_CHANNEL:-stable}"
+    local profile
+    profile=$(cat /etc/shani-profile 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    local current_version
+    current_version=$(cat /etc/shani-version 2>/dev/null | tr -cd '0-9' || echo "unknown")
+
+    _row "Current Channel" "--  ${channel}"
+    _row "Current Version" "--  v${current_version}"
+    _row "Profile"         "--  ${profile}"
+
+    local mirror_base
+    mirror_base=$(get_mirror_url "shanios" "${profile}" "latest.txt")
+    if [[ -z "$mirror_base" ]]; then
+        log_warn "Could not discover mirror"
+        return 1
+    fi
+
+    local latest_url="${mirror_base}/latest.txt"
+    local stable_url="${mirror_base}/stable.txt"
+    local latest_version="" stable_version=""
+
+    # Use a temporary file to avoid command substitution issues
+    local tmp_latest tmp_stable
+    tmp_latest=$(mktemp /run/shanios-latest.XXXXXX)
+    tmp_stable=$(mktemp /run/shanios-stable.XXXXXX)
+
+    if (( HAS_CURL )); then
+        timeout 15 curl -fsSL --connect-timeout 5 --max-time 10 "$latest_url" > "$tmp_latest" 2>/dev/null || true
+        timeout 15 curl -fsSL --connect-timeout 5 --max-time 10 "$stable_url" > "$tmp_stable" 2>/dev/null || true
+    elif (( HAS_WGET )); then
+        timeout 15 wget -q --timeout=10 --tries=1 -O "$tmp_latest" "$latest_url" 2>/dev/null || true
+        timeout 15 wget -q --timeout=10 --tries=1 -O "$tmp_stable" "$stable_url" 2>/dev/null || true
+    fi
+
+    if [[ -s "$tmp_latest" ]]; then
+        latest_version=$(cat "$tmp_latest" | tr -cd '0-9A-Za-z.-' | head -c 32)
+        _row "Latest Channel"  "--  v${latest_version}"
+        if [[ "$latest_version" != "$current_version" && "$channel" == "latest" ]]; then
+            _row "Update Available" "!!  v${current_version} → v${latest_version}"
+        fi
+    else
+        _row "Latest Channel"  "!   unavailable"
+    fi
+
+    if [[ -s "$tmp_stable" ]]; then
+        stable_version=$(cat "$tmp_stable" | tr -cd '0-9A-Za-z.-' | head -c 32)
+        _row "Stable Channel"  "--  v${stable_version}"
+        if [[ "$stable_version" != "$current_version" && "$channel" == "stable" ]]; then
+            _row "Update Available" "!!  v${current_version} → v${stable_version}"
+        fi
+    else
+        _row "Stable Channel"  "!   unavailable"
+    fi
+
+    rm -f "$tmp_latest" "$tmp_stable"
+
+    # Also check local download cache
+    if [[ -d "$DOWNLOAD_DIR" ]]; then
+        local cached
+        cached=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" -printf "%T@ %p\n" 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || echo "")
+        if [[ -n "$cached" ]]; then
+            local cached_name cached_date
+            cached_name=$(basename "$cached")
+            cached_date=$(stat -c '%y' "$cached" 2>/dev/null | cut -d. -f1 || echo "unknown")
+            _row "Cached Image"    "--  ${cached_name} (downloaded: ${cached_date})"
+        fi
+    fi
+
+    return 0
 }
 
 #####################################
@@ -3022,6 +3280,9 @@ Options:
   -d, --dry-run           Simulate
   -v, --verbose           Verbose output
   --set-channel           permanently set channel in /etc/shani-channel (latest|stable)
+  --verify-existing       Verify current deployment integrity without updating
+  --list-backups          List available rollback backups with timestamps
+  --channel-status        Show latest/stable versions available remotely
   --skip-self-update      Skip auto-update of shani-deploy
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
 
@@ -3039,6 +3300,7 @@ EOF
 main() {
     local ROLLBACK="no" CLEANUP="no" STORAGE_OPTIMIZE="no"
     local SET_CHANNEL="no" SET_CHANNEL_VAL=""
+    local VERIFY_EXISTING="no" LIST_BACKUPS="no" CHANNEL_STATUS="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3051,6 +3313,9 @@ main() {
                 SET_CHANNEL="yes"
                 SET_CHANNEL_VAL="$2"
                 shift 2 ;;
+            --verify-existing) VERIFY_EXISTING="yes"; shift ;;
+            --list-backups) LIST_BACKUPS="yes"; shift ;;
+            --channel-status) CHANNEL_STATUS="yes"; shift ;;
             -t|--channel)
                 [[ $# -ge 2 ]] || die "Missing argument for $1 (expected 'stable' or 'latest')"
                 UPDATE_CHANNEL="$2"; shift 2 ;;
@@ -3066,8 +3331,8 @@ main() {
     done
 
     if [[ "$DOWNLOAD_ONLY" == "yes" ]]; then
-        if [[ "$ROLLBACK" == "yes" || "$CLEANUP" == "yes" || "$STORAGE_OPTIMIZE" == "yes" || "$SET_CHANNEL" == "yes" ]]; then
-            die "--download-only cannot be combined with --rollback, --cleanup, --optimize, or --set-channel"
+        if [[ "$ROLLBACK" == "yes" || "$CLEANUP" == "yes" || "$STORAGE_OPTIMIZE" == "yes" || "$SET_CHANNEL" == "yes" || "$VERIFY_EXISTING" == "yes" || "$LIST_BACKUPS" == "yes" || "$CHANNEL_STATUS" == "yes" ]]; then
+            die "--download-only cannot be combined with --rollback, --cleanup, --optimize, --set-channel, --verify-existing, --list-backups, or --channel-status"
         fi
     fi
 
@@ -3077,6 +3342,21 @@ main() {
 
     if [[ "$SET_CHANNEL" == "yes" ]]; then
         set_channel_persistent "$SET_CHANNEL_VAL"
+        exit 0
+    fi
+
+    if [[ "$VERIFY_EXISTING" == "yes" ]]; then
+        verify_existing_deployment
+        exit 0
+    fi
+
+    if [[ "$LIST_BACKUPS" == "yes" ]]; then
+        list_backups
+        exit 0
+    fi
+
+    if [[ "$CHANNEL_STATUS" == "yes" ]]; then
+        channel_status
         exit 0
     fi
 

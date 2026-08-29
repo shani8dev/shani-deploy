@@ -8,6 +8,11 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# No ProtectSystem/ReadOnlyPaths — this writes /etc/bees/*.conf and enables a
+# unit under /etc/systemd/system via `systemctl enable`; ProtectSystem=full
+# or =strict would make /etc read-only and break both.
+NoNewPrivileges=yes
+PrivateTmp=yes
 ExecStart=/usr/local/bin/beesd-setup
 
 [Install]

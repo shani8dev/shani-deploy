@@ -1,11 +1,47 @@
 #!/bin/bash
 # check-boot-failure.sh – Record boot failure if boot-success marker is missing.
+#
+# Deliberately NO `set -Eeuo pipefail` here, unlike its sibling scripts —
+# tried adding it and reverted after live-testing found a real regression:
+# `[ -z "$BOOTED_SLOT" ] && BOOTED_SLOT=$(btrfs subvolume get-default / ...)`
+# is a bare `cmd1 && cmd2` statement (not inside an `if`), so under `set -e`
+# a failing `btrfs` call here (missing binary, not-a-btrfs-root, run inside
+# a container without a real subvolume, etc.) aborts the whole script
+# instead of falling through to the graceful "cannot detect booted
+# subvolume — skip" exit this script's own logic already handles a few
+# lines later. Confirmed live: a sandboxed run with no `btrfs` on `$PATH`
+# exits 127 immediately with strict mode on, vs. correctly reaching the
+# graceful skip path without it. Don't re-add strict mode without also
+# auditing every risky line for an explicit `|| true`-style guard first —
+# that's a bigger change than "add set -e", not a drop-in one-liner.
+
+# Serialize marker read+write with flock — same pattern used for the
+# subid-allocation lock in shani-user-setup.sh. This script reads then
+# conditionally writes/removes /data/boot_failure, /data/boot_failure.acked,
+# /data/boot_hard_failure, /data/boot-ok and /data/boot_in_progress; without a
+# lock, two concurrent invocations (e.g. a manual run racing the 15-minute
+# timer, or a re-triggered check-boot-failure.service) could interleave their
+# read-then-write sequences and produce a lost update or a corrupted marker
+# state. Held for the remainder of this script.
+BOOT_MARKER_LOCK="/run/shani-boot-failure.lock"
+exec 9>"$BOOT_MARKER_LOCK"
+if ! flock -w 30 9; then
+    logger -t check-boot-failure "Could not acquire boot-marker lock within 30s — skipping this run to avoid racing a concurrent invocation."
+    exit 0
+fi
 
 # The slot that actually booted (the fallback, working slot).
-# Uses the same rootflags= parsing as shani-deploy and shani-update for consistency.
+# Uses the same rootflags= parsing as shani-deploy and shani-update for
+# consistency — a 5th, previously-unaudited copy of this detection logic
+# (the "duplicated 4×" finding in AGENTS.md missed this one since it's
+# inline, not a named get_booted_subvol()/_get_booted_subvol() function).
+# Keep in sync with those 4 too.
 _rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
 BOOTED_SLOT=$(awk -F'subvol=' '{print $2}' <<< "$_rootflags" | cut -d, -f1)
 BOOTED_SLOT="${BOOTED_SLOT#@}"
+# Fallback: a bare subvol=@name directly on cmdline, no rootflags= wrapper.
+[ -z "$BOOTED_SLOT" ] && \
+    BOOTED_SLOT=$(grep -oP 'subvol=@?\K[^ ,]+' /proc/cmdline 2>/dev/null | head -1)
 [ -z "$BOOTED_SLOT" ] && \
     BOOTED_SLOT=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
 if [ -z "$BOOTED_SLOT" ]; then

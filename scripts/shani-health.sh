@@ -249,23 +249,6 @@ _nagios_escape() {
 }
 
 # Continuation line — indented to align under the value column
-_row2() {
-    local text="$1"
-    # Colour-map leading sigils in continuation lines too
-    local prefix="${text%%  *}"
-    local rest="${text#*  }"
-    local coloured
-    case "$prefix" in
-        "!!")  coloured="${_C_RED}${_SYM_ERR}${_C_RESET}  ${rest}" ;;
-        "!")   coloured="${_C_YELLOW}${_SYM_WARN}${_C_RESET}  ${rest}" ;;
-        "--")  coloured="${_C_DIM}${_SYM_INFO}${_C_RESET}  ${rest}" ;;
-        "~~")  coloured="${_C_CYAN}${_SYM_IDLE}${_C_RESET}  ${rest}" ;;
-        ">>")  coloured="${_C_GREEN}${_C_DIM}${_SYM_READY}${_C_RESET}  ${rest}" ;;
-        "->")  coloured="${_C_CYAN}${_SYM_SPIN}${_C_RESET}  ${rest}" ;;
-        *)     coloured="$text" ;;
-    esac
-    printf "    %-14s%b\n" "" "$coloured"
-}
 
 # Section heading with a subtle underline
 _head() {
@@ -337,17 +320,23 @@ _srv_opt_row2() { _srv_opt_begin; _row "$1" "$2"; _row2 "$3"; _srv_opt_end; }
 _is_mounted() { findmnt -M "$1" &>/dev/null; }
 
 _get_booted_subvol() {
+    # Keep this parsing logic in sync with the other 3 copies —
+    # gen-efi.sh's get_booted_subvol(), shani-update.sh's
+    # _get_booted_subvol(), shani-deploy.sh's get_booted_subvol() — see
+    # AGENTS.md. This copy deliberately returns "unknown" instead of
+    # aborting (a health/diagnostics tool shouldn't crash on a detection
+    # miss) — don't change that to match the other 3's die/error_exit.
     local subvol=""
     # Prefer rootflags=...subvol=@name... from /proc/cmdline
     local rootflags
     rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2- || echo "")
     if [[ -n "$rootflags" ]]; then
-        subvol=$(echo "$rootflags" | grep -oP '(?<=subvol=@?)[^,]+' | head -1 || echo "")
+        subvol=$(echo "$rootflags" | grep -oP "subvol=@?\K[^,]+" | head -1 || echo "")
         subvol="${subvol#@}"
     fi
     # Fallback: top-level subvol=@name directly on cmdline (no rootflags wrapper)
     if [[ -z "$subvol" ]]; then
-        subvol=$(grep -oP '(?<=subvol=@?)[^ ,]+' /proc/cmdline 2>/dev/null | head -1 || echo "")
+        subvol=$(grep -oP 'subvol=@?\K[^ ,]+' /proc/cmdline 2>/dev/null | head -1 || echo "")
         subvol="${subvol#@}"
     fi
     # Last resort: btrfs default subvolume

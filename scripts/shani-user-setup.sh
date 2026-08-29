@@ -156,7 +156,15 @@ while IFS=: read -r username _ uid gid _ home shell; do
     fi
 
     # ── subuid/subgid (rootless podman / lxc / lxd) ──────────────────────────
+    # Serialize range allocation with flock: two concurrent invocations could
+    # otherwise read the same 'last' value and hand out overlapping ranges
+    # (classic TOCTOU between read of /etc/subuid and usermod's write).
     if [[ "$HAS_PODMAN" -eq 1 || "$HAS_LXC" -eq 1 || "$HAS_LXD" -eq 1 ]]; then
+        exec 9>/run/shani-user-setup-subid.lock
+        if ! flock -w 30 9; then
+            warn "could not acquire subid allocation lock within 30s — skipping subuid/subgid setup"
+            user_ok=0
+        else
         if ! grep -q "^${username}:" /etc/subuid 2>/dev/null; then
             # Find the highest end of any existing range to avoid collisions.
             # If /etc/subuid is missing or empty, start at 100000.
@@ -188,6 +196,8 @@ while IFS=: read -r username _ uid gid _ home shell; do
             run usermod --add-subgids "${last}-$((last + 65535))" "$username" \
                 || { warn "subgid setup failed for $username"; user_ok=0; }
             log "added subgid range for $username (${last}-$((last + 65535)))"
+        fi
+        exec 9>&-   # release lock
         fi
     fi
 
@@ -222,8 +232,8 @@ while IFS=: read -r username _ uid gid _ home shell; do
 
 done < <(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 {print}')
 
-log "done — processed ${#processed[@]} user(s): ${processed[@]+"${processed[@]}"}"
-[[ ${#skipped[@]}  -gt 0 ]] && log "skipped  ${#skipped[@]}  user(s): ${skipped[@]+"${skipped[@]}"}"
-[[ ${#failed[@]}   -gt 0 ]] && warn "FAILED   ${#failed[@]}  user(s): ${failed[@]+"${failed[@]}"}"
+log "done — processed ${#processed[@]} user(s): ${processed[*]:-}"
+[[ ${#skipped[@]}  -gt 0 ]] && log "skipped  ${#skipped[@]}  user(s): ${skipped[*]:-}"
+[[ ${#failed[@]}   -gt 0 ]] && warn "FAILED   ${#failed[@]}  user(s): ${failed[*]:-}"
 
 [[ ${#failed[@]} -eq 0 ]]

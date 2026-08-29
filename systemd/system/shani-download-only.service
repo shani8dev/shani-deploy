@@ -13,6 +13,9 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
 
 ExecStart=/usr/local/bin/shani-deploy --download-only
 

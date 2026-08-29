@@ -11,6 +11,9 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
 
 ExecStart=/usr/bin/flatpak update --noninteractive --assumeyes --system
 ExecStartPost=/usr/bin/flatpak uninstall --unused --delete-data --noninteractive --assumeyes --system

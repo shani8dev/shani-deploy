@@ -177,11 +177,25 @@ _validate_environment() {
 #####################################
 
 _get_booted_subvol() {
-    local rootflags subvol
-    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
-    subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
-    subvol="${subvol#@}"
-    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    # Keep this parsing logic in sync with the other 3 copies —
+    # gen-efi.sh's get_booted_subvol(), shani-deploy.sh's
+    # get_booted_subvol(), shani-health.sh's _get_booted_subvol() — see
+    # AGENTS.md. Only the final not-found handling differs per script.
+    local rootflags subvol=""
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2- || echo "")
+    if [[ -n "$rootflags" ]]; then
+        subvol=$(grep -oP 'subvol=@?\K[^,]+' <<< "$rootflags" | head -1 || echo "")
+        subvol="${subvol#@}"
+    fi
+    # Fallback: a bare subvol=@name directly on cmdline, no rootflags= wrapper.
+    if [[ -z "$subvol" ]]; then
+        subvol=$(grep -oP 'subvol=@?\K[^ ,]+' /proc/cmdline 2>/dev/null | head -1 || echo "")
+        subvol="${subvol#@}"
+    fi
+    # Last resort: btrfs default subvolume.
+    if [[ -z "$subvol" ]]; then
+        subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    fi
     if [[ -z "$subvol" ]]; then
         err "Cannot detect booted subvolume — /proc/cmdline has no subvol= and btrfs get-default returned nothing"
     fi
@@ -354,8 +368,20 @@ _build_terminal_args() {
     case "$terminal" in
         # gnome-terminal: modern (non-deprecated) syntax is `--title=X -- CMD...`.
         # -e/-x are deprecated in favor of --. Ref: gnome-terminal(1).
+        # --wait: without it, `gnome-terminal` just hands the command off to
+        # the already-running gnome-terminal-server over D-Bus and returns
+        # immediately with that handoff's own exit code — NOT the exit code
+        # of CMD. Every caller here (_run_rollback in particular) treats a
+        # zero exit from this array's invocation as "the launched command
+        # actually finished successfully", so without --wait a rollback
+        # could still be running (or could have failed) while shani-update
+        # already logged "Rollback succeeded" and offered to reboot. --wait
+        # makes gnome-terminal block until the window/tab running CMD closes
+        # and propagate CMD's exit status, matching every other terminal
+        # branch below (kitty/xterm/etc. are all directly exec'd, so their
+        # own exit code already is CMD's).
         gnome-terminal)
-            _arr=("$terminal" "--title=$title" "--" "${cmd[@]}") ;;
+            _arr=("$terminal" "--wait" "--title=$title" "--" "${cmd[@]}") ;;
         # kgx (GNOME Console) intentionally dropped window titling. Its man
         # page documents -e/--command as the execution flag; "--" is not
         # documented anywhere for kgx (unlike gnome-terminal), and

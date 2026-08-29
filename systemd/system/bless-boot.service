@@ -35,6 +35,13 @@ Type=oneshot
 # independent of systemd-boot's native tries counter.
 ExecStart=/usr/lib/systemd/systemd-bless-boot good
 RemainAfterExit=yes
+# No ProtectSystem here — matches systemd's own upstream
+# systemd-bless-boot.service template, which ships with zero hardening
+# directives (checked directly: the real installed unit shipped by systemd
+# itself), almost certainly because this binary needs to write boot-loader
+# entry state under /boot/efi.
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

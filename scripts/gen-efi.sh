@@ -211,20 +211,37 @@ error_exit() {
 in_chroot() {
     local root_id proc_id
     root_id=$(stat -c %d:%i / 2>/dev/null) || return 1
-    proc_id=$(stat -c %d:%i /proc/1/root/. 2>/dev/null) || return 0
+    # Fail CLOSED, not open: a failed stat here must never be silently
+    # treated as "yes we're in a chroot" -- that would make
+    # validate_target_slot() skip its check against writing the wrong
+    # slot's boot entry on the live system. If we cannot determine chroot
+    # status at all, error out instead of guessing.
+    proc_id=$(stat -c %d:%i /proc/1/root/. 2>/dev/null) || \
+        error_exit "Cannot determine chroot status: 'stat /proc/1/root' failed. Refusing to guess whether this is a chroot — this check exists to prevent writing a boot entry for the wrong slot."
     [[ "$root_id" != "$proc_id" ]]
 }
 
 # Get currently booted slot — unified implementation matching shani-deploy/shani-update.
 get_booted_subvol() {
-    local rootflags subvol
-    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
-    subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
-    subvol="${subvol#@}"
-    # || true: this is the last member of the && list, so its own failure is
-    # NOT exempt from set -e -- would crash here instead of reaching the
-    # error_exit two lines below that's meant to handle exactly this case.
-    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}') || true
+    # Keep this parsing logic in sync with the other 3 copies —
+    # shani-update.sh's _get_booted_subvol(), shani-deploy.sh's
+    # get_booted_subvol(), shani-health.sh's _get_booted_subvol() — see
+    # AGENTS.md. Only the final not-found handling differs per script.
+    local rootflags subvol=""
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2- || echo "")
+    if [[ -n "$rootflags" ]]; then
+        subvol=$(grep -oP 'subvol=@?\K[^,]+' <<< "$rootflags" | head -1 || echo "")
+        subvol="${subvol#@}"
+    fi
+    # Fallback: a bare subvol=@name directly on cmdline, no rootflags= wrapper.
+    if [[ -z "$subvol" ]]; then
+        subvol=$(grep -oP 'subvol=@?\K[^ ,]+' /proc/cmdline 2>/dev/null | head -1 || echo "")
+        subvol="${subvol#@}"
+    fi
+    # Last resort: btrfs default subvolume.
+    if [[ -z "$subvol" ]]; then
+        subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    fi
     if [[ -z "$subvol" ]]; then
         error_exit "Cannot detect booted subvolume — /proc/cmdline has no subvol= and btrfs get-default returned nothing."
     fi
@@ -258,7 +275,6 @@ validate_target_slot() {
         echo "" >&2
         log "ERROR: Solutions:"
         log "ERROR:   1. Run: gen-efi configure ${booted}  (regenerate current booted slot)"
-        log "ERROR:      Or:  shani-deploy --fix-security  (auto-fixes booted slot UKI)"
         log "ERROR:   2. Use: shani-deploy  (handles @${target} via chroot on next deploy)"
         log "ERROR:      Or:  shani-deploy --rollback  (restores @${target} and regenerates its UKI)"
         echo "" >&2
@@ -317,17 +333,19 @@ sign_efi_binary() {
     local tmp_backup="${file}.orig.tmp"
     rm -f "$tmp_signed" "$tmp_backup"
     cp "$file" "$tmp_backup" || { rm -f "$tmp_signed" "$tmp_backup"; error_exit "Failed to backup ${file} before signing"; }
-    if sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$tmp_signed" "$file"; then
-        mv "$tmp_signed" "$file"
-    else
+    if ! sbsign --key "$MOK_KEY" --cert "$MOK_CRT" --output "$tmp_signed" "$file"; then
         rm -f "$tmp_signed" "$tmp_backup"
         error_exit "sbsign failed for $file"
     fi
-    if ! sbverify --cert "$MOK_CRT" "$file" &>/dev/null 2>&1; then
-        log_warn "sbverify failed for $file — restoring original"
-        mv "$tmp_backup" "$file"
-        error_exit "sbverify failed for $file — original restored"
+    # Verify the freshly-signed TMP file BEFORE it ever replaces the live
+    # binary — the live file must never be observed in a signed-but-invalid
+    # state. Only a tmp file that verifies clean is moved into place.
+    if ! sbverify --cert "$MOK_CRT" "$tmp_signed" &>/dev/null 2>&1; then
+        log_warn "sbverify failed for freshly-signed ${tmp_signed} — leaving ${file} untouched"
+        rm -f "$tmp_signed" "$tmp_backup"
+        error_exit "sbverify failed for signed output of $file — live file left unchanged"
     fi
+    mv "$tmp_signed" "$file" || { rm -f "$tmp_signed" "$tmp_backup"; error_exit "Failed to move verified signed file into place for $file"; }
     rm -f "$tmp_backup"
 }
 

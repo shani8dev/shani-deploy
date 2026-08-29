@@ -28,6 +28,11 @@ Requires=data.mount
 
 [Service]
 Type=oneshot
+# No ProtectSystem/ReadOnlyPaths — this writes /etc (passwd/group/skel sync
+# for all regular users); ProtectSystem=full or =strict would make /etc
+# read-only and defeat the entire purpose of this unit.
+NoNewPrivileges=yes
+PrivateTmp=yes
 ExecStart=/usr/local/bin/shani-user-setup
 # Clear the deploy marker after a successful run so the service does not
 # re-trigger on the next boot. The .path unit will still re-trigger it if a

@@ -1,7 +1,7 @@
 # shani-deploy
 
 Blue-green deployment, health/diagnostics, and system-recovery tooling for
-ShaniOS — an immutable, Btrfs-backed Arch Linux derivative that updates by
+Shanios — an immutable, Btrfs-backed Arch Linux derivative that updates by
 writing a full new OS copy to an inactive root subvolume while the running
 system stays untouched, then switching to it on the next boot.
 
@@ -12,7 +12,7 @@ wrong.
 
 ## The blue-green model, in short
 
-ShaniOS keeps two root subvolumes, `@blue` and `@green`. Exactly one is
+Shanios keeps two root subvolumes, `@blue` and `@green`. Exactly one is
 booted (active); the other is the candidate. An update extracts a fresh
 image into the candidate slot, builds and signs a new Unified Kernel Image
 (UKI) for it, and updates the systemd-boot entries so the candidate becomes
@@ -29,99 +29,45 @@ offer to roll back.
 ## Scripts
 
 ### `scripts/shani-deploy.sh`
-The core deployment engine. Typical flow: self-update check, fetch the
-update manifest, verify GPG signature, snapshot the candidate slot as a
-timestamped backup, `btrfs receive` the new image into it, generate/sign
-the UKI via `gen-efi` inside a chroot, update boot entries, write the
-`/run/shanios/reboot-needed` marker.
+
+Core deployment engine. Typical flow: self-update check, fetch manifest, verify GPG signature, `btrfs receive` into candidate slot, generate/sign UKI, update boot entries, write reboot-needed marker.
 
 Key flags:
-- `-r`, `--rollback` — restore the non-booted slot from its most recent
-  backup snapshot. Run from the slot you want to **keep**.
-- `-c`, `--cleanup` — remove old backup snapshots and cached downloads.
-- `-o`, `--optimize` — manual maintenance dedup pass (bees itself runs
-  continuously in the background; this is not required for normal operation).
-- `-t`, `--channel <chan>` — `latest` or `stable`.
-- `--download-only` — fetch and verify the image, don't deploy it yet.
-- `-d`, `--dry-run` — simulate without making changes.
-- `--set-channel` — persist a channel choice to `/etc/shani-channel`.
+- `-r`, `--rollback` — restore the non-booted slot from its most recent backup snapshot
+- `-c`, `--cleanup` — remove old backup snapshots and cached downloads
+- `-o`, `--optimize` — manual maintenance dedup pass
+- `-t`, `--channel <chan>` — `latest` or `stable`
+- `--download-only` — fetch and verify the image, don't deploy it yet
+- `-d`, `--dry-run` — simulate without making changes
+- `--set-channel` — persist a channel choice to `/etc/shani-channel`
 
-**Auto-reboot is opt-in (`AUTO_REBOOT=yes`, default `no`).** The candidate
-slot is fully deployed and bootable the moment the script finishes —
-nothing about correctness depends on rebooting promptly — so by default
-`shani-deploy` leaves the reboot to the user's own convenience. Set
-`AUTO_REBOOT=yes` (and optionally `AUTO_REBOOT_DELAY=<seconds>`, default 60)
-to arm a one-shot `shanios-auto-reboot` systemd timer instead; cancel a
-pending one with `systemctl stop shanios-auto-reboot.timer`.
+Auto-reboot is opt-in (`AUTO_REBOOT=yes`, default `no`). The candidate slot is fully deployed and bootable the moment the script finishes — nothing about correctness depends on rebooting promptly.
 
-Every subvolume deletion in this script (backup cleanup, candidate/
-temp_update cleanup during deploy, and both the emergency-rollback and
-explicit `--rollback` paths) goes through `btrfs_subvolume_delete_safe()`,
-which pauses the `beesd@<uuid>` service around the delete and resumes it
-afterward. bees continuously deduplicates identical extents across every
-subvolume and has no way to know which one "matters more" — deleting a
-subvolume that bees has deduped against, while bees is concurrently running
-its own `LOGICAL_INO`/dedupe ioctls on the same shared extents, can trigger
-a documented, still-unfixed kernel hang/extent-accounting race. Pausing
-bees for the duration of the delete avoids it regardless of which
-subvolume bees happened to pick as the canonical copy.
+`flock`-based locking on `/run/shanios-deploy.lock` means overlapping invocations fail fast instead of racing.
 
-`flock`-based locking on `/run/shanios-deploy.lock` means overlapping
-invocations (a timer firing while an admin runs it manually, or two timers
-racing) fail fast with "Another shani-deploy is already running" instead of
-racing each other.
+### `scripts/boot-success-cleanup.sh`
+
+Clears a stale boot-failure marker after a successful boot. Triggered by the `mark-boot-success.service` one-shot unit.
 
 ### `scripts/shani-health.sh`
-System health, security, and diagnostics — read-mostly, no deployment side
-effects (except `--clean-logs` and `--clear-boot-failure`, which are
-explicit and narrowly scoped). Run with no arguments for a full report, or
-scope it down:
 
-`--security` · `--boot` · `--network` · `--hardware` · `--packages` ·
-`--verify` (deep integrity check: UKI signatures, Btrfs scrub, immutability
-— slower, use `--json` for machine-readable output) · `--journal [level]` ·
-`-s`/`--storage-info` · `--history [N]` · `--clean-logs [days]` ·
-`--clear-boot-failure` · `--export-logs [dir]`.
-
-Covers, among much else: boot slots and boot entries, the `/etc` OverlayFS
-and immutable-root guarantees (including that the `/usr/abin`
-pacman/useradd/adduser safety wrappers are actually installed, actually
-take PATH precedence, and actually block a write operation — not just that
-the files exist), the `[shani]` pacman repo's signing-key trust and
-`SigLevel`, Secure Boot/UKI signatures, LUKS encryption, TPM2, users and
-groups, hardware, storage, package managers, containers, virtualization,
-and firmware.
+System health, security, and diagnostics — read-mostly, no deployment side effects. Run with no arguments for a full report, or scope it down with `--security`, `--boot`, `--network`, `--verify`, etc.
 
 ### `scripts/shani-update.sh`
-The user-facing update wrapper — the thing the desktop timer/notification
-actually calls. Resolves the update channel (CLI flag > persisted file >
-default), validates version/channel input against untrusted external
-sources (remote manifests, downloaded metadata) before trusting it, and
-launches `shani-deploy` (in a detected terminal emulator when run
-interactively, or unattended via the timer) with sanitized environment.
+
+User-facing update wrapper. Resolves the update channel, validates input, and launches `shani-deploy` with sanitized environment.
 
 ### `scripts/gen-efi.sh`
-Builds and signs the Unified Kernel Image for a given slot: MOK key
-handling, `sign_efi_binary()`'s tmp+backup+verify+atomic-replace pattern
-(never leaves a partially-signed or corrupted EFI binary on failure),
-crypttab/cmdline generation, and slot-target validation (refuses to
-generate a UKI for a slot other than the one actually booted/being
-configured).
+
+Builds and signs the Unified Kernel Image for a given slot. `sign_efi_binary()` uses temp-file-then-atomic-replace — never leaves a partially-signed or corrupted EFI binary on failure.
 
 ### `scripts/beesd-setup.sh`
-One-time-per-filesystem setup for `bees` (continuous Btrfs deduplication):
-resolves the filesystem UUID, writes `/etc/bees/<uuid>.conf` sized off the
-filesystem's capacity, and enables `beesd@<uuid>.service`. Re-run is
-idempotent (checks a version marker in the config before doing anything).
+
+One-time setup for `bees` (continuous Btrfs deduplication). Re-run is idempotent.
 
 ### `scripts/shani-user-setup.sh`
-Syncs extra groups (from `/etc/shani-extra-groups`, the single source of
-truth shared with the `useradd`/`adduser` wrappers in shani-install-media),
-default shell, and one-time per-user bootstrap (Flatpak remote, Nix
-channel, subuid/subgid ranges, Podman storage migration) for every regular
-user (UID 1000–59999). Triggered by `shani-user-setup.path` watching the
-OverlayFS upper-layer `/etc/passwd` and a deploy-written marker — not a
-polling timer.
+
+Syncs extra groups, default shell, and one-time per-user bootstrap for every regular user (UID 1000–59999). Triggered by `shani-user-setup.path` watching the OverlayFS upper-layer `/etc/passwd` and a deploy-written marker — not a polling timer.
 
 ### `scripts/check-boot-failure.sh`
 Runs from `check-boot-failure.timer` (15 minutes after boot). If
@@ -170,3 +116,42 @@ configure continuous dedup.
 - **Everything's a mess** (`shani-reset`): wipes persistent `/etc`/`/var`
   state and boot markers back to first-boot defaults, without touching
   either OS copy or your files.
+
+## Testing changes
+
+The scripts here expect the Shanios Btrfs layout (`@blue`/`@green` slots,
+UKI boot entries), so testing on a random machine isn't meaningful. Two
+supported paths:
+
+1. **Loop-mounted test environment** — [`shani-install-media/test-env`](https://github.com/shani8dev/shani-install-media/tree/main/test-env)
+   installs a real image onto loop-mounted disks, then runs
+   install/boot/update/rollback cycles against it. This is how CI and
+   pre-release verification exercise `shani-deploy` end to end:
+
+   ```bash
+   cd shani-install-media
+   ./build.sh test bootstrap -p plasma   # install + first boot
+   ./build.sh test cycle -p plasma       # update → rollback → verify
+   ```
+
+2. **Static checks** — always run before committing:
+
+   ```bash
+   bash -n scripts/*.sh        # syntax check every script
+   shellcheck scripts/*.sh     # lint (warnings are triaged, errors must be fixed)
+   ```
+
+When changing user-visible flags or output, regenerate any affected docs —
+`docs/updates/system.md` in [shani-docs](https://github.com/shani8dev/shani-docs)
+and the blog reference posts mirror this README's flag tables.
+
+## Contributing
+
+- Every new CLI flag needs: implementation, a line in `usage()`, an entry in
+  this README's flag list, and a mention in the matching docs page.
+- Destructive operations (subvolume deletion, slot wipes) must go through
+  `btrfs_subvolume_delete_safe()` — see the bees note above for why.
+- Keep POSIX-portable patterns where practical; these scripts also run in
+  minimal chroot contexts during image build.
+- PRs should include the output of the static checks above and, for
+  deploy-path changes, a `test cycle` run summary.

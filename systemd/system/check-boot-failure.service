@@ -6,4 +6,7 @@ ConditionPathExists=/data/boot_in_progress
 
 [Service]
 Type=oneshot
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
 ExecStart=/usr/local/bin/check-boot-failure

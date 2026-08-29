@@ -6,6 +6,17 @@ Description=Shani OS Update Check
 
 [Service]
 Type=oneshot
+# Deliberately NO NoNewPrivileges/ProtectSystem/PrivateTmp here, unlike this
+# repo's other units — shani-update.sh's actual deploy path re-execs itself
+# via `pkexec shani-deploy ...` (see scripts/shani-update.sh's
+# _build_pkexec_env), and pkexec is a setuid-root binary. NoNewPrivileges is
+# inherited by child processes and would silently block that setuid
+# escalation entirely (confirmed: this is exactly what NoNewPrivileges is
+# for), breaking every update/deploy this unit exists to trigger. Any mount-
+# namespacing directive (ProtectSystem/PrivateTmp/etc.) is inherited across
+# the pkexec boundary the same way, since pkexec doesn't create a new mount
+# namespace — so it would also sandbox the escalated shani-deploy process
+# that needs real, unrestricted /etc and /boot access to actually deploy.
 ExecStart=/usr/local/bin/shani-update --startup
 Environment=XDG_RUNTIME_DIR=%t
 # No timeout — shani-deploy can take several minutes to download and deploy.

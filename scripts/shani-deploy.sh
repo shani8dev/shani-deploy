@@ -36,8 +36,29 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
         rm -f "$SHANIOS_DEPLOY_STATE_FILE"
 
         if [[ -n "$state_content" ]]; then
-            state_content=$(echo "$state_content" | grep -v "declare.*OS_NAME\|declare.*DOWNLOAD_DIR\|declare.*MOUNT_DIR\|declare.*ROOT_DEV\|declare.*GENEFI_SCRIPT\|declare.*LOG_FILE\|declare.*DEPLOY_PENDING\|declare.*GPG_KEY_ID\|declare.*CHROOT_BIND_DIRS\|declare.*CHROOT_STATIC_DIRS\|declare.*CHANNEL_FILE\|declare.*STATE_DIR" || true)
-            [[ -n "$state_content" ]] && eval "$state_content" 2>/dev/null || true
+            _restore_state() {
+                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
+                local _line _var _val
+                while IFS= read -r _line; do
+                    if [[ $_line =~ ^declare\ -[-a-z]*\ ([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                        _var="${BASH_REMATCH[1]}"
+                        # Capture the value from BASH_REMATCH IMMEDIATELY --
+                        # the whitelist check below is itself a [[ =~ ]]
+                        # match, which overwrites BASH_REMATCH as a side
+                        # effect even though its own pattern has no capture
+                        # groups. Reading BASH_REMATCH[2] after that check
+                        # (as opposed to before it) always yields an empty
+                        # string, silently discarding every restored value.
+                        _val="${BASH_REMATCH[2]}"
+                        if [[ " $_whitelist " =~ " $_var " ]]; then
+                            _val="${_val#\"}" ; _val="${_val%\"}"
+                            _val="${_val#\'}" ; _val="${_val%\'}"
+                            printf -v "$_var" '%s' "$_val" 2>/dev/null || true
+                        fi
+                    fi
+                done <<< "$state_content"
+            }
+            _restore_state
         fi
         set -e
     else
@@ -66,9 +87,10 @@ readonly BOOT_HARD_FAILURE_FILE="/data/boot_hard_failure"
 # Written world-readable so shani-update (running as a normal user) can read it.
 readonly REBOOT_NEEDED_FILE="/run/shanios/reboot-needed"
 readonly LOCK_FILE="/run/shanios-deploy.lock"
-readonly GPG_KEY_ID="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
+readonly GPG_KEY_ID="${SHANIOS_DEPLOY_GPG_KEY_ID:-7B927BFFD4A9EAAA8B666B77DE217F3DA8014792}"
 readonly LOG_FILE="/var/log/shanios-deploy.log"
 readonly CHANNEL_FILE="/etc/shani-channel"
+readonly LICENSE_FILE="/etc/shani-license"
 readonly ESP="/boot/efi"
 readonly R2_BASE_URL="https://downloads.shani.dev"
 
@@ -83,7 +105,6 @@ command -v curl &>/dev/null && HAS_CURL=1
 command -v pv &>/dev/null && HAS_PV=1
 
 declare -g LOCAL_VERSION LOCAL_PROFILE
-declare -g CHROOT_ESP_BIND=0
 declare -g BACKUP_NAME="${BACKUP_NAME:-}" CURRENT_SLOT="${CURRENT_SLOT:-}" CANDIDATE_SLOT="${CANDIDATE_SLOT:-}"
 declare -g REMOTE_VERSION="${REMOTE_VERSION:-}" REMOTE_PROFILE="${REMOTE_PROFILE:-}" IMAGE_NAME="${IMAGE_NAME:-}"
 declare -g UPDATE_CHANNEL="${UPDATE_CHANNEL:-}" UPDATE_CHANNEL_SOURCE="${UPDATE_CHANNEL_SOURCE:-}"
@@ -389,11 +410,25 @@ safe_mount() {
 #####################################
 
 get_booted_subvol() {
-    local rootflags subvol
-    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline | cut -d= -f2- 2>/dev/null || echo "")
-    subvol=$(awk -F'subvol=' '{print $2}' <<< "$rootflags" | cut -d, -f1)
-    subvol="${subvol#@}"
-    [[ -z "$subvol" ]] && subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    # Keep this parsing logic in sync with the other 3 copies —
+    # gen-efi.sh's get_booted_subvol(), shani-update.sh's
+    # _get_booted_subvol(), shani-health.sh's _get_booted_subvol() — see
+    # AGENTS.md. Only the final not-found handling differs per script.
+    local rootflags subvol=""
+    rootflags=$(grep -o 'rootflags=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2- || echo "")
+    if [[ -n "$rootflags" ]]; then
+        subvol=$(grep -oP 'subvol=@?\K[^,]+' <<< "$rootflags" | head -1 || echo "")
+        subvol="${subvol#@}"
+    fi
+    # Fallback: a bare subvol=@name directly on cmdline, no rootflags= wrapper.
+    if [[ -z "$subvol" ]]; then
+        subvol=$(grep -oP 'subvol=@?\K[^ ,]+' /proc/cmdline 2>/dev/null | head -1 || echo "")
+        subvol="${subvol#@}"
+    fi
+    # Last resort: btrfs default subvolume.
+    if [[ -z "$subvol" ]]; then
+        subvol=$(btrfs subvolume get-default / 2>/dev/null | awk '{gsub(/@/,""); print $NF}')
+    fi
     if [[ -z "$subvol" ]]; then
         die "Cannot detect booted subvolume — /proc/cmdline has no subvol= and btrfs get-default returned nothing. Check that the system booted from a ShaniOS slot."
     fi
@@ -1287,31 +1322,46 @@ self_update() {
     log "Checking for script updates..."
 
     local self_update_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/shani-deploy.sh"
-    if download_file "$self_update_url" "$temp" 1; then
-        if grep -q "#!/bin/bash" "$temp" && grep -q "shanios-deploy" "$temp"; then
-            if ! cmp -s "$script_path" "$temp"; then
-                chmod +x "$temp"
-                log_success "Script updated — re-executing with new version..."
-                # Clean up STATE_DIR before exec — EXIT trap won't fire after exec
-                cleanup_state
-                # Preserve LOCK_ACQUIRED so re-exec'd process knows it holds the lock
-                export LOCK_ACQUIRED=1
-                if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
-                    exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
+    local temp_sha="${temp}.sha256"
+    local temp_asc="${temp}.asc"
+
+    # Same trust boundary as the OS image download (verify_sha256 + verify_gpg,
+    # signed with $GPG_KEY_ID) — a downloaded script that is not both
+    # checksum-correct AND GPG-signed by the shanios key is NEVER executed.
+    # Any failure below (download, checksum, signature, sanity check) falls
+    # closed: keep running the current, already-trusted copy.
+    if download_file "$self_update_url" "$temp" 1 && \
+       download_file "${self_update_url}.sha256" "$temp_sha" 1 && \
+       download_file "${self_update_url}.asc" "$temp_asc" 1; then
+        if verify_sha256 "$temp" "$temp_sha" && verify_gpg "$temp" "$temp_asc"; then
+            if grep -q "#!/bin/bash" "$temp" && grep -q "shanios-deploy" "$temp"; then
+                if ! cmp -s "$script_path" "$temp"; then
+                    chmod +x "$temp"
+                    log_success "Script updated and signature-verified — re-executing with new version..."
+                    # Clean up STATE_DIR before exec — EXIT trap won't fire after exec
+                    cleanup_state
+                    # Preserve LOCK_ACQUIRED so re-exec'd process knows it holds the lock
+                    export LOCK_ACQUIRED=1
+                    rm -f "$temp_sha" "$temp_asc"
+                    if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+                        exec /bin/bash "$temp" "${ORIGINAL_ARGS[@]}"
+                    else
+                        exec /bin/bash "$temp"
+                    fi
                 else
-                    exec /bin/bash "$temp"
+                    log_verbose "Script is already up to date"
                 fi
             else
-                log_verbose "Script is already up to date"
+                log_warn "Downloaded script passed SHA256/GPG verification but failed content sanity check — keeping current version"
             fi
         else
-            log_verbose "Downloaded script failed sanity check, keeping current version"
+            log_error "Self-update failed SHA256/GPG verification — refusing to run downloaded script, keeping current version"
         fi
     else
-        log_verbose "Could not check for script update, continuing with current version"
+        log_verbose "Could not fetch script update (or its .sha256/.asc) — continuing with current version"
     fi
 
-    rm -f "$temp"
+    rm -f "$temp" "$temp_sha" "$temp_asc"
 }
 
 
@@ -1563,14 +1613,15 @@ prepare_chroot() {
     if mountpoint -q /boot/efi; then
         log_verbose "ESP already mounted — bind-mounting into chroot"
         run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi"
-        # Record that we did a bind-mount (not a fresh label mount) so cleanup
-        # knows it should NOT try to unmount the host's /boot/efi itself.
-        CHROOT_ESP_BIND=1
     else
         log_verbose "Mounting ESP (LABEL=shani_boot) into chroot"
         safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults"
-        CHROOT_ESP_BIND=0
     fi
+    # cleanup_chroot() unconditionally unmounts $MOUNT_DIR/boot/efi in either
+    # case above, and that's correct regardless of which branch ran: a bind
+    # mount's target can be unmounted without ever touching its source, so
+    # there's no distinct "was this a bind mount" state cleanup needs to
+    # track here.
 
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR/$dir"
@@ -1634,15 +1685,27 @@ generate_uki() {
     local tmp_genefi=""
     if [[ "${UPDATE_GENEFI:-no}" == "yes" ]]; then
         tmp_genefi=$(mktemp /run/shanios-genefi-update.XXXXXX)
+        local tmp_genefi_sha="${tmp_genefi}.sha256"
+        local tmp_genefi_asc="${tmp_genefi}.asc"
         log "Downloading gen-efi from upstream for chroot injection..."
+        # Same trust boundary as the OS image and self-update paths: this is
+        # code that will run as root inside the chroot to sign the boot
+        # image, so it gets the SAME SHA256 + GPG verification (signed with
+        # $GPG_KEY_ID) before it is ever injected — any failure falls closed
+        # to the host's already-trusted copy of gen-efi.sh.
         if download_file "$GENEFI_SCRIPT_URL" "$tmp_genefi" 1 && \
+           download_file "${GENEFI_SCRIPT_URL}.sha256" "$tmp_genefi_sha" 1 && \
+           download_file "${GENEFI_SCRIPT_URL}.asc" "$tmp_genefi_asc" 1 && \
+           verify_sha256 "$tmp_genefi" "$tmp_genefi_sha" && \
+           verify_gpg "$tmp_genefi" "$tmp_genefi_asc" && \
            grep -q "#!/bin/bash" "$tmp_genefi" && \
            grep -q "generate_uki\|generate_cmdline" "$tmp_genefi"; then
             injected=1
         else
-            log_warn "gen-efi: downloaded copy failed sanity check — falling back to host copy"
+            log_warn "gen-efi: downloaded copy failed SHA256/GPG verification or sanity check — falling back to host copy"
             rm -f "$tmp_genefi"; tmp_genefi=""
         fi
+        rm -f "$tmp_genefi_sha" "$tmp_genefi_asc"
     fi
 
     btrfs property set -f -ts "$MOUNT_DIR" ro false 2>/dev/null \
@@ -1695,17 +1758,6 @@ finalize_boot_entries() {
 
     mkdir -p "$ESP/loader/entries"
 
-    # Remove all stale entries for both slots before writing new ones:
-    # - tries-suffixed files (+3-0, +3-3 etc.) left by previous deploys
-    #   or renamed by bless-boot/systemd-boot boot counting
-    # - plain .conf files left when a slot transitions from no-tries to tries
-    #   (e.g. shanios-blue.conf orphaned when blue becomes active and gets
-    #   shanios-blue+3-0.conf on the next deploy)
-    rm -f "$ESP/loader/entries/${OS_NAME}-${active_slot}"+*.conf 2>/dev/null || true
-    rm -f "$ESP/loader/entries/${OS_NAME}-${candidate_slot}"+*.conf 2>/dev/null || true
-    rm -f "$ESP/loader/entries/${OS_NAME}-${active_slot}.conf" 2>/dev/null || true
-    rm -f "$ESP/loader/entries/${OS_NAME}-${candidate_slot}.conf" 2>/dev/null || true
-
     # Default slot — the new unproven slot being set as the next boot target.
     # Gets +3-0 boot-count tries on normal deploy so systemd-boot automatically
     # falls back to the fallback entry if it fails to reach multi-user.target.
@@ -1721,18 +1773,55 @@ finalize_boot_entries() {
         active_filename="${OS_NAME}-${active_slot}.conf"
     fi
     active_conf="$ESP/loader/entries/${active_filename}"
-    cat > "$active_conf" <<EOF
-title   ${OS_NAME}-${active_slot} (Active)
-efi     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
-EOF
 
     # Fallback slot — the old proven slot. No tries needed: if the new slot
     # exhausts its tries systemd-boot falls back to this entry unconditionally.
-    local candidate_conf="$ESP/loader/entries/${OS_NAME}-${candidate_slot}.conf"
-    cat > "$candidate_conf" <<EOF
+    local candidate_filename="${OS_NAME}-${candidate_slot}.conf"
+    local candidate_conf="$ESP/loader/entries/${candidate_filename}"
+
+    # Write each entry to a hidden tmp file in the same directory (same
+    # filesystem as the final path, so `mv` is an atomic rename(2)), then mv
+    # it into place, and only THEN remove any stale variant of that slot's
+    # entry (old tries-suffixed leftovers, or a plain .conf orphaned when a
+    # slot transitions from no-tries to tries). This ordering guarantees a
+    # valid boot entry exists for BOTH slots at every instant — a crash
+    # mid-write can, at worst, leave a harmless stray .tmp file (systemd-boot
+    # skips dotfiles when scanning loader/entries) or an extra stale entry
+    # around; it can never leave a slot with zero boot entries.
+    local active_tmp="$ESP/loader/entries/.${active_filename}.tmp"
+    cat > "$active_tmp" <<EOF
+title   ${OS_NAME}-${active_slot} (Active)
+efi     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
+EOF
+    mv -f "$active_tmp" "$active_conf" || {
+        log_error "Could not write boot entry for @${active_slot} — boot entries left unchanged"
+        rm -f "$active_tmp"
+        [[ $esp_mounted -eq 1 ]] && umount "$ESP" 2>/dev/null
+        return 1
+    }
+
+    local candidate_tmp="$ESP/loader/entries/.${candidate_filename}.tmp"
+    cat > "$candidate_tmp" <<EOF
 title   ${OS_NAME}-${candidate_slot} (Candidate)
 efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
 EOF
+    mv -f "$candidate_tmp" "$candidate_conf" || {
+        log_error "Could not write boot entry for @${candidate_slot} — @${active_slot} entry already updated, candidate left on its previous entry"
+        rm -f "$candidate_tmp"
+        [[ $esp_mounted -eq 1 ]] && umount "$ESP" 2>/dev/null
+        return 1
+    }
+
+    # Both new entries are now safely in place — clean up stale variants:
+    # tries-suffixed files (+3-0, +3-3 etc.) left by previous deploys or
+    # renamed by bless-boot/systemd-boot boot counting, and an orphaned plain
+    # .conf left over from a slot's previous no-tries/tries state. Excludes
+    # the filenames just written above.
+    find "$ESP/loader/entries" -maxdepth 1 -name "${OS_NAME}-${active_slot}+*.conf" ! -name "$active_filename" -exec rm -f {} + 2>/dev/null || true
+    if [[ "$active_filename" != "${OS_NAME}-${active_slot}.conf" ]]; then
+        rm -f "$ESP/loader/entries/${OS_NAME}-${active_slot}.conf" 2>/dev/null || true
+    fi
+    find "$ESP/loader/entries" -maxdepth 1 -name "${OS_NAME}-${candidate_slot}+*.conf" -exec rm -f {} + 2>/dev/null || true
 
     # Use the base entry ID (without tries suffix) as the loader.conf default.
     # systemd-boot matches the "default" value against entry IDs, not filenames.
@@ -2760,6 +2849,49 @@ try_zsync2_download() {
     return 1
 }
 
+# verify_license CHANNEL
+#   Free channels (latest/stable) need no license. Paid channels require
+#   /etc/shani-license: a JWT whose payload grants the channel and carries a
+#   non-expired 'exp' (90-day grace before lockout — never brick a running
+#   fleet over billing).
+verify_license() {
+    local channel="$1"
+    case "$channel" in
+        latest|stable|"") return 0 ;;
+    esac
+
+    if [[ ! -f "$LICENSE_FILE" ]]; then
+        log_error "Channel '$channel' requires a license but ${LICENSE_FILE} is missing"
+        log_error "Obtain a license at https://shani.dev/pricing or switch to a free channel"
+        return 1
+    fi
+
+    local payload_b64 payload_json exp now
+    payload_b64=$(cut -d. -f2 "$LICENSE_FILE" 2>/dev/null)
+    case $((${#payload_b64} % 4)) in
+        2) payload_b64="${payload_b64}==" ;;
+        3) payload_b64="${payload_b64}="  ;;
+    esac
+    payload_json=$(printf '%s' "$payload_b64" | tr '_-' '/+' | base64 -d 2>/dev/null)
+
+    exp=$(printf '%s' "$payload_json" | grep -oE '"exp"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    now=$(date +%s)
+    local grace=$((90 * 86400))
+    if [[ -z "$exp" || "$now" -gt $((exp + grace)) ]]; then
+        log_error "License invalid or expired for paid channel '$channel'"
+        log_error "Obtain a renewed license at https://shani.dev/pricing"
+        return 1
+    fi
+
+    if ! printf '%s' "$payload_json" | grep -q "\"${channel}\""; then
+        log_error "License does not grant channel '${channel}'"
+        return 1
+    fi
+
+    log_verbose "License OK for paid channel '${channel}'"
+    return 0
+}
+
 download_update() {
     log_section "Download Phase"
 
@@ -2787,6 +2919,10 @@ download_update() {
     rm -f "${image}.tmp"
 
     [[ "${DRY_RUN}" == "yes" ]] && return 0
+
+    # Paid-channel licensing gate (latest/stable always pass)
+    verify_license "${UPDATE_CHANNEL:-stable}" \
+        || die "Licensing prevents downloading channel '${UPDATE_CHANNEL:-stable}'"
 
     # URLs
     local sf_base="https://sourceforge.net/projects/shanios/files"
@@ -3446,3 +3582,4 @@ main() {
 }
 
 main "$@"
+    trap - RETURN

@@ -53,7 +53,11 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
                         if [[ " $_whitelist " =~ " $_var " ]]; then
                             _val="${_val#\"}" ; _val="${_val%\"}"
                             _val="${_val#\'}" ; _val="${_val%\'}"
-                            printf -v "$_var" '%s' "$_val" 2>/dev/null || true
+                            if [[ "$_val" == "()" ]]; then
+                                eval "$_var=()"
+                            else
+                                printf -v "$_var" '%s' "$_val" 2>/dev/null || true
+                            fi
                         fi
                     fi
                 done <<< "$state_content"

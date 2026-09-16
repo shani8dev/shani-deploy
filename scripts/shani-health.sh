@@ -1319,6 +1319,7 @@ _section_data_state() {
 }
 
 _section_immutability() {
+    _set_section "immutability"
     _head "Immutability"
     local opts; opts=$(findmnt -n -o OPTIONS / 2>/dev/null || true)
     if echo "$opts" | grep -qw ro; then _row "Root (/)"   "OK  read-only"
@@ -1491,6 +1492,12 @@ _section_secureboot() {
     local uki_booted_bad_ref="$2"
     local hibernate_stale="$3"
 
+    # Was missing (unlike _check_firmware_updates/_check_ssh_hardening's
+    # _set_section calls) — every row this function records via _row
+    # landed with section:"" in --json/--nagios/--prometheus output,
+    # making the structured output unable to distinguish these checks by
+    # section at all (only by the more fragile/ambiguous `key` field).
+    _set_section "secureboot"
     _head "Secure Boot"
 
     if [[ ! -d /sys/firmware/efi ]]; then
@@ -1652,6 +1659,7 @@ _section_secureboot() {
 _section_kernel_security() {
     local sb_active="$1"   # "yes" if Secure Boot is enabled
 
+    _set_section "kernel_security"
     _head "Kernel Security"
     local expected_lsm_param="landlock,lockdown,yama,integrity,apparmor,bpf"
     local actual_lsm_param; actual_lsm_param=$(grep -o 'lsm=[^ ]*' /proc/cmdline 2>/dev/null \
@@ -1727,6 +1735,7 @@ _section_kernel_security() {
 }
 
 _section_encryption() {
+    _set_section "encryption"
     _head "Encryption"
 
     if [[ ! -e "/dev/mapper/${ROOTLABEL}" ]]; then
@@ -1771,6 +1780,7 @@ _section_encryption() {
 }
 
 _section_tpm2() {
+    _set_section "tpm2"
     _head "TPM2"
 
     # TPM2 section needs the cryptenroll output — re-derive underlying device here
@@ -1827,6 +1837,7 @@ _section_tpm2() {
 }
 
 _section_security_services() {
+    _set_section "security_services"
     _head "Security Services"
     if _check_tool_executable "aa-status" "AppArmor"; then
         if aa-status --enabled >/dev/null 2>&1; then
@@ -2095,6 +2106,7 @@ _section_security_services() {
 }
 
 _section_security_audit() {
+    _set_section "security_audit"
     _head "Security Tools"
     # Security auditing tools — show last scan date and hardening index if available
     if _check_tool_executable "lynis" "lynis"; then
@@ -2236,6 +2248,7 @@ _section_krb5() {
     # Show whenever krb5 client tools are installed — even if not configured.
     command -v kinit &>/dev/null || return 0
 
+    _set_section "krb5"
     _head "Kerberos"
     if [[ ! -f /etc/krb5.conf ]]; then
         _row "krb5"        "~~  not configured — /etc/krb5.conf absent"
@@ -2381,6 +2394,7 @@ _section_krb5() {
 }
 
 _section_users() {
+    _set_section "users"
     _head "Users & Access Control"
     local login_users=()
     _get_login_users login_users
@@ -2666,6 +2680,7 @@ _section_users() {
 }
 
 _section_groups() {
+    _set_section "groups"
     _head "Groups"
     local -A STATIC_GIDS=([sys]=3 [lp]=7 [kvm]=78 [video]=91 [scanner]=96 [input]=97 [cups]=209)
     # Dynamic groups (no fixed GID — just need to exist):
@@ -7750,7 +7765,7 @@ _check_ssh_hardening() {
     if [[ "${prl,,}" != "no" && "${prl,,}" != "prohibit-password" && "${prl,,}" != "without-password" ]]; then
         _row "PermitRootLogin" "!!  set to '${prl}' (should be 'no' or 'prohibit-password')"
         _rec "Set PermitRootLogin no in $sshd_config"
-        ((issues++))
+        issues=$((issues + 1))
     else
         _row "PermitRootLogin" "OK  ${prl}"
     fi
@@ -7761,7 +7776,7 @@ _check_ssh_hardening() {
     if [[ "${pa,,}" != "no" ]]; then
         _row "PasswordAuth" "!!  enabled (should be 'no')"
         _rec "Set PasswordAuthentication no in $sshd_config"
-        ((issues++))
+        issues=$((issues + 1))
     else
         _row "PasswordAuth" "OK  disabled"
     fi
@@ -7772,7 +7787,7 @@ _check_ssh_hardening() {
     if [[ "${pka,,}" != "yes" ]]; then
         _row "PubkeyAuth" "!!  disabled (should be 'yes')"
         _rec "Set PubkeyAuthentication yes in $sshd_config"
-        ((issues++))
+        issues=$((issues + 1))
     else
         _row "PubkeyAuth" "OK  enabled"
     fi
@@ -7814,7 +7829,7 @@ _check_auto_updates() {
         else
             _row "unattended-upgrades" "!   installed but disabled"
             _rec "Enable: systemctl enable --now unattended-upgrades"
-            ((issues++))
+            issues=$((issues + 1))
         fi
     elif systemctl cat pacman-auto-update.service &>/dev/null; then
         if systemctl is-enabled --quiet pacman-auto-update.service; then
@@ -7822,7 +7837,7 @@ _check_auto_updates() {
         else
             _row "pacman-auto-update" "!   installed but disabled"
             _rec "Enable: systemctl enable --now pacman-auto-update"
-            ((issues++))
+            issues=$((issues + 1))
         fi
     elif systemctl cat shani-update.timer &>/dev/null; then
         if systemctl is-enabled --quiet shani-update.timer; then
@@ -7830,12 +7845,12 @@ _check_auto_updates() {
         else
             _row "shani-update" "!   timer disabled"
             _rec "Enable: systemctl enable --now shani-update.timer"
-            ((issues++))
+            issues=$((issues + 1))
         fi
     else
         _row "Auto-updates" "!!  no auto-update mechanism detected"
         _rec "Install and enable unattended-upgrades, pacman-auto-update, or shani-update.timer"
-        ((issues++))
+        issues=$((issues + 1))
     fi
 
     # Check pacman refresh timer
@@ -7958,6 +7973,21 @@ _print_verify_json() {
 
 verify_system() {
     local json_output="${1:-no}"
+    # When --json is requested, the human-readable report below must not
+    # land on stdout — it's colored/boxed output written via bare
+    # `echo`/`printf` throughout this function's report body (not just
+    # `_log_*`, which already goes to stderr), so it would land BEFORE
+    # _print_verify_json's JSON blob on the same stream, corrupting it
+    # for any consumer piping stdout into `jq` (confirmed live: this
+    # broke `--verify --json` outright, which shani-fleet's agent calls
+    # on every heartbeat). Save the real stdout as fd 3, send stdout to
+    # stderr for the report body, then restore fd 3 as stdout right
+    # before the one line of actual JSON output.
+    local _json_fd_saved=0
+    if [[ "$json_output" == "yes" ]]; then
+        exec 3>&1 1>&2
+        _json_fd_saved=1
+    fi
     _log_section "System Integrity Verification"
     local errors=0
     local _esp_mounted=0   # shared across both ESP access windows in this function
@@ -8097,6 +8127,10 @@ verify_system() {
     echo ""
 
     if [[ "$json_output" == "yes" ]]; then
+        # Restore the real stdout (saved as fd 3 above) so ONLY this one
+        # line — the actual JSON — reaches it; everything before this
+        # point in the function went to stderr instead.
+        if (( _json_fd_saved )); then exec 1>&3 3>&-; fi
         _print_verify_json "$errors"
     fi
     return $(( errors > 0 ? 1 : 0 ))
@@ -9131,11 +9165,22 @@ main() {
         esac
     done
 
-    # Validate output format combinations
+    # Validate output format combinations.
+    # NOT `((format_count++))` — under `set -e`, a bare post-increment
+    # arithmetic command's exit status is the PRE-increment value; going
+    # 0->1 evaluates the compound `[[ ... ]] && ((format_count++))`
+    # statement as failing (0 is falsy), and since it's a bare top-level
+    # statement (not an if/while condition), that abrupts the whole
+    # script with zero output and no error message. This silently broke
+    # EVERY single-format invocation, including the already-relied-upon
+    # `--verify --json` that shani-fleet's agent calls on every
+    # heartbeat (verified live: both `--verify --json` and
+    # `--security --json` died with rc=1, zero stdout/stderr, before
+    # this fix). Plain arithmetic assignment has no such gotcha.
     local format_count=0
-    [[ "$JSON_OUTPUT" == "yes" ]] && ((format_count++))
-    [[ "$NAGIOS_OUTPUT" == "yes" ]] && ((format_count++))
-    [[ "$PROMETHEUS_OUTPUT" == "yes" ]] && ((format_count++))
+    [[ "$JSON_OUTPUT" == "yes" ]] && format_count=$((format_count + 1))
+    [[ "$NAGIOS_OUTPUT" == "yes" ]] && format_count=$((format_count + 1))
+    [[ "$PROMETHEUS_OUTPUT" == "yes" ]] && format_count=$((format_count + 1))
     if [[ $format_count -gt 1 ]]; then
         _die "Only one of --json, --nagios, --prometheus can be used at a time"
     fi
@@ -9145,6 +9190,20 @@ main() {
     # Load previous trend data for comparison
     if [[ -f "$TREND_FILE" ]]; then
         _load_trend "$TREND_FILE"
+    fi
+
+    # Same stdout/stderr isolation as verify_system() above, for every
+    # OTHER mode's structured-output path (--security --json, --boot
+    # --nagios, etc.) — these all fall through to _print_json/_print_
+    # nagios/_print_prometheus below, and their report bodies print via
+    # bare printf/echo (stdout) just like verify_system()'s did. `verify`
+    # is excluded here since it already manages its own fd 3 internally
+    # (it exits before reaching this point) — doing it twice would save
+    # the wrong value into fd 3 for the outer scope.
+    local _outer_json_fd_saved=0
+    if [[ "$MODE" != "verify" ]] && { [[ "$JSON_OUTPUT" == "yes" ]] || [[ "$NAGIOS_OUTPUT" == "yes" ]] || [[ "$PROMETHEUS_OUTPUT" == "yes" ]]; }; then
+        exec 3>&1 1>&2
+        _outer_json_fd_saved=1
     fi
 
     case "$MODE" in
@@ -9165,6 +9224,11 @@ main() {
 
     # Save trend data for next run
     _save_trend "$TREND_FILE"
+
+    # Restore the real stdout (saved above) before emitting the one
+    # structured-output blob — everything before this point in whatever
+    # report ran above went to stderr instead.
+    if (( _outer_json_fd_saved )); then exec 1>&3 3>&-; fi
 
     # Emit structured output if requested
     if [[ "$JSON_OUTPUT" == "yes" ]]; then

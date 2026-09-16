@@ -174,6 +174,54 @@ not how it got that way.
 - **Terminal exit-code trust — RESOLVED.** `shani-update.sh` uses `--wait`
   for gnome-terminal; rollback "success" reporting while mid-flight is
   fixed.
+- **`shani-health.sh`: every single-format structured-output invocation
+  was silently broken — FIXED (2026-09-03).** `main()`'s output-format
+  counter used `((format_count++))` under `set -Eeuo pipefail`; a bare
+  post-increment from 0 evaluates the compound `[[ ... ]] &&
+  ((format_count++))` statement as failing (0 is falsy for `((...))`'s
+  exit status), and since it's a top-level statement (not an if/while
+  condition), that aborted the whole script with **zero output and no
+  error message** — for `--verify --json`, `--security --json`,
+  `--boot --nagios`, any single-format combo. Verified live in a real
+  systemd-nspawn container (`shani-install-media/test-env`): both
+  `shani-health --verify --json` and `--security --json` died at
+  exactly that line with rc=1, nothing on stdout or stderr. This means
+  **`shani-fleet`'s `collect_verify()` — called on every heartbeat —
+  has been silently getting empty output and reporting `verify_status:
+  "fail"` with an always-empty `failed` array for every machine**,
+  regardless of actual health, for as long as this bug has existed.
+  Same fix pattern already used elsewhere in this file
+  (`errors=$(( errors + 1 ))` in `_check_fail`) applied to all 10
+  bare `((issues++))`/`((format_count++))` occurrences.
+- **`shani-health.sh --json`/`--nagios`/`--prometheus`: human-readable
+  report corrupted the structured output stream — FIXED (2026-09-03).**
+  `_row`/`_row2`/`_head`/`_focused_header` print via bare
+  `printf`/`echo` (stdout), not the stderr-redirected `_log_*` family a
+  stale doc comment claimed was the only output path — so the colored
+  report landed on stdout BEFORE the JSON/Nagios/Prometheus blob,
+  corrupting it for any consumer piping stdout into `jq` (the
+  documented, intended usage: `shani-health --verify --json | jq`).
+  Fixed by saving real stdout to fd 3 and redirecting stdout to stderr
+  for the report-generation phase in both `verify_system()` and
+  `main()`'s generic dispatch, restoring fd 3 immediately before the
+  one line of actual structured output. Verified live: `--verify --json`
+  and `--security --json` now produce clean, `jq`-parseable JSON with
+  correct `errors`/`ok` fields, reproducibly across repeated runs.
+- **`shani-health.sh --security`'s structured output had blank/wrong
+  section labels — FIXED (2026-09-03).** `_section_secureboot`,
+  `_section_tpm2`, `_section_encryption`, `_section_immutability`,
+  `_section_kernel_security`, `_section_security_services`,
+  `_section_security_audit`, `_section_krb5`, `_section_users`, and
+  `_section_groups` never called `_set_section` before recording their
+  rows — `_RECORD_SECTION` is a persistent global, so every one of
+  their checks inherited whichever section was set last (mostly none —
+  blank `section:""`; after adding secureboot/tpm2's own `_set_section`
+  calls, everything downstream incorrectly showed `"tpm2"` until all 10
+  were fixed). All 10 now set their own section; verified live that
+  `--security --json`'s `.checks[].section` values are exactly the 10
+  distinct expected names with correct per-section counts, and that
+  `--verify --json`'s independent `_CHECK_RESULTS`/`_print_verify_json`
+  pipeline (which doesn't use sections at all) is unaffected.
 - **`get_booted_subvol()` — 5 copies total (4 named functions + 1 inline
   in `check-boot-failure.sh`), harmonized, not merged into a shared
   file.** All 5 now share the same core parsing logic (including a

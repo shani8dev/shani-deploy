@@ -15,6 +15,47 @@
 # auditing every risky line for an explicit `|| true`-style guard first —
 # that's a bigger change than "add set -e", not a drop-in one-liner.
 
+_load_ini_config() {
+    local conf_file="$1" section="" line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            [[ -z "$section" ]] && continue
+            printf -v "${section}_${key}" '%s' "$value"
+        fi
+    done < "$conf_file"
+}
+
+DEFAULT_current_slot="/data/current-slot"
+DEFAULT_boot_failure="/data/boot_failure"
+DEFAULT_boot_failure_acked="/data/boot_failure.acked"
+DEFAULT_boot_hard_failure="/data/boot_hard_failure"
+DEFAULT_boot_ok="/data/boot-ok"
+DEFAULT_boot_in_progress="/data/boot_in_progress"
+
+if [[ -f /etc/shani/shani.conf ]]; then
+    _load_ini_config /etc/shani/shani.conf
+fi
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+fi
+
+CURRENT_SLOT_FILE="${current_slot:-${DEFAULT_current_slot}}"
+BOOT_FAILURE_FILE="${boot_failure:-${DEFAULT_boot_failure}}"
+BOOT_FAILURE_ACKED="${boot_failure_acked:-${DEFAULT_boot_failure_acked}}"
+BOOT_HARD_FAILURE_FILE="${boot_hard_failure:-${DEFAULT_boot_hard_failure}}"
+BOOT_OK_FILE="${boot_ok:-${DEFAULT_boot_ok}}"
+BOOT_IN_PROGRESS_FILE="${boot_in_progress:-${DEFAULT_boot_in_progress}}"
+
 # Serialize marker read+write with flock — same pattern used for the
 # subid-allocation lock in shani-user-setup.sh. This script reads then
 # conditionally writes/removes /data/boot_failure, /data/boot_failure.acked,
@@ -52,7 +93,7 @@ fi
 # The slot that was *supposed* to boot (the one that failed).
 # shani-update._check_fallback_boot() expects boot_failure to contain
 # this value so it can match it against /data/current-slot.
-FAILED_SLOT=$(cat /data/current-slot 2>/dev/null | tr -cd 'a-z')
+FAILED_SLOT=$(cat "$CURRENT_SLOT_FILE" 2>/dev/null | tr -cd 'a-z')
 [ -z "$FAILED_SLOT" ] && FAILED_SLOT="$BOOTED_SLOT"
 
 # Sanity-check: current-slot must be a valid slot name and must differ from
@@ -76,26 +117,26 @@ if [ "$FAILED_SLOT" = "$BOOTED_SLOT" ] || \
 fi
 
 # Hard failure already written by dracut hook — nothing more to do
-if [ -f /data/boot_hard_failure ]; then
+if [ -f "$BOOT_HARD_FAILURE_FILE" ]; then
     logger -t check-boot-failure "Hard failure already recorded for slot '$FAILED_SLOT', skipping."
     exit 0
 fi
 
 # If system already recovered and booted the same slot successfully,
 # any existing failure marker is stale and should be removed.
-if [ -f /data/boot-ok ] && [ -f /data/boot_failure ]; then
-    RECORDED_FAILED=$(cat /data/boot_failure | tr -cd 'a-z')
+if [ -f "$BOOT_OK_FILE" ] && [ -f "$BOOT_FAILURE_FILE" ]; then
+    RECORDED_FAILED=$(cat "$BOOT_FAILURE_FILE" | tr -cd 'a-z')
     if [ "$BOOTED_SLOT" = "$RECORDED_FAILED" ]; then
-        rm -f /data/boot_failure /data/boot_failure.acked
+        rm -f "$BOOT_FAILURE_FILE" "$BOOT_FAILURE_ACKED"
         logger -t check-boot-failure \
           "Recovered slot '@${BOOTED_SLOT}' booted successfully — clearing stale failure marker."
     fi
 fi
 
 # Boot failed if still "in progress" and never marked ok
-if [ -f /data/boot_in_progress ] && [ ! -f /data/boot-ok ]; then
-    if [ ! -f /data/boot_failure ] && [ ! -f /data/boot_failure.acked ]; then
-        echo "$FAILED_SLOT" > /data/boot_failure
+if [ -f "$BOOT_IN_PROGRESS_FILE" ] && [ ! -f "$BOOT_OK_FILE" ]; then
+    if [ ! -f "$BOOT_FAILURE_FILE" ] && [ ! -f "$BOOT_FAILURE_ACKED" ]; then
+        echo "$FAILED_SLOT" > "$BOOT_FAILURE_FILE"
         logger -t check-boot-failure \
           "Boot failure: slot '@${FAILED_SLOT}' failed to boot, system fell back to '@${BOOTED_SLOT}'."
     fi

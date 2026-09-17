@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DRY_RUN=false
+JSON_OUTPUT=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check-only) DRY_RUN=true ;;
+        --json) JSON_OUTPUT=true ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+REPO_DIR="/home/shrinivaskumbhar/Documents/shani/shani-repo"
+INSTALLED_VERSION="0.0.0"
+AVAILABLE_VERSION="0.0.0"
+
+if [[ -f /etc/shani/version ]]; then
+    INSTALLED_VERSION=$(cat /etc/shani/version)
+fi
+
+if [[ -f "$REPO_DIR/version" ]]; then
+    AVAILABLE_VERSION=$(cat "$REPO_DIR/version")
+fi
+
+report() {
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo "{\"installed\":\"$INSTALLED_VERSION\",\"available\":\"$AVAILABLE_VERSION\",\"upgrade_available\":$([ "$INSTALLED_VERSION" != "$AVAILABLE_VERSION" ] && echo true || echo false),\"dry_run\":$DRY_RUN}"
+    else
+        echo "=== Shani Upgrade Adviser ==="
+        echo "Installed version: $INSTALLED_VERSION"
+        echo "Available version: $AVAILABLE_VERSION"
+        if [[ "$INSTALLED_VERSION" != "$AVAILABLE_VERSION" ]]; then
+            echo "Upgrade available: YES"
+        else
+            echo "Upgrade available: NO"
+        fi
+        echo "Dry run: $DRY_RUN"
+    fi
+}
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "Running in check-only mode (dry run)..."
+fi
+
+# Check disk space
+DISK_AVAIL=$(df / | tail -1 | awk '{print $4}')
+if [[ "$DISK_AVAIL" -lt 1048576 ]]; then
+    echo "WARNING: Less than 1GB disk space available" >&2
+fi
+
+report

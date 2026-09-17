@@ -68,13 +68,42 @@ else
     CMDLINE_FILE=""
 fi
 
-# Configuration
+_load_ini_config() {
+    local conf_file="$1" section="" line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            [[ -z "$section" ]] && continue
+            printf -v "${section}_${key}" '%s' "$value"
+        fi
+    done < "$conf_file"
+}
+
+DEFAULT_deploy_esp_path="/boot/efi"
+DEFAULT_deploy_rootlabel="shani_root"
+
+if [[ -f /etc/shani/shani.conf ]]; then
+    _load_ini_config /etc/shani/shani.conf
+fi
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+fi
+
 readonly OS_NAME="shanios"
-readonly ESP="${esp_path:-/boot/efi}"
+readonly ESP="${deploy_esp_path:-${DEFAULT_deploy_esp_path}}"
 readonly EFI_DIR="$ESP/EFI/${OS_NAME}"
 readonly MOK_KEY="/etc/secureboot/keys/MOK.key"
 readonly MOK_CRT="/etc/secureboot/keys/MOK.crt"
-readonly ROOTLABEL="${rootlabel:-shani_root}"
+readonly ROOTLABEL="${deploy_rootlabel:-${DEFAULT_deploy_rootlabel}}"
 
 # Ensure MOK keys exist — they are normally placed by build-base-image.sh and
 # verified by configure.sh at install time. If missing (e.g. custom image built

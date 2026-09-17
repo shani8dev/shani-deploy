@@ -44,7 +44,6 @@ _load_ini_config() {
     done < "$conf_file"
 }
 
-# Default values (fallbacks) — named to match INI section_key variables
 DEFAULT_deploy_channel="stable"
 DEFAULT_deploy_download_dir="/data/downloads"
 DEFAULT_deploy_mount_dir="/mnt"

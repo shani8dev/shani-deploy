@@ -35,12 +35,12 @@ _load_ini_config() {
     done < "$conf_file"
 }
 
-DEFAULT_current_slot="/data/current-slot"
-DEFAULT_boot_failure="/data/boot_failure"
-DEFAULT_boot_failure_acked="/data/boot_failure.acked"
-DEFAULT_boot_hard_failure="/data/boot_hard_failure"
-DEFAULT_boot_ok="/data/boot-ok"
-DEFAULT_boot_in_progress="/data/boot_in_progress"
+DEFAULT_deploy_current_slot="/data/current-slot"
+DEFAULT_deploy_boot_failure="/data/boot_failure"
+DEFAULT_deploy_boot_failure_acked="/data/boot_failure.acked"
+DEFAULT_deploy_boot_hard_failure="/data/boot_hard_failure"
+DEFAULT_deploy_boot_ok="/data/boot-ok"
+DEFAULT_deploy_boot_in_progress="/data/boot_in_progress"
 
 if [[ -f /etc/shani/shani.conf ]]; then
     _load_ini_config /etc/shani/shani.conf
@@ -49,12 +49,12 @@ if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
     _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
 fi
 
-CURRENT_SLOT_FILE="${current_slot:-${DEFAULT_current_slot}}"
-BOOT_FAILURE_FILE="${boot_failure:-${DEFAULT_boot_failure}}"
-BOOT_FAILURE_ACKED="${boot_failure_acked:-${DEFAULT_boot_failure_acked}}"
-BOOT_HARD_FAILURE_FILE="${boot_hard_failure:-${DEFAULT_boot_hard_failure}}"
-BOOT_OK_FILE="${boot_ok:-${DEFAULT_boot_ok}}"
-BOOT_IN_PROGRESS_FILE="${boot_in_progress:-${DEFAULT_boot_in_progress}}"
+CURRENT_SLOT_FILE="${deploy_current_slot:-${DEFAULT_deploy_current_slot}}"
+BOOT_FAILURE_FILE="${deploy_boot_failure:-${DEFAULT_deploy_boot_failure}}"
+BOOT_FAILURE_ACKED="${deploy_boot_failure_acked:-${DEFAULT_deploy_boot_failure_acked}}"
+BOOT_HARD_FAILURE_FILE="${deploy_boot_hard_failure:-${DEFAULT_deploy_boot_hard_failure}}"
+BOOT_OK_FILE="${deploy_boot_ok:-${DEFAULT_deploy_boot_ok}}"
+BOOT_IN_PROGRESS_FILE="${deploy_boot_in_progress:-${DEFAULT_deploy_boot_in_progress}}"
 
 # Serialize marker read+write with flock — same pattern used for the
 # subid-allocation lock in shani-user-setup.sh. This script reads then

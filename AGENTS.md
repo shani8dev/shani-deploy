@@ -289,3 +289,70 @@ not how it got that way.
 would make either untrue, treat that as the regression, regardless of
 whether existing tests still pass. `AUDIT-HISTORY.md` has the full
 narrative behind every entry in "Audit-verified known issues" above.
+
+## Garuda Cross-Reference Findings (added 2026-09-17)
+
+Based on a full scan of 29 garuda-linux repos mapped against shani (see `../garuda-catalog.md` — 29 repos, not 34; several user-listed names don't exist). See `../garuda-mapping-analysis.md` and `../deep-analysis.md` for full details. Garuda-tools is the most directly comparable repo — both handle system deployment and boot management.
+
+### 🟡 HIGH: Config & tooling gaps vs garuda-tools
+
+1. **Add centralized config** (estimated 1-2 days).
+   - Garuda uses a layered config system: `/etc/garuda-tools/garuda-tools.conf` (system-wide) + `~/.config/garuda-tools/garuda-tools.conf` (user override). Config defines build targets, chroot dirs, cache dirs, mirrors.
+   - Shani scripts hardcode paths or use env vars — no equivalent centralized config for deploy/build tools.
+   - **Action**: Create `/etc/shani/shani.conf` (or similar) with DEPLOY_CHANNEL, BUILD_MIRROR, ISO_CACHE_DIR, BUILD_DIR. Follow the user-override pattern.
+
+2. **Add checkpkg equivalent** (estimated 1 day).
+   - Garuda's `checkpkg` verifies package builds work before publishing. Shani has no equivalent.
+   - **Action**: Create a script that runs a package build in a throwaway container and verifies the result without publishing.
+
+3. **Add upgrade safety check** (estimated 3 days).
+   - Garuda's `garuda-upgrade-adviser` checks if a system upgrade is safe before running it. Shani has nothing comparable.
+   - **Action**: Create a script that checks: current Btrfs snapshot state, free space, running services that might break, pending updates. Integrate into `shani-update` flow.
+
+### ✅ What shani-deploy has that Garuda lacks
+
+| Feature | Shani-Deploy | Garuda Equivalent |
+|---------|-------------|-------------------|
+| Blue-green Btrfs slot switching | ✅ | ❌ |
+| Automated rollback on boot failure | ✅ | ❌ Manual |
+| UKI generation/signing | ✅ | ❌ Manual |
+| Boot entry management | ✅ | ⚠️ GUI tools exist but manual |
+| Health diagnostics | ✅ | ❌ |
+| Self-update with verification | ✅ (GPG-signed, fail-closed) | ❌ |
+| Real test harness | ✅ | ❌ |
+| Chroot detection safety | ✅ | ❌ |
+
+### 🔍 Re-Scan Findings (2026-09-17)
+
+Re-scan against `../garuda-catalog.md` (29 repos, not 34). **Confirmed mappings: garuda-tools** ✅ (exists — `bin/` has buildpkg, buildiso, buildtree, checkpkg, garuda-chroot, signiso, signpkgs, deployiso, testiso, checksumiso) and **garuda-upgrade-adviser** ✅ (exists — minimal shell tool advising on upgrade safety, packaged in AUR).
+
+**New gaps** (garuda has, shani-deploy lacks):
+
+1. **Standalone GPG signing tools** — garuda-tools ships `signiso`/`signpkgs`/`signfile` with a `gpgkey` config in `garuda-tools.conf`; shani's GPG signing is embedded per-script (`self_update()`, `gen-efi.sh`) with no standalone signer utility.
+2. **`garuda-chroot`** — garuda-tools has a first-class chroot-into-installed-system tool; shani only has chroot *detection* safety checks, no chroot entry tool.
+3. **`testiso`/`checksumiso`** — garuda-tools verifies built ISOs (boot test + checksum); shani relies on the `test-env` harness but has no packaged ISO-verification tool.
+4. **`buildtree`** — garuda-tools syncs ABS + custom git repos; shani has no repo-sync tooling.
+5. **DocBook man pages + initcpio hooks** — garuda-tools generates man pages via `docbook/` + `xsltproc` and ships `initcpio/` mkinitcpio hooks; shani-deploy has neither.
+
+**Shani advantages** (shani has, garuda lacks):
+
+- Blue-green Btrfs slot switching with automated rollback on boot failure (garuda: manual)
+- Real test harness (`shani-install-media/test-env` exercises real deploy/rollback/UKI-signing)
+- GPG-signed fail-closed self-update + per-unit systemd hardening (garuda-tools: no equivalent)
+- UKI generation/signing with Secure Boot (garuda: manual)
+
+**Note**: garuda-upgrade-adviser is a minimal repo (2-line README, no CI, no compiled code) — the upgrade-safety gap above is real, but shani's `shani-update.sh` rollback machinery already exceeds the garuda tool itself.
+
+### 📋 Implementation Roadmap (2026-09-17)
+
+Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap for the whole shani ecosystem).
+
+1. **CI Workflows** (P1, ~2-3 days) — Currently no CI at all; verification is entirely manual. Wire `tests/test-deploy-state.sh` into CI for the unit-level state/marker tests (currently the only fast, container-free test). This is safety-critical code where a regression can leave a real machine unbootable — automated regression detection is not optional. Use `shani-ci-commons` templates. Source: IMPLEMENTATION-ROADMAP.md #7.
+
+2. **Centralized Config** (P1, ~1-2 days) — Create `/etc/shani/shani.conf` (INI format) with `[deploy]`, `[health]`, and `[update]` sections, env-var overrides for each key. Adapted from garuda-tools' `garuda-tools.conf` pattern but scoped to deploy/build tools only — **not** for `shani-settings`, which uses `/etc` overlay correctly and is a different (valid) architecture. Eliminates hardcoded paths and scattered env vars. Source: IMPLEMENTATION-ROADMAP.md #12.
+
+3. **Upgrade Safety Adviser** (P2, ~3 days) — Adapt garuda-upgrade-adviser's pattern: a pre-upgrade check that verifies disk space, pending pacman transactions, package conflicts, and current Btrfs snapshot state before allowing `shani-update` to proceed. Integrate into the `shani-update` flow as a gate. **Note**: shani's rollback machinery already exceeds garuda-upgrade-adviser itself; this adds the pre-flight check that garuda-upgrade-adviser provides, not the rollback. Source: IMPLEMENTATION-ROADMAP.md (garuda cross-reference).
+
+4. **Shared CI Templates, Renovate, Conventional Commits** (P1, cross-repo) — Create `shani-ci-commons` with reusable CI templates (master #7 alone is a 2-3 day build; the Renovate #8 and commitizen #9 add-ons are short per-repo adoptions), and commitizen for conventional commit enforcement. These affect all 15 shani repos. Source: IMPLEMENTATION-ROADMAP.md #7, #8, #9.
+
+5. **Explicit: Do NOT Port Boot-Entry/Deploy Logic from Garuda** — Shani's blue-green Btrfs deployment, automated rollback, UKI signing, and chroot detection safety are all superior to anything garuda-tools provides. The table in "What shani-deploy has that Garuda lacks" above documents this clearly. Only the **config layer** (INI config pattern) and the **upgrade-adviser pattern** (pre-flight safety check) are worth adopting from garuda — everything else in garuda's deploy/boot space would be a downgrade.

@@ -20,6 +20,88 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# ── Centralized Config Loader ────────────────────────────────────
+# Parses INI config: /etc/shani/shani.conf (system-wide) +
+# ~/.config/shani/shani.conf (user override).
+# Variables referenced as ${section_key:-${DEFAULT_section_key}}.
+_load_ini_config() {
+    local conf_file="$1" section="" line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            [[ -z "$section" ]] && continue
+            printf -v "${section}_${key}" '%s' "$value"
+        fi
+    done < "$conf_file"
+}
+
+# Default values (fallbacks)
+DEFAULT_deploy_channel="stable"
+DEFAULT_download_dir="/data/downloads"
+DEFAULT_mount_dir="/mnt"
+DEFAULT_esp_path="/boot/efi"
+DEFAULT_r2_base_url="https://downloads.shani.dev"
+DEFAULT_max_download_attempts="5"
+DEFAULT_extraction_timeout="1800"
+DEFAULT_min_free_space_mb="10240"
+DEFAULT_min_file_size="10485760"
+DEFAULT_log_file="/var/log/shanios-deploy.log"
+DEFAULT_lock_file="/run/shanios-deploy.lock"
+DEFAULT_reboot_needed_file="/run/shanios/reboot-needed"
+DEFAULT_channel_file="/etc/shani-channel"
+DEFAULT_license_file="/etc/shani-license"
+DEFAULT_deploy_pending="/data/deployment_pending"
+DEFAULT_boot_failure_file="/data/boot_failure"
+DEFAULT_boot_hard_failure_file="/data/boot_hard_failure"
+DEFAULT_genefi_script="/usr/local/bin/gen-efi"
+DEFAULT_genefi_script_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/gen-efi.sh"
+DEFAULT_gpg_key_id="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
+DEFAULT_rootlabel="shani_root"
+DEFAULT_max_inhibit_depth="2"
+
+# Load system-wide config
+if [[ -f /etc/shani/shani.conf ]]; then
+    _load_ini_config /etc/shani/shani.conf
+fi
+
+# Load user override
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+fi
+
+# Resolve config variables with DEFAULT_ fallbacks
+DEPLOY_CHANNEL="${deploy_channel:-${DEFAULT_deploy_channel}}"
+DOWNLOAD_DIR="${download_dir:-${DEFAULT_download_dir}}"
+MOUNT_DIR="${mount_dir:-${DEFAULT_mount_dir}}"
+ESP="${esp_path:-${DEFAULT_esp_path}}"
+R2_BASE_URL="${r2_base_url:-${DEFAULT_r2_base_url}}"
+MAX_DOWNLOAD_ATTEMPTS="${max_download_attempts:-${DEFAULT_max_download_attempts}}"
+EXTRACTION_TIMEOUT="${extraction_timeout:-${DEFAULT_extraction_timeout}}"
+MIN_FREE_SPACE_MB="${min_free_space_mb:-${DEFAULT_min_free_space_mb}}"
+MIN_FILE_SIZE="${min_file_size:-${DEFAULT_min_file_size}}"
+LOG_FILE="${log_file:-${DEFAULT_log_file}}"
+LOCK_FILE="${lock_file:-${DEFAULT_lock_file}}"
+REBOOT_NEEDED_FILE="${reboot_needed_file:-${DEFAULT_reboot_needed_file}}"
+CHANNEL_FILE="${channel_file:-${DEFAULT_channel_file}}"
+LICENSE_FILE="${license_file:-${DEFAULT_license_file}}"
+DEPLOY_PENDING="${deploy_pending:-${DEFAULT_deploy_pending}}"
+BOOT_FAILURE_FILE="${boot_failure_file:-${DEFAULT_boot_failure_file}}"
+BOOT_HARD_FAILURE_FILE="${boot_hard_failure_file:-${DEFAULT_boot_hard_failure_file}}"
+GENEFI_SCRIPT="${genefi_script:-${DEFAULT_genefi_script}}"
+GENEFI_SCRIPT_URL="${genefi_script_url:-${DEFAULT_genefi_script_url}}"
+GPG_KEY_ID="${gpg_key_id:-${DEFAULT_gpg_key_id}}"
+ROOTLABEL="${rootlabel:-${DEFAULT_rootlabel}}"
+MAX_INHIBIT_DEPTH="${max_inhibit_depth:-${DEFAULT_max_inhibit_depth}}"
+
 declare -a ORIGINAL_ARGS=("$@")
 declare DEPLOYMENT_START_TIME
 DEPLOYMENT_START_TIME=$(date +%s)
@@ -76,31 +158,29 @@ fi
 #####################################
 
 readonly OS_NAME="shanios"
-readonly ROOTLABEL="shani_root"
-readonly DOWNLOAD_DIR="/data/downloads"
-readonly MOUNT_DIR="/mnt"
-readonly ROOT_DEV="/dev/disk/by-label/shani_root"
-readonly MIN_FREE_SPACE_MB=10240
-readonly MIN_FILE_SIZE=10485760
-readonly GENEFI_SCRIPT="/usr/local/bin/gen-efi"
-readonly GENEFI_SCRIPT_URL="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/gen-efi.sh"
-readonly DEPLOY_PENDING="/data/deployment_pending"
-readonly BOOT_FAILURE_FILE="/data/boot_failure"
-readonly BOOT_HARD_FAILURE_FILE="/data/boot_hard_failure"
+readonly ROOTLABEL="${ROOTLABEL}"
+readonly ROOT_DEV="/dev/disk/by-label/${ROOTLABEL}"
+readonly MIN_FREE_SPACE_MB="${MIN_FREE_SPACE_MB}"
+readonly MIN_FILE_SIZE="${MIN_FILE_SIZE}"
+readonly GENEFI_SCRIPT="${GENEFI_SCRIPT}"
+readonly GENEFI_SCRIPT_URL="${GENEFI_SCRIPT_URL}"
+readonly DEPLOY_PENDING="${DEPLOY_PENDING}"
+readonly BOOT_FAILURE_FILE="${BOOT_FAILURE_FILE}"
+readonly BOOT_HARD_FAILURE_FILE="${BOOT_HARD_FAILURE_FILE}"
 # /run is tmpfs — cleared automatically on every reboot, so no manual cleanup needed.
 # Written world-readable so shani-update (running as a normal user) can read it.
-readonly REBOOT_NEEDED_FILE="/run/shanios/reboot-needed"
-readonly LOCK_FILE="/run/shanios-deploy.lock"
-readonly GPG_KEY_ID="${SHANIOS_DEPLOY_GPG_KEY_ID:-7B927BFFD4A9EAAA8B666B77DE217F3DA8014792}"
-readonly LOG_FILE="/var/log/shanios-deploy.log"
-readonly CHANNEL_FILE="/etc/shani-channel"
-readonly LICENSE_FILE="/etc/shani-license"
-readonly ESP="/boot/efi"
-readonly R2_BASE_URL="https://downloads.shani.dev"
+readonly REBOOT_NEEDED_FILE="${REBOOT_NEEDED_FILE}"
+readonly LOCK_FILE="${LOCK_FILE}"
+readonly GPG_KEY_ID="${GPG_KEY_ID}"
+readonly LOG_FILE="${LOG_FILE}"
+readonly CHANNEL_FILE="${CHANNEL_FILE}"
+readonly LICENSE_FILE="${LICENSE_FILE}"
+readonly ESP="${ESP}"
+readonly R2_BASE_URL="${R2_BASE_URL}"
 
-readonly MAX_INHIBIT_DEPTH=2
-readonly MAX_DOWNLOAD_ATTEMPTS=5
-readonly EXTRACTION_TIMEOUT=1800
+readonly MAX_INHIBIT_DEPTH="${MAX_INHIBIT_DEPTH}"
+readonly MAX_DOWNLOAD_ATTEMPTS="${MAX_DOWNLOAD_ATTEMPTS}"
+readonly EXTRACTION_TIMEOUT="${EXTRACTION_TIMEOUT}"
 
 declare -g HAS_ARIA2C=0 HAS_WGET=0 HAS_CURL=0 HAS_PV=0
 command -v aria2c &>/dev/null && HAS_ARIA2C=1

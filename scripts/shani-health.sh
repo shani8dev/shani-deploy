@@ -29,16 +29,67 @@ IFS=$'\n\t'
 ### Constants                                                                ###
 ###############################################################################
 
+_load_ini_config() {
+    local conf_file="$1" section="" line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            [[ -z "$section" ]] && continue
+            printf -v "${section}_${key}" '%s' "$value"
+        fi
+    done < "$conf_file"
+}
+
+DEFAULT_esp_path="/boot/efi"
+DEFAULT_genefi_bin="/usr/local/bin/gen-efi"
+DEFAULT_user_setup_bin="/usr/local/bin/shani-user-setup"
+DEFAULT_deploy_log="/var/log/shanios-deploy.log"
+DEFAULT_channel_file="/etc/shani-channel"
+DEFAULT_gpg_signing_key="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
+DEFAULT_gpg_signing_key_file="/etc/shani-keys/signing.asc"
+DEFAULT_data_boot_ok="/data/boot-ok"
+DEFAULT_data_boot_fail="/data/boot_failure"
+DEFAULT_data_boot_fail_acked="/data/boot_failure.acked"
+DEFAULT_data_boot_hard_fail="/data/boot_hard_failure"
+DEFAULT_data_current_slot="/data/current-slot"
+DEFAULT_data_prev_slot="/data/previous-slot"
+DEFAULT_data_deploy_pending="/data/deployment_pending"
+DEFAULT_data_reboot_needed="/run/shanios/reboot-needed"
+
+if [[ -f /etc/shani/shani.conf ]]; then
+    _load_ini_config /etc/shani/shani.conf
+fi
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+fi
+
 readonly OS_NAME="shanios"
 readonly ROOTLABEL="shani_root"
 readonly ROOT_DEV="/dev/disk/by-label/shani_root"
-readonly ESP="/boot/efi"
-readonly GENEFI_BIN="/usr/local/bin/gen-efi"
-readonly USER_SETUP_BIN="/usr/local/bin/shani-user-setup"
-readonly DEPLOY_LOG="/var/log/shanios-deploy.log"
-readonly CHANNEL_FILE="/etc/shani-channel"
-readonly GPG_SIGNING_KEY="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
-readonly GPG_SIGNING_KEY_FILE="/etc/shani-keys/signing.asc"
+readonly ESP="${esp_path:-${DEFAULT_esp_path}}"
+readonly GENEFI_BIN="${genefi_bin:-${DEFAULT_genefi_bin}}"
+readonly USER_SETUP_BIN="${user_setup_bin:-${DEFAULT_user_setup_bin}}"
+readonly DEPLOY_LOG="${deploy_log:-${DEFAULT_deploy_log}}"
+readonly CHANNEL_FILE="${channel_file:-${DEFAULT_channel_file}}"
+readonly GPG_SIGNING_KEY="${gpg_signing_key:-${DEFAULT_gpg_signing_key}}"
+readonly GPG_SIGNING_KEY_FILE="${gpg_signing_key_file:-${DEFAULT_gpg_signing_key_file}}"
+readonly DATA_BOOT_OK="${data_boot_ok:-${DEFAULT_data_boot_ok}}"
+readonly DATA_BOOT_FAIL="${data_boot_fail:-${DEFAULT_data_boot_fail}}"
+readonly DATA_BOOT_FAIL_ACKED="${data_boot_fail_acked:-${DEFAULT_data_boot_fail_acked}}"
+readonly DATA_BOOT_HARD_FAIL="${data_boot_hard_fail:-${DEFAULT_data_boot_hard_fail}}"
+readonly DATA_CURRENT_SLOT="${data_current_slot:-${DEFAULT_data_current_slot}}"
+readonly DATA_PREV_SLOT="${data_prev_slot:-${DEFAULT_data_prev_slot}}"
+readonly DATA_DEPLOY_PENDING="${data_deploy_pending:-${DEFAULT_data_deploy_pending}}"
+readonly DATA_REBOOT_NEEDED="${data_reboot_needed:-${DEFAULT_data_reboot_needed}}"
 
 readonly DATA_BOOT_OK="/data/boot-ok"
 readonly DATA_BOOT_FAIL="/data/boot_failure"

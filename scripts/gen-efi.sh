@@ -70,11 +70,11 @@ fi
 
 # Configuration
 readonly OS_NAME="shanios"
-readonly ESP="/boot/efi"
+readonly ESP="${esp_path:-/boot/efi}"
 readonly EFI_DIR="$ESP/EFI/${OS_NAME}"
 readonly MOK_KEY="/etc/secureboot/keys/MOK.key"
 readonly MOK_CRT="/etc/secureboot/keys/MOK.crt"
-readonly ROOTLABEL="shani_root"
+readonly ROOTLABEL="${rootlabel:-shani_root}"
 
 # Ensure MOK keys exist — they are normally placed by build-base-image.sh and
 # verified by configure.sh at install time. If missing (e.g. custom image built

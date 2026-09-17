@@ -32,33 +32,73 @@ IFS=$'\n\t'
 ### Constants                     ###
 #####################################
 
+_load_ini_config() {
+    local conf_file="$1" section="" line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            [[ -z "$section" ]] && continue
+            printf -v "${section}_${key}" '%s' "$value"
+        fi
+    done < "$conf_file"
+}
+
+DEFAULT_update_channel_default="stable"
+DEFAULT_r2_base_url="https://downloads.shani.dev"
+DEFAULT_base_url="https://sourceforge.net/projects/shanios/files"
+DEFAULT_channel_file="/etc/shani-channel"
+DEFAULT_current_slot_file="/data/current-slot"
+DEFAULT_boot_failure_file="/data/boot_failure"
+DEFAULT_boot_hard_failure_file="/data/boot_hard_failure"
+DEFAULT_boot_ok_file="/data/boot-ok"
+DEFAULT_reboot_needed_file="/run/shanios/reboot-needed"
+DEFAULT_network_timeout="30"
+DEFAULT_curl_retries="3"
+DEFAULT_curl_retry_delay="5"
+DEFAULT_defer_delay="86400"
+DEFAULT_deploy_log="/var/log/shanios-deploy.log"
+DEFAULT_update_log="/var/log/shani-update.log"
+DEFAULT_lock_file="/run/shanios/shani-update.lock"
+
+if [[ -f /etc/shani/shani.conf ]]; then
+    _load_ini_config /etc/shani/shani.conf
+fi
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+fi
+
+UPDATE_CHANNEL_DEFAULT="${update_channel_default:-${DEFAULT_update_channel_default}}"
+R2_BASE_URL="${r2_base_url:-${DEFAULT_r2_base_url}}"
+BASE_URL="${base_url:-${DEFAULT_base_url}}"
+CHANNEL_FILE="${channel_file:-${DEFAULT_channel_file}}"
+CURRENT_SLOT_FILE="${current_slot_file:-${DEFAULT_current_slot_file}}"
+BOOT_FAILURE_FILE="${boot_failure_file:-${DEFAULT_boot_failure_file}}"
+BOOT_HARD_FAILURE_FILE="${boot_hard_failure_file:-${DEFAULT_boot_hard_failure_file}}"
+BOOT_OK_FILE="${boot_ok_file:-${DEFAULT_boot_ok_file}}"
+REBOOT_NEEDED_FILE="${reboot_needed_file:-${DEFAULT_reboot_needed_file}}"
+NETWORK_TIMEOUT="${network_timeout:-${DEFAULT_network_timeout}}"
+CURL_RETRIES="${curl_retries:-${DEFAULT_curl_retries}}"
+CURL_RETRY_DELAY="${curl_retry_delay:-${DEFAULT_curl_retry_delay}}"
+DEFER_DELAY="${defer_delay:-${DEFAULT_defer_delay}}"
+DEPLOY_LOG="${deploy_log:-${DEFAULT_deploy_log}}"
+LOG_FILE="${update_log:-${DEFAULT_update_log}}"
+LOCK_FILE="${lock_file:-${DEFAULT_lock_file}}"
+
 readonly SCRIPT_VERSION="3.1"
 readonly OS_NAME="shanios"
 readonly DEPLOY_BIN="/usr/local/bin/shani-deploy"
 readonly HEALTH_BIN="/usr/local/bin/shani-health"
-readonly DEFER_DELAY=86400
-readonly UPDATE_CHANNEL_DEFAULT="stable"
-readonly BASE_URL="https://sourceforge.net/projects/shanios/files"
-readonly R2_BASE_URL="https://downloads.shani.dev"
 readonly LOCAL_VERSION_FILE="/etc/shani-version"
 readonly LOCAL_PROFILE_FILE="/etc/shani-profile"
-# Same file shani-deploy --set-channel writes to. Must be consulted here too,
-# or shani-update can check one channel while shani-deploy (which resolves
-# CLI arg > this file > "stable") deploys a different one.
-readonly CHANNEL_FILE="/etc/shani-channel"
-readonly CURRENT_SLOT_FILE="/data/current-slot"
-readonly BOOT_FAILURE_FILE="/data/boot_failure"
-readonly BOOT_HARD_FAILURE_FILE="/data/boot_hard_failure"
-readonly BOOT_OK_FILE="/data/boot-ok"
-# Matches shani-deploy's path — /run is tmpfs so the file auto-clears on reboot.
-readonly REBOOT_NEEDED_FILE="/run/shanios/reboot-needed"
-readonly LOG_TAG="shani-update"
-# shani-deploy's own log — separate file, written as root. Read-only viewer
-# access from the dashboard; falls back to pkexec if not world-readable.
-readonly DEPLOY_LOG="/var/log/shanios-deploy.log"
-readonly NETWORK_TIMEOUT=30
-readonly CURL_RETRIES=3
-readonly CURL_RETRY_DELAY=5
 
 # LOG_DIR: validate stays within HOME to prevent log injection via XDG_CACHE_HOME
 _lcd="${XDG_CACHE_HOME:-$HOME/.cache}"

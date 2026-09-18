@@ -253,6 +253,86 @@ evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
 is deliberately just the current-state summary — what's true right now,
 not how it got that way.
 
+- **`check-boot-failure.sh` misattributed a same-slot timeout to the
+  untouched sibling slot — FIXED (2026-09-19).** Its sanity-check treated
+  `FAILED_SLOT == BOOTED_SLOT` as invalid data (comment: "we are on the
+  fallback, so current-slot should name the slot that failed, not the one
+  we are running") and unconditionally flipped to the opposite slot. That
+  assumption is wrong: `/data/current-slot` only advances to a new
+  candidate during an active deploy's `finalize_update()` — once a slot
+  has been the accepted default for a while (the normal, everyday steady
+  state, not an edge case), `current-slot == BOOTED_SLOT` legitimately.
+  Reproduced live in `test-env`: entering `@blue` with `current-slot=blue`
+  (steady-state, no pending deploy) and `boot_in_progress` set produced
+  `boot_failure=green` — blaming the healthy, never-touched sibling slot
+  for a timeout that actually happened on `@blue`. Fixed to only derive
+  from `BOOTED_SLOT` when `current-slot`'s value is genuinely invalid
+  (not blue/green), not merely equal to it. Verified all three cases live
+  post-fix: same-slot timeout now correctly records the slot that
+  actually timed out; the genuine-fallback case (entering `@green` with
+  `current-slot=blue`) still correctly records `blue`, unchanged; garbage
+  `current-slot` content still correctly derives from `BOOTED_SLOT`.
+
+- **`shani-deploy --rollback`'s core slot-direction logic has the SAME
+  flawed assumption, one level deeper — NOT fixed, needs a human
+  architecture decision (Critical).** `rollback_system()` in
+  `scripts/shani-deploy.sh` derives `failed_slot` unconditionally as
+  "whichever slot is NOT currently booted" (its own comment: "The failed
+  slot is always the NON-booted slot") — it never treats
+  `/data/boot_failure`'s content as authoritative, only as a warn-only
+  cross-check it overrides ("Using @${failed_slot} (derived from booted
+  slot) — boot_failure may be stale"). This means `--rollback` has **no
+  code path that can ever target the currently-booted slot as the failed
+  one** — for a same-slot timeout (the bug above, now fixed at the
+  diagnostic-marker level, but this is the command that actually acts),
+  running `--rollback` would "repair" the healthy, untouched sibling slot
+  from a backup snapshot while leaving the real problem (the booted
+  default slot itself) completely untouched, still the default, and
+  report success ("Fallback slot ready... Default boot slot: @blue")
+  despite having fixed nothing. This is not a one-line fix like the one
+  above — it needs a real design decision about what recovery should even
+  *do* for a same-slot failure (there is no "other slot's backup" to
+  restore from in that case; the right action might be switching
+  `loader.conf`'s default to the sibling slot directly, with no
+  snapshot-repair step at all, or refusing to act without an explicit
+  `--target-slot` flag). Do not silently patch this without that
+  decision — a wrong fix here has the same blast radius as the bug.
+
+- **`finalize_boot_entries()`'s `+3-0` tries-counted candidate entry for a
+  fresh deploy likely provides no real automatic hard-failure fallback on
+  this systemd version (High, not independently re-confirmed this
+  session — inferred from existing evidence, needs a dedicated real
+  QEMU+OVMF hard-failure test to close out).** The function's own comment
+  claims "systemd-boot automatically falls back to the fallback entry if
+  it fails to reach multi-user.target" via the `+3-0` tries suffix. But
+  `bless-boot.service`'s own comment (already verified via a real
+  qemu+OVMF boot in an earlier session) states systemd-boot "never
+  renames a +tries_left-tries_done loader entry... at all on systemd
+  261" — a known, open upstream regression
+  (systemd/systemd#40405, only 257 and earlier confirmed working). That
+  finding was previously scoped only to `bless-boot.service`'s "blessing"
+  step (marking a boot good to stop counting); it was not connected to
+  `finalize_boot_entries()`'s use of the SAME tries-file-renaming
+  mechanism for the opposite purpose (counting down on failure). If
+  renaming never happens at all, the counting-down half is equally inert,
+  and a hard failure (e.g. root mount fails) on a freshly-deployed
+  candidate slot would not trigger any bootloader-level fallback —
+  systemd-boot would keep retrying the same broken `+3-0` entry
+  indefinitely, since `loader.conf`'s `default=` still names it and the
+  file is never aged out. This session verified the marker-file
+  chain (`mark-boot-in-progress`/`mark-boot-success`/`check-boot-failure`)
+  thoroughly via `systemd-nspawn` (`enter`/`verify-boot`), but nspawn
+  cannot exercise real UEFI firmware/bootloader entry selection at all —
+  confirming or refuting this specific claim needs an actual QEMU+OVMF
+  boot cycle with a genuinely hard-failing candidate slot, which is slow
+  (no `/dev/kvm` on this host) and was not run this session. Until that's
+  done, treat "automated rollback on boot failure" (touted in this
+  repo's own garuda-comparison table) as unverified for the hard-failure
+  case specifically — the marker/timer path is real and verified, but it
+  only ever *records* a failure; it does not itself switch the default
+  boot entry (see the `--rollback` entry above for what does, and its own
+  gap).
+
 - **`shani-health --storage-info` crashed with `STOR_MNT: unbound variable`
   every single time — FIXED (2026-09-18).** `analyze_storage()` sets `trap
   '...cleanup...' RETURN` to unmount its temp mount, but bash's RETURN

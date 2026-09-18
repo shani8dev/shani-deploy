@@ -96,13 +96,32 @@ fi
 FAILED_SLOT=$(cat "$CURRENT_SLOT_FILE" 2>/dev/null | tr -cd 'a-z')
 [ -z "$FAILED_SLOT" ] && FAILED_SLOT="$BOOTED_SLOT"
 
-# Sanity-check: current-slot must be a valid slot name and must differ from
-# the booted slot (we are on the fallback, so current-slot should name the
-# slot that failed, not the one we are running). If they match or the value
-# is invalid, derive the failed slot from the booted slot instead to avoid
-# recording the wrong slot as having failed.
-if [ "$FAILED_SLOT" = "$BOOTED_SLOT" ] || \
-   { [ "$FAILED_SLOT" != "blue" ] && [ "$FAILED_SLOT" != "green" ]; }; then
+# Sanity-check: current-slot must be a valid slot name. An invalid/empty
+# value carries no signal, so derive a best-effort answer from the booted
+# slot. current-slot legitimately CAN equal the booted slot — that is the
+# normal steady-state (current-slot is only advanced to a new candidate
+# during an active deploy's finalize_update(); once a slot has been the
+# accepted default for a while, current-slot == BOOTED_SLOT). A same-slot
+# timeout (this slot itself never reached mark-boot-success in time, no
+# bootloader-level fallback occurred) must be recorded as itself, not
+# "corrected" to the sibling slot.
+#
+# CONFIRMED LIVE BUG (fixed here): the previous version treated
+# FAILED_SLOT == BOOTED_SLOT as invalid data and unconditionally flipped
+# to the opposite slot. Reproduced in test-env: entering @blue with
+# current-slot=blue (steady-state, no pending deploy) and boot_in_progress
+# set produced boot_failure=green — blaming the untouched, healthy sibling
+# instead of the slot that actually failed to confirm success. Verified
+# the intended case still works correctly (entering @green with
+# current-slot=blue — a genuine fallback — still correctly records
+# boot_failure=blue). shani-deploy.sh's own rollback_system() has a
+# SEPARATE, deeper version of the same "failed slot is always the
+# non-booted slot" assumption baked into its core rollback-direction
+# logic (not just this diagnostic marker) — that one needs a real design
+# decision about what recovery should even DO for a same-slot failure
+# (there is no "other slot's backup" to restore from), not a same-shape
+# one-line fix; see AGENTS.md's known-issues entry, left unfixed here.
+if [ "$FAILED_SLOT" != "blue" ] && [ "$FAILED_SLOT" != "green" ]; then
     if [ "$BOOTED_SLOT" = "blue" ]; then
         FAILED_SLOT="green"
     elif [ "$BOOTED_SLOT" = "green" ]; then
@@ -113,7 +132,7 @@ if [ "$FAILED_SLOT" = "$BOOTED_SLOT" ] || \
         exit 0
     fi
     logger -t check-boot-failure \
-      "current-slot invalid or matches booted slot — derived failed slot as '@${FAILED_SLOT}'."
+      "current-slot invalid — derived failed slot as '@${FAILED_SLOT}' from booted slot."
 fi
 
 # Hard failure already written by dracut hook — nothing more to do

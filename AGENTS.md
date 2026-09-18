@@ -58,6 +58,80 @@ a regression in state persistence across `self_update()`'s re-exec broke
 things silently once before (a regex match clobbering `BASH_REMATCH`) and
 would again.
 
+## 🧪 MANDATORY: Full Real Test Harness (non-negotiable)
+
+**You MUST run the full test harness. Do not skip it. Do not substitute
+static checks for it. Do not say "this should work" without evidence.**
+
+Every change to this repo must be verified with the real test harness in
+`../shani-install-media/test-env/`. This is the ONLY way to prove boot,
+signing, deploy, and rollback logic actually works.
+
+### The complete test sequence (run ALL of these)
+
+```bash
+cd ../shani-install-media
+
+# 1. Clean any stale loop devices from previous sessions
+./run_in_container.sh build.sh test clean
+
+# 2. Generate throwaway CA + leaf cert for downloads.shani.dev
+./run_in_container.sh build.sh test ca
+
+# 3. Bootstrap: REAL install.sh + configure.sh into @blue/@green
+#    This creates real Btrfs subvolumes, signs EFI binaries, writes boot entries
+./run_in_container.sh build.sh test bootstrap -p gnome -d latest
+
+# 4. REAL deploy: download → SHA256+GPG verify → extract → UKI gen/sign → boot entry write
+#    --local-src overlays THIS repo's current scripts over the slot
+./run_in_container.sh build.sh test upgrade --local-src=/opt/shani-deploy/scripts
+
+# 5. REAL rollback: snapshot current slot, restore previous
+./run_in_container.sh build.sh test rollback --local-src=/opt/shani-deploy/scripts
+
+# 6. ALWAYS clean up loop devices when done
+./run_in_container.sh build.sh test clean
+```
+
+### What each step actually proves
+
+| Step | Proves |
+|------|--------|
+| `clean` | No stale loop devices break the next run |
+| `ca` | Test CA + leaf cert generation works |
+| `bootstrap` | install.sh + configure.sh produce a bootable slot with signed EFI |
+| `upgrade` | shani-deploy does download → verify → extract → UKI sign → boot entry write |
+| `rollback` | Snapshot + restore mechanism works |
+| `clean` | Loop devices released, no resource leaks |
+
+### Prerequisites
+
+- Docker must be running (`docker info`)
+- The `shani-builder` Docker image must be built (`shrinivasvkumbhar/shani-builder:latest`)
+- Pre-built images should exist at `cache/output/<profile>/` — check there first
+- No `/dev/kvm` on this host — QEMU boots are very slow, use nspawn commands
+
+### If a step fails
+
+Do NOT skip it. Do NOT say "it probably works." Investigate the failure:
+- Check the log file referenced in the error
+- Run the step again with verbose output
+- If it's a stale loop device issue, run `clean` first
+- If it's a corrupted cached package, the error will say so explicitly
+
+### Quick unit tests (fast, no container — run these FIRST)
+
+```bash
+# Syntax check ALL scripts
+for script in scripts/*.sh bin/*.sh; do bash -n "$script"; done
+
+# Unit tests
+bash tests/test-deploy-state.sh     # expect: ✓ N passed, 0 failed
+bash tests/test_upgrade_adviser.sh  # expect: 21 passed, 0 failed
+```
+
+These are the floor, not the ceiling. The harness above is the real proof.
+
 ## For anything touching boot entries, signing, self-update, or chroot detection
 
 Unit tests can't exercise these for real — they need a real Btrfs slot, a

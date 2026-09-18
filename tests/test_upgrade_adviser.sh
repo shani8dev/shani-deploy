@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ADVISER="$SCRIPT_DIR/../bin/shani-upgrade-adviser"
+ADVISER="$SCRIPT_DIR/../scripts/shani-upgrade-adviser.sh"
 TEMP_DIR=$(mktemp -d)
 TRAP_CLEANUP=false
 

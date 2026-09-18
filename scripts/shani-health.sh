@@ -8418,7 +8418,11 @@ _stor_subvol_row() {
 
 analyze_storage() {
     local STOR_MNT; STOR_MNT=$(mktemp -d /tmp/shani-storage-XXXXXX)
-    trap '_umount_r "$STOR_MNT"; rmdir "$STOR_MNT" 2>/dev/null || true' RETURN
+    # Bash's RETURN trap re-fires on every ANCESTOR function's return too, not
+    # just this one's — confirmed live: it crashed main()'s own return with
+    # "STOR_MNT: unbound variable" after this function's local var had long
+    # gone out of scope. Self-clear so it fires exactly once, here.
+    trap '_umount_r "$STOR_MNT"; rmdir "$STOR_MNT" 2>/dev/null || true; trap - RETURN' RETURN
 
     # Mount at subvolid=5 (the Btrfs root) so every subvolume is reachable
     if ! mount -o subvolid=5,ro "$ROOT_DEV" "$STOR_MNT" 2>/dev/null; then

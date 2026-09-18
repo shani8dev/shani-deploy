@@ -20,10 +20,7 @@ jobs:
 
       - name: bash -n on all scripts
         run: |
-          # Check every file in scripts/ and bin/ — robust glob catches
-          # bin/shani-upgrade-adviser (no .sh extension) that scripts/*.sh
-          # and bin/*.sh would miss.
-          for script in scripts/* bin/*; do
+          for script in scripts/*; do
             [ -f "$script" ] && bash -n "$script"
           done
 

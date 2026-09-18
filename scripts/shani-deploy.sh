@@ -1610,7 +1610,13 @@ optimize_storage() {
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" || { log_error "Could not mount root filesystem for deduplication — check ${ROOT_DEV}"; set -e; return 1; }
-    trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true' RETURN
+    # Bash's RETURN trap re-fires on every ANCESTOR function's return too, not
+    # just this one's (live-confirmed elsewhere in this codebase: it crashed a
+    # later, unrelated function's return referencing an out-of-scope local).
+    # MOUNT_DIR is global here so this hasn't crashed, but a stale trap firing
+    # mid-flow could still unmount it while a later phase is actively using it
+    # for something else. Self-clear so it fires exactly once, here.
+    trap 'safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
 
     if ! btrfs_subvol_exists "$MOUNT_DIR/@blue" || ! btrfs_subvol_exists "$MOUNT_DIR/@green"; then
         log_warn "Skipping deduplication (missing blue/green subvolumes)"
@@ -1753,7 +1759,11 @@ generate_uki() {
     # (restore_candidate, armed by finalize_update/deploy_update) is never
     # overwritten. Arming EXIT here would silently replace it with cleanup_chroot,
     # causing restore_candidate to never fire on UKI failure.
-    trap 'cleanup_chroot' RETURN
+    # Also self-clear: a RETURN trap re-fires on every ANCESTOR function's
+    # return too, not just this one's, until cleared (live-confirmed
+    # elsewhere in this codebase) — without this, cleanup_chroot would rerun
+    # on every later function return for the rest of the script.
+    trap 'cleanup_chroot; trap - RETURN' RETURN
 
     [[ "${DRY_RUN}" == "yes" ]] && return 0
 
@@ -2651,7 +2661,12 @@ verify_and_create_subvolumes() {
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
+    # Self-clear: a RETURN trap re-fires on every ANCESTOR function's return
+    # too, not just this one's, until cleared (live-confirmed elsewhere in
+    # this codebase — MOUNT_DIR being global here means this wasn't crashing,
+    # but a stale trap firing mid-flow could still unmount it while a later
+    # phase is actively using it).
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
 
     local fstab="$MOUNT_DIR/@${CANDIDATE_SLOT}/etc/fstab"
     if [[ ! -f "$fstab" ]]; then
@@ -2880,7 +2895,12 @@ fetch_update() {
     log "Local and remote versions match (v${REMOTE_VERSION})"
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
+    # Self-clear: a RETURN trap re-fires on every ANCESTOR function's return
+    # too, not just this one's, until cleared (live-confirmed elsewhere in
+    # this codebase — MOUNT_DIR being global here means this wasn't crashing,
+    # but a stale trap firing mid-flow could still unmount it while a later
+    # phase is actively using it).
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
 
     if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
         log_warn "Candidate slot @${CANDIDATE_SLOT} is missing — will redeploy from remote to recreate it"
@@ -3231,7 +3251,12 @@ deploy_update() {
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
-    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true' RETURN
+    # Self-clear: a RETURN trap re-fires on every ANCESTOR function's return
+    # too, not just this one's, until cleared (live-confirmed elsewhere in
+    # this codebase — MOUNT_DIR being global here means this wasn't crashing,
+    # but a stale trap firing mid-flow could still unmount it while a later
+    # phase is actively using it).
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
 
     if findmnt -S "$ROOT_DEV" -o TARGET,OPTIONS | grep -qE "subvol=/@${CANDIDATE_SLOT}([^a-zA-Z]|$)"; then
         die "Candidate slot @${CANDIDATE_SLOT} is currently mounted — cannot deploy to an active mount"
@@ -3687,4 +3712,3 @@ main() {
 }
 
 main "$@"
-    trap - RETURN

@@ -253,6 +253,83 @@ evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
 is deliberately just the current-state summary — what's true right now,
 not how it got that way.
 
+- **`shani-health --storage-info` crashed with `STOR_MNT: unbound variable`
+  every single time — FIXED (2026-09-18).** `analyze_storage()` sets `trap
+  '...cleanup...' RETURN` to unmount its temp mount, but bash's RETURN
+  trap re-fires on every ANCESTOR function's return too, not just the
+  function that set it — live-confirmed with a minimal repro (3-level
+  nested calls: the trap fired once for its own function's return, then
+  AGAIN for every caller up the stack, including the shell's real top
+  level). Since `STOR_MNT` is `local` to `analyze_storage()`, the second
+  firing — attributed by bash to `main()`'s own return, at end of script —
+  found it out of scope and crashed with `set -u`, right after the full
+  report had already printed correctly (rc=1 despite complete, correct
+  output). Fixed by having the trap clear itself
+  (`trap - RETURN` appended inside the handler) so it fires exactly once.
+  Verified live pre/post: crashed with `rc=1` and the unbound-variable
+  message before, `rc=0` with no such error after, same command, same
+  session, `--local-src` overlay picking up the edited script automatically.
+  **The identical pattern existed 4x in `shani-deploy.sh`**
+  (`optimize_storage`/dedup, the chroot-UKI-gen cleanup, `verify_and_create_subvolumes()`,
+  `deploy_update()`) — not crashing there only because `MOUNT_DIR` happens
+  to be a global, not a `local`, so the re-fired trap just harmlessly
+  re-runs an idempotent `safe_umount || true` — but a stale trap firing
+  mid-flow could still unmount `MOUNT_DIR` while a later phase is actively
+  using it for something else (a live correctness hazard, not just noise).
+  Fixed the same way in all 4 places; also removed a stray, ineffective
+  `trap - RETURN` sitting after `main "$@"` at the very end of the file —
+  a prior, incomplete attempt at this same fix that only ran after the
+  script had already finished, so it did nothing. Re-verified the full
+  real upgrade→rollback cycle and `--optimize` (real `duperemove` run)
+  still pass end-to-end after these changes.
+- **`bin/shani-upgrade-adviser` was never installed on any real system —
+  FIXED (2026-09-18).** The PKGBUILD (`shani-pkgbuilds/shani-deploy/PKGBUILD`)
+  only ever globbed `scripts/*` into `/usr/local/bin`; `bin/` was never
+  referenced there at all, despite this repo's own CI syntax-checking it
+  and running its 21-test suite, treating it as real shipped code. The
+  command was completely unreachable on any installed slot — confirmed
+  live inside the real test harness (`command not found`, rc=127) even
+  though the script itself is fully implemented and its unit tests pass.
+  Fixed by moving it to `scripts/shani-upgrade-adviser.sh` (matching this
+  repo's existing `scripts/*.sh`→strip-extension convention exactly, so
+  no PKGBUILD change was needed at all — the existing glob just picks it
+  up). Updated `tests/test_upgrade_adviser.sh` and `.github/workflows/ci.yml`
+  for the new path. Verified live with the test harness's documented
+  `SHANIOS_TEST_ALLOW_NEW_LOCAL_SRC=1` opt-in (since it was never
+  previously packaged, the default overlay correctly refuses it, exactly
+  as designed): `shani-upgrade-adviser` and `--json` both now run for
+  real and produce correct output. **Still needs a human**: this fix has
+  to actually reach a real install — `shani-pkgbuilds/shani-deploy/PKGBUILD`'s
+  pinned `_commit` must be bumped to a commit that includes this rename
+  once it's pushed, or the real package will keep shipping without it.
+- **Self-update fail-closed behavior — NOT independently re-verified this
+  session, environment-blocked.** `test-env/self-update-test.sh` (bad
+  SHA256 / bad GPG / valid-signed scenarios) failed all 3 scenarios
+  identically with "could not fetch script update," not a differentiated
+  pass/fail — traced to the test sandbox's own outbound network being
+  intercepted/proxied: a `curl` to the `/etc/hosts`-redirected
+  `127.0.0.1` for `raw.githubusercontent.com` returned a **real,
+  validly-chained Let's Encrypt certificate for `*.github.io`**, meaning
+  something outside this container is terminating/forwarding the
+  connection regardless of the container's own `/etc/hosts`, so the
+  test's local-mock-server mechanism cannot work in this environment.
+  This is an environment limitation of this sandbox, not a change to
+  self_update()'s logic in this session (untouched) and not evidence of a
+  regression — a previous session did verify this path live (see
+  `AUDIT-HISTORY.md`). Flagging for re-verification whenever this repo is
+  worked on from an environment with real, unproxied outbound network.
+- **`shani-health` — every output-format × mode combination re-verified
+  live (2026-09-18).** All of `--verify`/`--security`/`--boot`/`--info`/
+  `--network`/`--hardware`/`--packages`/`--storage-info`, crossed with
+  plain/`--json`/`--nagios`/`--prometheus` (32 combinations), produce
+  non-empty, correctly-structured output with no crashes — `--json`
+  output validated with `jq`. `--verify`'s real findings in this test
+  slot (root writable, `/etc` overlay not mounted) reflect this being a
+  non-`--boot` `enter` session, not a bug in the check itself.
+- **`check-boot-failure.sh`, `boot-success-cleanup.sh`, `beesd-setup.sh`,
+  `shani-user-setup.sh`, `shani-reset.sh --dry-run --yes` — all
+  re-verified live (2026-09-18), no new bugs found**, each executed for
+  real inside the test harness against a real bootstrapped slot.
 - **`shani-deploy --verify-existing` was completely non-functional — FIXED
   (2026-09-18).** `verify_existing_deployment()` referenced two variables,
   `$DATA_CURRENT_SLOT`/`$DATA_PREV_SLOT`, that are never defined anywhere

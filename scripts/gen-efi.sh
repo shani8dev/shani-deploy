@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 
 # Check for required dependencies.
-REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs")
+REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs" "lsblk" "findmnt" "df")
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Required command '$cmd' not found. Please install it." >&2
@@ -99,8 +99,12 @@ if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
 fi
 
 readonly OS_NAME="shanios"
-readonly ESP="${deploy_esp_path:-${DEFAULT_deploy_esp_path}}"
-readonly EFI_DIR="$ESP/EFI/${OS_NAME}"
+# ESP and EFI_DIR are intentionally NOT readonly: ensure_esp_mounted() may
+# repoint them to /boot/efi or /efi (or a discovered PARTLABEL=EFI partition)
+# when the configured deploy_esp_path is not mounted. error_exit/cleanup_esp
+# unmount whatever ESP currently points at, so the repointed value is honored.
+ESP="${deploy_esp_path:-${DEFAULT_deploy_esp_path}}"
+EFI_DIR="$ESP/EFI/${OS_NAME}"
 readonly MOK_KEY="/etc/secureboot/keys/MOK.key"
 readonly MOK_CRT="/etc/secureboot/keys/MOK.crt"
 readonly ROOTLABEL="${deploy_rootlabel:-${DEFAULT_deploy_rootlabel}}"
@@ -314,13 +318,106 @@ validate_target_slot() {
     return 0
 }
 
-# Ensure ESP is mounted
+# Ensure ESP is mounted.
+#
+# Fallback chain:
+#   a. Configured ESP path already a mountpoint → use it.
+#   b. `mount "$ESP"` succeeds → use it (ESP_WAS_UNMOUNTED=1).
+#   c. /etc/fstab has /boot/efi or /efi entry → mount it, repoint ESP/EFI_DIR.
+#   d. `mount LABEL=shani_boot /boot/efi` — this codebase's own ESP labeling
+#      convention (see shani-deploy.sh), repoint ESP/EFI_DIR. The most
+#      reliable fallback in practice — verified live to work in a real
+#      systemd-nspawn test container where (e) below does not.
+#   e. Best-effort last resort: discover a PARTLABEL=EFI or C12A7328-type
+#      vfat partition via lsblk, mount it at /boot/efi, repoint ESP/EFI_DIR.
+#      Confirmed live NOT to work inside a chroot/container whose mount
+#      namespace only exposes the ESP partition node, not its parent
+#      whole-disk device — lsblk needs the parent to read PARTLABEL/PARTTYPE
+#      from the GPT header, so this step silently no-ops there. Kept as a
+#      fallback for environments where the parent device IS visible and the
+#      label isn't "shani_boot" (e.g. a differently-provisioned disk).
+#   f. All fail → error_exit.
+#
+# When this function repoints ESP/EFI_DIR, error_exit/cleanup_esp will
+# `umount "$ESP"` against the repointed value — which is exactly the mount
+# this function created. No separate tracking of the mountpoint is needed.
 ensure_esp_mounted() {
-    if ! mountpoint -q "$ESP" 2>/dev/null; then
-        log "ESP not mounted, mounting temporarily..."
-        mount "$ESP" || error_exit "Failed to mount ESP"
-        ESP_WAS_UNMOUNTED=1
+    # (a) Already mounted at the configured ESP path.
+    if mountpoint -q "$ESP" 2>/dev/null; then
+        return 0
     fi
+
+    # (b) Try mounting the configured ESP path directly.
+    log "ESP not mounted at ${ESP}, mounting temporarily..."
+    if mount "$ESP" 2>/dev/null; then
+        ESP_WAS_UNMOUNTED=1
+        return 0
+    fi
+
+    # (c) Fall back to /etc/fstab entries for /boot/efi or /efi.
+    if [[ -r /etc/fstab ]]; then
+        if grep -qE '[[:space:]]/boot/efi[[:space:]]' /etc/fstab; then
+            mkdir -p /boot/efi
+            if mount /boot/efi 2>/dev/null; then
+                ESP="/boot/efi"
+                EFI_DIR="$ESP/EFI/${OS_NAME}"
+                ESP_WAS_UNMOUNTED=1
+                log "ESP repointed to /boot/efi (fstab entry)"
+                return 0
+            fi
+        fi
+        if grep -qE '[[:space:]]/efi[[:space:]]' /etc/fstab; then
+            mkdir -p /efi
+            if mount /efi 2>/dev/null; then
+                ESP="/efi"
+                EFI_DIR="$ESP/EFI/${OS_NAME}"
+                ESP_WAS_UNMOUNTED=1
+                log "ESP repointed to /efi (fstab entry)"
+                return 0
+            fi
+        fi
+    fi
+
+    # (d) Mount by this project's well-known ESP filesystem label — the same
+    # convention shani-deploy.sh already uses in 3 places ("mount LABEL=shani_boot
+    # ..."). This resolves via /dev/disk/by-label/, which udev populates from the
+    # filesystem superblock alone. Try this before the lsblk-based discovery below:
+    # confirmed live in a real systemd-nspawn test container that lsblk's
+    # PARTLABEL/PARTTYPE columns come back empty for the ESP partition node there
+    # (the parent whole-disk device isn't bind-mounted into the container, and
+    # lsblk needs it to read the GPT partition table), while LABEL=shani_boot
+    # mounts correctly in the same environment.
+    mkdir -p /boot/efi
+    if mount LABEL=shani_boot /boot/efi 2>/dev/null; then
+        ESP="/boot/efi"
+        EFI_DIR="$ESP/EFI/${OS_NAME}"
+        ESP_WAS_UNMOUNTED=1
+        log "ESP repointed to /boot/efi (LABEL=shani_boot)"
+        return 0
+    fi
+
+    # (e) Last resort: discover an EFI System Partition by PARTLABEL or partition
+    # type GUID. Best-effort only — known not to work when the parent whole-disk
+    # device node isn't visible (chroot/container contexts); (d) above is the more
+    # reliable fallback for this codebase's actual ESP labeling convention.
+    local esp_dev=""
+    esp_dev="$(lsblk -no PATH,PARTLABEL,FSTYPE 2>/dev/null | awk '$2=="EFI" && $3 ~ /vfat|fat/ {print $1; exit}')"
+    if [[ -z "$esp_dev" ]]; then
+        esp_dev="$(lsblk -no PATH,FSTYPE,PARTTYPE 2>/dev/null | awk '$3 ~ /[Cc]12[Aa]7328|[Ee][Ff][Ii]/ && $2 ~ /vfat|fat/ {print $1; exit}')"
+    fi
+    if [[ -n "$esp_dev" && -b "$esp_dev" ]]; then
+        mkdir -p /boot/efi
+        if mount -t vfat "$esp_dev" /boot/efi 2>/dev/null; then
+            ESP="/boot/efi"
+            EFI_DIR="$ESP/EFI/${OS_NAME}"
+            ESP_WAS_UNMOUNTED=1
+            log "ESP repointed to /boot/efi (discovered partition: ${esp_dev})"
+            return 0
+        fi
+    fi
+
+    # (f) All fallbacks exhausted.
+    error_exit "Could not mount an EFI partition. Fix /etc/fstab or mount the ESP manually, then re-run."
 }
 
 # Unmount ESP if we mounted it
@@ -404,6 +501,15 @@ generate_cmdline() {
 
     local fs_uuid
     fs_uuid=$(blkid -s UUID -o value /dev/disk/by-label/"${ROOTLABEL}" 2>/dev/null || true)
+    if [[ -z "$fs_uuid" ]]; then
+        # Fallback 1: findmnt on the root mount (works in chroot/live where
+        # the root device is already mounted and blkid by-label may not resolve).
+        fs_uuid=$(findmnt -no UUID / 2>/dev/null || true)
+    fi
+    if [[ -z "$fs_uuid" ]]; then
+        # Fallback 2: parse /etc/fstab for the root entry's UUID=.
+        fs_uuid=$(awk '$2=="/" && $1 ~ /^UUID=/ {sub(/^UUID=/,"",$1); print $1; exit}' /etc/fstab 2>/dev/null || true)
+    fi
     if [[ -z "$fs_uuid" ]]; then
         if [[ -f "$CMDLINE_FILE" ]]; then
             log_warn "Failed to retrieve filesystem UUID for label ${ROOTLABEL} — keeping existing cmdline file unchanged"
@@ -1082,6 +1188,14 @@ generate_uki() {
     kernel_cmdline=$(<"$CMDLINE_FILE")
     if [[ -z "$kernel_cmdline" ]]; then
         error_exit "Kernel command line is empty."
+    fi
+
+    # Warn if the ESP is running low on free space — dracut's UKI bundle
+    # (kernel + initramfs + ucode + signed PE) needs ~200MB headroom.
+    local avail_kb
+    avail_kb=$(df -Pk "$ESP" 2>/dev/null | awk 'NR==2{print $4}')
+    if [[ -n "$avail_kb" && "$avail_kb" -lt 200000 ]]; then
+        log_warn "ESP has less than ~200MB free (${avail_kb}K) — UKI generation may fail"
     fi
 
     dracut --force --uefi --kver "$kernel_ver" --kernel-cmdline "$kernel_cmdline" "${uki_path}.tmp" || error_exit "dracut failed"

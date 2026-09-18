@@ -287,6 +287,32 @@ not how it got that way.
   in this codebase (`errors=$(( errors + 1 ))` in shani-health.sh's
   `_check_fail`). Verified live post-fix: the function now correctly
   counts and reports multiple issues without aborting.
+- **`gen-efi.sh`'s ESP-mount fallback chain — completed and fixed
+  (2026-09-18).** A pre-existing uncommitted change to `ensure_esp_mounted()`
+  added a fallback chain (already-mounted → direct `mount "$ESP"` → fstab
+  entries for `/boot/efi`/`/efi` → lsblk-based partition discovery) but was
+  never verified before this pass. Verified live via the mandatory real
+  test harness: full `clean → ca → bootstrap -p gnome → upgrade
+  --local-src → rollback --local-src → clean` sequence passed end-to-end
+  with the change in place. A negative control (unmount `/boot/efi`, strip
+  its `/etc/fstab` entry, call `ensure_esp_mounted()` directly in a real
+  systemd-nspawn session) exposed a real bug in the lsblk-based discovery
+  step: `lsblk -no PATH,PARTLABEL,FSTYPE,PARTTYPE` returns empty
+  PARTLABEL/PARTTYPE for the ESP partition node inside this container,
+  because the parent whole-disk device isn't bind-mounted into it and
+  lsblk needs that parent to read the GPT partition table — so that step
+  silently no-ops in exactly the chroot/container context this codebase
+  runs `gen-efi` in. Fixed by adding `mount LABEL=shani_boot /boot/efi` as
+  an earlier, more reliable fallback step, matching the ESP-labeling
+  convention `shani-deploy.sh` already uses in 3 other places (`mount
+  LABEL=shani_boot ...`) — this works via `/dev/disk/by-label/`, populated
+  by udev from the filesystem superblock alone, independent of parent
+  device visibility. Re-ran the same negative control post-fix: confirmed
+  live that `ensure_esp_mounted()` now correctly falls through to the
+  `LABEL=shani_boot` step and mounts successfully. Also fixed a stale
+  doc-comment claiming the fallback chain "mirrors sync-esp-boot.sh's
+  ensure_esp_mounted" — no file by that name exists anywhere in the shani
+  ecosystem.
 - **Terminal exit-code trust — RESOLVED.** `shani-update.sh` uses `--wait`
   for gnome-terminal; rollback "success" reporting while mid-flight is
   fixed.

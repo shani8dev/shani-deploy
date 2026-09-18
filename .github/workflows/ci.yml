@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: deploy-ci
+  cancel-in-progress: false
+
+jobs:
+  syntax-check:
+    name: Syntax check scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: bash -n on all scripts
+        run: |
+          # Check every file in scripts/ and bin/ — robust glob catches
+          # bin/shani-upgrade-adviser (no .sh extension) that scripts/*.sh
+          # and bin/*.sh would miss.
+          for script in scripts/* bin/*; do
+            [ -f "$script" ] && bash -n "$script"
+          done
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run deploy-state tests
+        run: bash tests/test-deploy-state.sh
+
+      - name: Run upgrade-adviser tests
+        run: bash tests/test_upgrade_adviser.sh

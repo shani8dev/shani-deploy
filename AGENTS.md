@@ -253,6 +253,40 @@ evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
 is deliberately just the current-state summary — what's true right now,
 not how it got that way.
 
+- **`shani-deploy --verify-existing` was completely non-functional — FIXED
+  (2026-09-18).** `verify_existing_deployment()` referenced two variables,
+  `$DATA_CURRENT_SLOT`/`$DATA_PREV_SLOT`, that are never defined anywhere
+  in this file (the real slot-marker paths used everywhere else are the
+  literal `/data/current-slot`/`/data/previous-slot`) — under `set -u`
+  this crashed with `unbound variable` on the very first line of the
+  function, before printing anything. It also called `_row`/`_rec`, helper
+  functions that exist only in `shani-health.sh` and were never defined
+  here — even past the unbound-variable crash, the function would have
+  died with `command not found` at its first `_row` call. Confirmed live
+  in a real systemd-nspawn container (`shani-install-media/test-env`):
+  `shani-deploy --verify-existing` crashed with exit 127 and zero useful
+  output before the fix. Fixed by correcting the two variable references
+  to the real paths and adding minimal, self-contained `_row`/`_rec`
+  helpers scoped to this function (not the full shani-health.sh
+  color/JSON/Nagios machinery, which isn't needed here). Verified live
+  post-fix: all 14 checks print correctly, and it correctly detected 2 real
+  issues on the test system (a slot mismatch and a missing backup) and
+  exited 1.
+- **`verify_existing_deployment()`'s `((issues++))` — FIXED (2026-09-18),
+  same bug class as `shani-health.sh`'s already-fixed `((format_count++))`
+  below.** All 6 occurrences were bare post-increments at top-level
+  statements under this file's `set -Eeuo pipefail` (line 20) — when
+  `issues` is 0 (the first issue found in a run), `((issues++))` evaluates
+  to the pre-increment value (falsy), aborting the whole function silently
+  under `-e`. This was masked by the unbound-variable crash above (the
+  function never reached this code in practice), but is a real,
+  independently-reproducible bug — confirmed live with a minimal repro
+  (`set -Eeuo pipefail; f(){ local n=0; echo before; ((n++)); echo after; }; f`
+  prints "before" and exits 1, never reaching "after"). Fixed to
+  `issues=$(( issues + 1 ))`, matching the pattern already used elsewhere
+  in this codebase (`errors=$(( errors + 1 ))` in shani-health.sh's
+  `_check_fail`). Verified live post-fix: the function now correctly
+  counts and reports multiple issues without aborting.
 - **Terminal exit-code trust — RESOLVED.** `shani-update.sh` uses `--wait`
   for gnome-terminal; rollback "success" reporting while mid-flight is
   fixed.

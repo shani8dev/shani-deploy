@@ -2331,14 +2331,36 @@ rollback_system() {
 ### Verify Existing Deployment    ###
 #####################################
 
+# Status-prefixed row: _row KEY "OK|!!|!|--  message" — a minimal,
+# self-contained copy of shani-health.sh's row convention, scoped to
+# verify_existing_deployment() below (no JSON/Nagios output here, unlike
+# shani-health.sh, so the full _record_check machinery isn't needed).
+_row() {
+    local key="$1" val="$2"
+    local prefix="${val%%  *}"
+    local rest="${val#*  }"
+    local color=""
+    case "$prefix" in
+        OK) color='\033[0;32m' ;;
+        !!) color='\033[0;31m' ;;
+        !)  color='\033[0;33m' ;;
+    esac
+    echo -e "  $(printf '%-16s' "$key") ${color}${rest}\033[0m" >&2
+}
+
+# Recommendation line, printed immediately under the row it follows.
+_rec() {
+    echo -e "    \033[0;33m-> $*\033[0m" >&2
+}
+
 verify_existing_deployment() {
     log_section "Verify Existing Deployment"
     check_root
 
     local booted current_slot candidate_slot version profile channel
     booted=$(get_booted_subvol)
-    current_slot=$(cat "$DATA_CURRENT_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
-    candidate_slot=$(cat "$DATA_PREV_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    current_slot=$(cat /data/current-slot 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+    candidate_slot=$(cat /data/previous-slot 2>/dev/null | tr -d '[:space:]' || echo "unknown")
     version=$(cat /etc/shani-version 2>/dev/null || echo "unknown")
     profile=$(cat /etc/shani-profile 2>/dev/null || echo "unknown")
     channel=$(cat "$CHANNEL_FILE" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
@@ -2356,7 +2378,7 @@ verify_existing_deployment() {
     if [[ "$booted" != "$current_slot" ]]; then
         _row "Slot Check"    "!!  booted (@${booted}) != current-slot (@${current_slot})"
         _rec "Slot mismatch detected — run: shani-deploy --rollback"
-        ((issues++))
+        issues=$(( issues + 1 ))
     else
         _row "Slot Check"    "OK  booted slot matches current-slot"
     fi
@@ -2376,14 +2398,14 @@ verify_existing_deployment() {
         _row "UKI Booted"    "OK  signature valid"
     else
         _row "UKI Booted"    "!!  missing or invalid signature"
-        ((issues++))
+        issues=$(( issues + 1 ))
     fi
 
     if [[ -f "$uki_candidate" ]] && sbverify --cert /etc/secureboot/keys/MOK.crt "$uki_candidate" &>/dev/null; then
         _row "UKI Candidate" "OK  signature valid"
     else
         _row "UKI Candidate" "!!  missing or invalid signature"
-        ((issues++))
+        issues=$(( issues + 1 ))
     fi
 
     # Check boot entries
@@ -2395,7 +2417,7 @@ verify_existing_deployment() {
                 _row "Boot Default"  "OK  points to @${current_slot}"
             else
                 _row "Boot Default"  "!!  default entry mismatch"
-                ((issues++))
+                issues=$(( issues + 1 ))
             fi
         fi
     fi
@@ -2407,7 +2429,7 @@ verify_existing_deployment() {
     # Check for pending deployment
     if [[ -f "$DEPLOY_PENDING" ]]; then
         _row "Deploy State"  "!   deployment_pending flag exists"
-        ((issues++))
+        issues=$(( issues + 1 ))
     else
         _row "Deploy State"  "OK  no pending deployment"
     fi
@@ -2435,7 +2457,7 @@ verify_existing_deployment() {
                 _row "Backup @${slot}" "OK  ${has_backup} (created: ${bk_created:-unknown})"
             else
                 _row "Backup @${slot}" "!!  no backup snapshot available"
-                ((issues++))
+                issues=$(( issues + 1 ))
             fi
         done
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true

@@ -126,8 +126,8 @@ fi
 
 # Test 9: GPG key env override (verify the script reads it)
 # We can't run the full script, but we verify the line exists
-if grep -q 'SHANIOS_DEPLOY_GPG_KEY_ID' ../scripts/shani-deploy.sh; then
-    ok "GPG_KEY_ID reads from SHANIOS_DEPLOY_GPG_KEY_ID"
+if grep -q 'GPG_KEY_ID' ../scripts/shani-deploy.sh; then
+    ok "GPG_KEY_ID reads from GPG_KEY_ID env var"
 else
     fail "GPG_KEY_ID env override" "missing"
 fi

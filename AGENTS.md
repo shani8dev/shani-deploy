@@ -359,11 +359,9 @@ not how it got that way.
   triggers the new switch-to-sibling path with zero interaction; a
   dracut-style hard-failure marker (genuine slot mismatch) correctly
   triggers the original repair-from-backup path, keeping the booted slot
-  as default. `shani-update.sh`'s dialog is unchanged and still runs
-  under `--startup` as a secondary, opt-in UX layer (useful if a user
-  happens to log in during the ~16-minute detection window, or wants to
-  manually trigger recovery earlier) — but it is no longer the mechanism
-  automated recovery depends on. Packaging: `shani-auto-rollback.sh`/
+  as default. `shani-update.sh`'s own fallback handling was rewritten to
+  match (see the next entry) rather than left as a parallel, now-redundant
+  implementation. Packaging: `shani-auto-rollback.sh`/
   `.service`/`.timer` are picked up automatically by
   `shani-pkgbuilds/shani-deploy/PKGBUILD`'s existing glob (no PKGBUILD
   change needed, same convention as every other script/unit here); its
@@ -398,6 +396,43 @@ not how it got that way.
     `shani-deploy` was crashing on the `$HOME` bug above, this script was
     still logging "Automatic rollback completed successfully." Fixed to
     capture the real exit code before piping output to `logger`.
+
+- **`shani-update.sh`'s fallback-boot dialog rewritten — no longer asks
+  "should we roll back?" (2026-09-19).** With `shani-auto-rollback`
+  handling real recovery unconditionally, an interactive confirm/decline
+  dialog was exactly the failure mode that mechanism exists to fix (the
+  console path even defaulted to DECLINE on a 60s timeout). Rewrote
+  `_handle_fallback_boot()`: if `/data/auto_rollback_done` already exists
+  (auto-rollback tried this boot) and markers are still present, tell the
+  user it failed and point at `journalctl -t shani-auto-rollback` — no
+  retry prompt, an unattended operation that already failed isn't fixed
+  by asking the same question a human wasn't there to answer the first
+  time. Otherwise (a genuine race — a user logged in faster than
+  auto-rollback's first ~1-16 minute trigger), call
+  `pkexec systemctl start shani-auto-rollback.service` directly instead
+  of reimplementing rollback-direction logic via `_run_rollback` a second
+  time in this file. `_run_rollback`/`show_dialog` themselves are
+  untouched — still used by `_handle_candidate_boot()` (a genuinely
+  different, opt-in "try the new update, keep or roll back?" feature, not
+  failure recovery) and the manual `-r`/`--rollback` CLI flag.
+  This also surfaced that `_check_fallback_boot()` had the SAME "same-slot
+  can't be meaningful" assumption as the two bugs above, a third
+  occurrence of the class: it returned "no fallback" whenever
+  `BOOTED_SLOT == CURRENT_SLOT`, **regardless of whether a failure marker
+  was present** — meaning a same-slot failure recorded by
+  `check-boot-failure.sh` (real, reachable, since that script's own fix
+  above) would never even reach the rewritten handler above. Fixed to
+  only bail out on a same-slot match when there's also no failure marker
+  at all. Verified live, both branches: with `auto_rollback_done` present
+  and a same-slot `boot_failure` marker, `_check_fallback_boot` now
+  correctly returns 0 ("Fallback confirmed") and `_handle_fallback_boot`
+  correctly reports the already-failed state; without
+  `auto_rollback_done`, it correctly triggers `shani-auto-rollback.service`
+  immediately via `systemctl start` and the rollback completes for real
+  (confirmed via `current-slot`/`loader.conf` state after). Also
+  re-verified the genuine hard-failure path (differing slot) still works
+  unchanged through the same rewritten function.
+  `tests/test-deploy-state.sh` (9/9) still pass.
 
 - **`finalize_boot_entries()`'s `+3-0` tries-counted candidate entry for a
   fresh deploy likely provides no real automatic hard-failure fallback on

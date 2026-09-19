@@ -58,6 +58,7 @@ DEFAULT_deploy_channel_file="/etc/shani-channel"
 DEFAULT_deploy_current_slot="/data/current-slot"
 DEFAULT_deploy_boot_failure="/data/boot_failure"
 DEFAULT_deploy_boot_hard_failure="/data/boot_hard_failure"
+DEFAULT_deploy_auto_rollback_done="/data/auto_rollback_done"
 DEFAULT_deploy_boot_ok="/data/boot-ok"
 DEFAULT_deploy_reboot_needed="/run/shanios/reboot-needed"
 DEFAULT_update_network_timeout="30"
@@ -81,6 +82,7 @@ CHANNEL_FILE="${deploy_channel_file:-${DEFAULT_deploy_channel_file}}"
 CURRENT_SLOT_FILE="${deploy_current_slot:-${DEFAULT_deploy_current_slot}}"
 BOOT_FAILURE_FILE="${deploy_boot_failure:-${DEFAULT_deploy_boot_failure}}"
 BOOT_HARD_FAILURE_FILE="${deploy_boot_hard_failure:-${DEFAULT_deploy_boot_hard_failure}}"
+AUTO_ROLLBACK_DONE_FILE="${deploy_auto_rollback_done:-${DEFAULT_deploy_auto_rollback_done}}"
 BOOT_OK_FILE="${deploy_boot_ok:-${DEFAULT_deploy_boot_ok}}"
 REBOOT_NEEDED_FILE="${deploy_reboot_needed:-${DEFAULT_deploy_reboot_needed}}"
 NETWORK_TIMEOUT="${update_network_timeout:-${DEFAULT_update_network_timeout}}"
@@ -279,10 +281,20 @@ _check_fallback_boot() {
 
     log "Slot marker: @${CURRENT_SLOT} | Booted: @${BOOTED_SLOT}"
 
-    [[ "$BOOTED_SLOT" == "$CURRENT_SLOT" ]] && {
-        log "Booted slot matches marker — no fallback"
+    # A same-slot marker is NOT automatically "no fallback" — it's the
+    # normal steady state (no pending deploy), but it can ALSO be a
+    # genuine same-slot timeout: check-boot-failure.sh legitimately
+    # records BOOT_FAILURE_FILE naming the SAME slot now (see
+    # shani-deploy/AGENTS.md's known-issues entry — this used to be
+    # mis-derived as the sibling slot instead, which is why this same-slot
+    # branch never mattered before that fix). Only bail out here when
+    # there's also no failure marker at all; otherwise fall through so a
+    # real same-slot failure still gets detected and handled below.
+    if [[ "$BOOTED_SLOT" == "$CURRENT_SLOT" ]] && \
+       [[ ! -f "$BOOT_FAILURE_FILE" && ! -f "${BOOT_FAILURE_FILE}.acked" ]]; then
+        log "Booted slot matches marker, no failure recorded — no fallback"
         return 1
-    }
+    fi
 
     [[ ! -f "$BOOT_FAILURE_FILE" && ! -f "${BOOT_FAILURE_FILE}.acked" ]] && {
         log "Slot mismatch but no failure file — nothing to act on"
@@ -726,70 +738,57 @@ _post_rollback_dialog() {
 
 _handle_fallback_boot() {
     # Called when _check_fallback_boot returns 0 (soft or hard failure).
-    # Hard failures (boot_hard_failure present) show extra context explaining
-    # that the slot failed to mount — not just that it booted incorrectly.
-    local title text hard_failure=0
+    #
+    # REWRITTEN 2026-09-19: no longer asks "should we roll back?" via an
+    # interactive dialog with a decline/timeout option. That was exactly
+    # the failure mode shani-auto-rollback.service/.timer exist to fix — a
+    # human who isn't present, declines, or lets a 60-120s prompt lapse
+    # (the console path defaulted to declining on timeout). Recovery from
+    # a confirmed failure isn't a choice to offer, it's the whole point of
+    # this mechanism. This function now only:
+    #   1. If auto-rollback already ran and failed this boot (markers
+    #      still present despite AUTO_ROLLBACK_DONE_FILE existing) — tell
+    #      the user clearly and point at the real logs. No retry prompt:
+    #      an operation that just failed unattended isn't fixed by asking
+    #      the same yes/no question a human wasn't there to answer the
+    #      first time either.
+    #   2. Otherwise (a genuine race — this session started before
+    #      shani-auto-rollback's first ~1-16 minute trigger) — kick off
+    #      the SAME canonical mechanism immediately via `systemctl start`
+    #      rather than reimplementing rollback-direction logic here a
+    #      second time (this file used to call _run_rollback itself,
+    #      which duplicated the slot-direction decision instead of
+    #      reusing shani-deploy --rollback's now-fixed logic).
+    local hard_failure=0
     [[ -f "$BOOT_HARD_FAILURE_FILE" ]] && hard_failure=1
+    local kind="soft"; (( hard_failure )) && kind="hard"
 
-    if (( hard_failure )); then
-        title="Shani OS — Hard Boot Failure"
-        text=$(printf '<b>Hard boot failure detected!</b>\n\nSlot <b>@%s</b> could not be mounted by the bootloader.\nThe system fell back to <b>@%s</b>.\n\nRoll back <b>@%s</b> now to restore a clean state?' \
-            "$FAILED_SLOT" "$BOOTED_SLOT" "$FAILED_SLOT")
-    else
-        title="Shani OS — Boot Failure Detected"
-        text=$(printf '<b>Boot failure detected!</b>\n\nSlot <b>@%s</b> failed to boot.\nThe system fell back to <b>@%s</b>.\n\nRoll back <b>@%s</b> now so it boots correctly next time?' \
-            "$FAILED_SLOT" "$BOOTED_SLOT" "$FAILED_SLOT")
-    fi
-
-    local rc=0
-    show_dialog "$title" "$text" "Roll Back Now" "Ignore" 120 "dialog-warning" || rc=$?
-
-    if [[ $rc -eq 2 ]]; then
-        # No GUI — console or notify
-        local notify_msg
-        if (( hard_failure )); then
-            notify_msg="Slot @${FAILED_SLOT} failed to mount. Run 'shani-update --rollback'."
-        else
-            notify_msg="Slot @${FAILED_SLOT} failed to boot. Run 'shani-update --rollback'."
-        fi
+    if [[ -f "$AUTO_ROLLBACK_DONE_FILE" ]]; then
+        log "ERROR: automatic rollback already ran and failed for @${FAILED_SLOT} (kind=${kind}) — see journalctl -t shani-auto-rollback"
         command -v notify-send &>/dev/null && \
-            notify-send -u critical -i dialog-warning \
-                "$title" "$notify_msg" 2>/dev/null || true
-        if [[ -t 0 && -t 1 ]]; then
-            printf '\n===================================\n  Shani OS — Boot Failure\n===================================\n'
-            (( hard_failure )) && printf 'HARD FAILURE (slot failed to mount)\n'
-            printf 'Failed: @%s  |  Booted: @%s\n\n' "$FAILED_SLOT" "$BOOTED_SLOT"
-            read -rp "Roll back now? [y/N]: " -t 60 response || response="n"
-            [[ "${response,,}" == y* ]] && rc=0 || return 0
-        else
-            return 0
-        fi
+            notify-send -u critical -i dialog-error \
+                "Shani OS — Automatic Recovery Failed" \
+                "Slot @${FAILED_SLOT} could not be automatically recovered. Run 'journalctl -t shani-auto-rollback' for details, then 'shani-deploy --rollback' manually." 2>/dev/null || true
+        [[ -t 1 ]] && printf '\n✗ Automatic recovery of @%s FAILED (kind=%s) — see: journalctl -t shani-auto-rollback\nRun manually: shani-deploy --rollback\n\n' "$FAILED_SLOT" "$kind"
+        _cleanup_and_exit 1
     fi
 
-    if [[ $rc -eq 0 ]]; then
-        log "User approved rollback of @${FAILED_SLOT}"
-        if _run_rollback "Shani OS — Rollback"; then
-            log "Rollback succeeded"
-            # Clear failure markers now that rollback is done.
-            # shani-deploy --rollback also clears these, but we do it here too
-            # for the case where rollback is invoked via shani-update's GUI path.
-            rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" \
-                  "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
-            _post_rollback_dialog
-            _cleanup_and_exit 0
-        else
-            log "ERROR: Rollback failed or cancelled"
-            command -v notify-send &>/dev/null && \
-                notify-send -u critical -i dialog-error \
-                    "Shani OS — Rollback Failed" "Check $LOG_FILE." 2>/dev/null || true
-            _cleanup_and_exit 1
-        fi
-    else
-        log "User declined rollback — exiting to avoid running update check in degraded state"
-        # Do not fall through to _check_candidate_boot or _run_update_check:
-        # current-slot still points to the failed slot, so shani-deploy would
-        # hit a slot mismatch. The user must rollback or reboot before updating.
+    log "Boot failure detected for @${FAILED_SLOT} (kind=${kind}), automatic recovery hasn't run yet this boot — triggering it now"
+    command -v notify-send &>/dev/null && \
+        notify-send -u critical -i dialog-warning \
+            "Shani OS — Boot Failure Detected" \
+            "Slot @${FAILED_SLOT} $([[ $hard_failure -eq 1 ]] && echo "could not be mounted by the bootloader" || echo "failed to boot"). Running automatic recovery now…" 2>/dev/null || true
+
+    if pkexec systemctl start shani-auto-rollback.service; then
+        log "Automatic recovery completed"
+        _post_rollback_dialog
         _cleanup_and_exit 0
+    else
+        log "ERROR: automatic recovery failed — see journalctl -t shani-auto-rollback"
+        command -v notify-send &>/dev/null && \
+            notify-send -u critical -i dialog-error \
+                "Shani OS — Rollback Failed" "Run 'journalctl -t shani-auto-rollback' for details, or 'shani-deploy --rollback' manually." 2>/dev/null || true
+        _cleanup_and_exit 1
     fi
 }
 

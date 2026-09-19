@@ -295,30 +295,109 @@ not how it got that way.
   `current-slot=blue`) still correctly records `blue`, unchanged; garbage
   `current-slot` content still correctly derives from `BOOTED_SLOT`.
 
-- **`shani-deploy --rollback`'s core slot-direction logic has the SAME
-  flawed assumption, one level deeper — NOT fixed, needs a human
-  architecture decision (Critical).** `rollback_system()` in
-  `scripts/shani-deploy.sh` derives `failed_slot` unconditionally as
-  "whichever slot is NOT currently booted" (its own comment: "The failed
-  slot is always the NON-booted slot") — it never treats
-  `/data/boot_failure`'s content as authoritative, only as a warn-only
-  cross-check it overrides ("Using @${failed_slot} (derived from booted
-  slot) — boot_failure may be stale"). This means `--rollback` has **no
-  code path that can ever target the currently-booted slot as the failed
-  one** — for a same-slot timeout (the bug above, now fixed at the
-  diagnostic-marker level, but this is the command that actually acts),
-  running `--rollback` would "repair" the healthy, untouched sibling slot
-  from a backup snapshot while leaving the real problem (the booted
-  default slot itself) completely untouched, still the default, and
-  report success ("Fallback slot ready... Default boot slot: @blue")
-  despite having fixed nothing. This is not a one-line fix like the one
-  above — it needs a real design decision about what recovery should even
-  *do* for a same-slot failure (there is no "other slot's backup" to
-  restore from in that case; the right action might be switching
-  `loader.conf`'s default to the sibling slot directly, with no
-  snapshot-repair step at all, or refusing to act without an explicit
-  `--target-slot` flag). Do not silently patch this without that
-  decision — a wrong fix here has the same blast radius as the bug.
+- **`shani-deploy --rollback`'s core slot-direction logic had the SAME
+  flawed assumption, one level deeper — FIXED (2026-09-19).**
+  `rollback_system()` derived `failed_slot` unconditionally as "whichever
+  slot is NOT currently booted" (its own comment: "The failed slot is
+  always the NON-booted slot") and never treated `/data/boot_failure`'s
+  content as authoritative, only as a warn-only cross-check it overrode.
+  For a same-slot timeout, `--rollback` had **no code path that could
+  ever target the currently-booted slot as the failed one** — it would
+  "repair" the healthy, untouched sibling slot from a backup while
+  leaving the real problem (the booted default slot itself) completely
+  untouched, still the default, and report success despite having fixed
+  nothing. Fixed by adding a new `switch_to_sibling_slot()` function,
+  called instead of the existing repair-from-backup logic whenever
+  `/data/boot_failure`(`.acked`) names the SAME slot as booted: it
+  switches `loader.conf`'s default to the sibling slot directly (via
+  `finalize_boot_entries`) with **no subvolume snapshot/delete at all** —
+  correct, since a same-slot timeout gives no evidence the booted slot's
+  filesystem is actually broken, only that it didn't confirm health in
+  time. The original "opposite of booted" repair logic is unchanged and
+  still runs for its two original, still-valid cases: a genuine confirmed
+  fallback (recorded failure names the OTHER slot) and a manual
+  `--rollback` invocation with no marker at all. Verified all three cases
+  live in `test-env`: same-slot timeout now correctly switches the
+  default to the sibling with the booted slot's data untouched; genuine
+  fallback still correctly repairs the other slot from backup, booted
+  stays default (regression-checked, unchanged); no-marker manual
+  invocation still correctly assumes opposite-of-booted (regression-checked,
+  unchanged). `tests/test-deploy-state.sh` still 9/9.
+
+- **Automated rollback is now a real, system-level, unattended mechanism —
+  separated from `shani-update` (2026-09-19).** Previously, the only code
+  that ever acted on a detected boot failure was `shani-update.sh`'s
+  `_check_fallback_boot()`/`_handle_fallback_boot()`, reachable only via
+  `shani-update --startup` — a `systemd --user` unit that **requires a
+  graphical session** (`DISPLAY`/`WAYLAND_DISPLAY`; confirmed live in its
+  own startup-mode guard: "No display — skipping startup check", exit 0
+  otherwise) and then shows an interactive dialog/console prompt asking
+  the user to approve the rollback (defaulting to **decline** on a 60s
+  console-prompt timeout, or doing nothing at all with no TTY and no GUI).
+  This never ran at all on the `server` profile (no desktop by design),
+  and never ran if the failure itself prevented the desktop from starting
+  — one of the most likely real failure shapes it needed to catch. The
+  "Automated rollback on boot failure" claim in this repo's own
+  garuda-comparison table was true only in the loosest sense: a logged-in,
+  attentive human had to approve it within a short window.
+  New `scripts/shani-auto-rollback.sh` + `shani-auto-rollback.service`/
+  `.timer` run unconditionally, system-level, no session/display/TTY of
+  any kind: triggered at `OnBootSec=1min` (catches a dracut-recorded hard
+  failure fast) and again at `OnBootSec=16min` (one minute after
+  `check-boot-failure.timer`'s own 15-minute check, to catch a same-slot
+  soft failure it just recorded). It only acts on an actual recorded
+  failure marker (never guesses), and calls `shani-deploy --rollback`
+  directly — which, after the fix above, now correctly handles both the
+  genuine-fallback and same-slot cases itself, so this script doesn't
+  duplicate that direction logic. Idempotent via `/data/auto_rollback_done`
+  (cleared each boot by `mark-boot-in-progress.service`, added there for
+  this purpose) since it can fire twice per boot; the service deliberately
+  has no `RemainAfterExit=yes` so the timer's second trigger actually
+  re-invokes it rather than finding it already "active" and no-op'ing.
+  Verified live end-to-end in `test-env` for both shapes: a same-slot
+  marker written by `check-boot-failure` gets picked up and correctly
+  triggers the new switch-to-sibling path with zero interaction; a
+  dracut-style hard-failure marker (genuine slot mismatch) correctly
+  triggers the original repair-from-backup path, keeping the booted slot
+  as default. `shani-update.sh`'s dialog is unchanged and still runs
+  under `--startup` as a secondary, opt-in UX layer (useful if a user
+  happens to log in during the ~16-minute detection window, or wants to
+  manually trigger recovery earlier) — but it is no longer the mechanism
+  automated recovery depends on. Packaging: `shani-auto-rollback.sh`/
+  `.service`/`.timer` are picked up automatically by
+  `shani-pkgbuilds/shani-deploy/PKGBUILD`'s existing glob (no PKGBUILD
+  change needed, same convention as every other script/unit here); its
+  sibling `.install` file needed (and got) one new
+  `systemctl enable shani-auto-rollback.timer` line, matching
+  `check-boot-failure.timer`'s existing entry exactly.
+
+  Two more real bugs surfaced building and verifying this under a genuine
+  `--boot` session (via the sibling repo's `probe` command, not just plain
+  `enter` — see its own AGENTS.md's harness-improvement entries for why
+  that distinction mattered here):
+  - **`${XDG_CONFIG_HOME:-$HOME/.config}` crashes under `set -u` when
+    `$HOME` is genuinely unset — FIXED across all 6 scripts that had it**
+    (`shani-deploy.sh`, `shani-update.sh`, `shani-health.sh`, `gen-efi.sh`,
+    `check-boot-failure.sh`, and the new `shani-auto-rollback.sh`). A
+    system-level systemd service (no logged-in user) has no `$HOME` at
+    all — confirmed live: `shani-deploy --rollback` crashed immediately
+    with `HOME: unbound variable` the first time anything in this repo was
+    ever invoked from that kind of context. `$HOME` inside the `:-`
+    fallback still gets eagerly expanded even when the outer variable
+    (`XDG_CONFIG_HOME`) is unset — bash's `:-` only protects the outer
+    variable, not ones referenced inside the default value. Fixed to
+    `${XDG_CONFIG_HOME:-${HOME:-}/.config}` (nest a second `:-`) everywhere
+    — this was a real, pre-existing, latent bug in all 6 scripts, just
+    never triggered before because they'd only ever run from a context
+    with `$HOME` set.
+  - **`shani-auto-rollback.sh`'s own success/failure check was the exact
+    "pipe to logger masks the real exit code" bug this session already
+    found and fixed once in `shani-ci-commons` — FIXED here too.**
+    `if shani-deploy --rollback 2>&1 | logger ...; then` reports `logger`'s
+    exit status (always 0), not `shani-deploy`'s — confirmed live: while
+    `shani-deploy` was crashing on the `$HOME` bug above, this script was
+    still logging "Automatic rollback completed successfully." Fixed to
+    capture the real exit code before piping output to `logger`.
 
 - **`finalize_boot_entries()`'s `+3-0` tries-counted candidate entry for a
   fresh deploy likely provides no real automatic hard-failure fallback on

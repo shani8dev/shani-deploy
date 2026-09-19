@@ -1,0 +1,25 @@
+[Unit]
+Description=Run Automatic Rollback Check Shortly After Boot and After the Boot-Failure Timer (Shani OS)
+DefaultDependencies=no
+# Explicit Conflicts= restores what DefaultDependencies=no removed,
+# preventing spurious timer activation during early shutdown — same
+# reasoning as check-boot-failure.timer's identical line.
+Conflicts=shutdown.target
+
+[Timer]
+# First pass: catch a hard failure (dracut-recorded root-mount failure) as
+# fast as reasonably possible — the marker is already on disk before this
+# boot even started, no need to wait for anything.
+OnBootSec=1min
+# Second pass: fires shortly after check-boot-failure.timer's own
+# OnBootSec=15m, to catch a same-slot soft-failure timeout it just
+# recorded. shani-auto-rollback.service deliberately has no
+# RemainAfterExit=yes so this second trigger actually re-invokes
+# ExecStart= instead of finding the unit already "active" and no-op'ing —
+# see that unit's own comment.
+OnBootSec=16m
+Unit=shani-auto-rollback.service
+
+[Install]
+WantedBy=timers.target
+WantedBy=emergency.target

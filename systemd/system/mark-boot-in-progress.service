@@ -13,7 +13,7 @@ Type=oneshot
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ExecStart=rm -f /data/boot-ok /data/boot_failure.acked /data/boot_in_progress
+ExecStart=rm -f /data/boot-ok /data/boot_failure.acked /data/boot_in_progress /data/auto_rollback_done
 ExecStart=touch /data/boot_in_progress
 RemainAfterExit=yes
 

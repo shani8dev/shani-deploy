@@ -1,0 +1,23 @@
+[Unit]
+Description=Automatic System-Level Rollback for a Confirmed Boot Failure (Shani OS)
+After=data.mount mark-boot-in-progress.service
+Requires=data.mount
+
+[Service]
+Type=oneshot
+# Deliberately NOT RemainAfterExit=yes: this unit is triggered twice per
+# boot by shani-auto-rollback.timer's two OnBootSec= entries (an early
+# pass for hard failures, a later pass after check-boot-failure.timer's
+# own 15-minute check for soft failures) — RemainAfterExit=yes would leave
+# it "active (exited)" after the first pass, and starting an
+# already-active oneshot unit again is a no-op in systemd, silently
+# skipping the second pass entirely. Returning to "inactive" between runs
+# is what makes the timer's second trigger actually re-invoke ExecStart=.
+# The script itself is idempotent via /data/auto_rollback_done, so nothing
+# here depends on systemd's own state tracking for correctness.
+#
+# No hardening directives (NoNewPrivileges/ProtectSystem/etc.): the
+# underlying `shani-deploy --rollback` needs to mount and snapshot real
+# Btrfs subvolumes and write real EFI boot entries under /boot/efi — same
+# reasoning as bless-boot.service's own lack of hardening.
+ExecStart=/usr/local/bin/shani-auto-rollback

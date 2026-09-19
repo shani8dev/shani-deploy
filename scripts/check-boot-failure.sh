@@ -45,8 +45,8 @@ DEFAULT_deploy_boot_in_progress="/data/boot_in_progress"
 if [[ -f /etc/shani/shani.conf ]]; then
     _load_ini_config /etc/shani/shani.conf
 fi
-if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
-    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+if [[ -f "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf"
 fi
 
 CURRENT_SLOT_FILE="${deploy_current_slot:-${DEFAULT_deploy_current_slot}}"

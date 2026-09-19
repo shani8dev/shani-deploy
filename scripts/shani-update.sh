@@ -71,8 +71,8 @@ DEFAULT_update_lock_file="/run/shanios/shani-update.lock"
 if [[ -f /etc/shani/shani.conf ]]; then
     _load_ini_config /etc/shani/shani.conf
 fi
-if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
-    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+if [[ -f "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf"
 fi
 
 R2_BASE_URL="${deploy_r2_base_url:-${DEFAULT_deploy_r2_base_url}}"
@@ -1253,6 +1253,21 @@ EOF
         # and must not be masked by a stale reboot-needed marker. A boot failure
         # means the system is in a degraded state; showing a "restart to activate
         # update" dialog instead would be misleading and block recovery.
+        #
+        # NOTE (2026-09-19): this is now a SECONDARY layer, not the primary
+        # recovery mechanism. system-level shani-auto-rollback.service/.timer
+        # (../systemd/system/) run unconditionally on every boot, no session
+        # or display required, and normally resolve a real failure before a
+        # user could even log in (~1min for a hard failure, ~16min for a
+        # same-slot soft failure) — by the time this --startup path runs (it
+        # requires a graphical session at all, see the DISPLAY/WAYLAND_DISPLAY
+        # check above, which this repo's own headless `server` profile never
+        # satisfies), the markers checked below will usually already be
+        # cleared. This code stays as a courtesy for a user who logs in
+        # during that window, or as a manual fallback if the automatic path
+        # itself failed — see shani-deploy/AGENTS.md's "Automated rollback is
+        # now a real, system-level, unattended mechanism" entry for the full
+        # history of why this separation exists.
         log "=== Startup: checking fallback boot ==="
         if _check_fallback_boot; then
             _handle_fallback_boot

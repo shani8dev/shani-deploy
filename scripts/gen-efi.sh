@@ -94,8 +94,8 @@ DEFAULT_deploy_rootlabel="shani_root"
 if [[ -f /etc/shani/shani.conf ]]; then
     _load_ini_config /etc/shani/shani.conf
 fi
-if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
-    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+if [[ -f "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf"
 fi
 
 readonly OS_NAME="shanios"

@@ -73,8 +73,8 @@ if [[ -f /etc/shani/shani.conf ]]; then
 fi
 
 # Load user override
-if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf" ]]; then
-    _load_ini_config "${XDG_CONFIG_HOME:-$HOME/.config}/shani/shani.conf"
+if [[ -f "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf" ]]; then
+    _load_ini_config "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf"
 fi
 
 # Resolve config variables with DEFAULT_ fallbacks
@@ -2156,6 +2156,66 @@ restore_candidate() {
 # Do NOT arm it here at global scope: it would fire on invalid arguments,
 # check_root failures, and every other early die() before validate_boot() runs.
 
+# Same-slot failure recovery: the booted slot itself never confirmed a
+# healthy boot in time (recorded in /data/boot_failure or .acked as the
+# SAME slot we're currently running) — no bootloader-level fallback ever
+# occurred, so there is no sibling backup to "repair from"; the booted
+# slot's own filesystem state may be perfectly fine, it just missed the
+# health-confirmation window. Distinct from rollback_system()'s normal
+# path below, which always keeps the booted slot as default and repairs
+# the OTHER slot from a backup — that assumption is correct for a genuine
+# confirmed fallback, but would restore the healthy, untouched sibling
+# while leaving the actually-struggling booted slot untouched and still
+# the default if applied to a same-slot failure (see AGENTS.md's
+# known-issues entry for the full incident this fixes).
+#
+# The right recovery here is switching the DEFAULT boot target to the
+# sibling slot (the last-known-good state) without touching either slot's
+# subvolume data at all — no snapshot, no delete, nothing that assumes
+# which slot is actually broken.
+switch_to_sibling_slot() {
+    local booted="$1"
+    local sibling
+    if [[ "$booted" == "blue" ]]; then
+        sibling="green"
+    else
+        sibling="blue"
+    fi
+
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_warn "  SAME-SLOT FAILURE RECOVERY"
+    log_warn "  @${booted} did not confirm a healthy boot in time and"
+    log_warn "  no automatic bootloader-level fallback occurred."
+    log_warn "  Switching the default boot target to @${sibling}."
+    log_warn "  @${booted}'s data is NOT being touched or repaired —"
+    log_warn "  only the boot-entry default changes."
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    if ! btrfs_subvol_exists "$MOUNT_DIR/@${sibling}"; then
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        die "SAFETY ABORT: sibling slot @${sibling} does not exist — cannot switch to it. Manual investigation required."
+    fi
+
+    finalize_boot_entries "$sibling" "$booted" "no-tries" || {
+        safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+        die "Could not update boot entries — @${booted} remains the default. Investigate ESP mount/write access before retrying."
+    }
+    echo "$sibling" > "$MOUNT_DIR/@data/current-slot"
+    echo "$booted"  > "$MOUNT_DIR/@data/previous-slot"
+    btrfs_sync "$MOUNT_DIR"
+    safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
+
+    rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
+    rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true
+
+    log_success "Boot default switched to @${sibling}"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "  New default boot slot: @${sibling}"
+    log "  @${booted} left untouched, now the fallback entry"
+    log "  Please reboot — the system will boot into @${sibling}"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
 rollback_system() {
     log_section "System Rollback"
     # Disable the restore_candidate ERR trap while we're already doing a rollback.
@@ -2166,12 +2226,35 @@ rollback_system() {
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
 
-    # The failed slot is always the NON-booted slot
-    # (the one that was supposed to be next but failed)
     local booted
     booted=$(get_booted_subvol)
     [[ ! "$booted" =~ ^(blue|green)$ ]] && die "Cannot determine booted slot (got: '${booted}') — check /proc/cmdline and btrfs subvolume get-default /"
 
+    # Read any recorded failure BEFORE assuming direction. Two real, distinct
+    # cases (see switch_to_sibling_slot()'s comment above and AGENTS.md's
+    # known-issues entry for the incident this branch fixes):
+    #   1. No marker, or a marker naming the OTHER slot: a genuine confirmed
+    #      fallback (or a manual invocation with no marker at all) — the
+    #      "failed slot = opposite of booted" logic below is correct and
+    #      unchanged for this case.
+    #   2. A marker naming the SAME slot we're booted into: a same-slot
+    #      timeout, no bootloader-level fallback occurred — handled
+    #      entirely differently by switch_to_sibling_slot(), which does a
+    #      boot-entry-only default switch with no subvolume repair.
+    local recorded_fail=""
+    if [[ -f /data/boot_failure ]]; then
+        recorded_fail=$(cat /data/boot_failure 2>/dev/null | tr -d '[:space:]' || true)
+    elif [[ -f /data/boot_failure.acked ]]; then
+        recorded_fail=$(cat /data/boot_failure.acked 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+
+    if [[ "$recorded_fail" =~ ^(blue|green)$ && "$recorded_fail" == "$booted" ]]; then
+        switch_to_sibling_slot "$booted"
+        return
+    fi
+
+    # The failed slot is otherwise the NON-booted slot
+    # (the one that was supposed to be next but failed)
     local failed_slot
     if [[ "$booted" == "blue" ]]; then
         failed_slot="green"
@@ -2179,17 +2262,13 @@ rollback_system() {
         failed_slot="blue"
     fi
 
-    # Cross-check against /data/boot_failure if it exists — it contains the slot
-    # that actually failed. If it disagrees with our derivation (which should never
-    # happen in practice), warn but proceed with the derived value since the user
-    # is running from the working slot.
-    if [[ -f /data/boot_failure ]]; then
-        local recorded_fail
-        recorded_fail=$(cat /data/boot_failure 2>/dev/null | tr -d '[:space:]' || true)
-        if [[ -n "$recorded_fail" && "$recorded_fail" =~ ^(blue|green)$ && "$recorded_fail" != "$failed_slot" ]]; then
-            log_warn "boot_failure records @${recorded_fail} but booted slot @${booted} implies @${failed_slot} failed"
-            log_warn "Using @${failed_slot} (derived from booted slot) — boot_failure may be stale"
-        fi
+    # If a recorded failure exists but disagrees with our derivation (which
+    # should never happen in practice now that the same-slot case is
+    # branched off above), warn but proceed with the derived value since
+    # the user is running from the working slot.
+    if [[ -n "$recorded_fail" && "$recorded_fail" =~ ^(blue|green)$ && "$recorded_fail" != "$failed_slot" ]]; then
+        log_warn "boot_failure records @${recorded_fail} but booted slot @${booted} implies @${failed_slot} failed"
+        log_warn "Using @${failed_slot} (derived from booted slot) — boot_failure may be stale"
     fi
 
     CURRENT_SLOT="$booted"
@@ -2656,6 +2735,95 @@ parse_fstab_bind_dirs() {
     }' "$1" | sort -u
 }
 
+run_migrations() {
+    log_section "Migration Hooks"
+
+    # One-time, per-name post-receive migrations, modelled on ChimeraOS's
+    # /usr/lib/frzr.d/*.migration: each script defines post_install(mount_path)
+    # and is run exactly once against the freshly-received slot, with its
+    # completion recorded so a rollback to the previous slot never re-runs it.
+    #
+    # Why this exists: shani-deploy's deploy_update() does btrfs receive into
+    # temp_update then snapshots it onto @CANDIDATE_SLOT. Everything in the new
+    # slot is byte-for-byte what the builder shipped — there is no install-time
+    # hook that runs on the receiving machine. A config file that needs to move
+    # or a service that needs enabling after a slot switch therefore has no
+    # home: it either had to be baked into the image (wrong for machine-local
+    # state) or done by hand. This gives post-receive a place to land.
+    #
+    # Scripts are discovered by prefix in /usr/local/bin (shani-migrate-*.sh),
+    # which the shani-deploy PKGBUILD's scripts/* glob already installs. Each
+    # must define post_install(); a script without one is skipped with a warn,
+    # never a fatal error — a broken migration must not block deployment.
+    #
+    # Completion is tracked by a marker under /data/shani/migrations-done/
+    # (persists across slot switches, so a rollback does not re-run). /data is
+    # the overlay-backed persistent store, so the marker survives reboot.
+    [[ "${DRY_RUN}" == "yes" ]] && { log "[DRY-RUN] Would run migrations"; return 0; }
+
+    # Overridable for testing (defaults to where the PKGBUILD installs them).
+    local migrate_dir="${SHANIOS_MIGRATION_DIR:-/usr/local/bin}"
+    local -a scripts=()
+    local f
+    for f in "${migrate_dir}"/shani-migrate-*.sh; do
+        [[ -e "$f" ]] && scripts+=("$f")
+    done
+    if [[ ${#scripts[@]} -eq 0 ]]; then
+        log "No migration scripts found — nothing to do"
+        return 0
+    fi
+
+    mkdir -p "$MOUNT_DIR"
+    safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5" \
+        || { log_error "Could not mount root for migrations"; return 1; }
+    # Self-clear: a RETURN trap re-fires on every ANCESTOR function's return
+    # too, not just this one's, until cleared.
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
+
+    # Overridable for testing (defaults to the real persistent store).
+    local data_dir="${SHANIOS_DATA_DIR:-/data}"
+    local marker_dir="${data_dir}/shani/migrations-done"
+    mkdir -p "$marker_dir"
+
+    local script name marker
+    for script in "${scripts[@]}"; do
+        name="$(basename "$script" .sh)"
+        marker="${marker_dir}/${name}.done"
+
+        if [[ -f "$marker" ]]; then
+            log_verbose "Migration ${name}: already applied (marker present), skipping"
+            continue
+        fi
+
+        log "Running migration: ${name}"
+        # Source in a subshell so a migration's locals/helpers cannot leak
+        # into this function's namespace or clobber its variables.
+        # || rc=$? is required: under set -e a bare failing subshell would
+        # abort run_migrations here, before the failure is even logged.
+        local rc=0
+        (
+            set +e
+            source "$script"
+            if [[ "$(type -t post_install)" != "function" ]]; then
+                echo "  ERROR: ${script} defines no post_install() — skipping" >&2
+                exit 1
+            fi
+            post_install "$MOUNT_DIR"
+        ) || rc=$?
+
+        if [[ $rc -ne 0 ]]; then
+            log_warn "Migration ${name} failed (exit ${rc}) — continuing; it will retry on the next deploy"
+            continue
+        fi
+
+        touch "$marker"
+        log_success "Migration ${name} applied"
+    done
+
+    btrfs_sync "$MOUNT_DIR"
+    log "Migrations complete"
+}
+
 verify_and_create_subvolumes() {
     log_section "Filesystem Structure Verification"
 
@@ -2869,7 +3037,7 @@ fetch_update() {
     IMAGE_NAME=$(tr -d '[:space:]' < "$temp")
     rm -f "$temp"
 
-    [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-zA-Z]+)\.zst$ ]] || die "Version manifest has unexpected format: ${IMAGE_NAME}"
+    [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-z0-9_-]+)\.zst$ ]] || die "Version manifest has unexpected format: ${IMAGE_NAME}"
 
     REMOTE_VERSION="${BASH_REMATCH[1]}"
     REMOTE_PROFILE="${BASH_REMATCH[2]}"
@@ -3371,6 +3539,7 @@ finalize_update() {
     trap 'restore_candidate' ERR
     trap '[[ $? -ne 0 ]] && restore_candidate' EXIT
 
+    run_migrations || { log_warn "Migrations had warnings — continuing"; }
     verify_and_create_subvolumes || { restore_candidate; return 1; }
     generate_uki "$CANDIDATE_SLOT"  || { restore_candidate; return 1; }
     finalize_boot_entries "$CANDIDATE_SLOT" "$CURRENT_SLOT" || { restore_candidate; return 1; }

@@ -527,8 +527,31 @@ _build_pkexec_env() {
 #   is NOT a general option; passing it here caused some yad builds to
 #   reject the whole invocation. --text-width is the general-options
 #   equivalent — it caps the text width in characters before GTK wraps it.
+#
+# CONFIRMED LIVE BUG, FIXED 2026-09-19: this list used to also include
+# --image-on-top, which does not exist as a yad option at all (confirmed
+# against a real yad 15.0: `yad --help-general` lists --image=IMAGE and
+# --on-top as two SEPARATE flags — both already present below under their
+# real names — but no combined --image-on-top). Every yad invocation
+# failed to even parse its command line ("Unable to parse command line:
+# Unknown option --image-on-top", exit 255) before ever trying to open a
+# display. Worse than a clean failure: the backend-detection logic a few
+# lines below only recognizes rc=1 (GTK's real "can't open display" code)
+# as a dead backend; rc=255 fell through as "non-standard exit = bad
+# backend, try next", silently exhausting every GDK_BACKEND value and
+# then zenity too, every single time, on any system, real display or not.
+# Net effect: no shani-update dialog has ever actually rendered via yad in
+# production — every one of them silently fell through to the
+# notify-send/console fallback instead. Found and confirmed live by
+# actually rendering a dialog end-to-end (X11-forwarded into a real test
+# session — see shani-install-media/AGENTS.md's X11/Wayland-forwarding
+# harness entry) rather than trusting this file read alone.
 show_dialog() {
-    local title="$1" text="$2" ok_label="${3:-OK}" cancel_label="${4:-Cancel}"
+    # cancel_label uses ${4-Cancel} (no colon) rather than ${4:-Cancel} —
+    # deliberately: show_alert() below passes an explicit empty string to
+    # mean "no second button", which the colon form would incorrectly
+    # treat the same as "not passed at all" and default back to "Cancel".
+    local title="$1" text="$2" ok_label="${3:-OK}" cancel_label="${4-Cancel}"
     local timeout="${5:-120}" icon="${6:-software-update-available}"
     local session="${XDG_SESSION_TYPE:-unknown}"
 
@@ -547,7 +570,6 @@ show_dialog() {
                 --title="$title"
                 --window-icon="$icon"
                 --image="$icon"
-                --image-on-top
                 --text="$text"
                 --text-align=center
                 --text-width=60
@@ -556,9 +578,13 @@ show_dialog() {
                 --center
                 --on-top
                 --sticky
+                --selectable-labels
                 --button="${ok_label}:0"
-                --button="${cancel_label}:1"
             )
+            # A single-button "alert" (see show_alert() below) passes an
+            # empty cancel_label — skip the second button entirely rather
+            # than showing two buttons with confusingly identical labels.
+            [[ -n "$cancel_label" ]] && yad_cmd+=(--button="${cancel_label}:1")
             [[ $timeout -gt 0 ]] && yad_cmd+=(--timeout="$timeout" --timeout-indicator=bottom)
 
             # Capture stderr (discard stdout) instead of throwing it away.
@@ -616,6 +642,79 @@ show_dialog() {
     fi
 
     return 2
+}
+
+# show_alert TITLE TEXT [ICON]
+# Single-button acknowledgment dialog for a critical, already-decided
+# failure — automatic recovery already ran and failed, there is no
+# meaningful "confirm or decline" choice left to offer, just "the user
+# needs to know this happened". Uses the same backend-detection/fallback
+# machinery as show_dialog() (a real dialog when a display is available,
+# notify-send/console otherwise) rather than duplicating it. Returns
+# 0=acknowledged, 1=notify-send/console fallback used, 2=no GUI at all —
+# callers that only care "did the user get told" should treat all three
+# as success and only escalate further (e.g. also log/wall) on a genuine
+# error, not on the return code here.
+show_alert() {
+    local title="$1" text="$2" icon="${3:-dialog-error}"
+    local rc
+    show_dialog "$title" "$text" "OK" "" 0 "$icon"
+    rc=$?
+    if [[ $rc -eq 2 ]]; then
+        command -v notify-send &>/dev/null && \
+            notify-send -u critical -i "$icon" "$title" "$text" 2>/dev/null
+        [[ -t 1 ]] && printf '\n%s\n%s\n\n' "$title" "$text"
+    fi
+    return "$rc"
+}
+
+# _run_tray — persistent system-tray icon (yad --notification). Requires
+# `gnome-shell-extension-appindicator` (already a shani-desktop-gnome
+# dependency) or an equivalent StatusNotifierItem host on other desktops
+# to actually be visible — GNOME Shell has no built-in legacy tray since
+# 3.26. Deliberately does NOT call _acquire_lock: this process is meant to
+# live for the whole session (started once at login, see
+# shani-update-tray.service), and every action it offers just spawns an
+# ORDINARY separate `shani-update` invocation, which acquires and releases
+# the single-instance lock itself exactly like a manual or timer-triggered
+# run would — a tray icon holding that lock for its entire lifetime would
+# deadlock every periodic/manual check for as long as it's running.
+# yad's own --menu=LABEL:CMD[|LABEL:CMD...] syntax confirmed live against
+# this yad build (see AGENTS.md's yad-audit entry) before wiring it here.
+_run_tray() {
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        log "No display — cannot run tray icon"
+        exit 0
+    fi
+    if ! command -v yad &>/dev/null; then
+        log "yad not installed — cannot run tray icon"
+        exit 0
+    fi
+
+    log "Starting shani-update tray icon"
+    local view_log_cmd
+    if TERMINAL=$(_find_terminal); then
+        view_log_cmd="${TERMINAL} -e less \\\"${LOG_FILE}\\\""
+    else
+        view_log_cmd="xdg-open \\\"${LOG_FILE}\\\""
+    fi
+
+    # yad's --command/--menu entries are NOT run through a shell — confirmed
+    # live: a bare trailing `&` was passed as a literal argv token to the
+    # target program instead of backgrounding it ("Unknown option: &").
+    # Every real action (everything except yad's own built-in "quit"
+    # keyword) needs an explicit `sh -c "..."` wrapper for `&`/quoting to
+    # mean anything.
+    local menu_entries="Check for Updates Now:sh -c \"shani-update &\""
+    menu_entries+="|View Update Log:sh -c \"${view_log_cmd} &\""
+    menu_entries+="|Roll Back...:sh -c \"shani-update --rollback &\""
+    menu_entries+="|Quit:quit"
+
+    yad --notification \
+        --image="software-update-available" \
+        --text="Shani OS Update" \
+        --command="sh -c \"shani-update &\"" \
+        --menu="$menu_entries"
 }
 
 #####################################
@@ -765,11 +864,14 @@ _handle_fallback_boot() {
 
     if [[ -f "$AUTO_ROLLBACK_DONE_FILE" ]]; then
         log "ERROR: automatic rollback already ran and failed for @${FAILED_SLOT} (kind=${kind}) — see journalctl -t shani-auto-rollback"
-        command -v notify-send &>/dev/null && \
-            notify-send -u critical -i dialog-error \
-                "Shani OS — Automatic Recovery Failed" \
-                "Slot @${FAILED_SLOT} could not be automatically recovered. Run 'journalctl -t shani-auto-rollback' for details, then 'shani-deploy --rollback' manually." 2>/dev/null || true
-        [[ -t 1 ]] && printf '\n✗ Automatic recovery of @%s FAILED (kind=%s) — see: journalctl -t shani-auto-rollback\nRun manually: shani-deploy --rollback\n\n' "$FAILED_SLOT" "$kind"
+        # A modal dialog here (not just a notify-send bubble, which is easy
+        # to dismiss/miss unread) — this is a real "your safety net didn't
+        # catch you" event, worth requiring active acknowledgment when a
+        # display is available. show_alert() falls back to notify-send/
+        # console on its own when one isn't.
+        show_alert "Shani OS — Automatic Recovery Failed" \
+            "Slot @${FAILED_SLOT} could not be automatically recovered.\n\nRun <b>journalctl -t shani-auto-rollback</b> for details, then <b>shani-deploy --rollback</b> manually." \
+            "dialog-error"
         _cleanup_and_exit 1
     fi
 
@@ -785,9 +887,9 @@ _handle_fallback_boot() {
         _cleanup_and_exit 0
     else
         log "ERROR: automatic recovery failed — see journalctl -t shani-auto-rollback"
-        command -v notify-send &>/dev/null && \
-            notify-send -u critical -i dialog-error \
-                "Shani OS — Rollback Failed" "Run 'journalctl -t shani-auto-rollback' for details, or 'shani-deploy --rollback' manually." 2>/dev/null || true
+        show_alert "Shani OS — Rollback Failed" \
+            "Run <b>journalctl -t shani-auto-rollback</b> for details, or <b>shani-deploy --rollback</b> manually." \
+            "dialog-error"
         _cleanup_and_exit 1
     fi
 }
@@ -1165,6 +1267,7 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --startup)          MODE="startup";       shift ;;
+            --tray)             MODE="tray";          shift ;;
             -r|--rollback)      MODE="rollback";      shift ;;
             -f|--force)         FORCE_UPDATE="yes";   shift ;;
             -t|--channel)
@@ -1197,6 +1300,8 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --startup           Run at login: fallback check → candidate check → update check
+  --tray              Run a persistent system-tray icon (yad --notification);
+                      click or its menu triggers a normal check on demand
   -r, --rollback      Roll back the inactive slot immediately
   -f, --force         Force deploy even if version matches or slot mismatch
   -t, --channel CHAN  Update channel: stable|latest  (default: $UPDATE_CHANNEL_DEFAULT)
@@ -1226,6 +1331,14 @@ EOF
 
     _validate_environment
     _resolve_channel
+
+    # ── Tray mode ────────────────────────────────────────────────────────────
+    # Deliberately BEFORE _acquire_lock — see _run_tray()'s own comment for
+    # why this long-lived process must never hold the single-instance lock.
+    if [[ "$MODE" == "tray" ]]; then
+        _run_tray
+        exit $?
+    fi
 
     # ── Startup mode ─────────────────────────────────────────────────────────
     if [[ "$MODE" == "startup" ]]; then

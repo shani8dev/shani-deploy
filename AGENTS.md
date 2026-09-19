@@ -253,6 +253,61 @@ evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
 is deliberately just the current-state summary — what's true right now,
 not how it got that way.
 
+- **`show_dialog()`'s yad invocation used a flag that doesn't exist —
+  FIXED (2026-09-19). No shani-update dialog had EVER actually rendered
+  via yad, on any real system, ever.** `--image-on-top` was never a real
+  yad option (confirmed against a real yad 15.0: `yad --help-general`
+  lists `--image=IMAGE` and `--on-top` as two SEPARATE flags — both
+  already present in this file under their real names — no combined
+  `--image-on-top`). Every yad invocation failed to even parse its
+  command line ("Unable to parse command line: Unknown option
+  --image-on-top", exit 255) before ever trying to open a display.
+  Worse than a clean failure: the backend-detection logic only recognizes
+  `rc=1` (GTK's real "can't open display" code) as a dead backend; `rc=255`
+  fell through as "non-standard exit = bad backend, try next", silently
+  exhausting every `GDK_BACKEND` value and then zenity too, every time.
+  Found and confirmed by actually rendering a dialog end-to-end — not by
+  reading the code — via a new X11/Wayland-forwarding capability added to
+  the sibling `shani-install-media` test harness specifically because the
+  harness's existing headless-Wayland-compositor approach (`gnome-shell
+  --headless --virtual-monitor=...`) has its own real GTK3/Wayland client
+  compatibility gap (see that repo's AGENTS.md for the full story). Fixed
+  by removing the invalid flag; `--image=`/`--on-top` already provide the
+  real functionality it was trying to duplicate. Every other yad flag in
+  this file was cross-checked against a real `yad --help-all` dump and
+  confirmed valid — this was the only one.
+- **Critical failure notifications upgraded from passive `notify-send`
+  bubbles to modal dialogs — new `show_alert()` (2026-09-19).**
+  `_handle_fallback_boot()`'s "automatic recovery failed" paths only used
+  `notify-send`, which is trivially missed (auto-dismisses, easy to not
+  notice) for what is a "your safety net didn't catch you" event that
+  deserves active acknowledgment. `show_alert()` wraps `show_dialog()` in
+  single-button mode (a new capability: `cancel_label=""` now suppresses
+  the second button entirely, via `${4-Cancel}` instead of
+  `${4:-Cancel}` in `show_dialog()`'s own parameter defaults — the colon
+  form can't distinguish "explicitly empty" from "not passed") with the
+  same GUI/notify-send/console fallback chain `show_dialog()` already has.
+- **New: persistent system-tray icon — `shani-update --tray` +
+  `shani-update-tray.service` (2026-09-19).** Uses `yad --notification`,
+  which needs a StatusNotifierItem/AppIndicator host to render at all
+  under modern GNOME (no built-in legacy tray since 3.26) —
+  `gnome-shell-extension-appindicator` is already a `shani-desktop-gnome`
+  PKGBUILD dependency, confirmed present. Deliberately does NOT call
+  `_acquire_lock`: this is a long-lived process (started once at login,
+  `WantedBy=graphical-session.target`), and its menu actions each spawn
+  an ORDINARY separate `shani-update` invocation that acquires/releases
+  the single-instance lock itself — a tray icon holding that lock for its
+  whole lifetime would deadlock every periodic/manual check for as long
+  as it's running. **Real bug found and fixed via live testing**: yad's
+  `--command=`/`--menu=` entries are NOT run through a shell — a bare
+  trailing `&` (intended to background the spawned `shani-update`) was
+  passed as a literal argv token instead ("Unknown option: &"), confirmed
+  live. Every real action now wraps in `sh -c "..."` explicitly (yad's own
+  built-in `quit` keyword is the one exception, left bare). Verified live:
+  the icon now starts and stays running (`RC=124` = killed by an external
+  timeout while still blocking correctly, not crashing) with no parse
+  errors.
+
 - **`shani-update.sh` crashed on every invocation — FIXED (2026-09-19).**
   Two variables were referenced but never defined anywhere in `scripts/` or
   `bin/`, and this script sources nothing: `UPDATE_CHANNEL_DEFAULT`

@@ -253,6 +253,28 @@ evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
 is deliberately just the current-state summary — what's true right now,
 not how it got that way.
 
+- **`shani-update.sh` crashed on every invocation — FIXED (2026-09-19).**
+  Two variables were referenced but never defined anywhere in `scripts/` or
+  `bin/`, and this script sources nothing: `UPDATE_CHANNEL_DEFAULT`
+  (L121 `DEPLOY_CHANNEL="$UPDATE_CHANNEL_DEFAULT"`) and `LOG_TAG`
+  (L158/160 `systemd-cat -t "$LOG_TAG"` / `logger -t "$LOG_TAG"`). Under the
+  script's own `set -Eeuo pipefail` that aborts at startup on **every**
+  mode — including `--rollback` and `--startup`, i.e. the automatic
+  fallback→rollback path (`_check_fallback_boot` L252 →
+  `_handle_fallback_boot` L725 → `_run_rollback` L675 →
+  `shani-deploy --rollback`) that runs at login. Net effect: the automatic
+  boot-failure recovery path was unreachable, even though the manual
+  `shani-deploy --rollback` path works fine. Found by the rollback-path
+  empirical verification pass; independently re-verified by grep across
+  `scripts/`+`bin/` (0 definitions, 0 `source` calls). Fixed by defining
+  `UPDATE_CHANNEL_DEFAULT="stable"` (matches `shani-deploy.sh:418`'s default
+  and this script's own `--channel` help text) and
+  `readonly LOG_TAG="shani-update"` (matches the convention every sibling
+  uses, e.g. `shani-reset.sh:51`). Verified: `bash -n` clean,
+  `test-deploy-state.sh` 9/0, `test_upgrade_adviser.sh` 21/0, and
+  `shani-update --help` / `--rollback` now run to completion instead of
+  crashing with "unbound variable".
+
 - **`check-boot-failure.sh` misattributed a same-slot timeout to the
   untouched sibling slot — FIXED (2026-09-19).** Its sanity-check treated
   `FAILED_SLOT == BOOTED_SLOT` as invalid data (comment: "we are on the

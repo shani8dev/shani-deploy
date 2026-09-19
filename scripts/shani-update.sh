@@ -130,6 +130,11 @@ SKIP_SELF_UPDATE="no"       # passed through as shani-deploy --skip-self-update
 UPDATE_GENEFI="no"          # passed through as shani-deploy --update-genefi
 SET_CHANNEL_VALUE=""        # channel arg for MODE=set-channel
 HEALTH_ARGS=()               # remaining argv forwarded verbatim to shani-health
+SHOW_TERMINAL_MODE="no"     # yes only via --terminal — explicit user opt-in;
+                            # default is the graphical progress window (see
+                            # _run_gui_progress). A bare terminal only ever
+                            # appears otherwise via the progress window's own
+                            # "Show Terminal" button, also an explicit click.
 
 LOCAL_VERSION=""
 LOCAL_PROFILE=""
@@ -195,8 +200,12 @@ _acquire_lock() {
     echo $$ > "$LOCK_FILE/pid"
 }
 
-_cleanup_and_exit() {
+_cleanup_lock() {
     rm -rf "$LOCK_FILE" 2>/dev/null || true
+}
+
+_cleanup_and_exit() {
+    _cleanup_lock
     exit "${1:-0}"
 }
 
@@ -503,7 +512,7 @@ _build_pkexec_env() {
     #                               to open with "cannot open display" or similar.
     local -n _pe="$1"
     local display_env xauth_env wayland_display runtime_dir
-    display_env=$(printf '%s'     "${DISPLAY:-:0}"                   | tr -cd '[:alnum:]:._-/')
+    display_env=$(printf '%s'     "${DISPLAY:-:0}"                   | tr -cd '[:alnum:]:._/-')
     xauth_env=$(printf '%s'       "${XAUTHORITY:-$HOME/.Xauthority}" | tr -cd '[:alnum:]/_.-')
     wayland_display=$(printf '%s' "${WAYLAND_DISPLAY:-}"             | tr -cd '[:alnum:]/_.-')
     runtime_dir=$(printf '%s'     "${XDG_RUNTIME_DIR:-}"             | tr -cd '[:alnum:]/_.-')
@@ -738,47 +747,197 @@ _build_install_args() {
     return 0
 }
 
-# _launch_deploy TITLE ARG [ARG...]
-# Opens a terminal running `pkexec shani-deploy ARG...`, giving the user full
-# visibility into (and Ctrl+C control over) whatever shani-deploy is doing.
-# Shared by rollback, install, cleanup, optimize, and channel changes so
-# there's exactly one code path that builds the pkexec/terminal invocation.
-_launch_deploy() {
+# _launch_in_terminal TITLE CMD [ARG...]
+# Opens CMD in a real terminal window and blocks until it exits, propagating
+# its exit code. This is now ONLY reached two ways, both an explicit user
+# request rather than the default: (1) `shani-update --terminal` was passed
+# on the command line, or (2) the user clicked "Show Terminal" in the
+# graphical progress window (see _run_gui_progress) and no display/yad was
+# available at all — a real terminal is the only way to show anything then,
+# not a preference. Shared by _launch_deploy/_launch_health so there's
+# exactly one code path that builds the terminal invocation.
+_launch_in_terminal() {
     local title="$1"; shift
-    log "Launching: $DEPLOY_BIN $*"
+    local -a cmd=("$@")
 
     if ! TERMINAL=$(_find_terminal); then
         err "No terminal emulator found — install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm"
     fi
+
+    local -a terminal_args
+    _build_terminal_args "$TERMINAL" "$title" terminal_args "${cmd[@]}"
+    log "Launching: ${terminal_args[*]}"
+    "${terminal_args[@]}"
+}
+
+# _launch_terminal_tail TITLE LOGFILE PID
+# The explicit "Show Terminal" escape hatch from inside the graphical
+# progress window (see _run_gui_progress): opens a real terminal doing a
+# live, read-only follow of the SAME log the GUI window is already showing.
+# Deliberately non-blocking (backgrounded) — the caller still owns waiting
+# on PID for the operation's real exit code; this is just an extra viewer,
+# not a replacement control path.
+#
+# Returns 0 only if the terminal is confirmed actually running a moment
+# after launch, 1 otherwise. This distinction matters: a terminal emulator
+# that needs D-Bus activation (gnome-terminal, kgx) can fail asynchronously
+# — the initial exec succeeds, a background job starts, and only ~1s later
+# does the child actually exit (e.g. "Error spawning command line
+# 'dbus-launch ...'" when no D-Bus session bus is available). Confirmed
+# live: without this check, _run_gui_progress's caller had already closed
+# the yad progress window for the button click, the terminal then silently
+# failed to appear a moment later, and the user was left with NO visible
+# window at all while the real operation kept running in the background —
+# reported live by a user watching the actual X11 display during testing.
+_launch_terminal_tail() {
+    local title="$1" logfile="$2" pid="$3"
+    local terminal
+    if ! terminal=$(_find_terminal); then
+        warn "No terminal emulator found — staying on the graphical progress view"
+        return 1
+    fi
+    local -a terminal_args
+    _build_terminal_args "$terminal" "$title" terminal_args \
+        bash -c "tail -n +1 -f --pid=${pid} '${logfile}'; echo; echo '--- finished — press Enter to close ---'; read -r _"
+    "${terminal_args[@]}" &
+    local term_pid=$!
+    disown
+    sleep 1.5
+    if kill -0 "$term_pid" 2>/dev/null; then
+        return 0
+    fi
+    warn "Terminal ('${terminal}') exited immediately after launch — likely no D-Bus session bus available. Falling back to the graphical progress view."
+    return 1
+}
+
+# _run_gui_progress TITLE CMD [ARG...]
+# Default path for _launch_deploy/_launch_health: runs CMD in the
+# background and streams its combined stdout/stderr into a modern yad
+# --progress window instead of opening a bare terminal — a real terminal
+# now only ever appears on an explicit user request (this window's own
+# "Show Terminal" button, or --terminal on shani-update's own command
+# line — see _launch_in_terminal).
+#
+# Uses yad's `--text-info --tail` widget for a live, scrolling, inline log
+# view (the original design's intent): the whole run is visible in the
+# window as it happens, not just the last line.
+#
+# `--disable-search` is LOAD-BEARING, not cosmetic — do not remove it.
+# yad's text-info builds a search bar whose entry icon (edit-find-symbolic/
+# edit-clear-symbolic) resolves to an SVG. This image has NO working SVG
+# rasterizer: there is no libpixbufloader-svg.so and no `svg` entry in
+# gdk-pixbuf's loaders.cache (gdk-pixbuf 2.44.7 routes SVG through the
+# out-of-process glycin loader, whose sandboxed `bwrap ... glycin-svg`
+# child exits 1 here), so GTK falls back to image-missing.svg, cannot load
+# that either, and asserts (gtkiconhelper.c:495 ... assertion failed) →
+# SIGABRT (rc=134). Confirmed live on the shanios image via the
+# shani-install-media X11 harness: identical invocation returns rc=134
+# without `--disable-search` and rc=124 (renders and stays open) with it;
+# the earlier "--text-info unconditionally crashes" finding was this same
+# search-bar icon, just not yet isolated to a caller-controllable flag.
+#
+# `tail --pid=` (GNU coreutils) is the clean producer/consumer split: it
+# follows the logfile until CMD's own PID exits, then stops on its own, so
+# the window has a natural end and its last line just settles once the real
+# work is done, with nothing here having to poll or race anything. yad's
+# text-info keeps its window open after this stdin EOF (verified), so the
+# user can still read the result and press a button. The actual exit code
+# always comes from `wait` on CMD's own PID directly — never from yad's or
+# tail's exit status.
+_run_gui_progress() {
+    local title="$1"; shift
+    local -a cmd=("$@")
+
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || ! command -v yad &>/dev/null; then
+        # No display, or yad isn't installed at all: the graphical view is
+        # simply impossible here, not a preference — fall back to a real
+        # terminal so the operation is still visible/controllable.
+        _launch_in_terminal "$title" "${cmd[@]}"
+        return $?
+    fi
+
+    local logfile
+    logfile=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/shani-update-progress.XXXXXX.log" 2>/dev/null) || {
+        warn "Could not create a progress logfile — falling back to a terminal"
+        _launch_in_terminal "$title" "${cmd[@]}"
+        return $?
+    }
+
+    log "Launching (graphical progress): ${cmd[*]}"
+    "${cmd[@]}" >"$logfile" 2>&1 &
+    local deploy_pid=$!
+
+    # Loop rather than a single shot: if "Show Terminal" is clicked but the
+    # terminal fails to actually come up (see _launch_terminal_tail's own
+    # comment), re-show the graphical progress view instead of leaving
+    # nothing on screen while $deploy_pid keeps running in the background.
+    local yad_rc=0
+    while kill -0 "$deploy_pid" 2>/dev/null; do
+        yad_rc=0
+        tail -n +1 -f --pid="$deploy_pid" "$logfile" | yad --text-info --tail --disable-search \
+            --title="$title" --window-icon="software-update-available" \
+            --width=700 --height=450 \
+            --button="Show Terminal:2" \
+            --button="Cancel:1" \
+            --button="Close:0" || yad_rc=$?
+
+        if [[ $yad_rc -eq 2 ]] && kill -0 "$deploy_pid" 2>/dev/null; then
+            log "User requested the terminal view — opening a live tail of the same output"
+            _launch_terminal_tail "$title" "$logfile" "$deploy_pid" && break
+            continue
+        elif [[ $yad_rc -eq 1 ]] && kill -0 "$deploy_pid" 2>/dev/null; then
+            log "User cancelled — terminating ${cmd[0]} (pid $deploy_pid)"
+            kill "$deploy_pid" 2>/dev/null || true
+            break
+        else
+            break
+        fi
+    done
+
+    local rc=0
+    wait "$deploy_pid" 2>/dev/null || rc=$?
+    rm -f "$logfile" 2>/dev/null || true
+    return "$rc"
+}
+
+# _launch_deploy TITLE ARG [ARG...]
+# Runs `pkexec shani-deploy ARG...` — graphical progress window by default
+# (_run_gui_progress), a real terminal only via --terminal or the window's
+# own "Show Terminal" button (_launch_in_terminal). Shared by rollback,
+# install, cleanup, optimize, and channel changes so there's exactly one
+# code path that builds the pkexec invocation.
+_launch_deploy() {
+    local title="$1"; shift
+    log "Launching: $DEPLOY_BIN $*"
 
     local -a pkexec_args
     _build_pkexec_env pkexec_args
     pkexec_args+=("$DEPLOY_BIN" "$@")
 
-    local -a terminal_args
-    _build_terminal_args "$TERMINAL" "$title" terminal_args "${pkexec_args[@]}"
-    log "Launching: ${terminal_args[*]}"
-    "${terminal_args[@]}"
+    if [[ "$SHOW_TERMINAL_MODE" == "yes" ]]; then
+        _launch_in_terminal "$title" "${pkexec_args[@]}"
+        return $?
+    fi
+    _run_gui_progress "$title" "${pkexec_args[@]}"
 }
 
 # _launch_health TITLE [ARG...]
-# Opens a terminal running `shani-health ARG...`. Unlike _launch_deploy this
-# does NOT wrap the command in pkexec — shani-health re-execs itself via
-# pkexec/sudo internally (see its _require_root) so wrapping it here would
-# just prompt for privileges twice.
+# Runs `shani-health ARG...` — graphical progress window by default, a real
+# terminal only via --terminal or the window's own "Show Terminal" button.
+# Unlike _launch_deploy this does NOT wrap the command in pkexec —
+# shani-health re-execs itself via pkexec/sudo internally (see its
+# _require_root) so wrapping it here would just prompt for privileges twice.
 _launch_health() {
     local title="$1"; shift
     log "Launching: $HEALTH_BIN $*"
 
-    if ! TERMINAL=$(_find_terminal); then
-        err "No terminal emulator found — install konsole (KDE), kgx (GNOME), gnome-terminal, alacritty, kitty, or xterm"
-    fi
-
     local -a cmd_args=("$HEALTH_BIN" "$@")
-    local -a terminal_args
-    _build_terminal_args "$TERMINAL" "$title" terminal_args "${cmd_args[@]}"
-    log "Launching: ${terminal_args[*]}"
-    "${terminal_args[@]}"
+
+    if [[ "$SHOW_TERMINAL_MODE" == "yes" ]]; then
+        _launch_in_terminal "$title" "${cmd_args[@]}"
+        return $?
+    fi
+    _run_gui_progress "$title" "${cmd_args[@]}"
 }
 
 #####################################
@@ -823,9 +982,9 @@ _post_rollback_dialog() {
         # status (nonzero whenever stdout isn't a tty -- the normal case for
         # every non-interactive/autostart caller) becomes _post_rollback_dialog's
         # return value. All three call sites invoke it bare, immediately
-        # followed by _cleanup_and_exit 0 -- currently masked only because the
-        # EXIT trap happens to also call _cleanup_and_exit on abort, but that's
-        # an accident, not a guarantee, the moment either call site changes.
+        # followed by an explicit _cleanup_and_exit 0, so this return value is
+        # not currently load-bearing -- but keep the function itself returning
+        # 0 rather than relying on that.
         [[ -t 1 ]] && printf '\n✓ Rollback complete. Restart your system when ready.\n\n'
         true
     fi
@@ -1278,6 +1437,7 @@ main() {
                 shift 2 ;;
             -v|--verbose)       VERBOSE_DEPLOY="yes"; shift ;;
             -d|--dry-run)       DRY_RUN_DEPLOY="yes"; shift ;;
+            --terminal)         SHOW_TERMINAL_MODE="yes"; shift ;;
             -c|--cleanup)       MODE="cleanup";       shift ;;
             -o|--optimize)      MODE="optimize";      shift ;;
             --download-only)    MODE="download-only"; shift ;;
@@ -1307,6 +1467,10 @@ Options:
   -t, --channel CHAN  Update channel: stable|latest  (default: $UPDATE_CHANNEL_DEFAULT)
   -v, --verbose       Verbose output from shani-deploy
   -d, --dry-run       Simulate deployment without changes
+  --terminal          Show a real terminal window instead of the graphical
+                      progress window for this run (default: graphical; a
+                      "Show Terminal" button in the progress window is the
+                      other way to get one, on demand)
   -c, --cleanup       Passthrough: shani-deploy --cleanup (manual backup/download cleanup)
   -o, --optimize      Passthrough: shani-deploy --optimize (manual Btrfs dedup)
   --download-only     Passthrough: shani-deploy --download-only (fetch+verify update image, no deploy)
@@ -1356,7 +1520,16 @@ EOF
     fi
 
     _acquire_lock
-    trap '_cleanup_and_exit' EXIT INT TERM
+    # EXIT must only drop the lock, never re-enter _cleanup_and_exit: that
+    # re-exits 0 regardless of the real status and silently masked every
+    # failure path (err(), and the explicit `_cleanup_and_exit 1` in every
+    # dispatch branch). Confirmed live: a cancelled rollback logged
+    # "ERROR: Rollback failed" yet the process still returned rc=0. Letting
+    # bash keep its own status here is what makes those failures visible;
+    # INT/TERM get the conventional 128+signal codes instead of also 0.
+    trap '_cleanup_lock' EXIT
+    trap '_cleanup_and_exit 130' INT
+    trap '_cleanup_and_exit 143' TERM
 
     # ── Startup mode (continued after lock) ───────────────────────────────────
     if [[ "$MODE" == "startup" ]]; then

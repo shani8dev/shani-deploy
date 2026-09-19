@@ -249,9 +249,23 @@ broke.
 ## Audit-verified known issues (confirmed present)
 
 **For the full narrative, verification methodology, and before/after
-evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
-is deliberately just the current-state summary — what's true right now,
-not how it got that way.
+  evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
+  is deliberately just the current-state summary — what's true right now,
+  not how it got that way.
+
+- **`download_update()` built its R2 path from the wrong profile token —
+  FIXED (2026-09-19). R2 was wired in but the path was wrong, so every
+  deploy silently fell back to SourceForge.** `r2_image_path` used
+  `${REMOTE_PROFILE}` = `stable-gnome`, but R2 stores artifacts under the
+  bare profile (`gnome/`); `stable-gnome/` 404s, so `get_remote_file_size`
+  returned 0 and the mirror fallback ran instead. Fixed to
+  `${REMOTE_PROFILE#*-}`. Verified live: R2 now reports `Primary server
+  available — image size: 2.4G` and the zsync2 differential download
+  begins from `downloads.shani.dev/gnome/20260918/...`. **SourceForge's
+  v20260918 404 is a separate, real upstream publish gap** (pointer exists,
+  artifact not uploaded) — host-confirmed, not this bug. SF and R2 use
+  *different* directory conventions for the same artifact, so the fix is
+  R2-only; the SF checksum/signature URLs still use `stable-gnome/`.
 
 - **`show_dialog()`'s yad invocation used a flag that doesn't exist —
   FIXED (2026-09-19). No shani-update dialog had EVER actually rendered
@@ -307,6 +321,172 @@ not how it got that way.
   the icon now starts and stays running (`RC=124` = killed by an external
   timeout while still blocking correctly, not crashing) with no parse
   errors.
+
+- **`_launch_deploy`/`_launch_health` now default to a graphical progress
+  window, not a bare terminal — a real terminal only appears on explicit
+  user request (2026-09-19).** Previously EVERY real `shani-deploy`/
+  `shani-health` invocation (update install, rollback, cleanup, optimize,
+  channel change, health report) unconditionally opened a terminal emulator
+  running `pkexec shani-deploy ...` — functional, but not what "make full
+  use of yad" should look like for the common case, and not something a
+  non-technical user should have to look at by default. New default path
+  (`_run_gui_progress`): the command runs in the background with its
+  combined stdout/stderr redirected to a per-run logfile
+  (`mktemp .../shani-update-progress.XXXXXX.log`), and `tail -n +1 -f
+  --pid=<pid> logfile | yad --text-info --tail --disable-search` streams
+  that log live into a scrolling, inline log view (`Show Terminal` /
+  `Cancel` / `Close` buttons) — the whole run is visible in the window as
+  it happens, not just a single status line. `tail`'s own `--pid=` (GNU
+  coreutils) makes it stop following on its own once the real command
+  exits, so the window's last line just settles naturally with no polling
+  loop on this script's side; yad's text-info keeps the window open after
+  that stdin EOF, so the finished result stays readable until a button is
+  pressed. The actual exit code always comes from `wait`ing on the command's
+  own PID directly — never from yad's or tail's exit status — so every
+  existing call site's `if _launch_deploy ...; then / else` contract is
+  unchanged.
+  **`--disable-search` is LOAD-BEARING, not cosmetic — do not remove it.**
+  yad's text-info builds a search bar whose entry icon
+  (`edit-find-symbolic`/`edit-clear-symbolic`) resolves to an SVG, and this
+  image has NO working SVG rasterizer — no `libpixbufloader-svg.so`, no
+  `svg` entry in gdk-pixbuf 2.44.7's `loaders.cache`, and the out-of-process
+  glycin loader's sandboxed `bwrap ... glycin-svg` child exits 1 — so GTK
+  falls back to `image-missing.svg`, cannot load that either, and asserts
+  (`gtkiconhelper.c:495:ensure_surface_for_gicon: assertion failed`) →
+  SIGABRT (rc=134). This is exactly what the earlier "--text-info
+  unconditionally crashes" finding was, just not yet isolated to a
+  caller-controllable flag: confirmed live via the `shani-install-media`
+  X11-forwarding + real `--exec=` probe against this exact yad build
+  (15.0/GTK+ 3.24.52), the identical invocation returns `rc=134` without
+  `--disable-search` and `rc=124` (renders and stays open) with it.
+  `_run_gui_progress` now ships `--text-info --tail --disable-search`;
+  removing the flag reproduces the SIGABRT.
+  A real terminal now only appears two ways, both an explicit ask, never
+  the default: (1) `shani-update --terminal` (new CLI flag) forces the old
+  terminal-only behavior for that whole invocation, or (2) clicking
+  "Show Terminal" inside the progress window opens a real terminal doing a
+  live, read-only `tail -f --pid=` of the exact same logfile (the window
+  stays the authority on the real exit code either way — the terminal here
+  is just an extra viewer, not a replacement control path). `_launch_in_
+  terminal` (the old terminal-building code, renamed/kept verbatim) is also
+  the automatic fallback when no display or no `yad` is available at all —
+  that's an environment fact, not a preference, so it's not gated behind
+  the explicit-request logic.
+  **Known limitation, not yet independently verified:** this assumes a
+  graphical polkit authentication agent is registered for the session
+  (standard for GNOME/Plasma/Cosmic — `polkit-gnome-authentication-agent-1`
+  or equivalent, normally pulled in by the desktop session package) since
+  `pkexec`'s own stdin/stdout are now redirected to the logfile rather than
+  a real TTY; on a session with no graphical polkit agent, `pkexec` would
+  have nothing to prompt on. The previous terminal-per-invocation design
+  had the same requirement in practice (a text-mode polkit fallback prompt
+  needs a real, interactive TTY, which a terminal emulator provides and a
+  redirected-to-file stdin does not) — this is a pre-existing assumption
+  made more explicit by this change, not a new one introduced by it.
+  **Cancel's signal delivery is a known simplification:** the `Cancel`
+  button sends `SIGTERM` to the `pkexec` PID directly (not to a process
+  group), relying on `pkexec`'s own documented behavior of forwarding
+  common signals to its child — not independently re-verified here.
+
+  **Full empirical verification pass (2026-09-19), every branch exercised
+  against the real, shipped code (not a reimplementation) via the
+  `shani-install-media` X11-forwarding test harness:**
+  - Happy path (`Close` after natural completion): `rc=0`, matching the
+    real command's own exit.
+  - `Cancel` clicked mid-run: the underlying process was confirmed actually
+    gone (not just the window closed) — but the exit code the caller got
+    back was **masked to 0**, not `143`. The earlier "`rc=143`" reading was
+    the worker *process* receiving SIGTERM, not the code the caller
+    observed: `shani-update.sh`'s EXIT trap re-invoked `_cleanup_and_exit`
+    with no argument, so `exit "${1:-0}"` reset every non-zero exit to 0
+    (see the "exit-code masking" entry below). FIXED 2026-09-19 — verified
+    live: the real `shani-update --health` now returns `rc=1` when its
+    worker genuinely fails.
+  - `Show Terminal` clicked mid-run: a real `gnome-terminal` window opened
+    (needs a D-Bus session bus present — see the next bullet), the
+    underlying command kept running in the background, and the final
+    `rc=0` matched its natural completion.
+  - `yad` missing (real binary temporarily renamed aside, then restored via
+    a trap — never left the image in a broken state): confirmed live,
+    screenshotted, a real terminal renders the fallback output end-to-end;
+    `rc=0`.
+  - No `DISPLAY`/`WAYLAND_DISPLAY` at all: correctly attempts the terminal
+    fallback, which correctly fails (`rc=1`) since a display is genuinely
+    required — no false success reported.
+  - `mktemp` failure (`XDG_RUNTIME_DIR` pointed at a nonexistent dir, with
+    a real display otherwise available): correctly falls back to a
+    terminal, which renders fully; `rc=0`.
+  - `--terminal` CLI flag: confirmed it skips `_run_gui_progress` (and any
+    `yad` attempt) entirely, going straight to a real terminal.
+  - The actual `shani-update --rollback` binary, overlaid onto a live probe
+    via `test-env/test.sh probe --local-src=/opt/shani-deploy/scripts`
+    (not extracted functions) — the real rollback succeeded, the real
+    progress window rendered and streamed live `[INFO]` lines from
+    `shani-deploy`'s own output, exit code `0`.
+  - **Two real bugs found and fixed only because of this pass:**
+    1. `_build_pkexec_env`'s `tr -cd '[:alnum:]:._-/'` placed `-` between
+       `_` and `/`, which `tr` parses as a (reversed, invalid) range —
+       confirmed reproducing `tr: range-endpoints of '_-/' are in reverse
+       collating sequence order` on both the host and inside the test
+       image. `tr` errors and produces empty output, so `DISPLAY` silently
+       became an empty string in the `pkexec env DISPLAY=... ...` line
+       passed to every privileged `shani-deploy` invocation — confirmed
+       live in the real rollback run above (`DISPLAY=` empty in the
+       logged command line) before the fix, `DISPLAY=:1` correctly
+       preserved after it. Fixed by moving `-` to the end of the set
+       (`'[:alnum:]:._/-'`), where `tr` always treats it as a literal.
+    2. `_launch_terminal_tail` had no way to detect that a terminal it just
+       launched failed to actually come up — reported live by a user
+       watching the real X11 display during this same testing session
+       ("clicked show terminal and it closed"): `gnome-terminal`/`kgx` can
+       fail *asynchronously* (their D-Bus-activation client process starts
+       fine, then exits ~1s later once activation itself fails, e.g. no
+       D-Bus session bus present), and by the time that happens the yad
+       progress window had already closed for the button click — leaving
+       the user with no visible window at all while the real operation
+       kept running unattended in the background. Fixed two ways together:
+       `_launch_terminal_tail` now waits 1.5s after launch and checks the
+       terminal's own PID is still alive before reporting success; and
+       `_run_gui_progress` now loops — a failed terminal launch re-shows
+       the graphical progress view instead of leaving the screen blank.
+  - **One real, pre-existing bug found but NOT fixed here (out of this
+    session's scope — not part of the GUI-progress-window change):** in
+    that same real `--rollback` run, `_post_rollback_dialog`'s
+    `show_dialog()` call (asking "Restart Now?") failed to open a display
+    on *every* `GDK_BACKEND` it tried (`yad backend 'wayland' failed to
+    initialize ...: cannot open display: :1`), even though a `yad`
+    text-info window from the exact same script invocation, on the exact
+    same `DISPLAY=:1`, had rendered correctly just ~71 seconds earlier (the
+    real rollback's own duration). `show_dialog()` explicitly forces
+    `GDK_BACKEND=wayland`/`x11` per attempt (see its own code, ~L555-560),
+    while `_run_gui_progress`'s `yad` call sets no `GDK_BACKEND`
+    at all — the working theory is something in the session state changed
+    over that ~71s window (candidates: `XDG_SESSION_TYPE` getting set by
+    the `systemctl --user`/D-Bus activity visible in the same log, or a
+    stale/reused `GDK_BACKEND` value forced too early) that made explicit
+    backend-forcing fail where auto-detection still succeeds — not
+    root-caused further here. User-visible effect: the post-rollback
+    "restart now?" dialog silently never appears in this scenario, falling
+    straight to the quieter `notify-send`/log fallback ("User will restart
+    later after rollback") instead.
+
+- **`shani-update.sh` silently masked the real exit code of every operation
+  it ran — FIXED (2026-09-19).** `_cleanup_and_exit()` ended with a bare
+  `exit "${1:-0}"`, and the trap was the single line
+  `trap '_cleanup_and_exit' EXIT INT TERM`. On a real `exit 1` — any of the
+  ~10 `_cleanup_and_exit 1` sites, or the `err()` path — the EXIT trap
+  re-invoked `_cleanup_and_exit` with **no argument**, so `"${1:-0}"`
+  reset the code to **0**: every failure was reported to the caller and to
+  `systemd` as success. Confirmed live on the real overlaid binary
+  (`shani-update --health` with `/usr/local/bin/shani-health` moved aside,
+  forcing the post-trap `err()` path): the buggy trap form returned
+  `rc=0`, the fixed form returns `rc=1`, identical ERROR output — a
+  positive test and a within-run negative control. Fixed by splitting
+  cleanup from exit: a new idempotent `_cleanup_lock()` runs on `EXIT`,
+  and `INT`/`TERM` map to `_cleanup_and_exit 130`/`143`, so the signal is
+  still honoured while cleanup stays single-instance. This is also why the
+  GUI-progress "Cancel" test above originally *looked* like it returned
+  `143` when it did not.
 
 - **`shani-update.sh` crashed on every invocation — FIXED (2026-09-19).**
   Two variables were referenced but never defined anywhere in `scripts/` or

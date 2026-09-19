@@ -3037,6 +3037,8 @@ fetch_update() {
     IMAGE_NAME=$(tr -d '[:space:]' < "$temp")
     rm -f "$temp"
 
+    # No branch segment in the filename anymore — it's tracked by the
+    # latest.txt/<channel>.txt pointers instead.
     [[ "$IMAGE_NAME" =~ ^shanios-([0-9]+)-([a-z0-9_-]+)\.zst$ ]] || die "Version manifest has unexpected format: ${IMAGE_NAME}"
 
     REMOTE_VERSION="${BASH_REMATCH[1]}"
@@ -3219,6 +3221,12 @@ download_update() {
 
     # URLs
     local sf_base="https://sourceforge.net/projects/shanios/files"
+    # REMOTE_PROFILE is parsed from the image FILENAME and is the bare profile
+    # (gnome, plasma, …). Both R2 and SourceForge store artifacts under that
+    # same bare directory — verified live against both backends — so it is
+    # reused directly for every URL below. (A branch-prefixed directory like
+    # stable-gnome/ does not exist on either backend and 404s, which silently
+    # falls the whole download back to the other backend.)
     local sha_url="${sf_base}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.sha256/download"
     local asc_url="${sf_base}/${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}.asc/download"
 

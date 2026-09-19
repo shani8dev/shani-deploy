@@ -146,3 +146,124 @@ inflate the main file back to unreadable length.
   source regardless. Removed the dead variable and the 3 assignments;
   replaced the misleading comment with one explaining why no such flag is
   needed. `bash -n` clean, `tests/test-deploy-state.sh` still 9/9.
+
+- **`_run_gui_progress` switched from `--progress --pulsate` to an inline
+  `--text-info --tail --disable-search` log view — and the earlier
+  "`--text-info` unconditionally crashes" finding was corrected
+  (2026-09-19).** The user's actual ask ("it should have shown an inline
+  terminal in the yad UI, like Ubuntu's installer") is a scrolling log
+  view, not a single pulsing status line — the original `--progress`
+  fallback was a workaround for a crash, not the intended design. Re-ran
+  the crash investigation with the user's own report as the new data
+  point ("i clicked on show terminal and it exited"):
+  1. Root-caused the `--text-info` SIGABRT (rc=134) to a **search-bar
+     icon**, not anything `--text-info` unconditionally does. yad's
+     text-info builds a search entry whose icon resolves to an SVG; the
+     image has no working SVG rasterizer (no `libpixbufloader-svg.so`, no
+     `svg` in gdk-pixbuf 2.44.7's `loaders.cache`; glycin's sandboxed
+     `bwrap ... glycin-svg` child exits 1 under `/usr/share/glycin-loaders`),
+     GTK falls back to `image-missing.svg` (present, 1331 bytes, but still
+     unloadable), and asserts in `gtkiconhelper.c:495`. Isolated with
+     `yad --list` (renders, rc=124) and `bwrap --ro-bind / / true` (works,
+     so bwrap itself is fine).
+  2. Found `--disable-search` via `yad --help-all` ("Disable search in
+     text and html dialogs") and proved it fixes the exact invocation.
+  3. Probe matrix on one yad build, all else equal: plain `--text-info`
+     → **rc=134** (the control); `--text-info --disable-search --tail
+     --filename` → **rc=124**; live stdin stream → rc=124; the real shape
+     (icon + `Show Terminal`/`Cancel`/`Close`) → rc=124; `tail -f --pid |
+     --text-info --disable-search --tail` → rc=124. A no-`--tail`
+     variant returned rc=1 from the harness's own timeout-kill teardown
+     (benign X MIT-SHM BadAccess), not a render failure.
+  4. **Shipped and verified end-to-end on the real path, with visual
+     evidence**: `shani-update --health` overlaid via `test-env/test.sh
+     probe --local-src=/opt/shani-deploy/scripts`, screenshotted off the
+     live X11 display. The screenshot shows a scrollable multi-line log
+     with **real health-report content** (the smsd/Samba/NFS/Caddy/… rows),
+     the **Show Terminal / Cancel / Close** buttons, and **no search bar**
+     (confirming `--disable-search` took effect). Live streaming was proved
+     by two snapshots of the same run: at ~3 s the view showed `live-log`
+     lines 1–4; ~12 s later it showed lines 1–16, timestamps one second
+     apart — content accumulating in place, which the old single-line
+     `--progress` view could not have shown. Window geometry was exactly
+     the configured 700×450.
+  The `--disable-search` flag is now documented in the function's own
+  comment as load-bearing (removing it reproduces the SIGABRT).
+
+- **`shani-update.sh` masked the real exit code of every operation —
+  FIXED (2026-09-19).** `_cleanup_and_exit()` ended with a bare
+  `exit "${1:-0}"` and the trap was `trap '_cleanup_and_exit' EXIT INT
+  TERM`. A genuine `exit 1` (any of the ~10 `_cleanup_and_exit 1` sites or
+  `err()`) fired the EXIT trap, which re-invoked `_cleanup_and_exit` with
+  **no argument**, so `"${1:-0}"` reset the status to **0** — every
+  failure reported as success to the caller and to `systemd`.
+  This was found while investigating the user's Cancel report: an earlier
+  session claimed "Cancel → rc=143", but a real repackaged rollback run
+  produced `REAL_ROLLBACK_EXIT_CODE:0` — the worker *process* was indeed
+  killed (no orphan; the signal delivery was fine), but the code the
+  caller observed was wrong. Verified live on the real overlaid binary
+  (`shani-update --health`, `/usr/local/bin/shani-health` moved aside, so
+  execution reaches the **post-trap** `err()` at the health dispatch):
+  **positive test** — fixed script returns `rc=1`; **negative control**
+  — the same real script with only the trap lines reverted to the buggy
+  single-line form returns `rc=0`, with identical ERROR output. Also
+  unit-controlled the mechanism with `/tmp/ec_new.sh` (rc=1) vs
+  `/tmp/ec_old.sh` (rc=0). Fixed by splitting lock cleanup from exit: a
+  new idempotent `_cleanup_lock()` on `EXIT`, and `INT`/`TERM` mapped to
+  `_cleanup_and_exit 130`/`143`. `bash -n` clean;
+  `tests/test-deploy-state.sh` 9/9; `tests/test_upgrade_adviser.sh` 21/21.
+  While in the area, the Cancel log line was corrected from a hardcoded
+  `$DEPLOY_BIN` to the actual worker `${cmd[0]}` — the health path was
+  logging "terminating shani-deploy" while killing `shani-health`.
+
+- **`download_update()` built its R2 path from the wrong profile token —
+  R2 was "checked" and silently abandoned on every deploy (2026-09-19).**
+  `r2_image_path="${REMOTE_PROFILE}/${REMOTE_VERSION}/${IMAGE_NAME}"`
+  put the artifact under `stable-gnome/...`, but R2 stores it under the
+  **bare** profile directory (`gnome/...`). `REMOTE_PROFILE` is parsed from
+  the image *filename* (`shanios-20260918-stable-gnome.zst` → `stable-gnome`),
+  which embeds the release-branch prefix; the R2 directory is the plain
+  profile, matching `build-base-image.sh:92`
+  (`IMAGE_NAME="${OS_NAME}-${BUILD_DATE}-${BRANCH}-${PROFILE}.zst"` published
+  to `${R2_BASE_URL}/${PROFILE}/${BUILD_DATE}/${IMAGE_NAME}`) and
+  `promote-stable.sh`'s `${R2_BASE_URL}/${PROFILE}/...` layout. There is no
+  `stable-gnome/` directory on R2 at all, so `get_remote_file_size` returned
+  0 and the code fell back to SourceForge — for every profile, every deploy,
+  ever. This is why the user's question "download should have used r2?"
+  was the right one: R2 was wired in (`R2_BASE_URL=https://downloads.shani.dev`,
+  `download_from_r2()`, the "Checking primary download server (R2)..." log
+  line at `download_update` L3231) but the path was wrong, so it was
+  effectively dead code. **Confirmed live against the real public R2:**
+  `gnome/20260918/shanios-20260918-stable-gnome.zst` → **200**,
+  `content-length: 2541284404` (~2.5 GB), first bytes `28 b5 2f fd` (valid
+  zstd), plus `.sha256`/`.asc`/`.zsync` all **200**; the same path under
+  `stable-gnome/` → **404**. The harness log showed the failure in action:
+  `Checking primary download server (R2)...` → immediately
+  `Discovering SourceForge mirror...` → SF 403/404 on all 5 attempts →
+  `FATAL Download failed after 5 attempts`. The v20260918 artifact is
+  genuinely missing from SourceForge (host-confirmed 404), so the SF leg
+  was an upstream publish gap, not the bug — but the R2 leg was ours.
+  **Fix** (`shani-deploy.sh` L3230):
+  `local r2_image_path="${REMOTE_PROFILE#*-}/${REMOTE_VERSION}/${IMAGE_NAME}"`
+  — strip the branch prefix with a single parameter expansion, correct for
+  every branch (`stable-gnome` → `gnome`, `unstable-gnome` → `gnome`) and
+  for cross-profile updates, and strictly safer than the current code.
+  This also fixes the `.sha256`/`.asc` fetches at L3394/3399, which derive
+  from the same `r2_image_path` and 404 identically. `bash -n` clean.
+  **Verified live in the real harness:** `clean`/`ca`/`bootstrap` all pass,
+  and `upgrade` now reaches R2 — `Primary server available — image size:
+  2.4G`, `use_r2=1`, and it begins the zsync2 differential download from
+  `https://downloads.shani.dev/gnome/20260918/shanios-20260918-stable-gnome.zst.zsync`
+  (confirmed via the container's own process table and an established HTTPS
+  connection to `204.90.140.1:443`). The full 2.5 GB transfer was not
+  completed here — this sandbox's egress is throttled (~150 KB/s) and
+  zsync2 is CPU-bound at ~99% computing rsync checksums over the 4.8 GB of
+  seed files, so the run was stopped rather than burn the session on a
+  multi-hour download. The R2 path is proven reachable and correct; the
+  remaining time is pure transfer, not correctness. Left a clean state:
+  removed the partial 20260918 artifacts and the stale `mirror.url` cache.
+  **Note on the SourceForge side:** `sha_url`/`asc_url` (L3222-3223) still
+  use `${REMOTE_PROFILE}` = `stable-gnome/`, which matches what SourceForge
+  *does* serve (the log's mirror URL is `/stable-gnome/...`) — SF and R2
+  genuinely use different directory conventions for the same artifact, so
+  the fix is R2-only, not a blanket `REMOTE_PROFILE`→`LOCAL_PROFILE` swap.

@@ -105,6 +105,7 @@ readonly LOG_DIR="$_lcd"
 unset _lcd
 
 readonly LOG_FILE="$LOG_DIR/shani-update.log"
+readonly LOG_TAG="shani-update"
 
 # Lock: prefer XDG_RUNTIME_DIR (user-private 0700) — startup mode requires it.
 # In interactive mode LOG_DIR is an acceptable fallback.
@@ -118,6 +119,7 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 MODE="interactive"          # interactive | startup | rollback | cleanup | optimize | download-only | set-channel | health
 FORCE_UPDATE="no"
+UPDATE_CHANNEL_DEFAULT="stable"
 DEPLOY_CHANNEL="$UPDATE_CHANNEL_DEFAULT"
 CHANNEL_FROM_CLI="no"       # set to "yes" once -t/--channel is parsed on the command line
 VERBOSE_DEPLOY="no"

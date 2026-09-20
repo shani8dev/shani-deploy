@@ -220,14 +220,97 @@ release loop devices — see `../shani-install-media/test-env/README.md`
 for the full command reference.
 
 **Write a negative control, not just a positive test.** For a
-security-relevant fix (verify-before-replace ordering, fail-closed
-detection, a lock, etc.), the test that actually proves something is one
-that shows the *old* behavior would have failed it — e.g. stub the signing
-tool to "succeed" while producing garbage and confirm the live file is
-never touched; force the chroot-detection `stat` to fail and confirm the
-function now errors out instead of silently proceeding. A test that only
-exercises the happy path doesn't prove the bug is fixed, only that nothing
-broke.
+  security-relevant fix (verify-before-replace ordering, fail-closed
+  detection, a lock, etc.), the test that actually proves something is one
+  that shows the *old* behavior would have failed it — e.g. stub the signing
+  tool to "succeed" while producing garbage and confirm the live file is
+  never touched; force the chroot-detection `stat` to fail and confirm the
+  function now errors out instead of silently proceeding. A test that only
+  exercises the happy path doesn't prove the bug is fixed, only that nothing
+  broke.
+
+## Testing GUI/desktop changes in this repo
+
+`shani-update.sh`'s `show_dialog`/`show_alert`/`_run_gui_progress`/`_launch_*`
+code cannot be verified by reading — a yad flag that doesn't parse, an SVG
+icon that SIGABRTs GTK, a terminal that silently fails to come up: all of
+these are invisible in source and only show up when a real dialog actually
+renders. The sibling `shani-install-media` repo owns the harness that makes
+that possible; this section is the pointer to it.
+
+**Prerequisite (host-side, one-time):** run `xhost +local:` on the host
+before starting the harness. This is a host-wide access-control change —
+restore with `xhost -` when done. Wayland forwarding also works if the host
+has `$WAYLAND_DISPLAY`, but X11 is what's verified here.
+
+**The two layers that forward the host's real display:**
+
+1. **Docker layer** (`shani-install-media/run_in_container.sh`) —
+   `X11_FORWARD_ARGS` / `WAYLAND_FORWARD_ARGS`, conditional on the host
+   actually having a socket (`$DISPLAY` / `$WAYLAND_DISPLAY`). Binds
+   `/tmp/.X11-unix` (X11) or just the one Wayland file into the container.
+2. **nspawn layer** (`shani-install-media/test-env/test.sh`
+   `_nspawn_binds()`) — builds `X11_BIND` / `WAYLAND_BIND` and wires them
+   into `NSPAWN_ENTER_ARGS` and `NSPAWN_FULL_BOOT_ARGS`, so the socket
+   reaches the booted slot too.
+
+This is the standard way to run a container GUI app on the host's real
+display (see systemd/systemd#12671). It needs no GPU/EGL for a plain 2D
+dialog, and required no changes to any real (non-test) code.
+
+**To render a real `shani-update` dialog:**
+
+```bash
+cd ../shani-install-media
+./run_in_container.sh build.sh test enter blue \
+    --local-src=/opt/shani-deploy/scripts \
+    -- bash -c 'shani-update --health --terminal'
+```
+
+`--local-src` overlays *this* checkout's current scripts onto the slot's
+`/usr/local/bin`, so you're testing the real edited code, not a snapshot.
+`shani-update` needs a real display to open its progress terminal, which
+is exactly what the forwarding above provides.
+
+**To see the result, screenshot it from inside the slot** — ImageMagick's
+`import` is already in the image:
+
+```bash
+import -window root /data/screenshot.png
+```
+
+`/data` is bind-mounted out through the existing `SHANIOS_TEST_EXTRA_BINDS`
+mechanism, so the PNG appears on the host. Bind your own scratch scripts the
+same way:
+
+```bash
+SHANIOS_TEST_EXTRA_BINDS="/host/path/my-script.sh:/usr/local/bin/my-script.sh"
+```
+
+**What this harness has already caught in this repo's GUI code** (full
+narrative in "Audit-verified known issues" below): the invalid
+`--image-on-top` yad flag that meant no shani-update dialog had ever
+rendered via yad on any real system; three separate SVG-icon SIGABRTs
+(`--window-icon`, `_run_tray`'s `--image=`); `_launch_terminal_tail`'s
+failure to detect a terminal that launched but then died ~1s later via
+D-Bus activation; `_build_pkexec_env`'s `tr` range bug that silently
+emptied `DISPLAY` for every privileged `shani-deploy` invocation; and the
+`--disable-search` requirement on `_run_gui_progress`'s yad text-info
+window (the search bar's icon resolves to an SVG, and this image has no
+working SVG rasterizer, so GTK SIGABRTs without the flag).
+
+**Unit-level fallback tests (deterministic, no container):**
+`../shani-install-media/test-env/.verify-bin/alert-fallback-unit.sh`
+exercises `show_alert`/`show_dialog`'s no-display fallback paths on the
+host with stubbed `yad` + `notify-send` and a minimal PATH (so the host's
+own `/usr/bin/zenity` can't leak in and give a false rc=1). The *positive*
+paths (real yad dialog rendering) were verified live via the forwarding
+harness above; the unit test covers the fallback branches that the flaky
+nspawn harness can't. `termargs.sh`/`termargs2.sh`/`termargs3.sh` in the
+same directory exercise `_build_terminal_args` for every supported
+terminal — but note they are host-side scratch scripts that must source the
+real `shani-update.sh` themselves (they do not run inside a slot), so run
+them from a checkout where `/usr/local/bin/shani-update` is the overlay.
 
 ## Known sharp edges (already found once — don't reintroduce)
 
@@ -259,13 +342,25 @@ broke.
   `${REMOTE_PROFILE}` = `stable-gnome`, but R2 stores artifacts under the
   bare profile (`gnome/`); `stable-gnome/` 404s, so `get_remote_file_size`
   returned 0 and the mirror fallback ran instead. Fixed to
-  `${REMOTE_PROFILE#*-}`. Verified live: R2 now reports `Primary server
-  available — image size: 2.4G` and the zsync2 differential download
+  `${REMOTE_PROFILE#stable-}` in `fetch_update()` (L3058) — applied to
+  `REMOTE_PROFILE` *itself*, so EVERY downstream use gets the bare profile:
+  the R2/SF download URLs, the checksum/asc URLs, the mirror-discovery
+  path, and the profile-mismatch comparison against `LOCAL_PROFILE` (which
+  `/etc/shani-profile` stores bare). Verified live: R2 now reports `Primary
+  server available — image size: 2.4G` and the zsync2 differential download
   begins from `downloads.shani.dev/gnome/20260918/...`. **SourceForge's
   v20260918 404 is a separate, real upstream publish gap** (pointer exists,
   artifact not uploaded) — host-confirmed, not this bug. SF and R2 use
   *different* directory conventions for the same artifact, so the fix is
   R2-only; the SF checksum/signature URLs still use `stable-gnome/`.
+  **Note:** the fix was already documented here as applied before this
+  session's regression run, but the source did not actually contain it —
+  the full `clean → ca → bootstrap → upgrade → rollback → clean` sequence
+  reproduced the failure live (`Remote version: v20260918 (stable-gnome)`
+  → R2 404 → SF 404 → "All download tools failed"), which is how the gap
+  between doc and code was found. The strip is now a no-op for manifests
+  that are already bare (e.g. `shanios-20260807-gnome.zst`), so it handles
+  both filename forms.
 
 - **`show_dialog()`'s yad invocation used a flag that doesn't exist —
   FIXED (2026-09-19). No shani-update dialog had EVER actually rendered
@@ -301,6 +396,15 @@ broke.
   `${4:-Cancel}` in `show_dialog()`'s own parameter defaults — the colon
   form can't distinguish "explicitly empty" from "not passed") with the
   same GUI/notify-send/console fallback chain `show_dialog()` already has.
+  **Return-code contract (corrected 2026-09-19):** `show_alert()` returns
+  the SAME codes as `show_dialog()` — 0=acknowledged, 1=cancelled/timeout,
+  2=no GUI at all. It does NOT repurpose rc to mean "fallback used": when
+  rc=2 it has ALREADY done the notify-send/console fallback itself. Every
+  current caller (`_handle_fallback_boot` L1036/L1054) follows it with
+  `_cleanup_and_exit N` regardless and never inspects the value, so this
+  is documentation-only, not a behavior change. (An earlier version of the
+  docstring claimed rc=1 meant "fallback used"; that was wrong — confirmed
+  by a deterministic unit test with stubbed yad/notify-send.)
 - **New: persistent system-tray icon — `shani-update --tray` +
   `shani-update-tray.service` (2026-09-19).** Uses `yad --notification`,
   which needs a StatusNotifierItem/AppIndicator host to render at all
@@ -915,8 +1019,14 @@ broke.
   mount-namespacing would silently break that escalation. Verified
   against the real kernel mechanism (`unshare --mount` + real read-only
   bind mounts), not just `systemd-analyze verify`.
-- **CI status.** No CI workflows in this repo — verification is entirely
-  manual.
+- **CI status — corrected, was stale.** `.github/workflows/ci.yml` has
+  three jobs: `lint` (shellcheck via the shared `shani-ci-commons`
+  template), `unit-tests` (`test-deploy-state.sh` 9/9 +
+  `test_upgrade_adviser.sh` 21/21), and `security` (secret scan via the
+  shared template). Migrated from the old hand-written single-job
+  workflow 2026-09-20. The full boot/signing/deploy/rollback harness in
+  `../shani-install-media/test-env/` is still manual — that's the
+  safety-critical proof, and CI is the floor, not the ceiling.
 - **`log`/`warn` argument-splitting — FIXED.** `shani-user-setup.sh`'s
   array-to-string join now uses `"${arr[*]:-}"` instead of a
   double-quoted `${arr[@]+"${arr[@]}"}` (shellcheck SC2145).

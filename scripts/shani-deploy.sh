@@ -3043,6 +3043,19 @@ fetch_update() {
 
     REMOTE_VERSION="${BASH_REMATCH[1]}"
     REMOTE_PROFILE="${BASH_REMATCH[2]}"
+    # The manifest filename carries the branch segment
+    # (shanios-20260918-stable-gnome.zst), but the artifact DIRECTORY on both
+    # backends is the bare profile (gnome/, plasma/, …) — confirmed live via
+    # curl against both downloads.shani.dev and sourceforge.net:
+    #   gnome/20260918/...        -> 200 (both backends)
+    #   stable-gnome/20260918/... -> 404 (both backends)
+    # Strip the known "stable-" branch prefix here so REMOTE_PROFILE is the
+    # bare profile for EVERY downstream use — not just the download URLs,
+    # but also the profile-mismatch comparison against LOCAL_PROFILE (which
+    # /etc/shani-profile stores bare, e.g. "gnome") and the version log.
+    # `${REMOTE_PROFILE#stable-}` is a no-op when the manifest is already
+    # bare (e.g. shanios-20260918-gnome.zst), so it handles both forms.
+    REMOTE_PROFILE="${REMOTE_PROFILE#stable-}"
 
     log "Remote version: v${REMOTE_VERSION} (${REMOTE_PROFILE})"
     log "Local  version: v${LOCAL_VERSION} (${LOCAL_PROFILE})"

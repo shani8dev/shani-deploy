@@ -84,6 +84,25 @@ structure fresh on next boot. Does **not** touch `/home`, `/root`,
 currently-installed OS, it doesn't touch the OS copies themselves or your
 files. `--home` additionally wipes `/home` (separately confirmed).
 
+### `scripts/shani-auto-rollback.sh`
+
+System-level, unattended boot-failure recovery. Runs from
+`shani-auto-rollback.service`/`.timer` (triggered at `OnBootSec=1min` for
+dracut-recorded hard failures and again at `OnBootSec=16min`, one minute
+after `check-boot-failure.timer`'s 15-minute check, for same-slot soft
+failures). No session, display, or TTY required — works on the `server`
+profile and when the failure itself prevented the desktop from starting.
+Acts only on a recorded failure marker (`/data/boot_failure`), never
+guesses. Idempotent via `/data/auto_rollback_done` (cleared each boot by
+`mark-boot-in-progress.service`). Calls `shani-deploy --rollback` directly.
+
+### `scripts/shani-upgrade-adviser.sh`
+
+Pre-upgrade safety check. Advises whether a system upgrade is safe before
+`shani-update` proceeds (Btrfs snapshot state, free space, running
+services, pending transactions). Supports `--json` for machine-readable
+output.
+
 ## systemd units
 
 **Boot lifecycle:** `mark-boot-in-progress.service` → (boot completes) →
@@ -103,6 +122,12 @@ the OS slot update cycle.
 
 **Maintenance:** `beesd-setup.service` — runs `beesd-setup.sh` once to
 configure continuous dedup.
+
+**Boot failure recovery:** `shani-auto-rollback.service`/`.timer` —
+system-level, unattended rollback on a recorded boot failure (see
+`shani-auto-rollback.sh` above). `shani-update-tray.service` — persistent
+system-tray icon (`shani-update --tray`), started at
+`WantedBy=graphical-session.target`.
 
 ## Recovery paths
 
@@ -125,21 +150,27 @@ supported paths:
 
 1. **Loop-mounted test environment** — [`shani-install-media/test-env`](https://github.com/shani8dev/shani-install-media/tree/main/test-env)
    installs a real image onto loop-mounted disks, then runs
-   install/boot/update/rollback cycles against it. This is how CI and
-   pre-release verification exercise `shani-deploy` end to end:
+install/boot/update/rollback cycles against it. This is how
+   `shani-deploy` is verified end to end — **there is no CI in this
+   repo, verification is entirely manual**, so every change is exercised
+   through this harness by hand:
 
    ```bash
-   cd shani-install-media
-   ./build.sh test bootstrap -p plasma   # install + first boot
-   ./build.sh test cycle -p plasma       # update → rollback → verify
+   cd ../shani-install-media
+   ./run_in_container.sh build.sh test bootstrap -p plasma   # install + first boot
+   ./run_in_container.sh build.sh test cycle -p plasma       # update → rollback → verify
    ```
 
-2. **Static checks** — always run before committing:
+   2. **Static checks** — always run before committing:
 
-   ```bash
-   bash -n scripts/*.sh        # syntax check every script
-   shellcheck scripts/*.sh     # lint (warnings are triaged, errors must be fixed)
-   ```
+    ```bash
+    bash -n scripts/*.sh        # syntax check every script
+    shellcheck scripts/*.sh     # lint (warnings are triaged, errors must be fixed)
+
+    # Unit tests — fast, no container needed
+    bash tests/test-deploy-state.sh      # expect: ✓ N passed, 0 failed
+    bash tests/test_upgrade_adviser.sh   # expect: 21 passed, 0 failed
+    ```
 
 When changing user-visible flags or output, regenerate any affected docs —
 `docs/updates/system.md` in [shani-docs](https://github.com/shani8dev/shani-docs)
@@ -155,3 +186,47 @@ and the blog reference posts mirror this README's flag tables.
   minimal chroot contexts during image build.
 - PRs should include the output of the static checks above and, for
   deploy-path changes, a `test cycle` run summary.
+
+## Known gaps & design rules
+
+**Safety-critical invariants (don't reintroduce):**
+- Boot-entry writes must go temp-file-then-atomic-`mv`, never a direct
+  `cat > file` — a crash between deleting the old entry and writing the
+  new one can leave a slot with zero valid boot entries.
+- Signing must verify the signed output *before* it replaces the live
+  file, never after.
+- Any host/network-facing code that runs before a signature check (like
+  self-update) must fail closed on any verification failure — keep running
+  the current, already-trusted copy rather than falling through to
+  execution.
+- `_restore_state()`'s variable-whitelist check
+  (`[[ " $_whitelist " =~ " $_var " ]]`) is itself a regex match that
+  overwrites `$BASH_REMATCH` — if you read `${BASH_REMATCH[…]}` for the
+  variable's *value* after that check runs, capture it *before*.
+
+**Open, not yet independently verified:**
+- `finalize_boot_entries()`'s `+3-0` tries-counted candidate entry likely
+  provides no real automatic hard-failure fallback on systemd 261
+  (systemd/systemd#40405). Needs a dedicated real QEMU+OVMF hard-failure
+  test to close out. Until then, treat "automated rollback on boot
+  failure" as unverified for the hard-failure case specifically — the
+  marker/timer path is real and verified, but it only ever *records* a
+  failure; it does not itself switch the default boot entry.
+
+**Cross-repo impact:**
+- `shani-fleet`'s `check_selfupdate()` independently re-implements this
+  repo's "download → checksum → GPG-verify → fail closed" trust chain for
+  agent self-update. If you fix a bug in this repo's `self_update()` or
+  signing logic, check `shani-fleet/agent/bin/shani-fleet-agent` for the
+  same class of bug — it's a separate implementation of the same pattern,
+  not shared code.
+- `get_booted_subvol()` is reimplemented separately in 4 copies:
+  `scripts/shani-deploy.sh`, `scripts/shani-update.sh`,
+  `scripts/gen-efi.sh`, and `scripts/shani-health.sh` — kept as 4 copies
+  deliberately (no shared-lib mechanism exists). If you fix a bug in the
+  shared parsing logic, find every copy and fix them all.
+
+**Trust model:** See `SECURITY.md` for the intended trust model
+(fingerprint-pinned GPG, atomic boot-entry writes, fail-closed
+self-update) — if a change would make either untrue, that's the
+regression, regardless of whether tests still pass.

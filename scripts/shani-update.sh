@@ -182,6 +182,13 @@ err() {
 #####################################
 
 _acquire_lock() {
+    # `mkdir -p` the lock's parent: LOCK_FILE lives under $XDG_RUNTIME_DIR,
+    # which is always present in a real session but can be set to a path that
+    # doesn't exist yet in a non-session context (a headless test slot, CI, a
+    # systemd --user unit with no runtime dir) — confirmed live: without this,
+    # `mkdir "$LOCK_FILE"` failed with "No such file or directory" and every
+    # invocation died at the lock instead of doing what it was asked to do.
+    mkdir -p "${LOCK_FILE%/*}" 2>/dev/null || true
     if ! mkdir "$LOCK_FILE" 2>/dev/null; then
         # A lock dir with no pid file (e.g. a crash between mkdir and writing
         # the pid) is just as stale as one whose owning process has died —
@@ -577,7 +584,6 @@ show_dialog() {
             [[ -n "$backend" ]] && yad_cmd+=("GDK_BACKEND=$backend")
             yad_cmd+=(yad
                 --title="$title"
-                --window-icon="$icon"
                 --image="$icon"
                 --text="$text"
                 --text-align=center
@@ -659,11 +665,14 @@ show_dialog() {
 # meaningful "confirm or decline" choice left to offer, just "the user
 # needs to know this happened". Uses the same backend-detection/fallback
 # machinery as show_dialog() (a real dialog when a display is available,
-# notify-send/console otherwise) rather than duplicating it. Returns
-# 0=acknowledged, 1=notify-send/console fallback used, 2=no GUI at all —
-# callers that only care "did the user get told" should treat all three
-# as success and only escalate further (e.g. also log/wall) on a genuine
-# error, not on the return code here.
+# notify-send/console otherwise) rather than duplicating it. Returns the
+# same codes as show_dialog(): 0=acknowledged, 1=cancelled/timeout,
+# 2=no GUI at all. NOTE the return code is deliberately NOT repurposed to
+# mean "fallback used": when rc=2 show_alert has ALREADY done the
+# notify-send/console fallback itself, so it returns 2 just like
+# show_dialog would — every current caller (L1036, L1054) follows it with
+# `_cleanup_and_exit N` regardless and never inspects the value, so this
+# is a documentation-only distinction, not a behavior one.
 show_alert() {
     local title="$1" text="$2" icon="${3:-dialog-error}"
     local rc
@@ -720,7 +729,6 @@ _run_tray() {
     menu_entries+="|Quit:quit"
 
     yad --notification \
-        --image="software-update-available" \
         --text="Shani OS Update" \
         --command="sh -c \"shani-update &\"" \
         --menu="$menu_entries"
@@ -875,7 +883,7 @@ _run_gui_progress() {
     while kill -0 "$deploy_pid" 2>/dev/null; do
         yad_rc=0
         tail -n +1 -f --pid="$deploy_pid" "$logfile" | yad --text-info --tail --disable-search \
-            --title="$title" --window-icon="software-update-available" \
+            --title="$title" \
             --width=700 --height=450 \
             --button="Show Terminal:2" \
             --button="Cancel:1" \

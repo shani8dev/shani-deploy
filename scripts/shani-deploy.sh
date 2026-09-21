@@ -1725,6 +1725,13 @@ prepare_chroot() {
     if mountpoint -q /boot/efi; then
         log_verbose "ESP already mounted — bind-mounting into chroot"
         run_cmd mount --bind /boot/efi "$MOUNT_DIR/boot/efi"
+        # Host mounts are shared by default (systemd boots / as shared), so
+        # a plain bind stays shared: cleanup's recursive unmount would then
+        # propagate to the HOST and tear down live mounts (observed live:
+        # /sys/fs/cgroup vanished during chroot teardown, after which no
+        # new cgroup/scope/service could start until reboot). Sever the
+        # propagation here so teardown can only ever affect the chroot side.
+        run_cmd mount --make-private "$MOUNT_DIR/boot/efi"
     else
         log_verbose "Mounting ESP (LABEL=shani_boot) into chroot"
         safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults"
@@ -1738,16 +1745,19 @@ prepare_chroot() {
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR/$dir"
         run_cmd mount --bind "/$dir" "$MOUNT_DIR/$dir"
+        run_cmd mount --make-private "$MOUNT_DIR/$dir"
     done
 
     for d in "${CHROOT_BIND_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR$d"
         run_cmd mount --rbind "$d" "$MOUNT_DIR$d"
+        run_cmd mount --make-rprivate "$MOUNT_DIR$d"
     done
 
     if [[ -d /sys/firmware/efi/efivars ]]; then
         mkdir -p "$MOUNT_DIR/sys/firmware/efi/efivars"
         run_cmd mount --rbind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars"
+        run_cmd mount --make-rprivate "$MOUNT_DIR/sys/firmware/efi/efivars"
     fi
 }
 

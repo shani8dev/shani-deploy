@@ -741,10 +741,22 @@ _run_tray() {
     menu_entries+="|Roll Back...:sh -c \"shani-update --rollback &\""
     menu_entries+="|Quit:quit"
 
+    # Explicit PNG path: theme-name resolution can land on an SVG, and
+    # this image has no working SVG rasterizer (see AGENTS.md). Prefer a
+    # real 22px PNG; fall back to the theme name and let GTK sort it out.
+    local tray_icon="system-software-update"
+    local _icon_path
+    for _icon_path in \
+        /usr/share/icons/AdwaitaLegacy/22x22/legacy/system-software-update.png \
+        /usr/share/icons/hicolor/22x22/apps/system-software-update.png; do
+        if [[ -f "$_icon_path" ]]; then tray_icon="$_icon_path"; break; fi
+    done
+
     if [[ "$_session_type" == "wayland" ]]; then
         # XWayland attempt; a fast failure means no usable tray here —
         # stay inactive instead of looping under Restart=on-failure.
         GDK_BACKEND=x11 yad --notification \
+            --image="$tray_icon" \
             --text="Shani OS Update" \
             --command="sh -c \"shani-update &\"" \
             --menu="$menu_entries" \
@@ -753,6 +765,7 @@ _run_tray() {
     fi
 
     yad --notification \
+        --image="$tray_icon" \
         --text="Shani OS Update" \
         --command="sh -c \"shani-update &\"" \
         --menu="$menu_entries"

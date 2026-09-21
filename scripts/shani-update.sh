@@ -707,6 +707,14 @@ _run_tray() {
         log "No display — cannot run tray icon"
         exit 0
     fi
+    # Singleton: yad outlives this wrapper (killing the wrapper orphans
+    # a fully functional yad icon), and the service's Restart= plus
+    # manual runs would otherwise stack duplicate icons. If an icon for
+    # us already exists, leave it alone.
+    if pgrep -f "Shani OS Update" >/dev/null 2>&1; then
+        log "Tray icon already running — not starting another"
+        exit 0
+    fi
     # yad --notification is X11-only (see comment above): remember which
     # session type this is for the final invocation below.
     local _session_type="${XDG_SESSION_TYPE:-}"

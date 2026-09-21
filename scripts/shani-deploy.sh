@@ -576,8 +576,23 @@ _bees_resume() {
     (( --_BEES_PAUSE_COUNT == 0 )) || return 0
     [[ "${_BEES_PAUSED:-0}" == "1" ]] || return 0
     log_verbose "Resuming ${_BEES_SERVICE}"
-    systemctl start "$_BEES_SERVICE" 2>/dev/null || log_warn "Failed to restart ${_BEES_SERVICE}"
+    # The restart can transiently fail (observed live: cgroup churn right
+    # after the gen-efi chroot teardown) and land in start-limit-hit,
+    # leaving dedup silently down after a reported-success deploy — clear
+    # any such state and retry before giving up.
+    systemctl reset-failed "$_BEES_SERVICE" 2>/dev/null || true
+    local _try
+    for _try in 1 2 3; do
+        if systemctl start "$_BEES_SERVICE" 2>/dev/null; then
+            _BEES_PAUSED=0
+            return 0
+        fi
+        sleep 2
+        systemctl reset-failed "$_BEES_SERVICE" 2>/dev/null || true
+    done
+    log_warn "Failed to restart ${_BEES_SERVICE} after 3 attempts — dedup stays down until it is started manually"
     _BEES_PAUSED=0
+    return 0
 }
 
 # Drop-in replacement for `btrfs subvolume delete` that pauses bees for the

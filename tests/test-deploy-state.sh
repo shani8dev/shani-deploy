@@ -20,7 +20,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 # Extract the _restore_state function from shani-deploy.sh (test the real code)
 _restore_state() {
-    local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
+    local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
     local _line _var _val
     while IFS= read -r _line; do
         if [[ $_line =~ ^declare\ -[-a-z]*\ ([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
@@ -130,6 +130,20 @@ if grep -q 'GPG_KEY_ID' ../scripts/shani-deploy.sh; then
     ok "GPG_KEY_ID reads from GPG_KEY_ID env var"
 else
     fail "GPG_KEY_ID env override" "missing"
+fi
+
+# Test 10: a stale `declare -a ORIGINAL_ARGS=...` line in state (written by
+# pre-fix versions) must NOT clobber the real argv-derived array. The old
+# scalar `printf -v` path mangled element [0] into the literal string
+# `([0]="-t" [1]="latest")`, so the next re-exec died with
+# `Invalid option: ([0]="-t" [1]="latest")`.
+ORIGINAL_ARGS=("-t" "latest")
+state=$'declare -a ORIGINAL_ARGS=([0]="--rollback")\ndeclare -- UPDATE_CHANNEL="latest"'
+_restore_state "$state"
+if [[ ${#ORIGINAL_ARGS[@]} -eq 2 && ${ORIGINAL_ARGS[0]} == "-t" && ${ORIGINAL_ARGS[1]} == "latest" && ${UPDATE_CHANNEL:-} == "latest" ]]; then
+    ok "stale declare -a ORIGINAL_ARGS line ignored, real args preserved"
+else
+    fail "ORIGINAL_ARGS array preservation" "count=${#ORIGINAL_ARGS[@]} [0]=${ORIGINAL_ARGS[0]:-} [1]=${ORIGINAL_ARGS[1]:-}"
 fi
 
 summary

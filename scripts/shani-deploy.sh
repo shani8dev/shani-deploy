@@ -104,7 +104,15 @@ MAX_INHIBIT_DEPTH="${deploy_max_inhibit_depth:-${DEFAULT_deploy_max_inhibit_dept
 declare -a ORIGINAL_ARGS=("$@")
 declare DEPLOYMENT_START_TIME
 DEPLOYMENT_START_TIME=$(date +%s)
-export ORIGINAL_ARGS DEPLOYMENT_START_TIME
+# NOTE: ORIGINAL_ARGS is deliberately NOT exported (bash cannot export
+# arrays) and NOT persisted to state (see persist_state): every re-exec path
+# (check_root sudo, self_update, inhibit_system) passes the real argv
+# explicitly, and the new process rebuilds ORIGINAL_ARGS from "$@" above.
+# Persisting it wrote `declare -a ORIGINAL_ARGS=([0]="..." ...)` into the
+# state file, which _restore_state's scalar `printf -v` path then mangled
+# into element [0] — so the next re-exec received a literal
+# `([0]="-t" [1]="latest")` as $1 and died with "Invalid option".
+export DEPLOYMENT_START_TIME
 
 #####################################
 ### State Restoration             ###
@@ -118,7 +126,7 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
 
         if [[ -n "$state_content" ]]; then
             _restore_state() {
-                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
+                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
                 local _line _var _val
                 while IFS= read -r _line; do
                     if [[ $_line =~ ^declare\ -[-a-z]*\ ([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
@@ -257,7 +265,7 @@ persist_state() {
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE DOWNLOAD_ONLY 2>/dev/null || true
-        declare -p ORIGINAL_ARGS DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
+        declare -p DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
         declare -p AUTO_REBOOT AUTO_REBOOT_DELAY 2>/dev/null || true
         declare -p LOCK_ACQUIRED 2>/dev/null || true
         declare -p _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE 2>/dev/null || true

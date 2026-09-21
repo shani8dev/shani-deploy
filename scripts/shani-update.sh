@@ -687,13 +687,12 @@ show_alert() {
 }
 
 # _run_tray — persistent system-tray icon (yad --notification). yad's
-# notification icon is a legacy XEmbed/GtkStatusIcon icon: it renders ONLY
-# on X11 sessions with an XEmbed-capable tray host. It does NOT work on
-# Wayland — this yad build refuses outright ("not supported outside
-# X11"), and modern desktops (Plasma 6, GNOME 3.26+) accept only
-# StatusNotifierItem icons, which yad cannot produce. So on Wayland we
-# log and exit 0 (quietly inactive) instead of crash-looping every 5s
-# under the unit's Restart=on-failure.
+# notification icon is a legacy XEmbed/GtkStatusIcon icon: under a native
+# Wayland backend this yad build refuses outright ("not supported outside
+# X11"), so there we run it through XWayland (GDK_BACKEND=x11) — confirmed
+# live to stay up on Plasma Wayland. If that fails too (no XWayland, no
+# XEmbed host), log and exit 0 instead of crash-looping every 5s under
+# the unit's Restart=on-failure.
 # Deliberately does NOT call _acquire_lock: this process is meant to
 # live for the whole session (started once at login, see
 # shani-update-tray.service), and every action it offers just spawns an
@@ -708,9 +707,8 @@ _run_tray() {
         log "No display — cannot run tray icon"
         exit 0
     fi
-    # yad --notification is X11-only (see comment above): on a Wayland
-    # session it can never render, so exit quietly instead of failing
-    # into the unit's 5s restart loop forever.
+    # yad --notification is X11-only (see comment above): remember which
+    # session type this is for the final invocation below.
     local _session_type="${XDG_SESSION_TYPE:-}"
     if [[ -z "$_session_type" ]]; then
         if [[ -n "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
@@ -718,10 +716,6 @@ _run_tray() {
         else
             _session_type="x11"
         fi
-    fi
-    if [[ "$_session_type" == "wayland" ]]; then
-        log "Wayland session — yad tray icon unsupported here, staying inactive"
-        exit 0
     fi
     if ! command -v yad &>/dev/null; then
         log "yad not installed — cannot run tray icon"
@@ -746,6 +740,17 @@ _run_tray() {
     menu_entries+="|View Update Log:sh -c \"${view_log_cmd} &\""
     menu_entries+="|Roll Back...:sh -c \"shani-update --rollback &\""
     menu_entries+="|Quit:quit"
+
+    if [[ "$_session_type" == "wayland" ]]; then
+        # XWayland attempt; a fast failure means no usable tray here —
+        # stay inactive instead of looping under Restart=on-failure.
+        GDK_BACKEND=x11 yad --notification \
+            --text="Shani OS Update" \
+            --command="sh -c \"shani-update &\"" \
+            --menu="$menu_entries" \
+            || log "yad tray icon unavailable on this Wayland session — staying inactive"
+        exit 0
+    fi
 
     yad --notification \
         --text="Shani OS Update" \

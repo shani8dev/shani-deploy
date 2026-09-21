@@ -145,13 +145,23 @@ while IFS=: read -r username _ uid gid _ home shell; do
     # Only bootstrap a default channel if the user has none named nixpkgs.
     # Never overwrite an existing nixpkgs channel — the user may have
     # deliberately chosen a different URL.
+    # Requires a functional system Nix (nix-daemon.socket active, /nix/store
+    # populated). Without it, `nix-channel --add` vacuously "succeeds"
+    # (it only writes ~/.nix-channels) while every real nix operation fails
+    # — so refuse to stamp success and retry on the next run instead.
     if [[ "$HAS_NIX" -eq 1 ]]; then
-        if ! runuser -u "$username" -- nix-channel --list 2>/dev/null \
+        if ! systemctl is-active --quiet nix-daemon.socket 2>/dev/null; then
+            warn "system Nix not ready (nix-daemon.socket inactive, /nix/store likely unpopulated) — skipping nixpkgs channel bootstrap for $username, will retry next run"
+            user_ok=0
+        elif ! runuser -u "$username" -- nix-channel --list 2>/dev/null \
                 | grep -q "^nixpkgs "; then
-            run runuser -u "$username" -- nix-channel --add \
-                https://nixos.org/channels/nixpkgs-unstable nixpkgs 2>/dev/null \
-                || warn "nix-channel add failed for $username"
-            log "added nixpkgs channel for $username"
+            if run runuser -u "$username" -- nix-channel --add \
+                https://nixos.org/channels/nixpkgs-unstable nixpkgs 2>/dev/null; then
+                log "added nixpkgs channel for $username"
+            else
+                warn "nix-channel add failed for $username"
+                user_ok=0
+            fi
         fi
     fi
 

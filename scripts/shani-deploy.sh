@@ -3169,8 +3169,17 @@ try_zsync2_download() {
 
     local -a seed_args=()
     local seed
+    local largest_seed=""
+    local largest_size=0
     while IFS= read -r seed; do
-        [[ -n "$seed" && -s "$seed" ]] && seed_args+=(--seed-file "$seed")
+        [[ -n "$seed" && -s "$seed" ]] || continue
+        local s
+        s=$(get_file_size "$seed")
+        if (( s > largest_size )); then
+            largest_size=$s
+            largest_seed="$seed"
+        fi
+        seed_args+=(--seed-file "$seed")
     done < <(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name "shanios-*.zst" \
         ! -name "$(basename "$output")" 2>/dev/null)
 
@@ -3179,7 +3188,16 @@ try_zsync2_download() {
         return 1
     fi
 
-    log "Attempting differential download via zsync2 (seed: $(basename "${seed_args[1]}"))..."
+    # Skip zsync2 for very large seed files (>2GB) — reading the entire seed to
+    # compute rolling checksums is slower than parallel full download from R2.
+    # aria2c with 4 connections saturates bandwidth much faster than zsync2's
+    # single-threaded seed processing on HDDs.
+    if (( largest_size > 2147483648 )); then
+        log_verbose "zsync2: seed file $(basename "$largest_seed") is $(format_bytes "$largest_size") — skipping differential, using parallel full download"
+        return 1
+    fi
+
+    log "Attempting differential download via zsync2 (seed: $(basename "$largest_seed"))..."
     local tmp_output="${output}.zsync2.tmp"
     rm -f "$tmp_output"
 

@@ -1729,9 +1729,9 @@ prepare_chroot() {
         # a plain bind stays shared: cleanup's recursive unmount would then
         # propagate to the HOST and tear down live mounts (observed live:
         # /sys/fs/cgroup vanished during chroot teardown, after which no
-        # new cgroup/scope/service could start until reboot). Sever the
-        # propagation here so teardown can only ever affect the chroot side.
-        run_cmd mount --make-private "$MOUNT_DIR/boot/efi"
+        # new cgroup/scope/service could start until reboot). Use rslave to
+        # receive host mounts but NOT propagate unmounts back to host.
+        run_cmd mount --make-rslave "$MOUNT_DIR/boot/efi"
     else
         log_verbose "Mounting ESP (LABEL=shani_boot) into chroot"
         safe_mount "LABEL=shani_boot" "$MOUNT_DIR/boot/efi" "defaults"
@@ -1745,19 +1745,19 @@ prepare_chroot() {
     for dir in "${CHROOT_STATIC_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR/$dir"
         run_cmd mount --bind "/$dir" "$MOUNT_DIR/$dir"
-        run_cmd mount --make-private "$MOUNT_DIR/$dir"
+        run_cmd mount --make-rslave "$MOUNT_DIR/$dir"
     done
 
     for d in "${CHROOT_BIND_DIRS[@]}"; do
         mkdir -p "$MOUNT_DIR$d"
         run_cmd mount --rbind "$d" "$MOUNT_DIR$d"
-        run_cmd mount --make-rprivate "$MOUNT_DIR$d"
+        run_cmd mount --make-rslave "$MOUNT_DIR$d"
     done
 
     if [[ -d /sys/firmware/efi/efivars ]]; then
         mkdir -p "$MOUNT_DIR/sys/firmware/efi/efivars"
         run_cmd mount --rbind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars"
-        run_cmd mount --make-rprivate "$MOUNT_DIR/sys/firmware/efi/efivars"
+        run_cmd mount --make-rslave "$MOUNT_DIR/sys/firmware/efi/efivars"
     fi
 }
 
@@ -1766,6 +1766,15 @@ cleanup_chroot() {
     set +e
 
     [[ -d "$MOUNT_DIR/sys/firmware/efi/efivars" ]] && safe_umount "$MOUNT_DIR/sys/firmware/efi/efivars"
+
+    # Explicitly unmount /sys/fs/cgroup FIRST to avoid propagation to host.
+    # Even with --make-rprivate, recursive lazy unmount of /sys can race with
+    # systemd's cgroup management and tear down the host's cgroup hierarchy
+    # (observed live: /sys/fs/cgroup vanished, no new scopes/services could start).
+    if mountpoint -q "$MOUNT_DIR/sys/fs/cgroup" 2>/dev/null; then
+        safe_umount "$MOUNT_DIR/sys/fs/cgroup" || umount -l "$MOUNT_DIR/sys/fs/cgroup" 2>/dev/null || true
+    fi
+
     # Unmount bind dirs in reverse order to handle nested mounts correctly
     local -a bind_reversed=()
     for d in "${CHROOT_BIND_DIRS[@]}"; do bind_reversed=("$d" "${bind_reversed[@]}"); done
@@ -3119,7 +3128,7 @@ fetch_update() {
     trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
 
     if ! btrfs_subvol_exists "$MOUNT_DIR/@${CANDIDATE_SLOT}"; then
-        log_warn "Candidate slot @${CANDIDATE_SLOT} is missing — will redeploy from remote to recreate it"
+        log "Candidate slot @${CANDIDATE_SLOT} does not exist — will recreate it from the system image"
         return 0
     fi
 

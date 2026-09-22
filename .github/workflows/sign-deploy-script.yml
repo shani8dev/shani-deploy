@@ -1,0 +1,49 @@
+name: Sign Deploy Script
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/shani-deploy.sh'
+  workflow_dispatch:
+
+concurrency:
+  group: sign-deploy-script
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    name: Sign shani-deploy.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gnupg
+
+      - name: Sign deploy script
+        run: bash scripts/sign-deploy-script.sh
+
+      - name: Commit and push signatures
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/shani-deploy.sh.sha256 scripts/shani-deploy.sh.asc
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update shani-deploy.sh checksum and signature [skip ci]"
+            git push
+          else
+            echo "No changes to commit"
+          fi

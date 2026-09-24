@@ -29,9 +29,14 @@ PathExists=/data/user-setup-needed
 
 Unit=shani-user-setup.service
 
-# Rate-limit: at most 3 triggers per 60s to prevent runaway loops.
+# Rate-limit against runaway loops. Not 3: several passwd changes in a row
+# (a script or fleet enrolment adding users, then this service fixing each)
+# are one trigger each, and a burst of 3 left this unit failed - so users
+# added afterwards got no setup until reboot (slot-test user-setup-path,
+# 6 users: died in 1 of 3 runs at 3, depending on how events coalesce).
+# A no-change run writes nothing, so 20/60s only stops a real loop.
 TriggerLimitIntervalSec=60s
-TriggerLimitBurst=3
+TriggerLimitBurst=20
 
 [Install]
 WantedBy=multi-user.target

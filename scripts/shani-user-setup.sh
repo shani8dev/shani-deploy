@@ -43,8 +43,14 @@ if [[ -n "$EXTRA_GROUPS" ]]; then
 fi
 
 # Hoist constant tool lookups — no point re-running these per user.
-ZSH_PATH=$(command -v zsh  2>/dev/null || true)
-BASH_PATH=$(command -v bash 2>/dev/null || true)
+# Real paths: since the /usr/sbin merge, /bin/zsh, /usr/sbin/zsh and
+# /usr/bin/zsh are one binary, and which name `command -v` returns depends
+# on the caller's PATH. Comparing names rewrote every user's shell to the
+# other spelling on each run; each rewrite of passwd re-triggered
+# shani-user-setup.path until its trigger limit killed it (found by
+# shani-testbed's gate, 2026-09-24).
+ZSH_PATH=$(realpath -e "$(command -v zsh 2>/dev/null)" 2>/dev/null || true)
+BASH_PATH=$(realpath -e "$(command -v bash 2>/dev/null)" 2>/dev/null || true)
 HAS_FLATPAK=$(command -v flatpak          &>/dev/null && echo 1 || echo 0)
 HAS_NIX=$(command -v nix-channel          &>/dev/null && echo 1 || echo 0)
 HAS_PODMAN=$(command -v podman            &>/dev/null && echo 1 || echo 0)
@@ -108,6 +114,7 @@ while IFS=: read -r username _ uid gid _ home shell; do
     # ── Default shell ─────────────────────────────────────────────────────────
     # Re-read from getent — $shell is stale if usermod changed it earlier.
     current_shell=$(getent passwd "$username" | cut -d: -f7)
+    current_shell=$(realpath -e "$current_shell" 2>/dev/null || echo "$current_shell")
 
     if [[ -n "$ZSH_PATH" && -x "$ZSH_PATH" && "$current_shell" != "$ZSH_PATH" ]]; then
         log "setting shell to zsh ($ZSH_PATH) for $username"

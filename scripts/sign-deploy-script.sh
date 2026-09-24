@@ -27,7 +27,10 @@ die()  { echo "[ERROR] $*" >&2; exit 1; }
 
 # Generate SHA256 checksum
 log "Generating SHA256 checksum for $(basename "$TARGET_SCRIPT")..."
-sha256sum "$TARGET_SCRIPT" > "${TARGET_SCRIPT}.sha256" || die "Checksum generation failed"
+# Hash from inside scripts/ so the file records the bare name (as f82f2d7
+# did by hand), not the CI runner's absolute path; verify_sha256 only reads
+# the hash field, but `sha256sum -c` and humans read the name too.
+(cd "$SCRIPT_DIR" && sha256sum "$(basename "$TARGET_SCRIPT")") > "${TARGET_SCRIPT}.sha256" || die "Checksum generation failed"
 log "SHA256: $(cat "${TARGET_SCRIPT}.sha256")"
 
 # Prepare GPG keyring

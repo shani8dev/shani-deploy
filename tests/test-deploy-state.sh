@@ -18,9 +18,12 @@ summary() {
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Extract the _restore_state function from shani-deploy.sh (test the real code)
+# The real whitelist, read from shani-deploy.sh (a hand-kept copy here
+# never noticed the script's list changing)
+WHITELIST=$(grep -oP 'local _whitelist="\K[^"]+' ../scripts/shani-deploy.sh)
+[[ -n $WHITELIST ]] || { echo "could not read _whitelist from ../scripts/shani-deploy.sh"; exit 1; }
 _restore_state() {
-    local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
+    local _whitelist="$WHITELIST"
     local _line _var _val
     while IFS= read -r _line; do
         if [[ $_line =~ ^declare\ -[-a-z]*\ ([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
@@ -145,5 +148,14 @@ if [[ ${#ORIGINAL_ARGS[@]} -eq 2 && ${ORIGINAL_ARGS[0]} == "-t" && ${ORIGINAL_AR
 else
     fail "ORIGINAL_ARGS array preservation" "count=${#ORIGINAL_ARGS[@]} [0]=${ORIGINAL_ARGS[0]:-} [1]=${ORIGINAL_ARGS[1]:-}"
 fi
+
+# AUTO_REBOOT must not survive a self-update: a pre-2026-08-21 script
+# persisted its default "yes" and the new one re-enabled auto-reboot with it
+unset AUTO_REBOOT AUTO_REBOOT_DELAY
+_restore_state $'declare -- AUTO_REBOOT="yes"\ndeclare -- AUTO_REBOOT_DELAY="60"'
+if [[ -z ${AUTO_REBOOT:-} && -z ${AUTO_REBOOT_DELAY:-} ]]; then ok "AUTO_REBOOT from an older script's state is ignored"
+else fail "AUTO_REBOOT from an older script's state is ignored" "AUTO_REBOOT=${AUTO_REBOOT:-}"; fi
+if ! sed -n '/^persist_state()/,/^}/p' ../scripts/shani-deploy.sh | grep -q 'declare -p .*AUTO_REBOOT'; then ok "persist_state does not hand AUTO_REBOOT on"
+else fail "persist_state does not hand AUTO_REBOOT on" "found in persist_state"; fi
 
 summary

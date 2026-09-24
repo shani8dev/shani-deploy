@@ -126,7 +126,7 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
 
         if [[ -n "$state_content" ]]; then
             _restore_state() {
-                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY DEPLOYMENT_START_TIME CANDIDATE_MODIFIED AUTO_REBOOT AUTO_REBOOT_DELAY LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
+                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY DEPLOYMENT_START_TIME CANDIDATE_MODIFIED LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
                 local _line _var _val
                 while IFS= read -r _line; do
                     if [[ $_line =~ ^declare\ -[-a-z]*\ ([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
@@ -266,7 +266,11 @@ persist_state() {
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE DOWNLOAD_ONLY 2>/dev/null || true
         declare -p DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
-        declare -p AUTO_REBOOT AUTO_REBOOT_DELAY 2>/dev/null || true
+        # not AUTO_REBOOT/AUTO_REBOOT_DELAY: they are set only through the
+        # environment, which the re-exec keeps. Carrying them in the state
+        # handed a pre-2026-08-21 script's default (yes) to this one, so
+        # every self-updated upgrade from stable armed a reboot nobody asked
+        # for (found by shani-testbed's gate, 2026-09-24).
         declare -p LOCK_ACQUIRED 2>/dev/null || true
         declare -p _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE 2>/dev/null || true
     } > "$state_file"
@@ -3733,7 +3737,9 @@ finalize_update() {
     # reboot-needed marker above — pkexec strips DISPLAY so notify-send here
     # would silently fail.
 
-    schedule_reboot_timer
+    # the deploy has succeeded; a reboot timer that can't be armed is
+    # already warned about and must not turn that into exit 1
+    schedule_reboot_timer || true
 }
 
 #####################################

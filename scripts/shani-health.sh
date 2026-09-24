@@ -2186,22 +2186,32 @@ _section_unit_exposure() {
         running|degraded|starting) ;;
         *) _row "Exposure" "--  not available (${_state:-offline} — needs a running systemd)"; return 0 ;;
     esac
-    local _table; _table=$(systemd-analyze security --no-pager 2>/dev/null) || true
+    # Name the units: without arguments systemd-analyze security scores only
+    # units currently loaded, and ShaniOS's are mostly oneshots systemd has
+    # already unloaded - so the section always said "no units loaded".
+    # Templates (@) can't be scored without an instance.
+    local -a _units=()
+    mapfile -t _units < <(systemctl list-unit-files --no-legend --type=service \
+        'shani-*' 'mark-boot-*' check-boot-failure.service bless-boot.service \
+        beesd-setup.service flatpak-update-system.service 2>/dev/null \
+        | awk '{print $1}' | grep -vE '@|^shani-test-')
+    if (( ${#_units[@]} == 0 )); then
+        _row "Exposure" "--  no ShaniOS service units installed"
+        return 0
+    fi
+    local _table; _table=$(systemd-analyze security --no-pager "${_units[@]}" 2>/dev/null) || true
     if [[ -z "$_table" ]]; then
         _row "Exposure" "--  systemd-analyze security returned nothing"
         return 0
     fi
-    local _unit _score _level _rest _n=0
-    while read -r _unit _score _level _rest; do
-        case "$_unit" in
-            shani-*.service|mark-boot-*.service|check-boot-failure.service) ;;
-            bless-boot.service|beesd-setup.service|flatpak-update-system.service) ;;
-            *) continue ;;
-        esac
+    # Named units get the detailed report, one summary line per unit:
+    #   → Overall exposure level for shani-user-setup.service: 9.6 UNSAFE 😨
+    local _unit _score _level _n=0
+    while read -r _unit _score _level; do
         _row "${_unit%.service}" "--  ${_score} ${_level}"
         _n=$(( _n + 1 ))
-    done <<< "$_table"
-    (( _n > 0 )) || _row "Exposure" "--  no ShaniOS service units loaded"
+    done < <(sed -nE 's/.*Overall exposure level for ([^:]+):[[:space:]]*([0-9.]+)[[:space:]]+([A-Z]+).*/\1 \2 \3/p' <<< "$_table")
+    (( _n > 0 )) || _row "Exposure" "--  systemd-analyze scored none of ${#_units[@]} unit(s)"
 }
 
 _section_security_audit() {

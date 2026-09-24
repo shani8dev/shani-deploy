@@ -2946,8 +2946,16 @@ verify_and_create_subvolumes() {
                             mem=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "2048")
                             local avail
                             avail=$(get_btrfs_available_mb "$MOUNT_DIR")
-                            create_swapfile "$swapfile" "$mem" "$avail" || \
-                                log_warn "Swapfile creation failed"
+                            # never into the space this deploy (and the next)
+                            # needs - same rule as the installer's swapfile
+                            local swap_mb=$(( avail - MIN_FREE_SPACE_MB - 2048 ))
+                            (( swap_mb > mem )) && swap_mb=$mem
+                            if (( swap_mb >= 1024 )); then
+                                create_swapfile "$swapfile" "$swap_mb" "$avail" || \
+                                    log_warn "Swapfile creation failed"
+                            else
+                                log_warn "No room for a swapfile after keeping space for updates - zram covers swap"
+                            fi
                         fi
                         ;;
 

@@ -111,17 +111,22 @@ while IFS=: read -r username _ uid gid _ home shell; do
         log "$username already has all groups"
     fi
 
-    # ── Default shell ─────────────────────────────────────────────────────────
-    # Re-read from getent — $shell is stale if usermod changed it earlier.
+    # ── Shell ─────────────────────────────────────────────────────────────────
+    # A user's shell is theirs: new installs start on zsh (configure.sh's
+    # useradd -s /bin/zsh), and whatever a user picks later with chsh - or
+    # was created with - stays. Only a shell that no longer exists (its
+    # binary gone after a slot switch, so they could not log in) is replaced,
+    # by zsh or else bash. Paths compare by realpath: since the /usr/sbin
+    # merge /bin/zsh, /usr/sbin/zsh and /usr/bin/zsh are one binary.
     current_shell=$(getent passwd "$username" | cut -d: -f7)
-    current_shell=$(realpath -e "$current_shell" 2>/dev/null || echo "$current_shell")
-
-    if [[ -n "$ZSH_PATH" && -x "$ZSH_PATH" && "$current_shell" != "$ZSH_PATH" ]]; then
-        log "setting shell to zsh ($ZSH_PATH) for $username"
-        run usermod -s "$ZSH_PATH" "$username" || { warn "usermod -s zsh failed for $username"; user_ok=0; }
-    elif [[ -z "$ZSH_PATH" && -n "$BASH_PATH" && -x "$BASH_PATH" && "$current_shell" != "$BASH_PATH" ]]; then
-        log "zsh not found, setting shell to bash ($BASH_PATH) for $username"
-        run usermod -s "$BASH_PATH" "$username" || { warn "usermod -s bash failed for $username"; user_ok=0; }
+    if [[ -n "$current_shell" && ! -x "$(realpath -e "$current_shell" 2>/dev/null)" ]]; then
+        if [[ -n "$ZSH_PATH" && -x "$ZSH_PATH" ]]; then
+            log "shell ${current_shell} of $username is missing - setting zsh ($ZSH_PATH)"
+            run usermod -s "$ZSH_PATH" "$username" || { warn "usermod -s zsh failed for $username"; user_ok=0; }
+        elif [[ -n "$BASH_PATH" && -x "$BASH_PATH" ]]; then
+            log "shell ${current_shell} of $username is missing - setting bash ($BASH_PATH)"
+            run usermod -s "$BASH_PATH" "$username" || { warn "usermod -s bash failed for $username"; user_ok=0; }
+        fi
     fi
 
     # Warn if user is currently logged in — group/shell changes won't take

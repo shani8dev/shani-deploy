@@ -2977,12 +2977,20 @@ verify_and_create_subvolumes() {
     # Check bind mount directories from fstab
     mapfile -t bind_dirs < <(parse_fstab_bind_dirs "$fstab")
 
-    if [[ ${#bind_dirs[@]} -gt 0 ]]; then
+    if [[ ${#bind_dirs[@]} -gt 0 ]] && ! btrfs_subvol_exists "$MOUNT_DIR/@data"; then
+        log_warn "@data missing - bind mount sources not checked"
+    elif [[ ${#bind_dirs[@]} -gt 0 ]]; then
         log "Checking ${#bind_dirs[@]} bind mount director(ies)"
 
         local created=0
         for dir in "${bind_dirs[@]}"; do
-            local full_path="$MOUNT_DIR/${dir#/}"
+            # $MOUNT_DIR is the Btrfs top level, where /data is the @data
+            # subvolume (parse_fstab_bind_dirs only returns /data/... sources).
+            # "$MOUNT_DIR/${dir#/}" created a stray top-level data/varlib/*
+            # tree on every deploy and never the real source, so a bind a new
+            # image added to fstab had no source at boot (found by
+            # shani-testbed, 2026-09-24).
+            local full_path="$MOUNT_DIR/@data/${dir#/data/}"
 
             if [[ -d "$full_path" ]]; then
                 log_verbose "Exists: $dir"
@@ -3944,7 +3952,6 @@ main() {
     persist_state
     inhibit_system
     validate_boot
-    check_space
     fetch_update
 
     if [[ -f "${STATE_DIR}/skip-deployment" ]]; then
@@ -3976,6 +3983,10 @@ main() {
         exit 0
     fi
 
+    # Only once there is something to download: checked first, a full disk
+    # made every "no update" run die too (a minimum-size install failed its
+    # daily update check with nothing to update - shani-testbed, 2026-09-24).
+    check_space
     download_update || die "Download failed"
 
     if [[ "$DOWNLOAD_ONLY" == "yes" ]]; then

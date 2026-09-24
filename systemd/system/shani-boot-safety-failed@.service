@@ -1,0 +1,25 @@
+[Unit]
+Description=Record Failure of Shani OS Boot-Safety Unit %i
+# Pulled in via OnFailure= by the boot-safety units (mark-boot-in-progress,
+# mark-boot-success, check-boot-failure, shani-auto-rollback). If one of
+# THOSE fails, boot-failure detection or automatic rollback silently did not
+# happen this boot — `systemctl is-failed` only shows that until the next
+# reboot, so record it somewhere that persists and that shani-health reads.
+#
+# Deliberately not bless-boot.service: it is best-effort only (upstream
+# systemd/systemd#40405, see its own unit comments).
+DefaultDependencies=no
+# Wants=, not Requires=: if /data itself is the problem, the journal line
+# below must still be written.
+Wants=data.mount
+After=data.mount
+
+[Service]
+Type=oneshot
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ExecStart=/usr/bin/logger -p daemon.crit -t shani-boot-safety "%i failed: boot-failure detection or automatic rollback may not have run this boot (journalctl -u %i)"
+# Last 20 failures, newest last: "<ISO-8601 time> <unit>". Cleared by
+# shani-reset along with the other /data/boot_* markers.
+ExecStart=-/bin/sh -c 'f=/data/boot_safety_failed; { cat "$$f" 2>/dev/null; echo "$$(date -Iseconds) $$1"; } | tail -n 20 > "$$f.tmp" && mv -f "$$f.tmp" "$$f"' _ %i

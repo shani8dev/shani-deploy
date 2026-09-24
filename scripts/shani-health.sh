@@ -556,7 +556,8 @@ _svc_present() { command -v "$1" &>/dev/null || systemctl cat "$1" &>/dev/null 2
 _umount_r() {
     local tgt="$1"
     _is_mounted "$tgt" || return 0
-    umount -R "$tgt" 2>/dev/null || umount -R -l "$tgt" 2>/dev/null || true
+    # plain -l last: see shani-deploy.sh _umount_tree (nspawn /proc boot_id)
+    umount -R "$tgt" 2>/dev/null || umount -R -l "$tgt" 2>/dev/null || umount -l "$tgt" 2>/dev/null || true
 }
 
 # Check that a command exists AND is executable.
@@ -835,6 +836,26 @@ _section_boot_health() {
     if [[ ${#overlay_boot_failed[@]} -gt 0 ]]; then
         _row "Overlay boot" "!!  failed: $(_join "${overlay_boot_failed[@]}")"
         _rec "Overlay boot service(s) failed: $(_join "${overlay_boot_failed[@]}") — run: systemctl status <unit>"
+    fi
+    # Written by shani-boot-safety-failed@.service (OnFailure= of the
+    # boot-safety units). Unlike is-failed above, this survives a reboot.
+    if [[ -s /data/boot_safety_failed ]]; then
+        local _bsf_n _bsf_last
+        _bsf_n=$(wc -l < /data/boot_safety_failed 2>/dev/null || echo "?")
+        _bsf_last=$(tail -n 1 /data/boot_safety_failed 2>/dev/null || echo "?")
+        _row "Safety units" "!!  ${_bsf_n} failure(s) recorded, latest: ${_bsf_last}"
+        _rec "A boot-safety unit failed (boot-failure detection/rollback may not have run) — see: journalctl -t shani-boot-safety; delete /data/boot_safety_failed once resolved"
+    fi
+    # systemd-pstore archives kernel panic/oops records from EFI pstore at
+    # boot. /var/lib/systemd is shared by both slots, so this also covers a
+    # panic in the other slot.
+    local _pstore=/var/lib/systemd/pstore
+    if [[ -d "$_pstore" ]] && [[ -n "$(ls -A "$_pstore" 2>/dev/null || true)" ]]; then
+        local _ps_n _ps_new
+        _ps_n=$(find "$_pstore" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l || echo "?")
+        _ps_new=$(ls -1t "$_pstore" 2>/dev/null | head -n 1 || true)
+        _row "Kernel crash" "!   ${_ps_n} pstore record(s), newest: ${_ps_new} — see ${_pstore}/"
+        _rec "Kernel crash records archived by systemd-pstore — inspect ${_pstore}/${_ps_new}"
     fi
     if [[ -f "$DATA_BOOT_OK" ]]; then
         local last_ok; last_ok=$(stat -c '%y' "$DATA_BOOT_OK" 2>/dev/null | cut -d. -f1 || echo "?")
@@ -2145,6 +2166,42 @@ _section_security_services() {
     fi
 
     _optional_end
+}
+
+_section_unit_exposure() {
+    _set_section "unit_exposure"
+    _head "Unit Sandboxing"
+    # systemd-analyze security's exposure score (0 = fully sandboxed, 10 =
+    # none) for ShaniOS's own service units. Informational only: several are
+    # deliberately unsandboxed (shani-auto-rollback needs btrfs + the ESP,
+    # bless-boot writes the ESP, shani-user-setup writes /etc — see
+    # shani-deploy AGENTS.md "Systemd hardening"), so a high score here is
+    # not by itself a finding.
+    if ! command -v systemd-analyze &>/dev/null; then
+        _row "Exposure" "N/A"
+        return 0
+    fi
+    local _state; _state=$(systemctl is-system-running 2>/dev/null) || true
+    case "$_state" in
+        running|degraded|starting) ;;
+        *) _row "Exposure" "--  not available (${_state:-offline} — needs a running systemd)"; return 0 ;;
+    esac
+    local _table; _table=$(systemd-analyze security --no-pager 2>/dev/null) || true
+    if [[ -z "$_table" ]]; then
+        _row "Exposure" "--  systemd-analyze security returned nothing"
+        return 0
+    fi
+    local _unit _score _level _rest _n=0
+    while read -r _unit _score _level _rest; do
+        case "$_unit" in
+            shani-*.service|mark-boot-*.service|check-boot-failure.service) ;;
+            bless-boot.service|beesd-setup.service|flatpak-update-system.service) ;;
+            *) continue ;;
+        esac
+        _row "${_unit%.service}" "--  ${_score} ${_level}"
+        _n=$(( _n + 1 ))
+    done <<< "$_table"
+    (( _n > 0 )) || _row "Exposure" "--  no ShaniOS service units loaded"
 }
 
 _section_security_audit() {
@@ -7670,6 +7727,7 @@ security_report() {
     _section_encryption || true
     _section_tpm2
     _section_security_services || true
+    _section_unit_exposure || true
     _section_security_audit || true
     _section_krb5
     _section_users || true

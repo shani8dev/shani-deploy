@@ -7,6 +7,9 @@ DefaultDependencies=no
 # failure is visible in the journal rather than silently undetected.
 Requires=data.mount
 After=data.mount
+# Record a failure of this unit itself where shani-health will see it after
+# a reboot (see shani-boot-safety-failed@.service).
+OnFailure=shani-boot-safety-failed@%n.service
 
 [Service]
 Type=oneshot

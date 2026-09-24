@@ -71,8 +71,10 @@ would again.
 **You MUST run the full test harness. Do not skip it. Do not substitute
 static checks for it. Do not say "this should work" without evidence.**
 
-Every change to this repo must be verified with the real test harness in
-`../shani-install-media/test-env/`. This is the ONLY way to prove boot,
+Every change to this repo must be verified with the real test harness
+(`../shani-testbed`, run through `../shani-install-media`'s runner; the
+commands below are unchanged by the 2026-09-23 split — `suite` runs the
+whole sequence in one go). This is the ONLY way to prove boot,
 signing, deploy, and rollback logic actually works.
 
 ### The complete test sequence (run ALL of these)
@@ -183,7 +185,8 @@ images are cached at a host-persistent path (survives even a fresh
 For testing an individual function in isolation (a specific fault
 condition, e.g. a stub `sbsign` that "succeeds" while writing garbage —
 see `sign-efi-binary-test.sh` and its siblings in
-`../shani-install-media/test-env/` for the established pattern), use
+`../shani-testbed/slot-tests/` — visible in every slot at
+`/mnt/testbed/slot-tests/` — for the established pattern), use
 `enter` instead and call the real function directly:
 
 ```bash
@@ -249,8 +252,8 @@ has `$WAYLAND_DISPLAY`, but X11 is what's verified here.
    `X11_FORWARD_ARGS` / `WAYLAND_FORWARD_ARGS`, conditional on the host
    actually having a socket (`$DISPLAY` / `$WAYLAND_DISPLAY`). Binds
    `/tmp/.X11-unix` (X11) or just the one Wayland file into the container.
-2. **nspawn layer** (`shani-install-media/test-env/test.sh`
-   `_nspawn_binds()`) — builds `X11_BIND` / `WAYLAND_BIND` and wires them
+2. **nspawn layer** (`shani-testbed/lib/nspawn.sh`
+   `_nspawn_binds()`; was `shani-install-media/test-env/test.sh`) — builds `X11_BIND` / `WAYLAND_BIND` and wires them
    into `NSPAWN_ENTER_ARGS` and `NSPAWN_FULL_BOOT_ARGS`, so the socket
    reaches the booted slot too.
 
@@ -330,6 +333,29 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
   execution.
 
 ## Audit-verified known issues (confirmed present)
+
+- **Chroot teardown left `/mnt/proc` mounted under nspawn; the emergency
+  rollback then hung forever in `btrfs subvolume sync` — FIXED
+  (2026-09-24).** The mandatory suite's `upgrade` failed twice (2026-09-23
+  11:19 and 21:21) right after "UKI generated": `Failed to unmount:
+  /mnt/proc` → `/mnt` stuck → `restore_candidate` mounted `subvolid=5` on
+  top of the still-mounted `@green`, deleted `@green` underneath it
+  ("Subvolume restore failed"), and `btrfs subvolume sync /mnt` waited 4 h+
+  (the deploy namespace showed `/mnt` rooted at `/@green//deleted`). Root
+  cause, reproduced under plain systemd-nspawn: an rbind of `/proc` carries
+  `/proc/sys/kernel/random/boot_id` twice, and both `umount -R` and
+  `umount -R -l` abort on the second copy ("not mounted", rc 32) leaving the
+  tree mounted; a plain `umount -l` (MNT_DETACH) takes the whole subtree off
+  (rc 0). Fixes in `shani-deploy.sh`: `_umount_tree()` (`-R` → `-R -l` →
+  `-l`) used by `safe_umount` and every `restore_candidate` unmount;
+  `restore_candidate` now refuses to stack `subvolid=5` on a still-mounted
+  `$MOUNT_DIR` and aborts before touching any subvolume; `btrfs_sync` is
+  bounded (`BTRFS_SYNC_TIMEOUT`, default 900 s) because a deleted-but-mounted
+  subvolume is never cleaned. `shani-health.sh`'s unmount got the same `-l`
+  fallback. Verified: full `suite -p gnome` PASSED (upgrade 132 s,
+  "Deployment successful!", no unmount warning). The same run exposed a
+  *harness* pin on rollback (the upgrade step's `@blue` overlay stayed
+  mounted), fixed in shani-testbed `_enter_prep`, not here.
 
 **For the full narrative, verification methodology, and before/after
   evidence behind every line below, see `AUDIT-HISTORY.md`.** This section
@@ -808,6 +834,63 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
   boot entry (see the `--rollback` entry above for what does, and its own
   gap).
 
+- **Boot-safety units now record their own failure — NEW (2026-09-23).**
+  `mark-boot-in-progress`, `mark-boot-success`, `check-boot-failure` and
+  `shani-auto-rollback` have `OnFailure=shani-boot-safety-failed@%n.service`,
+  which logs `daemon.crit` (`journalctl -t shani-boot-safety`) and appends
+  `<ISO time> <unit>` to `/data/boot_safety_failed` (last 20 lines).
+  `shani-health --boot` shows it as "Safety units" (it survives a reboot,
+  unlike `systemctl is-failed`), and `shani-reset` wipes it with the other
+  markers. Deliberately not on `bless-boot.service` (best-effort, #40405).
+  `Wants=`/`After=data.mount`, not `Requires=`, so the journal line is
+  written even when `/data` is the problem. Verified live with the harness
+  `probe` (real `systemd --boot`, systemd 261.2, `--local-src`, needs
+  `SHANIOS_TEST_ALLOW_NEW_LOCAL_SRC=1` since the template is new): forcing
+  `check-boot-failure` to `/bin/true` recorded nothing (negative control);
+  `/bin/false` produced the crit line and the marker; 25 triggers left
+  exactly 20 lines; the health row appears/disappears with the file.
+  **Limit:** a unit that never starts because `data.mount` failed ends in
+  "dependency failed", not "failed", so `OnFailure=` doesn't fire for that
+  case.
+- **`shani-health --boot` shows systemd-pstore kernel-crash records — NEW
+  (2026-09-23).** "Kernel crash" row when `/var/lib/systemd/pstore` (on
+  `/data/varlib/systemd`, shared by both slots) is non-empty. Verified live
+  in the same probe, both with and without a record present; `--boot
+  --json` stays `jq`-valid.
+- **`shani-health --security` has a "Unit Sandboxing" section — NEW
+  (2026-09-23).** `systemd-analyze security` exposure score for ShaniOS's
+  own service units. Informational only: several units are deliberately
+  unsandboxed (see "Systemd hardening" below), so no recommendation is
+  raised. Shows "not available" when there is no running systemd (plain
+  `enter`).
+- **CI: `unit-files` job — NEW (2026-09-23).** `tests/verify-units.sh` runs
+  `systemd-analyze verify` over every unit here inside `archlinux:latest`
+  (real Arch systemd). It stubs only what ShaniOS provides at runtime (its
+  `/usr/local/bin` scripts, `data.mount`) and treats ANY output as failure,
+  because unknown keys only warn. It refuses to run outside a container (it
+  writes into `/usr/lib/systemd`). Verified: the current tree gives rc=0;
+  a typo'd key and a missing `ExecStart=` binary each give rc=1. It does
+  NOT catch a bad argument to a valid binary (the old `bootctl set-good`
+  class) or a typo in an `OnFailure=` target.
+
+- **`shani-user-setup.path` went to `failed` (`trigger-limit-hit`) seconds
+  after every boot — FIXED (2026-09-23, harness verification: see below).**
+  Seen in two real `systemd --boot` runs of `@blue` via the harness `probe`
+  command: `shani-user-setup.path: Trigger limit hit, refusing further
+  activation` → `Failed with result 'trigger-limit-hit'`. Cause:
+  `PathExists=/data/overlay/etc/upper/passwd` is true on every installed
+  system, and systemd re-checks `PathExists=` each time the triggered
+  service exits (systemd.path(5)), so it re-fired until `TriggerLimitBurst=3`
+  tripped. The unit's old comment ("PathExists fires once when the file is
+  first created") was wrong about that. Effect: once failed, later user
+  additions (`PathChanged=`) and skel changes were no longer watched until
+  the next boot. Fix: drop that one `PathExists=` line and keep
+  `PathChanged=` on the same file. First boot and slot switches don't need
+  it: `/data/user-setup-needed` is already written by
+  `os-installer-config/scripts/configure.sh:1100` (install) and
+  `scripts/shani-deploy.sh:3632` (every slot switch), and is consumed by the
+  service's `ExecStartPost=`, so its `PathExists=` never loops.
+
 - **`shani-health --storage-info` crashed with `STOR_MNT: unbound variable`
   every single time — FIXED (2026-09-18).** `analyze_storage()` sets `trap
   '...cleanup...' RETURN` to unmount its temp mount, but bash's RETURN
@@ -1024,7 +1107,9 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
   template), `unit-tests` (`test-deploy-state.sh` 9/9 +
   `test_upgrade_adviser.sh` 21/21), and `security` (secret scan via the
   shared template). Migrated from the old hand-written single-job
-  workflow 2026-09-20. The full boot/signing/deploy/rollback harness in
+  workflow 2026-09-20; a fourth job, `unit-files` (`systemd-analyze
+  verify` in `archlinux:latest`, see above), added 2026-09-23. The full
+  boot/signing/deploy/rollback harness in
   `../shani-install-media/test-env/` is still manual — that's the
   safety-critical proof, and CI is the floor, not the ceiling.
 - **`log`/`warn` argument-splitting — FIXED.** `shani-user-setup.sh`'s

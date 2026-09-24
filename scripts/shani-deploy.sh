@@ -447,11 +447,23 @@ safe_umount() {
         return 0
     fi
 
-    umount -R "$tgt" 2>/dev/null || \
-    umount -R -l "$tgt" 2>/dev/null || {
+    _umount_tree "$tgt" || {
         log_warn "Failed to unmount: $tgt"
         return 1
     }
+}
+
+# _umount_tree — unmount a mount and everything under it.
+# `umount -R` (and `umount -R -l`) walk the submount list entry by entry and
+# abort on the first one that errors. Under systemd-nspawn (the test harness,
+# containers) an rbind of /proc carries /proc/sys/kernel/random/boot_id
+# twice; the second entry is "not mounted" once the first is gone, so both
+# recursive forms fail and leave the whole tree mounted (observed live: the
+# chroot's /mnt/proc stuck -> /mnt stuck -> restore_candidate deleted a
+# still-mounted @green -> `btrfs subvolume sync` waited forever). A plain
+# lazy detach (MNT_DETACH) takes the whole subtree off in one call.
+_umount_tree() {
+    umount -R "$1" 2>/dev/null || umount -R -l "$1" 2>/dev/null || umount -l "$1" 2>/dev/null
 }
 
 force_umount_all() {
@@ -538,8 +550,12 @@ btrfs_subvol_exists() {
 # should not see stale/half-deleted entries.
 btrfs_sync() {
     local mnt="${1:-$MOUNT_DIR}"
-    btrfs subvolume sync "$mnt" 2>/dev/null || \
-        log_warn "btrfs subvolume sync failed on ${mnt} — deletion cleanup may still be pending"
+    # Bounded: a deleted subvolume that is still mounted somewhere is never
+    # cleaned, and an unbounded sync then blocks the deploy (or its emergency
+    # rollback) forever. The wait is only an optimisation - callers already
+    # handle cleanup still being pending.
+    timeout "${BTRFS_SYNC_TIMEOUT:-900}" btrfs subvolume sync "$mnt" 2>/dev/null || \
+        log_warn "btrfs subvolume sync failed or timed out on ${mnt} — deletion cleanup may still be pending"
 }
 
 
@@ -2016,7 +2032,7 @@ restore_candidate() {
             CANDIDATE_SLOT="blue"
         else
             log_error "Cannot determine booted slot — aborting emergency rollback. Check btrfs subvolumes manually."
-            umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+            _umount_tree "$MOUNT_DIR" || true
             rm -f "$DEPLOY_PENDING" 2>/dev/null
             exit 1
         fi
@@ -2024,7 +2040,16 @@ restore_candidate() {
     fi
 
     mkdir -p "$MOUNT_DIR" 2>/dev/null
-    umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+    _umount_tree "$MOUNT_DIR" || true
+    if is_mounted "$MOUNT_DIR"; then
+        # Mounting subvolid=5 on top would hide a still-mounted slot, and
+        # deleting that slot below would leave it undeletable (and
+        # `subvolume sync` waiting on it). Stop before touching anything.
+        log_error "Cannot unmount ${MOUNT_DIR} — aborting emergency rollback without touching any subvolume"
+        findmnt -R "$MOUNT_DIR" 2>/dev/null | head -20 >&2 || true
+        rm -f "$DEPLOY_PENDING" 2>/dev/null
+        exit 1
+    fi
     mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null || \
         log_warn "Failed to mount subvolid=5 — slot file writes may fail"
 
@@ -2108,7 +2133,7 @@ restore_candidate() {
                 echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
                 echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
                 _rc_cleanup_temp
-                umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+                _umount_tree "$MOUNT_DIR" || true
                 if generate_uki "$CANDIDATE_SLOT"; then
                     log "UKI regenerated for @${CANDIDATE_SLOT} from restored subvolume"
                     _efi_ok=1
@@ -2144,7 +2169,7 @@ restore_candidate() {
                 echo "$_rc_slot"       > "$MOUNT_DIR/@data/current-slot"  2>/dev/null || log_warn "Failed to write current-slot"
                 echo "$CANDIDATE_SLOT" > "$MOUNT_DIR/@data/previous-slot" 2>/dev/null || log_warn "Failed to write previous-slot"
                 _rc_cleanup_temp
-                umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+                _umount_tree "$MOUNT_DIR" || true
                 if generate_uki "$CANDIDATE_SLOT"; then
                     log "UKI generated for @${CANDIDATE_SLOT} — both slots consistent"
                     _efi_ok=1
@@ -2169,7 +2194,7 @@ restore_candidate() {
     fi
 
     is_mounted "$MOUNT_DIR" && btrfs_sync "$MOUNT_DIR"
-    umount -R "$MOUNT_DIR" 2>/dev/null || umount -R -l "$MOUNT_DIR" 2>/dev/null || true
+    _umount_tree "$MOUNT_DIR" || true
     rm -f "$DEPLOY_PENDING" 2>/dev/null
     rm -f "$REBOOT_NEEDED_FILE" 2>/dev/null || true
     rm -f "$BOOT_FAILURE_FILE" "${BOOT_FAILURE_FILE}.acked" "$BOOT_HARD_FAILURE_FILE" 2>/dev/null || true

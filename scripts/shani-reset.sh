@@ -310,6 +310,7 @@ else
         "${DATA_DIR}/boot_failure" \
         "${DATA_DIR}/boot_failure.acked" \
         "${DATA_DIR}/boot_hard_failure" \
+        "${DATA_DIR}/boot_safety_failed" \
         "${DATA_DIR}/deployment_pending" \
         2>/dev/null || true
     log_ok "  Boot markers cleared"

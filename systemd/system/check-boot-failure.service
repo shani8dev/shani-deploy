@@ -3,6 +3,9 @@ Description=Check Boot Success and Mark Boot Failure if Needed for Shani OS
 After=data.mount
 Requires=data.mount
 ConditionPathExists=/data/boot_in_progress
+# Record a failure of this unit itself where shani-health will see it after
+# a reboot (see shani-boot-safety-failed@.service).
+OnFailure=shani-boot-safety-failed@%n.service
 
 [Service]
 Type=oneshot

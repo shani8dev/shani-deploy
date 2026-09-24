@@ -2,6 +2,9 @@
 Description=Automatic System-Level Rollback for a Confirmed Boot Failure (Shani OS)
 After=data.mount mark-boot-in-progress.service
 Requires=data.mount
+# Record a failure of this unit itself where shani-health will see it after
+# a reboot (see shani-boot-safety-failed@.service).
+OnFailure=shani-boot-safety-failed@%n.service
 
 [Service]
 Type=oneshot

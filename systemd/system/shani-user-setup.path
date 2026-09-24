@@ -9,10 +9,12 @@ Requires=data.mount
 # Watch the upper-layer passwd directly — inotify on the OverlayFS merged path
 # (/etc/passwd) is unreliable; writes go to the upper layer and events are not
 # consistently delivered to watchers on the merged path.
-# PathExists fires once when the file is first created (copy-up on first useradd).
-# PathChanged fires on every subsequent write. Together they cover the full
-# lifecycle from an empty upper layer through all future user additions.
-PathExists=/data/overlay/etc/upper/passwd
+# PathChanged fires on every write, including the copy-up that first creates
+# the file. No PathExists= here: systemd re-checks PathExists= every time the
+# service exits, and this file exists on every installed system, so it
+# re-fired until TriggerLimitBurst tripped and left this unit failed
+# (trigger-limit-hit) seconds after every boot. First boot and slot switches
+# are covered by the /data/user-setup-needed marker below instead.
 PathChanged=/data/overlay/etc/upper/passwd
 
 # /etc/skel lives on the read-only root — watch the merged path here since skel

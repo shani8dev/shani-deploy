@@ -33,6 +33,22 @@ jobs:
       - name: Run upgrade-adviser tests
         run: bash tests/test_upgrade_adviser.sh
 
+  unit-files:
+    name: Unit files (systemd-analyze verify)
+    runs-on: ubuntu-latest
+    needs: lint
+    # Real Arch systemd, not the runner's Ubuntu one — the same systemd the
+    # image ships.
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install unit dependencies
+        run: pacman -Sy --noconfirm --needed flatpak
+
+      - name: Verify units
+        run: bash tests/verify-units.sh .
+
   security:
     name: Security
     uses: shani8dev/shani-ci-commons/.github/workflows/security.yml@main

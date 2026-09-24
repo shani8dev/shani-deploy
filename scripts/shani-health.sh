@@ -5957,7 +5957,7 @@ _section_package_managers() {
         fi
     fi
     # AppImages require FUSE to mount and run. Without it every .AppImage fails.
-    if find /home /root 2>/dev/null -maxdepth 4 -name '*.AppImage' -quit 2>/dev/null | grep -q .; then
+    if find /home /root -maxdepth 4 -name '*.AppImage' -quit 2>/dev/null | grep -q .; then
         local fuse_ok=0
         lsmod 2>/dev/null | grep -qw 'fuse' && fuse_ok=1
         command -v fusermount3 &>/dev/null && fuse_ok=1
@@ -8881,7 +8881,7 @@ export_logs() {
         | grep -vi 'password\|passwd\|secret\|token\|luks\|PIN' \
         > "$staging/journal-boot.log" 2>/dev/null || true
 
-    journalctl --no-pager -n 100 -u systemd-boot 2>/dev/null \
+    journalctl --no-pager -n 100 -u systemd-boot \
         > "$staging/journal-systemd-boot.log" 2>/dev/null || true
 
     {

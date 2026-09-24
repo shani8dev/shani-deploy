@@ -1264,9 +1264,10 @@ _validate_version() {
     local v="$1"
     [[ "$v" =~ ^[0-9]{8}$ ]] || return 1
     local y="${v:0:4}" m="${v:4:2}" d="${v:6:2}"
-    [[ "$y" < "2020" || "$y" > "2050" ]] && return 1
-    [[ "$m" < "01"   || "$m" > "12"   ]] && return 1
-    [[ "$d" < "01"   || "$d" > "31"   ]] && return 1
+    # 10#: base 10, so "08"/"09" aren't read as (invalid) octal
+    (( 10#$y < 2020 || 10#$y > 2050 )) && return 1
+    (( 10#$m < 1    || 10#$m > 12   )) && return 1
+    (( 10#$d < 1    || 10#$d > 31   )) && return 1
     return 0
 }
 

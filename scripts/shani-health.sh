@@ -1244,20 +1244,6 @@ _section_update_tools() {
             _rec "Partial downloads in /data/downloads — clean up: shani-deploy --cleanup"
         fi
     fi
-    # Lock file is in XDG_RUNTIME_DIR or ~/.cache — if it survives across boots
-    # (i.e. lives in a persistent location) and is old, the update process died
-    local _login_u_dep="$_CALLER_USER"
-    local _uhome_dep; _uhome_dep=$(getent passwd "${_login_u_dep}" 2>/dev/null | cut -d: -f6 || echo "")
-    if [[ -n "$_uhome_dep" ]]; then
-        local _lock="${_uhome_dep}/.cache/shani-update.lock"
-        if [[ -f "$_lock" ]]; then
-            local _lock_age; _lock_age=$(( ( $(date +%s) - $(stat -c '%Y' "$_lock" 2>/dev/null || echo "0") ) / 60 ))
-            if (( _lock_age > 30 )); then
-                _row "Upd lock"  "!   stale lock file (${_lock_age}min old) — update may be stuck"
-                _rec "Stale shani-update lock — remove: rm ${_lock}"
-            fi
-        fi
-    fi
     # shani-deploy tries aria2c → wget → curl; at least one must be present.
     # pv is optional but provides progress display during extraction.
     local dl_tools=()
@@ -5999,12 +5985,16 @@ _section_package_managers() {
             _row "plocate"     "!   plocate-updatedb.timer not enabled — locate results will be stale"
         fi
     fi
-    if _sysd_user is-active --quiet shani-update.timer 2>/dev/null; then
-        _row "shani-upd"  "OK  update checker active"
-    elif _sysd_user is-enabled --quiet shani-update.timer 2>/dev/null; then
-        _row "shani-upd"  "--  enabled, not yet started (starts at login)"
-    else
-        _row "shani-upd"  "!   shani-update.timer not enabled — OS updates won't be auto-checked"
+    # the desktop update notifier: Shani Cassini's user timer (it replaced
+    # shani-update, 2026-09-25); editions without a desktop have none
+    if [[ -f /usr/lib/systemd/user/shani-cassini-agent.timer ]]; then
+        if _sysd_user is-active --quiet shani-cassini-agent.timer 2>/dev/null; then
+            _row "cassini"    "OK  update/boot notifications active"
+        elif systemctl --global is-enabled --quiet shani-cassini-agent.timer 2>/dev/null; then
+            _row "cassini"    "--  enabled, not yet started (starts at login)"
+        else
+            _row "cassini"    "!   shani-cassini-agent.timer not enabled — no update or boot-failure notifications"
+        fi
     fi
 
     # Pre-check: PackageKit failure must always show
@@ -7949,17 +7939,20 @@ _check_auto_updates() {
             _rec "Enable: systemctl enable --now pacman-auto-update"
             issues=$((issues + 1))
         fi
-    elif systemctl cat shani-update.timer &>/dev/null; then
-        if systemctl is-enabled --quiet shani-update.timer; then
-            _row "shani-update" "OK  timer enabled"
+    elif [[ -f /usr/lib/systemd/user/shani-cassini-agent.timer ]]; then
+        # a user unit: enabled for every user (--global), not system-wide
+        if systemctl --global is-enabled --quiet shani-cassini-agent.timer 2>/dev/null; then
+            _row "Update checks" "OK  Shani Cassini checks at login and every 2 h"
         else
-            _row "shani-update" "!   timer disabled"
-            _rec "Enable: systemctl enable --now shani-update.timer"
+            _row "Update checks" "!   shani-cassini-agent.timer disabled"
+            _rec "Enable: sudo systemctl --global enable shani-cassini-agent.timer"
             issues=$((issues + 1))
         fi
+    elif command -v shani-deploy &>/dev/null; then
+        _row "Update checks" "--  no desktop notifier on this edition - update with: sudo shani-deploy"
     else
         _row "Auto-updates" "!!  no auto-update mechanism detected"
-        _rec "Install and enable unattended-upgrades, pacman-auto-update, or shani-update.timer"
+        _rec "Install and enable unattended-upgrades or pacman-auto-update"
         issues=$((issues + 1))
     fi
 
@@ -7993,10 +7986,12 @@ _fix_issues() {
     [[ "$FIX_MODE" == "yes" ]] || return 0
     _log_section "Auto-Fix Mode"
 
-    # Fix: enable shani-update.timer if disabled
-    if systemctl cat shani-update.timer &>/dev/null && ! systemctl is-enabled --quiet shani-update.timer; then
-        _log "Enabling shani-update.timer..."
-        systemctl enable --now shani-update.timer 2>/dev/null && _log_ok "Enabled shani-update.timer" || _log_warn "Failed to enable shani-update.timer"
+    # Fix: enable the desktop update notifier for every user if disabled
+    if [[ -f /usr/lib/systemd/user/shani-cassini-agent.timer ]] && \
+       ! systemctl --global is-enabled --quiet shani-cassini-agent.timer 2>/dev/null; then
+        _log "Enabling shani-cassini-agent.timer for all users..."
+        systemctl --global enable shani-cassini-agent.timer 2>/dev/null \
+            && _log_ok "Enabled shani-cassini-agent.timer" || _log_warn "Failed to enable shani-cassini-agent.timer"
     fi
 
     # Fix: enable pacman-db-refresh.timer if disabled

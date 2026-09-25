@@ -2706,6 +2706,36 @@ list_backups() {
 ### Channel Status                ###
 #####################################
 
+# --status [--check] --json: read-only state for GUIs (Shani Cassini) and
+# scripts. Needs no root and takes no deploy lock (handled before both in
+# main): only world-readable files, plus with --check the channel pointers
+# over HTTPS. Values are sanitized to [0-9A-Za-z._-], so plain printf JSON.
+status_json() {
+    local check="$1" booted cur prev ver prof chan fail
+    booted=$(get_booted_subvol 2>/dev/null || true)
+    cur=$(tr -cd 'a-z' 2>/dev/null < /data/current-slot || true)
+    prev=$(tr -cd 'a-z' 2>/dev/null < /data/previous-slot || true)
+    ver=$(tr -cd '0-9' 2>/dev/null < /etc/shani-version || true)
+    prof=$(tr -cd 'a-z0-9_-' 2>/dev/null < /etc/shani-profile || true)
+    chan=$(read_channel_from_file 2>/dev/null || true); chan=${chan:-stable}
+    fail=$(tr -cd 'a-z' 2>/dev/null < /data/boot_failure || true)
+    local remote_stable="" remote_latest="" update="null" f
+    if [[ "$check" == yes && -n "$prof" ]]; then
+        for f in stable latest; do
+            local v
+            v=$(curl -fsSL --connect-timeout 5 --max-time 10 "${R2_BASE_URL}/${prof}/${f}.txt" 2>/dev/null \
+                | grep -oE '[0-9]{8}' | head -1 || true)
+            [[ $f == stable ]] && remote_stable=$v || remote_latest=$v
+        done
+        local want; [[ $chan == latest ]] && want=$remote_latest || want=$remote_stable
+        if [[ -n "$want" && -n "$ver" ]]; then
+            (( want > ver )) && update=true || update=false
+        fi
+    fi
+    printf '{"version":"%s","profile":"%s","channel":"%s","booted_slot":"%s","current_slot":"%s","previous_slot":"%s","boot_failure":"%s","remote":{"stable":"%s","latest":"%s"},"update_available":%s}\n' \
+        "$ver" "$prof" "$chan" "$booted" "$cur" "$prev" "$fail" "$remote_stable" "$remote_latest" "$update"
+}
+
 channel_status() {
     log_section "Channel Status"
     check_tools
@@ -3872,6 +3902,8 @@ Options:
   --verify-existing       Verify current deployment integrity without updating
   --list-backups          List available rollback backups with timestamps
   --channel-status        Show latest/stable versions available remotely
+  --status --json         Machine-readable state (slots, version, channel); no root
+  --status --check --json  ...plus the remote stable/latest and update_available
   --skip-self-update      Skip auto-update of shani-deploy
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
 
@@ -3890,6 +3922,7 @@ main() {
     local ROLLBACK="no" CLEANUP="no" STORAGE_OPTIMIZE="no"
     local SET_CHANNEL="no" SET_CHANNEL_VAL=""
     local VERIFY_EXISTING="no" LIST_BACKUPS="no" CHANNEL_STATUS="no"
+    local STATUS_ONLY="no" STATUS_CHECK="no" STATUS_JSON="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3905,6 +3938,9 @@ main() {
             --verify-existing) VERIFY_EXISTING="yes"; shift ;;
             --list-backups) LIST_BACKUPS="yes"; shift ;;
             --channel-status) CHANNEL_STATUS="yes"; shift ;;
+            --status) STATUS_ONLY="yes"; shift ;;
+            --check) STATUS_CHECK="yes"; shift ;;
+            --json) STATUS_JSON="yes"; shift ;;
             -t|--channel)
                 [[ $# -ge 2 ]] || die "Missing argument for $1 (expected 'stable' or 'latest')"
                 UPDATE_CHANNEL="$2"; shift 2 ;;
@@ -3924,6 +3960,14 @@ main() {
             die "--download-only cannot be combined with --rollback, --cleanup, --optimize, --set-channel, --verify-existing, --list-backups, or --channel-status"
         fi
     fi
+
+    # read-only status: before check_root and the deploy lock on purpose
+    if [[ "$STATUS_ONLY" == "yes" ]]; then
+        [[ "$STATUS_JSON" == "yes" ]] || die "--status currently needs --json (human view: --channel-status / --verify-existing)"
+        status_json "$STATUS_CHECK"
+        exit 0
+    fi
+    [[ "$STATUS_CHECK" == "yes" || "$STATUS_JSON" == "yes" ]] && die "--check/--json go with --status"
 
     check_root
     acquire_deploy_lock

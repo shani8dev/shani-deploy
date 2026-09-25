@@ -334,6 +334,16 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
 
 ## Audit-verified known issues (confirmed present)
 
+- **Machine-readable interfaces (2026-09-25) — contracts with Shani
+  Cassini; change them together:** `shani-deploy --status [--check] --json`
+  (read-only, handled before check_root and the deploy lock), `gen-efi
+  tpm2-status --json` (stdout is the JSON alone: `log()` writes to stdout,
+  so the branch redirects it), `gen-efi enroll-tpm2 --stdin [--with-pin]`
+  (secrets via stdin -> systemd-cryptenroll's PASSWORD/NEWPIN, never argv).
+- **Oversized swapfiles from old ISOs:** `check_space` shrinks/drops
+  /swap/swapfile when the update does not fit (`reclaim_swap_space`) and
+  `sync -f`s before re-measuring — Btrfs' df only moves on commit.
+
 - **`-r` from the updated system destroyed the previous one — FIXED
   (2026-09-25).** `rollback_system` assumed it runs from the slot to keep
   and repaired the other from its backup; the previous slot has no backup

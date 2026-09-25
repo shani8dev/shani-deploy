@@ -334,6 +334,28 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
 
 ## Audit-verified known issues (confirmed present)
 
+- **`-r` from the updated system destroyed the previous one — FIXED
+  (2026-09-25).** `rollback_system` assumed it runs from the slot to keep
+  and repaired the other from its backup; the previous slot has no backup
+  (it was never a deploy candidate), so it was replaced with a snapshot of
+  the booted one - both slots ran the new build. The docs and the fleet
+  guide (`ssh ... 'shani-deploy -r && reboot'`) run it exactly that way.
+  Now: booted slot newer than the other and no recorded boot failure ->
+  `switch_to_sibling_slot ... go-back` (boot entries + markers only). The
+  suite's `rollback:restored` check (shani-testbed) now fails the old
+  behaviour; it exited 0 and passed before.
+- **Found by shani-testbed's release gate on 2026-09-24, all FIXED:** a
+  successful deploy exited 1 when the reboot timer could not be armed;
+  self-update carried a pre-2026-08-21 script's `AUTO_REBOOT=yes`;
+  `shani-user-setup` compared shells by name (/bin/zsh vs /usr/bin/zsh
+  after the sbin merge) and rewrote passwd on every run until the path
+  unit's trigger limit killed it, and it forced every user back to zsh
+  (now only a missing shell is replaced); fstab bind sources were created
+  at the Btrfs top level (a stray `data/varlib/*`) instead of `@data`;
+  `check_space` ran before knowing whether an update exists; a
+  deploy-time swapfile ignored the update reserve; `shani-health
+  --security` scored no units (systemd-analyze only lists loaded ones).
+
 - **Chroot teardown left `/mnt/proc` mounted under nspawn; the emergency
   rollback then hung forever in `btrfs subvolume sync` — FIXED
   (2026-09-24).** The mandatory suite's `upgrade` failed twice (2026-09-23

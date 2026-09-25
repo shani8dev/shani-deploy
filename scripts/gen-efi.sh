@@ -5,6 +5,10 @@
 #   ./gen-efi.sh configure <target_slot>  — generate/update UKI for a slot
 #   ./gen-efi.sh enroll-mok               — stage MOK enrollment without rebuilding UKI
 #   ./gen-efi.sh enroll-tpm2              — enroll TPM2 for automatic LUKS unlock
+#   ./gen-efi.sh enroll-tpm2 --stdin [--with-pin]
+#                                         — same without prompts (GUIs: Shani Cassini):
+#                                           line 1 = LUKS passphrase, line 2 = TPM2 PIN
+#   ./gen-efi.sh tpm2-status --json       — encryption / TPM2 / Secure Boot state
 #   ./gen-efi.sh cleanup-mok             — remove old MOK keys after new key is confirmed
 #   ./gen-efi.sh cleanup-tpm2            — remove stale TPM2 LUKS slots after re-enrolment
 #   ./gen-efi.sh remove-tpm2             — fully disable TPM2 auto-unlock (all slots)
@@ -40,11 +44,13 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" && "${1:-}" != "tpm2-status" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
+    echo "  $0 enroll-tpm2 --stdin [--with-pin]  — same, no prompts: passphrase (then PIN) on stdin"
+    echo "  $0 tpm2-status --json        — encryption / TPM2 / Secure Boot state as JSON"
     echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
     echo "  $0 cleanup-tpm2              — remove stale TPM2 LUKS slots after re-enrolment"
     echo "  $0 remove-tpm2               — fully disable TPM2 auto-unlock (wipes all TPM2 slots)"
@@ -1301,6 +1307,28 @@ enroll_mok() {
 # Your LUKS passphrase remains valid as a fallback at all times.
 # Re-enroll after: firmware updates, enabling/disabling Secure Boot, MOK changes.
 enroll_tpm2() {
+    # --stdin [--with-pin]: no prompts. The passphrase (and PIN) go to
+    # systemd-cryptenroll through its own $PASSWORD / $NEWPIN variables,
+    # never argv. Read before anything else can touch stdin.
+    local from_stdin=0 want_pin=0 a
+    for a in "$@"; do
+        case "$a" in
+            --stdin) from_stdin=1 ;;
+            --with-pin) want_pin=1 ;;
+            *) error_exit "enroll-tpm2: unknown option $a" ;;
+        esac
+    done
+    if (( want_pin && !from_stdin )); then error_exit "--with-pin goes with --stdin"; fi
+    if (( from_stdin )); then
+        IFS= read -r PASSWORD || true
+        [[ -n "${PASSWORD:-}" ]] || error_exit "enroll-tpm2 --stdin: no passphrase on stdin"
+        export PASSWORD
+        if (( want_pin )); then
+            IFS= read -r NEWPIN || true
+            [[ -n "${NEWPIN:-}" ]] || error_exit "enroll-tpm2 --stdin --with-pin: no PIN on stdin"
+            export NEWPIN
+        fi
+    fi
     # Must run on live system — TPM hardware not accessible in chroot
     if in_chroot; then
         error_exit "enroll-tpm2 must run on the live booted system, not inside a chroot"
@@ -1371,7 +1399,11 @@ enroll_tpm2() {
     local tpm2_pin_flag=""
     local use_tpm2_pin
     # || use_tpm2_pin="": same EOF reasoning as remove_tpm2()'s confirm read.
-    read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin || use_tpm2_pin=""
+    if (( from_stdin )); then
+        (( want_pin )) && use_tpm2_pin=Y || use_tpm2_pin=N
+    else
+        read -r -p "Require a TPM2 PIN at boot? [y/N]: " use_tpm2_pin || use_tpm2_pin=""
+    fi
     use_tpm2_pin="${use_tpm2_pin:-N}"
     if [[ "${use_tpm2_pin^^}" == "Y" ]]; then
         tpm2_pin_flag="--tpm2-with-pin=yes"
@@ -1379,7 +1411,7 @@ enroll_tpm2() {
     else
         log "TPM2 PIN not set — disk will unlock automatically on matching hardware"
     fi
-    log "You will be prompted for your LUKS passphrase"
+    (( from_stdin )) || log "You will be prompted for your LUKS passphrase"
     systemd-cryptenroll \
         --tpm2-device=auto \
         --tpm2-pcrs="${pcrs}" \
@@ -1402,7 +1434,33 @@ enroll_tpm2() {
     log "      cryptsetup luksDump ${underlying} | grep systemd-tpm2"
 }
 
+# tpm2-status --json: what a GUI shows on its encryption page. Read-only.
+tpm2_status_json() {
+    local enc=false tpm=false enrolled=false pin=false sb=false slots=0 dev="" dump=""
+    [[ -e "/dev/mapper/${ROOTLABEL}" ]] && enc=true
+    if command -v systemd-cryptenroll &>/dev/null \
+       && { systemd-cryptenroll --tpm2-device=list 2>/dev/null || true; } | grep -q '/dev/'; then
+        tpm=true
+    fi
+    if [[ $enc == true ]]; then
+        dev=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: *//p' | awk '{print $NF}' || true)
+        [[ -n "$dev" ]] && dump=$(cryptsetup luksDump "$dev" 2>/dev/null || true)
+        slots=$(grep -cE '^[[:space:]]+[0-9]+: systemd-tpm2' <<<"$dump" || true)
+        (( slots > 0 )) && enrolled=true
+        grep -qE 'tpm2-pin:[[:space:]]+true' <<<"$dump" && pin=true
+    fi
+    [[ "$(mokutil --sb-state 2>/dev/null || true)" == *"SecureBoot enabled"* ]] && sb=true
+    printf '{"encrypted":%s,"tpm2_present":%s,"tpm2_enrolled":%s,"tpm2_slots":%s,"tpm2_pin":%s,"secure_boot":%s,"luks_device":"%s"}\n' \
+        "$enc" "$tpm" "$enrolled" "${slots:-0}" "$pin" "$sb" "$dev"
+}
+
 case "${1:-}" in
+    tpm2-status)
+        [[ "${2:-}" == "--json" ]] || error_exit "tpm2-status currently needs --json"
+        # log() writes to stdout: keep stdout for the JSON alone
+        exec 3>&1 1>&2
+        tpm2_status_json >&3
+        ;;
     configure)
         generate_uki "$TARGET_SLOT"
         log "UKI generated for ${TARGET_SLOT}"
@@ -1411,7 +1469,7 @@ case "${1:-}" in
         enroll_mok
         ;;
     enroll-tpm2)
-        enroll_tpm2
+        enroll_tpm2 "${@:2}"
         ;;
     cleanup-mok)
         cleanup_mok

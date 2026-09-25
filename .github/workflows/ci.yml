@@ -30,6 +30,9 @@ jobs:
       - name: Run deploy-state tests
         run: bash tests/test-deploy-state.sh
 
+      - name: Run status-json contract tests
+        run: bash tests/test-status-json.sh
+
       - name: Run upgrade-adviser tests
         run: bash tests/test_upgrade_adviser.sh
 

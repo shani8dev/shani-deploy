@@ -62,6 +62,12 @@ DEFAULT_deploy_license_file="/etc/shani-license"
 DEFAULT_deploy_pending="/data/deployment_pending"
 DEFAULT_deploy_boot_failure="/data/boot_failure"
 DEFAULT_deploy_boot_hard_failure="/data/boot_hard_failure"
+DEFAULT_deploy_auto_rollback_done="/data/auto_rollback_done"
+# Read paths only — the WRITES below still use the literal /data/current-slot
+# and /data/previous-slot; never change one without the other. Same defaults
+# as the literals, and the same paths check-boot-failure.sh already reads.
+DEFAULT_deploy_current_slot="/data/current-slot"
+DEFAULT_deploy_prev_slot="/data/previous-slot"
 DEFAULT_deploy_genefi_script="/usr/local/bin/gen-efi"
 DEFAULT_deploy_genefi_script_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/gen-efi.sh"
 DEFAULT_deploy_gpg_key_id="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
@@ -96,6 +102,9 @@ LICENSE_FILE="${deploy_license_file:-${DEFAULT_deploy_license_file}}"
 DEPLOY_PENDING="${deploy_pending:-${DEFAULT_deploy_pending}}"
 BOOT_FAILURE_FILE="${deploy_boot_failure:-${DEFAULT_deploy_boot_failure}}"
 BOOT_HARD_FAILURE_FILE="${deploy_boot_hard_failure:-${DEFAULT_deploy_boot_hard_failure}}"
+AUTO_ROLLBACK_DONE_FILE="${deploy_auto_rollback_done:-${DEFAULT_deploy_auto_rollback_done}}"
+CURRENT_SLOT_FILE="${deploy_current_slot:-${DEFAULT_deploy_current_slot}}"
+PREV_SLOT_FILE="${deploy_prev_slot:-${DEFAULT_deploy_prev_slot}}"
 GENEFI_SCRIPT="${deploy_genefi_script:-${DEFAULT_deploy_genefi_script}}"
 GENEFI_SCRIPT_URL="${deploy_genefi_script_url:-${DEFAULT_deploy_genefi_script_url}}"
 GPG_KEY_ID="${deploy_gpg_key_id:-${DEFAULT_deploy_gpg_key_id}}"
@@ -175,8 +184,11 @@ readonly GENEFI_SCRIPT_URL="${GENEFI_SCRIPT_URL}"
 readonly DEPLOY_PENDING="${DEPLOY_PENDING}"
 readonly BOOT_FAILURE_FILE="${BOOT_FAILURE_FILE}"
 readonly BOOT_HARD_FAILURE_FILE="${BOOT_HARD_FAILURE_FILE}"
+readonly AUTO_ROLLBACK_DONE_FILE="${AUTO_ROLLBACK_DONE_FILE}"
+readonly CURRENT_SLOT_FILE="${CURRENT_SLOT_FILE}"
+readonly PREV_SLOT_FILE="${PREV_SLOT_FILE}"
 # /run is tmpfs — cleared automatically on every reboot, so no manual cleanup needed.
-# Written world-readable so shani-update (running as a normal user) can read it.
+# Written world-readable so the desktop agent (Shani Cassini, as the user) can read it.
 readonly REBOOT_NEEDED_FILE="${REBOOT_NEEDED_FILE}"
 readonly LOCK_FILE="${LOCK_FILE}"
 readonly GPG_KEY_ID="${GPG_KEY_ID}"
@@ -2710,15 +2722,75 @@ list_backups() {
 # scripts. Needs no root and takes no deploy lock (handled before both in
 # main): only world-readable files, plus with --check the channel pointers
 # over HTTPS. Values are sanitized to [0-9A-Za-z._-], so plain printf JSON.
+#
+# Every recovery field below is read from a marker some other part of this
+# repo really writes, and unreadable/absent state is reported empty or false,
+# never guessed. The system recovers on its own (shani-auto-rollback.timer);
+# this only tells the user what the markers actually say.
+#   boot_failure        slot from $BOOT_FAILURE_FILE, else from the
+#                       $BOOT_FAILURE_FILE.acked copy left behind once the
+#                       marker was acknowledged — the same precedence
+#                       rollback_system() uses, so --status can never
+#                       disagree with what --rollback would act on.
+#                       "" = no failure recorded.
+#   boot_hard_failure   slot from $BOOT_HARD_FAILURE_FILE, written by the
+#                       dracut initramfs hook before the root mount is even
+#                       attempted; takes priority over the soft marker.
+#                       "" = none recorded.
+#   auto_rollback_done  true once unattended shani-auto-rollback has run THIS
+#                       boot. Written on success AND on failure (it is the
+#                       "do not retry this boot" flag) and cleared at the
+#                       start of every boot by mark-boot-in-progress.service,
+#                       so true means "already attempted this boot", NOT
+#                       "recovered" — the outcome is in the journal.
+#   reboot_needed       version from $REBOOT_NEEDED_FILE, written by
+#                       finalize_update() and removed by every rollback path;
+#                       /run is tmpfs so it also vanishes on the next reboot.
+#                       "" = no finished deploy awaiting a reboot.
+#   candidate_boot      true only while such a finished deploy is still
+#                       pending in this session: the reboot marker exists AND
+#                       the slot markers show the default really moved to the
+#                       other slot while we keep running the old one. It must
+#                       NOT be derived from `booted != current` alone — that
+#                       is equally true after a bootloader fallback (a
+#                       failure, see boot_failure) and after a rollback has
+#                       already switched the default, where nothing is pending
+#                       at all. Fails closed to false when either input is
+#                       missing or not a real slot name.
+# `booted_slot` is "" when the running subvolume cannot be determined at all
+# (no subvol= on /proc/cmdline and no btrfs default) — reported, not fatal.
 status_json() {
     local check="$1" booted cur prev ver prof chan fail
-    booted=$(get_booted_subvol 2>/dev/null || true)
-    cur=$(tr -cd 'a-z' 2>/dev/null < /data/current-slot || true)
-    prev=$(tr -cd 'a-z' 2>/dev/null < /data/previous-slot || true)
+    # `|| booted=""` must sit OUTSIDE the substitution: get_booted_subvol
+    # ends in die(), and an `exit` inside $(...) terminates the subshell
+    # before an inner `|| true` can run, so the assignment itself returns
+    # non-zero and aborts the whole script under `set -e` — no JSON at all.
+    booted=$(get_booted_subvol 2>/dev/null) || booted=""
+    cur=$(tr -cd 'a-z' 2>/dev/null < "$CURRENT_SLOT_FILE" || true)
+    prev=$(tr -cd 'a-z' 2>/dev/null < "$PREV_SLOT_FILE" || true)
     ver=$(tr -cd '0-9' 2>/dev/null < /etc/shani-version || true)
     prof=$(tr -cd 'a-z0-9_-' 2>/dev/null < /etc/shani-profile || true)
     chan=$(read_channel_from_file 2>/dev/null || true); chan=${chan:-stable}
-    fail=$(tr -cd 'a-z' 2>/dev/null < /data/boot_failure || true)
+    if [[ -f "$BOOT_FAILURE_FILE" ]]; then
+        fail=$(tr -cd 'a-z' 2>/dev/null < "$BOOT_FAILURE_FILE" || true)
+    elif [[ -f "${BOOT_FAILURE_FILE}.acked" ]]; then
+        fail=$(tr -cd 'a-z' 2>/dev/null < "${BOOT_FAILURE_FILE}.acked" || true)
+    else
+        fail=""
+    fi
+    local hard auto=false reboot candidate=false
+    hard=$(tr -cd 'a-z' 2>/dev/null < "$BOOT_HARD_FAILURE_FILE" || true)
+    if [[ -f "$AUTO_ROLLBACK_DONE_FILE" ]]; then
+        auto=true
+    fi
+    if [[ -f "$REBOOT_NEEDED_FILE" ]]; then
+        reboot=$(tr -cd '0-9A-Za-z.-' 2>/dev/null < "$REBOOT_NEEDED_FILE" | head -c 32 || true)
+    else
+        reboot=""
+    fi
+    if [[ -n "$reboot" && "$cur" =~ ^(blue|green)$ && "$booted" =~ ^(blue|green)$ && "$booted" != "$cur" ]]; then
+        candidate=true
+    fi
     local remote_stable="" remote_latest="" update="null" f
     if [[ "$check" == yes && -n "$prof" ]]; then
         for f in stable latest; do
@@ -2732,8 +2804,8 @@ status_json() {
             (( want > ver )) && update=true || update=false
         fi
     fi
-    printf '{"version":"%s","profile":"%s","channel":"%s","booted_slot":"%s","current_slot":"%s","previous_slot":"%s","boot_failure":"%s","remote":{"stable":"%s","latest":"%s"},"update_available":%s}\n' \
-        "$ver" "$prof" "$chan" "$booted" "$cur" "$prev" "$fail" "$remote_stable" "$remote_latest" "$update"
+    printf '{"version":"%s","profile":"%s","channel":"%s","booted_slot":"%s","current_slot":"%s","previous_slot":"%s","boot_failure":"%s","boot_hard_failure":"%s","auto_rollback_done":%s,"candidate_boot":%s,"reboot_needed":"%s","remote":{"stable":"%s","latest":"%s"},"update_available":%s}\n' \
+        "$ver" "$prof" "$chan" "$booted" "$cur" "$prev" "$fail" "$hard" "$auto" "$candidate" "$reboot" "$remote_stable" "$remote_latest" "$update"
 }
 
 channel_status() {
@@ -3778,7 +3850,7 @@ finalize_update() {
         log_warn "Failed to remove deployment pending flag"
     fi
 
-    # Write reboot-needed marker so shani-update can surface the reboot dialog
+    # Write reboot-needed marker: Shani Cassini's agent offers the restart
     # to the desktop session. pkexec strips DISPLAY/WAYLAND_DISPLAY so we cannot
     # call notify-send here reliably. The marker stores the deployed version so
     # the dialog can show what was installed.
@@ -3846,7 +3918,7 @@ finalize_update() {
     log "  Please reboot to switch to the updated slot"
     log "  Tip: run with --optimize to reclaim disk space via deduplication"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    # Desktop notification is handled by shani-update which reads the
+    # Desktop notification comes from Shani Cassini's agent, which reads the
     # reboot-needed marker above — pkexec strips DISPLAY so notify-send here
     # would silently fail.
 
@@ -3945,7 +4017,8 @@ Options:
   --verify-existing       Verify current deployment integrity without updating
   --list-backups          List available rollback backups with timestamps
   --channel-status        Show latest/stable versions available remotely
-  --status --json         Machine-readable state (slots, version, channel); no root
+  --status --json         Machine-readable state (slots, version, channel, boot/recovery
+                          markers); no root. See status_json() for the field contract.
   --status --check --json  ...plus the remote stable/latest and update_available
   --skip-self-update      Skip auto-update of shani-deploy
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)

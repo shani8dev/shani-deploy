@@ -3,7 +3,10 @@
 Blue-green deployment, health/diagnostics, and system-recovery tooling for
 Shanios — an immutable, Btrfs-backed Arch Linux derivative that updates by
 writing a full new OS copy to an inactive root subvolume while the running
-system stays untouched, then switching to it on the next boot.
+system stays untouched, then switching to it on the next boot. The retired
+`shani-update` front end is not the current user updater: users operate
+these functions through Shani Cassini's **Updates & Rollback** page, backed
+by this deployment engine.
 
 This repo is standalone read-mostly-plus-deploy tooling: `shani-deploy`
 writes the new state, `shani-health` inspects and reports on it,
@@ -23,8 +26,9 @@ install already finished before you ever reboot.
 
 If the new slot fails to boot, systemd-boot's own boot-counting (`+3-0`
 tries) falls back to the previous slot automatically, and the
-`check-boot-failure` machinery records what happened so `shani-update` can
-offer to roll back.
+`check-boot-failure` machinery records what happened. Shani Cassini reads
+that state through `shani-deploy --status --check --json` and surfaces it
+in Updates & Rollback.
 
 ## Scripts
 
@@ -53,9 +57,16 @@ Clears a stale boot-failure marker after a successful boot. Triggered by the `ma
 
 System health, security, and diagnostics — read-mostly, no deployment side effects. Run with no arguments for a full report, or scope it down with `--security`, `--boot`, `--network`, `--verify`, etc.
 
-### `scripts/shani-update.sh`
+### Shani Cassini integration
 
-User-facing update wrapper. Resolves the update channel, validates input, and launches `shani-deploy` with sanitized environment.
+The user-facing deployment and rollback interface lives in
+[`../shani-cassini`](../shani-cassini), not in a `shani-update` wrapper.
+Cassini's **Updates & Rollback** page invokes `shani-deploy` (or
+`pkexec shani-deploy --rollback`) and uses the read-only
+`shani-deploy --status --check --json` contract to display update and
+recovery state. Its packaged `shani-cassini-agent.timer` periodically runs
+the same status check and sends notifications; the agent does not deploy or
+roll back.
 
 ### `scripts/gen-efi.sh`
 
@@ -73,8 +84,9 @@ Syncs extra groups, default shell, and one-time per-user bootstrap for every reg
 Runs from `check-boot-failure.timer` (15 minutes after boot). If
 `boot_in_progress` is still present and `boot-ok` was never written, the
 boot didn't complete cleanly even though it didn't hard-fail at the
-initramfs level — records which slot failed so `shani-update` can offer a
-rollback on next run.
+initramfs level. It records which slot failed; Shani Cassini reads the
+marker-derived state through `shani-deploy --status --check --json` and
+offers the appropriate recovery in **Updates & Rollback**.
 
 ### `scripts/shani-reset.sh`
 Factory reset: wipes `/data` (all `/etc`/`/var` overlay changes, service
@@ -99,9 +111,9 @@ guesses. Idempotent via `/data/auto_rollback_done` (cleared each boot by
 ### `scripts/shani-upgrade-adviser.sh`
 
 Pre-upgrade safety check. Advises whether a system upgrade is safe before
-`shani-update` proceeds (Btrfs snapshot state, free space, running
-services, pending transactions). Supports `--json` for machine-readable
-output.
+Shani Cassini proceeds with deployment (Btrfs snapshot state, free space,
+running services, pending transactions). Supports `--json` for
+machine-readable output.
 
 ## systemd units
 
@@ -111,23 +123,25 @@ reached, `check-boot-failure.timer`/`.service` (15 min post-boot) catches
 it. `bless-boot.service` handles systemd-boot's own boot-counting
 integration.
 
-**Updates:** `shani-update.timer`/`.service` (user-level) — the periodic
-unattended check-for-updates path. `shani-download-only.timer`/`.service`
-(system-level) — an opt-in pre-fetch-only timer, separate from actually
-deploying. `flatpak-update-system.timer`/`.service` and the user-level
-`flatpak-update-user.timer`/`.service` — Flatpak updates, independent of
-the OS slot update cycle.
+**Updates:** Shani Cassini's **Updates & Rollback** page is the
+user-facing deploy and rollback interface. Its packaged
+`shani-cassini-agent.timer`/`.service` runs the read-only update and boot
+status check periodically and sends notifications; it does not install an
+update or perform rollback. `shani-download-only.timer`/`.service`
+(system-level) is a separate opt-in pre-fetch-only timer.
+`flatpak-update-system.timer`/`.service` and the user-level
+`flatpak-update-user.timer`/`.service` handle Flatpak updates independently
+of the OS slot update cycle.
 
 **User provisioning:** `shani-user-setup.path`/`.service` — see above.
 
 **Maintenance:** `beesd-setup.service` — runs `beesd-setup.sh` once to
 configure continuous dedup.
 
-**Boot failure recovery:** `shani-auto-rollback.service`/`.timer` —
+**Boot failure recovery:** `shani-auto-rollback.service`/`.timer` provides
 system-level, unattended rollback on a recorded boot failure (see
-`shani-auto-rollback.sh` above). `shani-update-tray.service` — persistent
-system-tray icon (`shani-update --tray`), started at
-`WantedBy=graphical-session.target`.
+`shani-auto-rollback.sh` above). The current desktop interface for review
+and manual rollback is Shani Cassini's **Updates & Rollback** page.
 
 ## Recovery paths
 
@@ -222,11 +236,13 @@ and the blog reference posts mirror this README's flag tables.
   signing logic, check `shani-fleet/agent/bin/shani-fleet-agent` for the
   same class of bug — it's a separate implementation of the same pattern,
   not shared code.
-- `get_booted_subvol()` is reimplemented separately in 4 copies:
-  `scripts/shani-deploy.sh`, `scripts/shani-update.sh`,
-  `scripts/gen-efi.sh`, and `scripts/shani-health.sh` — kept as 4 copies
-  deliberately (no shared-lib mechanism exists). If you fix a bug in the
-  shared parsing logic, find every copy and fix them all.
+- `get_booted_subvol()` is present in the three shipped commands
+  `scripts/shani-deploy.sh`, `scripts/gen-efi.sh`, and
+  `scripts/shani-health.sh`. A fourth copy historically lived in the
+  retired `scripts/shani-update.sh` wrapper and is removed by the current
+  source migration. Keep the three shipped implementations' parsing
+  behavior aligned; they remain independent because there is no
+  shared-library mechanism.
 
 **Trust model:** See `SECURITY.md` for the intended trust model
 (fingerprint-pinned GPG, atomic boot-entry writes, fail-closed

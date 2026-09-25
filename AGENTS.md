@@ -51,11 +51,12 @@ execution.
 
 ```bash
 # 1. Syntax check every script you touched
-bash -n scripts/shani-deploy.sh scripts/gen-efi.sh scripts/shani-update.sh \
-        scripts/check-boot-failure.sh
+bash -n scripts/shani-deploy.sh scripts/gen-efi.sh \
+        scripts/check-boot-failure.sh scripts/shani-auto-rollback.sh
 
 # 2. The unit-level state/marker tests (fast, no container needed)
 bash tests/test-deploy-state.sh     # expect: ✓ N passed, 0 failed
+bash tests/test-status-json.sh      # expect: ✓ 20 passed, 0 failed
 ```
 
 `tests/test-deploy-state.sh` used to always fail (it grepped a file from a
@@ -137,6 +138,7 @@ for script in scripts/*.sh bin/*.sh; do bash -n "$script"; done
 
 # Unit tests
 bash tests/test-deploy-state.sh     # expect: ✓ N passed, 0 failed
+bash tests/test-status-json.sh      # expect: ✓ 20 passed, 0 failed
 bash tests/test_upgrade_adviser.sh  # expect: 21 passed, 0 failed
 ```
 
@@ -172,15 +174,15 @@ changes to `shani-deploy.sh`/`gen-efi.sh` actually need:
 ./run_in_container.sh build.sh test upgrade --local-src=/opt/shani-deploy/scripts
 ```
 
-This calls `shani-deploy` directly (not through `shani-update`, which
-needs a real display to open its progress terminal) with `--force
---channel latest --skip-self-update` — `--skip-self-update` matters here,
-not just as a flag: without it, `shani-deploy`'s own `self_update()` would
-fetch and exec the *published* script mid-run, silently discarding the
-`--local-src`-overlaid edited copy you're trying to test. Downloaded
-images are cached at a host-persistent path (survives even a fresh
-`bootstrap` re-run) — see `--local-src`/caching details in
-`../shani-install-media/test-env/README.md`.
+This invokes `shani-deploy` directly with `--force --channel latest
+--skip-self-update`. Shani Cassini's **Updates & Rollback** page normally
+drives the same engine through `pkexec`, but the harness runs inside a root
+nspawn session and therefore calls it directly. `--skip-self-update`
+matters here: without it, `shani-deploy`'s own `self_update()` would fetch
+and exec the published script mid-run, silently discarding the
+`--local-src`-overlaid edited copy. Downloaded images are cached at a
+host-persistent path (survives even a fresh `bootstrap` re-run) — see
+`--local-src`/caching details in `../shani-testbed/lib/deploy.sh`.
 
 For testing an individual function in isolation (a specific fault
 condition, e.g. a stub `sbsign` that "succeeds" while writing garbage —
@@ -232,88 +234,40 @@ for the full command reference.
   exercises the happy path doesn't prove the bug is fixed, only that nothing
   broke.
 
-## Testing GUI/desktop changes in this repo
+## Testing Shani Cassini and harness compatibility
 
-`shani-update.sh`'s `show_dialog`/`show_alert`/`_run_gui_progress`/`_launch_*`
-code cannot be verified by reading — a yad flag that doesn't parse, an SVG
-icon that SIGABRTs GTK, a terminal that silently fails to come up: all of
-these are invisible in source and only show up when a real dialog actually
-renders. The sibling `shani-install-media` repo owns the harness that makes
-that possible; this section is the pointer to it.
+The user-facing desktop implementation now lives in `../shani-cassini`; its
+**Updates & Rollback** page is the current interface for install, channel
+selection, status, and rollback. This repo verifies the engine and the
+read-only status contract that Cassini consumes. Do not use the retired
+`shani-update` wrapper as a current GUI test entry point.
 
-**Prerequisite (host-side, one-time):** run `xhost +local:` on the host
-before starting the harness. This is a host-wide access-control change —
-restore with `xhost -` when done. Wayland forwarding also works if the host
-has `$WAYLAND_DISPLAY`, but X11 is what's verified here.
-
-**The two layers that forward the host's real display:**
-
-1. **Docker layer** (`shani-install-media/run_in_container.sh`) —
-   `X11_FORWARD_ARGS` / `WAYLAND_FORWARD_ARGS`, conditional on the host
-   actually having a socket (`$DISPLAY` / `$WAYLAND_DISPLAY`). Binds
-   `/tmp/.X11-unix` (X11) or just the one Wayland file into the container.
-2. **nspawn layer** (`shani-testbed/lib/nspawn.sh`
-   `_nspawn_binds()`; was `shani-install-media/test-env/test.sh`) — builds `X11_BIND` / `WAYLAND_BIND` and wires them
-   into `NSPAWN_ENTER_ARGS` and `NSPAWN_FULL_BOOT_ARGS`, so the socket
-   reaches the booted slot too.
-
-This is the standard way to run a container GUI app on the host's real
-display (see systemd/systemd#12671). It needs no GPU/EGL for a plain 2D
-dialog, and required no changes to any real (non-test) code.
-
-**To render a real `shani-update` dialog:**
+To render the real Updates & Rollback page in a testbed slot, overlay this
+checkout's deployment scripts and follow the current desktop procedure in
+`../shani-cassini/AGENTS.md`:
 
 ```bash
 cd ../shani-install-media
-./run_in_container.sh build.sh test enter blue \
+./run_in_container.sh build.sh test desktop -p gnome \
     --local-src=/opt/shani-deploy/scripts \
-    -- bash -c 'shani-update --health --terminal'
+    --exec="(shani-cassini --section=updates &); sleep 25"
 ```
 
-`--local-src` overlays *this* checkout's current scripts onto the slot's
-`/usr/local/bin`, so you're testing the real edited code, not a snapshot.
-`shani-update` needs a real display to open its progress terminal, which
-is exactly what the forwarding above provides.
-
-**To see the result, screenshot it from inside the slot** — ImageMagick's
-`import` is already in the image:
+The testbed also retains `update-check` as a harness compatibility
+interface for the old `update` test-command name:
 
 ```bash
-import -window root /data/screenshot.png
+./run_in_container.sh build.sh test update-check \
+    --local-src=/opt/shani-deploy/scripts
+# or request the machine-readable result:
+./run_in_container.sh build.sh test update-check --json
 ```
 
-`/data` is bind-mounted out through the existing `SHANIOS_TEST_EXTRA_BINDS`
-mechanism, so the PNG appears on the host. Bind your own scratch scripts the
-same way:
-
-```bash
-SHANIOS_TEST_EXTRA_BINDS="/host/path/my-script.sh:/usr/local/bin/my-script.sh"
-```
-
-**What this harness has already caught in this repo's GUI code** (full
-narrative in "Audit-verified known issues" below): the invalid
-`--image-on-top` yad flag that meant no shani-update dialog had ever
-rendered via yad on any real system; three separate SVG-icon SIGABRTs
-(`--window-icon`, `_run_tray`'s `--image=`); `_launch_terminal_tail`'s
-failure to detect a terminal that launched but then died ~1s later via
-D-Bus activation; `_build_pkexec_env`'s `tr` range bug that silently
-emptied `DISPLAY` for every privileged `shani-deploy` invocation; and the
-`--disable-search` requirement on `_run_gui_progress`'s yad text-info
-window (the search bar's icon resolves to an SVG, and this image has no
-working SVG rasterizer, so GTK SIGABRTs without the flag).
-
-**Unit-level fallback tests (deterministic, no container):**
-`../shani-install-media/test-env/.verify-bin/alert-fallback-unit.sh`
-exercises `show_alert`/`show_dialog`'s no-display fallback paths on the
-host with stubbed `yad` + `notify-send` and a minimal PATH (so the host's
-own `/usr/bin/zenity` can't leak in and give a false rc=1). The *positive*
-paths (real yad dialog rendering) were verified live via the forwarding
-harness above; the unit test covers the fallback branches that the flaky
-nspawn harness can't. `termargs.sh`/`termargs2.sh`/`termargs3.sh` in the
-same directory exercise `_build_terminal_args` for every supported
-terminal — but note they are host-side scratch scripts that must source the
-real `shani-update.sh` themselves (they do not run inside a slot), so run
-them from a checkout where `/usr/local/bin/shani-update` is the overlay.
+`update-check` is read-only: it exercises
+`shani-deploy --status --check --json` and does not install an image,
+switch a slot, or run the Shani Cassini notification agent. The shim lives
+in `../shani-testbed/lib/deploy.sh`; it is not a user updater and must not
+replace the Cassini desktop test above.
 
 ## Known sharp edges (already found once — don't reintroduce)
 
@@ -340,6 +294,64 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
   tpm2-status --json` (stdout is the JSON alone: `log()` writes to stdout,
   so the branch redirects it), `gen-efi enroll-tpm2 --stdin [--with-pin]`
   (secrets via stdin -> systemd-cryptenroll's PASSWORD/NEWPIN, never argv).
+
+- **`--status --json` boot/recovery fields are a real, marker-derived
+  contract (2026-09-25).** Cassini's Updates & Rollback / System views read
+  `boot_failure`, `boot_hard_failure`, `auto_rollback_done`,
+  `reboot_needed` and `candidate_boot`; every one is read from a marker
+  some other part of this repo really writes, and unreadable state is
+  reported empty/false — never guessed, never defaulted. Semantics, all
+  enforced by `tests/test-status-json.sh` (20 tests):
+  - `boot_failure` — `$BOOT_FAILURE_FILE`, falling back to its `.acked`
+    copy, the same precedence `rollback_system()` uses, so `--status` can
+    never disagree with what `--rollback` would act on. `""` = none.
+  - `boot_hard_failure` — `$BOOT_HARD_FAILURE_FILE` (dracut initramfs
+    hook, before the root mount is attempted). Never merged into the soft
+    field; `shani-auto-rollback` gives it priority.
+  - `auto_rollback_done` — `$AUTO_ROLLBACK_DONE_FILE`. Written by
+    `shani-auto-rollback.sh` on success **and** on failure (it is the
+    "don't retry this boot" flag) and cleared at the start of every boot
+    by `mark-boot-in-progress.service`, so `true` means "already
+    attempted this boot", NOT "recovered" — the outcome is only in
+    `journalctl -t shani-auto-rollback`. Do not read it as a success flag.
+  - `reboot_needed` — version string from `$REBOOT_NEEDED_FILE`, written
+    by `finalize_update()` and removed by every rollback path; `/run` is
+    tmpfs, so it also vanishes on the next reboot. `""` = no finished
+    deploy awaiting a reboot.
+  - `candidate_boot` — true ONLY while a finished deploy is still pending
+    in this session: the reboot marker exists AND the slot markers show
+    the default really moved to the other slot while we keep running the
+    old one. **It must never be derived from `booted != current` alone** —
+    that is equally true after a bootloader fallback (a failure, reported
+    via `boot_failure`) and after a rollback that already switched the
+    default, where nothing is pending at all. Both inputs missing or not
+    a real slot name ⇒ `false`.
+  - `booted_slot` — `""` when the running subvolume cannot be determined
+    at all. It is reported, never fatal: `--status --json` must always
+    emit one valid JSON object, whatever the machine state.
+  - Two live bugs fixed here, both found by that "always emit JSON" rule:
+    `get_booted_subvol()` ends in `die()`, and an `exit` inside `$(...)`
+    kills the subshell before an inner `|| true` can run, so
+    `booted=$(get_booted_subvol 2>/dev/null || true)` returned non-zero
+    and aborted the whole script under `set -e` — **`--status --json`
+    printed nothing and exited 1** whenever the booted subvolume was
+    undetectable. The `|| booted=""` must sit OUTSIDE the substitution.
+    The same class of bug (a bare `[[ ... ]] && var=true` statement
+    aborting under `set -e` when the test is false — see the
+    `((issues++))` entries below) had also been introduced for
+    `auto_rollback_done` and `candidate_boot`; both are `if` blocks now.
+  - `CURRENT_SLOT_FILE`/`PREV_SLOT_FILE`/`AUTO_ROLLBACK_DONE_FILE` are
+    new config-resolved read paths. The slot-marker **writes** in this
+    file still use the literal `/data/current-slot` and
+    `/data/previous-slot` — same defaults, but never change one side
+    without the other. `tests/test-status-json.sh` fails if a literal
+    `/data/` or `/run/shanios` path reappears inside `status_json()`.
+  - **Still needs the real harness** (see "Required verification"): the
+    unit tests drive the real `status_json()` against a sandbox of marker
+    files with only `get_booted_subvol`/`read_channel_from_file` stubbed.
+    What they cannot cover is the real marker lifecycle on a real
+    installed system — the actual transitions below still need a live
+    `bootstrap → upgrade → reboot → fallback → rollback` run.
 - **Oversized swapfiles from old ISOs:** `check_space` shrinks/drops
   /swap/swapfile when the update does not fit (`reclaim_swap_space`) and
   `sync -f`s before re-measuring — Btrfs' df only moves on commit.
@@ -1137,12 +1149,14 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
 - **CI status — corrected, was stale.** `.github/workflows/ci.yml` has
   three jobs: `lint` (shellcheck via the shared `shani-ci-commons`
   template), `unit-tests` (`test-deploy-state.sh` 9/9 +
-  `test_upgrade_adviser.sh` 21/21), and `security` (secret scan via the
+  `test-status-json.sh` 20/0 + `test_upgrade_adviser.sh` 21/21), and
+  `security` (secret scan via the
   shared template). Migrated from the old hand-written single-job
   workflow 2026-09-20; a fourth job, `unit-files` (`systemd-analyze
   verify` in `archlinux:latest`, see above), added 2026-09-23. The full
   boot/signing/deploy/rollback harness in
-  `../shani-install-media/test-env/` is still manual — that's the
+  `../shani-testbed/` (via `../shani-install-media/run_in_container.sh`)
+  is still manual — that's the
   safety-critical proof, and CI is the floor, not the ceiling.
 - **`log`/`warn` argument-splitting — FIXED.** `shani-user-setup.sh`'s
   array-to-string join now uses `"${arr[*]:-}"` instead of a
@@ -1165,19 +1179,21 @@ them from a checkout where `/usr/local/bin/shani-update` is the overlay.
   signing logic, check `shani-fleet/agent/bin/shani-fleet-agent` for the
   same class of bug — it's a separate implementation of the same pattern,
   not shared code.
-- `get_booted_subvol()` is reimplemented separately in 4 copies:
-  `scripts/shani-deploy.sh`, `scripts/shani-update.sh`, `scripts/gen-efi.sh`,
-  and `scripts/shani-health.sh` — kept as 4 copies deliberately (see
-  "Audit-verified known issues" above for why a shared-lib merge isn't a
-  clean fix here). If you fix a bug in the shared parsing logic, find every
-  copy (`grep -rn "get_booted_subvol"`) and fix them all; only
-  `shani-health.sh`'s not-found handling (returns `"unknown"`, never
-  aborts) is supposed to differ from the other 3.
-- `shani-install-media/test-env` exercises this repo's real packaged
-  binaries. If you change a function's behavior in a way that changes what
-  a *correct* test result looks like, update the corresponding test in
-  that sibling repo too, or a stale expectation there will pass for the
-  wrong reason.
+- `get_booted_subvol()` is present in the three shipped commands
+  `scripts/shani-deploy.sh`, `scripts/gen-efi.sh`, and
+  `scripts/shani-health.sh`. A fourth copy historically lived in the
+  retired `scripts/shani-update.sh` wrapper and is removed by the current
+  source migration. The three shipped copies remain intentionally
+  independent (see "Audit-verified known issues" above for why a
+  shared-library merge is not a clean fix here); keep their parsing
+  behavior aligned.
+- `../shani-testbed` exercises this repo's real packaged binaries through
+  `../shani-install-media/run_in_container.sh`. If you change a function's
+  behavior in a way that changes what a *correct* test result looks like,
+  update the corresponding test in that sibling repo too, or a stale
+  expectation there will pass for the wrong reason. The testbed's
+  `update-check` shim is read-only status compatibility, not a user
+  updater.
 
 ## Where things are documented
 

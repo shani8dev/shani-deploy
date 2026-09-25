@@ -391,7 +391,7 @@ log "  • The desktop setup wizard (plasma-welcome / gnome-initial-setup)"
 log "    runs automatically and creates a new user account"
 log "  • Home directory files in /home are intact and accessible once"
 log "    the account is re-created with the same username"
-log "  • Run 'shani-update' to ensure latest OS version"
+log "  • Check for updates: Shani Cassini → Updates & Rollback, or sudo shani-deploy"
 echo "" >&2
 
 ##############################################################################

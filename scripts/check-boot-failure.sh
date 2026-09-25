@@ -91,7 +91,7 @@ if [ -z "$BOOTED_SLOT" ]; then
 fi
 
 # The slot that was *supposed* to boot (the one that failed).
-# shani-update._check_fallback_boot() expects boot_failure to contain
+# shani-deploy --status (read by Shani Cassini's agent) expects boot_failure to contain
 # this value so it can match it against /data/current-slot.
 FAILED_SLOT=$(cat "$CURRENT_SLOT_FILE" 2>/dev/null | tr -cd 'a-z')
 [ -z "$FAILED_SLOT" ] && FAILED_SLOT="$BOOTED_SLOT"

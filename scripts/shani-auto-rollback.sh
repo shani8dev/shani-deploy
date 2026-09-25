@@ -1,13 +1,14 @@
 #!/bin/bash
 # shani-auto-rollback.sh — unattended, system-level automatic rollback for a
-# CONFIRMED boot failure. Exists because shani-update's fallback-detection
-# dialog (_check_fallback_boot/_handle_fallback_boot in shani-update.sh)
-# only runs under `shani-update --startup`, which requires BOTH a
+# CONFIRMED boot failure. Exists because the retired `shani-update` wrapper's
+# fallback-detection dialog (_check_fallback_boot/_handle_fallback_boot in the
+# now-deleted shani-update.sh) only ever ran under `shani-update --startup`,
+# which required BOTH a
 # `systemd --user` session AND a graphical display (DISPLAY/WAYLAND_DISPLAY)
-# — confirmed live by reading its own startup-mode guard, which exits
+# — confirmed live by reading its own startup-mode guard, which exited
 # immediately with "No display — skipping startup check" otherwise. That
-# means it never runs at all on a headless boot (the `server` profile has
-# no desktop by design), and never runs if the failure itself is what's
+# meant it never ran at all on a headless boot (the `server` profile has
+# no desktop by design), and never ran if the failure itself was what's
 # preventing the desktop from starting — one of the most likely real
 # failure shapes this mechanism needs to catch. This script has no such
 # dependency: it is a system-level oneshot triggered directly by the

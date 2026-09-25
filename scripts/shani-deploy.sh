@@ -6,7 +6,8 @@
 #
 # Options:
 #   -h, --help              Show help
-#   -r, --rollback          Roll back the non-booted slot. IMPORTANT: run this from the slot you want to KEEP.
+#   -r, --rollback          From the newer system: make the previous one the default again (nothing
+#                           deleted). From the older one (after a fallback): repair the other slot from its backup.
 #   -c, --cleanup           Manual cleanup (backups, downloads)
 #   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
 #   -t, --channel <chan>    Update channel: latest|stable (default: stable)
@@ -2245,7 +2246,7 @@ restore_candidate() {
 # subvolume data at all — no snapshot, no delete, nothing that assumes
 # which slot is actually broken.
 switch_to_sibling_slot() {
-    local booted="$1"
+    local booted="$1" reason="${2:-same-slot-failure}"
     local sibling
     if [[ "$booted" == "blue" ]]; then
         sibling="green"
@@ -2254,10 +2255,16 @@ switch_to_sibling_slot() {
     fi
 
     log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_warn "  SAME-SLOT FAILURE RECOVERY"
-    log_warn "  @${booted} did not confirm a healthy boot in time and"
-    log_warn "  no automatic bootloader-level fallback occurred."
-    log_warn "  Switching the default boot target to @${sibling}."
+    if [[ "$reason" == go-back ]]; then
+        log_warn "  ROLLBACK TO THE PREVIOUS SYSTEM"
+        log_warn "  @${booted} is the newer system; @${sibling} is the one"
+        log_warn "  you updated from. Making @${sibling} the default again."
+    else
+        log_warn "  SAME-SLOT FAILURE RECOVERY"
+        log_warn "  @${booted} did not confirm a healthy boot in time and"
+        log_warn "  no automatic bootloader-level fallback occurred."
+        log_warn "  Switching the default boot target to @${sibling}."
+    fi
     log_warn "  @${booted}'s data is NOT being touched or repaired —"
     log_warn "  only the boot-entry default changes."
     log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -2340,6 +2347,23 @@ rollback_system() {
     if [[ -n "$recorded_fail" && "$recorded_fail" =~ ^(blue|green)$ && "$recorded_fail" != "$failed_slot" ]]; then
         log_warn "boot_failure records @${recorded_fail} but booted slot @${booted} implies @${failed_slot} failed"
         log_warn "Using @${failed_slot} (derived from booted slot) — boot_failure may be stale"
+    fi
+
+    # Booted into the NEWER system with no recorded failure: the user updated
+    # and wants the previous system back (what the docs, the fleet guide's
+    # `ssh ... 'shani-deploy -r && reboot'` and shani-update mean by
+    # rollback). The repair path below would instead overwrite that previous
+    # system with a copy of the booted one - @${failed_slot} has no backup
+    # (it was never a deploy candidate), so it gets snapshotted from
+    # @${booted} and the old version is gone (found by shani-testbed's gate,
+    # 2026-09-24). Switch the default back instead; nothing is deleted.
+    local _bv _ov
+    _bv=$(tr -cd '0-9' < "$MOUNT_DIR/@${booted}/etc/shani-version" 2>/dev/null || true)
+    _ov=$(tr -cd '0-9' < "$MOUNT_DIR/@${failed_slot}/etc/shani-version" 2>/dev/null || true)
+    if [[ -z "$recorded_fail" && "$_bv" =~ ^[0-9]+$ && "$_ov" =~ ^[0-9]+$ ]] && (( _bv > _ov )); then
+        log "Booted @${booted} (v${_bv}) is newer than @${failed_slot} (v${_ov}) - rolling back to @${failed_slot}"
+        switch_to_sibling_slot "$booted" go-back
+        return
     fi
 
     CURRENT_SLOT="$booted"
@@ -3834,7 +3858,9 @@ Usage: $0 [OPTIONS]
 
 Options:
   -h, --help              Show help
-  -r, --rollback          Roll back the non-booted slot. IMPORTANT: run from the slot you want to KEEP.
+  -r, --rollback          Booted into the newer system: make the previous one the default again
+                          (nothing is deleted; reboot to use it). Booted into the older one after a
+                          fallback: repair the other slot from its pre-update backup.
   -c, --cleanup           Manual cleanup
   -o, --optimize          Run manual deduplication (maintenance only; bees handles continuous dedup)
   -t, --channel <chan>    Update channel (latest|stable)

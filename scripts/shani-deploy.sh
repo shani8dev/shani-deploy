@@ -3146,6 +3146,39 @@ validate_boot() {
     log "Active slot: @${CURRENT_SLOT} | Update target (candidate): @${CANDIDATE_SLOT}"
 }
 
+# Shrink (or drop) /swap/swapfile so MIN_FREE_SPACE_MB is free. Only when
+# its contents fit in free RAM (swapoff must not fail or thrash). <free_mb>
+reclaim_swap_space() {
+    local free_mb="$1" file=/swap/swapfile size_mb need new used_kb avail_kb
+    size_mb=$(( $(stat -c %s "$file") / 1048576 ))
+    need=$(( MIN_FREE_SPACE_MB - free_mb ))
+    (( need < size_mb )) || { log_warn "Even without the ${size_mb}MB swapfile there is not enough space"; return 1; }
+    new=$(( size_mb - need - 1024 ))          # 1 GB margin
+    (( new < 1024 )) && new=0                  # too small to be worth keeping
+    used_kb=$(awk -v f="$file" '$1 == f {print $4}' /proc/swaps 2>/dev/null || true)
+    avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    if (( ${used_kb:-0} + 262144 > avail_kb )); then
+        log_warn "Swapfile holds $(( ${used_kb:-0} / 1024 ))MB and only $(( avail_kb / 1024 ))MB RAM is free - not shrinking it now"
+        return 1
+    fi
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log_warn "[DRY-RUN] Would shrink the swapfile ${size_mb}MB -> ${new}MB to make room for the update"
+        return 0
+    fi
+    log_warn "Shrinking the swapfile ${size_mb}MB -> ${new}MB to make room for the update (zram still provides swap)"
+    if [[ -n "$used_kb" ]]; then
+        swapoff "$file" || { log_warn "swapoff failed - keeping the swapfile"; return 1; }
+    fi
+    rm -f "$file"
+    sync -f /swap 2>/dev/null || true   # Btrfs: df only moves once the transaction commits
+    if (( new > 0 )); then
+        create_swapfile "$file" "$new" "$(( $(df --output=avail /swap | tail -1) / 1024 ))" \
+            && { swapon "$file" 2>/dev/null || log_warn "swapon failed - zram still provides swap"; }
+        sync -f /swap 2>/dev/null || true
+    fi
+    return 0
+}
+
 check_space() {
     log_section "Disk Space Check"
 
@@ -3155,6 +3188,16 @@ check_space() {
     local free_mb
     free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 ))
     log "Available space: ${free_mb}MB | Required: ${MIN_FREE_SPACE_MB}MB"
+
+    # Installs from ISOs before the swap cap (<= 2026.09.21) made the
+    # swapfile as large as RAM: on a minimum-size disk the first update then
+    # never had room (28 GB disk: 8230 MB free, 10240 needed). Give the
+    # update the space from the swapfile instead; zram still provides swap.
+    if (( free_mb < MIN_FREE_SPACE_MB )) && [[ -f /swap/swapfile ]]; then
+        reclaim_swap_space "$free_mb" || true
+        free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 ))
+        log "Available space now: ${free_mb}MB"
+    fi
 
     (( free_mb >= MIN_FREE_SPACE_MB )) || \
         die "Not enough disk space: ${free_mb}MB available, ${MIN_FREE_SPACE_MB}MB required. Run --cleanup to remove old downloads and backups, then try again."

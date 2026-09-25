@@ -1,6 +1,6 @@
 # shani-deploy Command Reference
 
-Production blue-green Btrfs deployment system for Shanios, an immutable Arch Linux derivative. This reference covers every CLI flag, environment variable, and exit code across the four main scripts.
+Production blue-green Btrfs deployment system for Shanios, an immutable Arch Linux derivative. This reference covers the current `shani-deploy`, `shani-health`, and `shani-reset` commands, Shani Cassini's integration, and the testbed's read-only `update-check` compatibility command.
 
 ---
 
@@ -13,7 +13,7 @@ Core deployment engine. Typical flow: self-update check, fetch manifest, verify 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-h, --help` | Show help and exit | — |
-| `-r, --rollback` | Roll back the non-booted slot from its most recent backup snapshot. IMPORTANT: run this from the slot you want to KEEP. | — |
+| `-r, --rollback` | From the newer system, make the previous one the default again (nothing is deleted; reboot to use it). From the older system after a fallback, repair the other slot from its pre-update backup. | — |
 | `-c, --cleanup` | Manual cleanup: remove old backup snapshots and cached downloads | — |
 | `-o, --optimize` | Run manual deduplication via `duperemove` (maintenance only; `bees` handles continuous dedup) | — |
 | `-t, --channel <chan>` | Update channel: `stable` or `latest` | `stable` |
@@ -25,6 +25,8 @@ Core deployment engine. Typical flow: self-update check, fetch manifest, verify 
 | `--verify-existing` | Verify current deployment integrity without updating | — |
 | `--list-backups` | List available rollback backups with timestamps | — |
 | `--channel-status` | Show latest/stable versions available remotely | — |
+| `--status --json` | Print local deployment state as JSON (slots, version, channel, boot and recovery markers); read-only and no root | — |
+| `--status --check --json` | Add remote stable/latest versions and `update_available` to the JSON status; read-only and no root | — |
 | `--skip-self-update` | Skip auto-update of `shani-deploy` itself | — |
 | `--update-genefi` | Download latest `gen-efi` from upstream and use it in the chroot (not installed to host) | — |
 
@@ -36,41 +38,33 @@ Core deployment engine. Typical flow: self-update check, fetch manifest, verify 
 
 ---
 
-## shani-update
+## Shani Cassini and testbed compatibility
 
-User-facing update wrapper. Resolves the update channel, validates input, handles fallback/candidate boot detection, and launches `shani-deploy` with a sanitized environment.
+The `shani-update` binary is retired. The current user-facing deploy and
+rollback interface is Shani Cassini's **Updates & Rollback** page, which
+streams the same deployment engine through `pkexec`.
 
-### Flags
+| Interface | Behavior |
+|-----------|----------|
+| `shani-cassini` (Updates & Rollback) | Install, channel selection, status, and rollback UI |
+| `shani-deploy --status --check --json` | Read-only local and remote update state used by Cassini |
+| `pkexec shani-deploy` | Install an available update through the deployment engine |
+| `pkexec shani-deploy --rollback` | Roll back according to the current slot/boot-failure state |
+| `pkexec shani-deploy --set-channel stable\|latest` | Persist the selected update channel |
+| `shani-cassini-agent.timer` / `.service` | Periodically run the read-only status check and send update/boot notifications; the agent never deploys or rolls back |
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--startup` | Run at login: fallback check → candidate check → update check | — |
-| `-r, --rollback` | Roll back the inactive slot immediately | — |
-| `-f, --force` | Force deploy even if version matches or slot mismatch | — |
-| `-t, --channel <chan>` | Update channel: `stable` or `latest` | `stable` |
-| `-v, --verbose` | Verbose output from `shani-deploy` | — |
-| `-d, --dry-run` | Simulate deployment without changes | — |
-| `-c, --cleanup` | Passthrough: `shani-deploy --cleanup` (manual backup/download cleanup) | — |
-| `-o, --optimize` | Passthrough: `shani-deploy --optimize` (manual Btrfs dedup) | — |
-| `--download-only` | Passthrough: `shani-deploy --download-only` (fetch+verify update image, no deploy) | — |
-| `--set-channel <chan>` | Passthrough: `shani-deploy --set-channel` (persist channel to `/etc/shani-channel`) | — |
-| `--skip-self-update` | On install, passed through as `shani-deploy --skip-self-update` | — |
-| `--update-genefi` | On install, passed through as `shani-deploy --update-genefi` | — |
-| `--health [ARGS...]` | Passthrough to `shani-health` (e.g. `--health --security`). Consumes all remaining arguments — must be last on the command line. | — |
-| `-h, --help` | Show help and exit | — |
+The testbed retains `update-check` as a read-only compatibility interface
+for the old `update` test-command name:
 
-### Modes
+```bash
+./run_in_container.sh build.sh test update-check \
+    --local-src=/opt/shani-deploy/scripts
+./run_in_container.sh build.sh test update-check --json
+```
 
-| Mode | Trigger | Behavior |
-|------|---------|----------|
-| `startup` | `--startup` | Fallback check → candidate check → update check |
-| `interactive` | (default) | Candidate check → update check |
-| `rollback` | `--rollback` | Roll back inactive slot immediately |
-| `cleanup` | `--cleanup` | Passthrough cleanup |
-| `optimize` | `--optimize` | Passthrough optimize |
-| `download-only` | `--download-only` | Passthrough download-only |
-| `set-channel` | `--set-channel` | Persist channel choice |
-| `health` | `--health` | Passthrough to shani-health |
+`update-check` exercises the `shani-deploy --status --check --json`
+contract only. It does not install an image, switch a slot, or run the
+Shani Cassini notification agent, and it is not a user updater.
 
 ---
 
@@ -181,12 +175,12 @@ User accounts (`/etc/passwd` entries) are part of the `/etc` overlay and ARE wip
 | `DOWNLOAD_ONLY` | Download only flag (`yes`/`no`) | `no` |
 | `CANDIDATE_MODIFIED` | Candidate modified flag (`yes`/`no`) | `no` |
 
-### shani-update
+### Shani Cassini agent
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `XDG_CACHE_HOME` | Log directory base (falls back to `$HOME/.cache`) | `~/.cache` |
-| `XDG_RUNTIME_DIR` | Lock file location (preferred over log dir) | — |
+| `XDG_STATE_HOME` | Base for the agent's deduplication state | `~/.local/state` |
+| `XDG_RUNTIME_DIR` | Runtime directory supplied by the systemd user manager | — |
 
 ### shani-reset
 
@@ -202,8 +196,8 @@ User accounts (`/etc/passwd` entries) are part of the `/etc` overlay and ARE wip
 |------|--------|---------|
 | `0` | `shani-deploy` | Success (deployment, cleanup, optimize, or info query completed) |
 | `1` | `shani-deploy` | Fatal error (invoked via `die()`) |
-| `0` | `shani-update` | Success or user deferred update |
-| `1` | `shani-update` | Fatal error (no internet, fetch failure, rollback failure) |
+| `0` | Shani Cassini agent | Status check completed; no action taken |
+| `1` | Shani Cassini agent | Status check could not be read or parsed |
 | `0` | `shani-health` | Success / no issues found |
 | `1` | `shani-health` | Fatal error, or (for `--verify`) integrity issues found |
 | `0` | `shani-reset` | Success (or user aborted confirmation) |

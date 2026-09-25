@@ -135,9 +135,11 @@ system-tray icon (`shani-update --tray`), started at
   tries-counter falls back to the previous slot automatically; no manual
   action needed to get back to a working system. `check-boot-failure`
   records it so a rollback can be offered.
-- **Boot "succeeds" but something's wrong** (`--rollback`): restores the
-  non-booted slot from its most recent backup snapshot, regenerates its
-  UKI, and updates boot entries — run from the slot you want to **keep**.
+- **Boot "succeeds" but something's wrong** (`--rollback`): from the
+  updated system, makes the previous system the default boot entry again
+  (nothing is deleted — reboot to use it). From the older system after a
+  fallback, restores the other slot from its most recent backup snapshot,
+  regenerates its UKI, and updates boot entries.
 - **Everything's a mess** (`shani-reset`): wipes persistent `/etc`/`/var`
   state and boot markers back to first-boot defaults, without touching
   either OS copy or your files.

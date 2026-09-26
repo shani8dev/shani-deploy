@@ -627,6 +627,8 @@ _sysd_user() {
 ###############################################################################
 
 _section_os_slots() {
+    _set_section "os_slots"
+
     local booted="$1"
     local version profile channel slot_current
     version=$(     cat /etc/shani-version   2>/dev/null || echo "unknown")
@@ -841,6 +843,8 @@ _section_os_slots() {
 }
 
 _section_boot_health() {
+    _set_section "boot_health"
+
     _head "Boot Health"
     local chain_failed=()
     for svc in mark-boot-in-progress.service mark-boot-success.service bless-boot.service; do
@@ -976,6 +980,8 @@ _section_boot_health() {
     fi
 }
 _section_boot_entries() {
+    _set_section "boot_entries"
+
     _head "Boot Entries"
 
     if ! mountpoint -q "$ESP" 2>/dev/null; then
@@ -1111,6 +1117,8 @@ _section_boot_entries() {
 }
 
 _section_deployment() {
+    _set_section "deployment"
+
     _head "Deployment"
 
     if [[ -f "$DATA_DEPLOY_PENDING" ]]; then
@@ -1209,6 +1217,8 @@ _section_deployment() {
 }
 
 _section_update_tools() {
+    _set_section "update_tools"
+
     _head "Update Tools"
     # gen-efi is the core UKI builder — without it, deploys cannot sign or install boot images.
     if [[ -x "$GENEFI_BIN" ]]; then
@@ -1314,6 +1324,8 @@ _section_update_tools() {
     fi
 }
 _section_data_state() {
+    _set_section "data_state"
+
     _head "Data State"
     if ! findmnt -n /data &>/dev/null; then
         _row "/data"          "!!  not mounted — system state unavailable"
@@ -2325,6 +2337,12 @@ _section_security_audit() {
                 _rec "Enable lynis timer: systemctl enable --now lynis.timer"
             fi
         fi
+    else
+        # Re-check with command -v: _check_tool_executable returns 1 both for
+        # "not installed" and for "installed but not executable" (which already
+        # got its own !! row), so only the former may report absence.
+        command -v "lynis" &>/dev/null || \
+            _row "lynis"  "--  not installed — enable: pacman -S lynis"
     fi
     # Rootkit hunter — show last scan date and any warnings
     if _check_tool_executable "rkhunter" "rkhunter"; then
@@ -2361,6 +2379,10 @@ _section_security_audit() {
         else
             _row "rkhunter"  "~~  no scan recorded — run: rkhunter --check to baseline"
         fi
+    else
+        # Same command -v re-check as the lynis branch above.
+        command -v "rkhunter" &>/dev/null || \
+            _row "rkhunter"  "--  not installed — enable: pacman -S rkhunter"
     fi
 }
 
@@ -2498,19 +2520,6 @@ _section_krb5() {
             fi
         fi
     fi  # end: only when Kerberos active
-    if _svc_present sssd; then
-        if systemctl is-active --quiet sssd 2>/dev/null; then
-            local _sssd_domains=""
-            _sssd_domains=$(grep -E '^\[domain/' /etc/sssd/sssd.conf 2>/dev/null \
-                | sed 's/\[domain\///' | tr -d ']' | tr '\n' ' ' | sed 's/ $//' || echo "")
-            _row "sssd"      "OK  running${_sssd_domains:+  (${_sssd_domains})}"
-        elif systemctl is-enabled --quiet sssd 2>/dev/null; then
-            _row "sssd"      "!   enabled but not running — Kerberos auth via SSSD broken"
-        else
-            _row "sssd"      "!   not enabled — Kerberos auth will require manual kinit"
-            _rec "Enable sssd for automatic Kerberos ticket management: systemctl enable --now sssd"
-        fi
-    fi
 }
 
 _section_users() {
@@ -2950,6 +2959,8 @@ _section_groups() {
 ###############################################################################
 
 _section_hardware() {
+    _set_section "hardware"
+
     _head "Hardware"
     local cpu_model cpu_cores cpu_arch cpu_flags
     cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null \
@@ -3508,6 +3519,8 @@ _section_hardware() {
 }
 
 _section_disk() {
+    _set_section "disk"
+
     local booted="$1"
     local hibernate_stale_ref="$2"
     local uki_booted_bad="$3"
@@ -3893,6 +3906,8 @@ _stor_check_bees() {
 }
 
 _section_storage() {
+    _set_section "storage"
+
     _head "Storage"
 
     # Free space — shared helper
@@ -4019,6 +4034,8 @@ _section_storage() {
 }
 
 _section_battery() {
+    _set_section "battery"
+
     # Only show this section if a battery is present (laptops/UPS systems)
     local bat_dir=""
     for d in /sys/class/power_supply/BAT* /sys/class/power_supply/CMB*; do
@@ -4093,6 +4110,8 @@ _section_battery() {
 }
 
 _section_printing() {
+    _set_section "printing"
+
     _head "Printing & Scanning"
     if getent group cups &>/dev/null; then
         local cups_st; cups_st=$(systemctl is-active cups.socket 2>/dev/null) || true; cups_st="${cups_st:-inactive}"
@@ -4173,6 +4192,8 @@ _check_webserver() {
     fi
 }
 _section_servers() {
+    _set_section "servers"
+
     # Only show if at least one server package is present
     local _any=0
     for _bin in smbd rpcbind exportfs gssproxy nbd-server \
@@ -4568,21 +4589,6 @@ _section_servers() {
                     _srv_opt_row "nmbd"       "~~  not enabled — NetBIOS browsing inactive: systemctl enable --now nmb"
                 fi
             fi
-            if systemctl cat winbind &>/dev/null 2>&1 || command -v winbindd &>/dev/null; then
-                local _smb_security=""
-                _smb_security=$(grep -i '^\s*security\s*=' /etc/samba/smb.conf 2>/dev/null \
-                    | awk -F= '{print $2}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | head -1 || echo "")
-                if [[ "$_smb_security" == "ads" || "$_smb_security" == "domain" ]]; then
-                    if systemctl is-active --quiet winbind 2>/dev/null; then
-                        _row "winbind"    "OK  running (AD/domain auth active)"
-                    elif systemctl is-enabled --quiet winbind 2>/dev/null; then
-                        _row "winbind"    "!   enabled but not running — domain auth broken"
-                            else
-                        _row "winbind"    "!   security=ads/domain set but winbind not enabled"
-                        _rec "Enable winbind for AD/domain auth: systemctl enable --now winbind"
-                    fi
-                fi
-            fi
         else
             _srv_opt_row "Samba"          "~~  not configured — create shares in /etc/samba/smb.conf, then systemctl enable --now smb"
         fi
@@ -4818,7 +4824,83 @@ _section_servers() {
         fi
     fi
     _check_svc "Memcached" "memcached" "not enabled — systemctl enable --now memcached"
-    if _svc_present slapd; then
+    # Commonly used for sending system mail (cron output, logwatch alerts).
+    if _svc_present minidlna; then
+        local _dlna_cfg=0
+        [[ -f /etc/minidlna.conf ]] &&             grep -qE '^media_dir=' /etc/minidlna.conf 2>/dev/null &&             _dlna_cfg=1
+        if systemctl is-active --quiet minidlna 2>/dev/null; then
+            _row "minidlna"    "OK  running"
+        elif systemctl is-enabled --quiet minidlna 2>/dev/null; then
+            if (( ! _dlna_cfg )); then
+                _row "minidlna"    "!   enabled but not configured — set media_dir= in /etc/minidlna.conf"
+                _rec "minidlna enabled but media_dir not set in /etc/minidlna.conf — configure before starting"
+            else
+                _row "minidlna"    "!   enabled but not running"
+            fi
+        elif (( _dlna_cfg )); then
+            _srv_opt_row "minidlna"    "~~  configured, not enabled — to enable: systemctl enable --now minidlna"
+        else
+            _srv_opt_row "minidlna"    "~~  not enabled — to serve DLNA: systemctl enable --now minidlna"
+        fi
+    fi
+    _check_svc "Jellyfin" "jellyfin" "not enabled — to stream media: systemctl enable --now jellyfin"
+
+    _srv_opt_flush
+}
+_section_directory() {
+    local _sel="${1:-all}"
+    _set_section "directory"
+    # "sssd" keeps the SSSD rows in the modes that emitted them via
+    # _section_krb5; "ldap" keeps winbind/slapd in the modes that emitted them
+    # via _section_servers. Both sets are still evaluated in --info.
+    if [[ "$_sel" == "sssd" || "$_sel" == "all" ]]; then
+        # These rows used to be emitted from inside _section_krb5, which returns
+        # early unless kinit exists, /etc/krb5.conf is present and default_realm
+        # is set. Replicated here so that moving them cannot make them appear
+        # (or vanish) on a host that is not Kerberos-configured.
+        local _dir_realm=""
+        _dir_realm=$(grep -E '^\s*default_realm\s*=' /etc/krb5.conf 2>/dev/null \
+            | head -1 | sed 's/.*=\s*//' | tr -d '[:space:]' || echo "")
+        if command -v kinit &>/dev/null && [[ -f /etc/krb5.conf ]] \
+           && [[ -n "$_dir_realm" ]]; then
+            if _svc_present sssd; then
+        if systemctl is-active --quiet sssd 2>/dev/null; then
+            local _sssd_domains=""
+            _sssd_domains=$(grep -E '^\[domain/' /etc/sssd/sssd.conf 2>/dev/null \
+                | sed 's/\[domain\///' | tr -d ']' | tr '\n' ' ' | sed 's/ $//' || echo "")
+            _row "sssd"      "OK  running${_sssd_domains:+  (${_sssd_domains})}"
+        elif systemctl is-enabled --quiet sssd 2>/dev/null; then
+            _row "sssd"      "!   enabled but not running — Kerberos auth via SSSD broken"
+        else
+            _row "sssd"      "!   not enabled — Kerberos auth will require manual kinit"
+            _rec "Enable sssd for automatic Kerberos ticket management: systemctl enable --now sssd"
+        fi
+            fi
+        fi
+    fi
+    if [[ "$_sel" == "ldap" || "$_sel" == "all" ]]; then
+        # winbind is Samba's AD/domain-auth client: it is only meaningful on a
+        # share config that actually joined a domain. These are the exact
+        # preconditions it had while nested inside the Samba block.
+        if _svc_present smb \
+           && { [[ -f /etc/samba/smb.conf ]] && grep -E '^\[' /etc/samba/smb.conf 2>/dev/null \
+                  | grep -qvE '^\[(global|homes|printers|print\$)\]'; } \
+           && { systemctl cat winbind &>/dev/null 2>&1 || command -v winbindd &>/dev/null; }; then
+                local _smb_security=""
+                _smb_security=$(grep -i '^\s*security\s*=' /etc/samba/smb.conf 2>/dev/null \
+                    | awk -F= '{print $2}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | head -1 || echo "")
+                if [[ "$_smb_security" == "ads" || "$_smb_security" == "domain" ]]; then
+                    if systemctl is-active --quiet winbind 2>/dev/null; then
+                        _row "winbind"    "OK  running (AD/domain auth active)"
+                    elif systemctl is-enabled --quiet winbind 2>/dev/null; then
+                        _row "winbind"    "!   enabled but not running — domain auth broken"
+                            else
+                        _row "winbind"    "!   security=ads/domain set but winbind not enabled"
+                        _rec "Enable winbind for AD/domain auth: systemctl enable --now winbind"
+                    fi
+                fi
+            fi
+        if _svc_present slapd; then
         local _ldap_cfg=0
         # CLI: check for a real user database beyond the default {-1}frontend / {0}config
         if command -v slaptest &>/dev/null; then
@@ -4869,8 +4951,13 @@ _section_servers() {
         else
             _srv_opt_row "slapd"         "~~  not configured — configure /etc/openldap/slapd.conf, then systemctl enable --now slapd"
         fi
+        fi
     fi
-    # Commonly used for sending system mail (cron output, logwatch alerts).
+    _srv_opt_flush
+}
+
+_section_email() {
+    _set_section "email"
     if _svc_present postfix; then
         local _pf_cfg=0
         # CLI: postconf reads compiled config including $config_directory includes
@@ -4920,6 +5007,7 @@ _section_servers() {
             _srv_opt_row "Postfix"     "~~  not enabled — to send system mail: systemctl enable --now postfix"
         fi
     fi
+
     if _svc_present dovecot; then
         local _dv_cfg=0
         # CLI: doveconf reads all conf.d/ includes and returns the compiled value
@@ -4947,30 +5035,13 @@ _section_servers() {
             _srv_opt_row "Dovecot"     "~~  not enabled — to serve IMAP/POP3: systemctl enable --now dovecot"
         fi
     fi
-    if _svc_present minidlna; then
-        local _dlna_cfg=0
-        [[ -f /etc/minidlna.conf ]] &&             grep -qE '^media_dir=' /etc/minidlna.conf 2>/dev/null &&             _dlna_cfg=1
-        if systemctl is-active --quiet minidlna 2>/dev/null; then
-            _row "minidlna"    "OK  running"
-        elif systemctl is-enabled --quiet minidlna 2>/dev/null; then
-            if (( ! _dlna_cfg )); then
-                _row "minidlna"    "!   enabled but not configured — set media_dir= in /etc/minidlna.conf"
-                _rec "minidlna enabled but media_dir not set in /etc/minidlna.conf — configure before starting"
-            else
-                _row "minidlna"    "!   enabled but not running"
-            fi
-        elif (( _dlna_cfg )); then
-            _srv_opt_row "minidlna"    "~~  configured, not enabled — to enable: systemctl enable --now minidlna"
-        else
-            _srv_opt_row "minidlna"    "~~  not enabled — to serve DLNA: systemctl enable --now minidlna"
-        fi
-    fi
-    _check_svc "Jellyfin" "jellyfin" "not enabled — to stream media: systemctl enable --now jellyfin"
-
     _srv_opt_flush
 }
 
+
 _section_performance() {
+    _set_section "performance"
+
     _head "Performance"
 
     # ── Power management ──────────────────────────────────────────────────────
@@ -5131,6 +5202,8 @@ _section_performance() {
 }
 
 _section_network() {
+    _set_section "network"
+
     _head "Network"
     if ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
         _row "Network"  "!   NetworkManager not running"
@@ -5699,6 +5772,8 @@ _section_network() {
 }
 
 _section_audio_display() {
+    _set_section "audio_display"
+
     _head "Audio & Display"
     local rtkit_st; rtkit_st=$(systemctl is-active rtkit-daemon 2>/dev/null) || true; rtkit_st="${rtkit_st:-inactive}"
     if [[ "$rtkit_st" == "active" ]]; then
@@ -5841,11 +5916,16 @@ _section_audio_display() {
 }
 
 _section_units() {
+    _set_section "units"
+
     _head "Units"
     local failed_units=()
-    # Filter known transient oneshot units that legitimately enter failed state
-    # (e.g. systemd-suspend.service fails after every suspend cycle by design)
-    local _transient_ok="systemd-suspend.service|systemd-hibernate.service|systemd-hybrid-sleep.service|drkonqi-coredump-processor@.*\.service"
+    # drkonqi's per-crash coredump processor legitimately ends in failed
+    # state after it has handled a dump.
+    local _transient_ok="drkonqi-coredump-processor@.*\.service"
+    # The three sleep units are handled separately below — they are only
+    # benign when they failed the by-design way, not by name.
+    local _sleep_units="systemd-suspend.service|systemd-hibernate.service|systemd-hybrid-sleep.service"
     # snap-*.mount units are alias forms of var-lib-snapd-snap-*.mount.
     # start-overlay-services intentionally skips them — they fail when the
     # canonical mount is already active at the same path. Filter here to
@@ -5854,7 +5934,48 @@ _section_units() {
         systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
             | awk '{print $2}' | grep -v '^$' | grep '\.' \
             | grep -vE "^(${_transient_ok})$" \
+            | grep -vE "^(${_sleep_units})$" \
             | grep -vE "^snap-.*\.mount$" || true)
+    # Sleep units: systemd-sleep blocks until the machine resumes, so the
+    # resume cancels the job and SIGTERMs it — Result=killed with
+    # ExecMainStatus=15 after every suspend cycle is by design. They are still
+    # counted as failures: a unit sitting in `failed` is a real, reportable
+    # fact, and excluding the by-design ones is exactly what let a genuinely
+    # broken suspend (Result=exit-code, or a signal that is not TERM) hide
+    # behind the same name filter. The by-design/fault split is kept only as
+    # one annotation row, so the row count per mode is unchanged.
+    local _sleep_failed=()
+    mapfile -t _sleep_failed < <(
+        systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null \
+            | awk '{print $2}' | grep -v '^$' | grep -E "^(${_sleep_units})$" || true)
+    local _sleep_by_design=() _sleep_fault=()
+    if [[ ${#_sleep_failed[@]} -gt 0 ]]; then
+        local _su _sres _sems
+        for _su in "${_sleep_failed[@]}"; do
+            _sres=$(systemctl show -p Result    --value "$_su" 2>/dev/null || echo "")
+            _sems=$(systemctl show -p ExecMainStatus --value "$_su" 2>/dev/null || echo "")
+            if [[ "$_sres" == "killed" || "$_sres" == "signal" ]] && [[ "$_sems" == "15" ]]; then
+                _sleep_by_design+=("$_su")
+            else
+                _sleep_fault+=("$_su")
+            fi
+        done
+        failed_units+=("${_sleep_failed[@]}")
+    fi
+    if [[ ${#_sleep_by_design[@]} -gt 0 || ${#_sleep_fault[@]} -gt 0 ]]; then
+        local _sleep_note=""
+        if [[ ${#_sleep_by_design[@]} -gt 0 ]]; then
+            _sleep_note="by design after resume: ${_sleep_by_design[*]}"
+        fi
+        if [[ ${#_sleep_fault[@]} -gt 0 ]]; then
+            if [[ -n "$_sleep_note" ]]; then
+                _sleep_note="${_sleep_note}; "
+            fi
+            _sleep_note="${_sleep_note}real fault: ${_sleep_fault[*]}"
+        fi
+        _row2 "--  ${#_sleep_failed[@]} sleep unit(s) failed (${_sleep_note})"
+    fi
+
     # Snap alias failures: report as info-only when canonical mounts are active.
     local _snap_alias_failed=()
     mapfile -t _snap_alias_failed < <(
@@ -5908,6 +6029,8 @@ _section_units() {
 }
 
 _section_package_managers() {
+    _set_section "package_managers"
+
     _head "Package Managers"
     if command -v flatpak &>/dev/null; then
         local flatpak_sys; flatpak_sys=$(systemctl is-enabled flatpak-update-system.timer 2>/dev/null) || true; flatpak_sys="${flatpak_sys:-disabled}"
@@ -6113,6 +6236,8 @@ _section_package_managers() {
 }
 
 _section_containers() {
+    _set_section "containers"
+
     _head "Containers"
     if command -v podman &>/dev/null; then
         local podman_sys_st podman_usr_st podman_ver=""
@@ -6447,6 +6572,8 @@ _check_vm_guest() {
     fi
 }
 _section_virtualization() {
+    _set_section "virtualization"
+
     # Only show if libvirt or qemu is installed
     if ! command -v virsh &>/dev/null && \
        ! command -v qemu-system-x86_64 &>/dev/null && \
@@ -6781,6 +6908,8 @@ _section_virtualization() {
 }
 
 _section_firmware() {
+    _set_section "firmware"
+
     _head "Firmware"
     local _cpu_vfw=$(grep -m1 "vendor_id" /proc/cpuinfo 2>/dev/null | awk '{print $3}' || echo "")
     case "$_cpu_vfw" in
@@ -6852,6 +6981,8 @@ _section_firmware() {
 }
 
 _section_backup_tools() {
+    _set_section "backup_tools"
+
     _head "Backup Tools"
     # ── rclone ───────────────────────────────────────────────────────────────
     if command -v rclone &>/dev/null; then
@@ -6901,6 +7032,8 @@ _section_backup_tools() {
 }
 
 _section_monitoring() {
+    _set_section "monitoring"
+
     _head "Monitoring"
     # Runs permanently, polls drives on a schedule, emails on failure.
     if _svc_present smartd; then
@@ -7153,6 +7286,8 @@ _section_monitoring() {
 }
 
 _section_runtime_health() {
+    _set_section "runtime_health"
+
     _head "Runtime Health"
     local load1 ncores load_int
     load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "")
@@ -7306,6 +7441,8 @@ _section_runtime_health() {
 }
 
 _section_coredump() {
+    _set_section "coredump"
+
     _head "Core Dumps"
 
     # systemd-coredump — is the handler wired up?
@@ -7385,6 +7522,8 @@ _section_coredump() {
 }
 
 _section_system_health() {
+    _set_section "system_health"
+
     _head "System Health"
     if systemctl is-active --quiet dbus 2>/dev/null || \
        systemctl is-active --quiet dbus.socket 2>/dev/null; then
@@ -7820,6 +7959,9 @@ security_report() {
     _section_unit_exposure || true
     _section_security_audit || true
     _section_krb5
+    # SSSD rows moved out of _section_krb5 into _section_directory; called with
+    # the "sssd" selector so --security still emits exactly the rows it did.
+    _section_directory         sssd || true
     _section_users || true
     _section_groups || true
     _check_ssh_hardening
@@ -7858,6 +8000,10 @@ system_info() {
     _section_performance || true
     _section_network || true
     _section_servers || true
+    # The "all"/"ldap" selectors keep the SSSD+LDAP and Postfix+Dovecot rows in
+    # exactly the modes that emitted them while nested in the above sections.
+    _section_directory         all || true
+    _section_email || true
     _section_audio_display || true
     _section_printing || true
     _section_package_managers || true
@@ -7927,7 +8073,10 @@ _save_trend() {
 
 # Check for firmware updates via fwupdmgr
 _check_firmware_updates() {
-    _set_section "firmware"
+    # Distinct from _section_firmware's "firmware" (the firmware/BIOS
+    # inventory): these rows are specifically about AVAILABLE UPDATES, and
+    # sharing the name lumped them together with the inventory section.
+    _set_section "firmware_updates"
     if command -v fwupdmgr &>/dev/null; then
         local updates
         updates=$(fwupdmgr get-updates 2>/dev/null | grep -c "Update available" || echo "0")
@@ -8373,6 +8522,10 @@ show_journal() {
     local level="${1:-crit}"   # crit, err, warning
     local since="${2:-}"       # optional: "-1h", "-1d", etc.
 
+    # Records its own rows directly (no _section_* function), so it must
+    # declare its own section or every row lands with section:"".
+    _set_section "journal"
+
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
     printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Journal — ${level} and above"
@@ -8578,6 +8731,11 @@ _stor_subvol_row() {
 }
 
 analyze_storage() {
+    # Records its own rows directly (reuses only the _stor_* helpers, not a
+    # _section_* function), so it must declare its own section — otherwise
+    # every row lands with section:"" and --storage-info.json is ungroupable.
+    _set_section "storage_info"
+
     local STOR_MNT; STOR_MNT=$(mktemp -d /tmp/shani-storage-XXXXXX)
     # Bash's RETURN trap re-fires on every ANCESTOR function's return too, not
     # just this one's — confirmed live: it crashed main()'s own return with
@@ -8914,6 +9072,7 @@ _focused_header() {
 _focused_summary() { _recs_print "No issues found"; }
 
 boot_report() {
+    _set_section "boot"
     _report_init
 
     _focused_header "ShaniOS Boot Report"
@@ -8932,16 +9091,21 @@ boot_report() {
 }
 
 network_report() {
+    _set_section "network"
     _recs_reset
     _focused_header "ShaniOS Network Report"
 
     _section_network || true
     _section_servers || true
+    # "ldap" here (not "all") because SSSD rows never appeared in --network.
+    _section_directory         ldap || true
+    _section_email || true
 
     _focused_summary
 }
 
 hardware_report() {
+    _set_section "hardware"
     _report_init
 
     _focused_header "ShaniOS Hardware Report"
@@ -8957,6 +9121,7 @@ hardware_report() {
 }
 
 packages_report() {
+    _set_section "packages"
     _recs_reset
     _focused_header "ShaniOS Package Report"
 

@@ -232,24 +232,54 @@ _set_section() {
     _RECORD_SECTION="$1"
 }
 
-# Emit accumulated results as JSON
-_print_json() {
-    local out="{\"timestamp\":\"$(date -Iseconds)\",\"checks\":["
-    local first=1 entry section key status msg
-    for entry in "${_REPORT_RESULTS[@]}"; do
-        IFS='|' read -r section key status msg <<< "$entry"
-        (( first )) || out+=","
-        first=0
-        out+="{\"section\":\"$(_json_escape "$section")\",\"key\":\"$(_json_escape "$key")\",\"status\":\"${status}\",\"message\":\"$(_json_escape "$msg")\"}"
+# _json_field ENTRY N TOTAL — the Nth (1-based) pipe-separated field of
+# ENTRY, where TOTAL is how many fields that record kind has. The last field
+# takes the whole remainder (so a `|` inside a value survives); a field past
+# the last separator is empty, matching `IFS='|' read`. `read` itself is
+# unusable here — it is line-oriented, so a value containing a newline was
+# silently truncated before it ever reached the JSON string.
+# `want` is the ORIGINAL n: the loop below decrements n, and only the
+# original value can tell "last field" from "field before the last".
+_json_field() {
+    local rest="$1" n="$2" total="$3" want="$2"
+    while (( n > 1 )); do
+        [[ "$rest" == *'|'* ]] || { printf '%s' ""; return 0; }
+        rest="${rest#*|}"
+        n=$(( n - 1 ))
     done
-    out+="]}"
-    echo "$out"
+    if (( want < total )); then rest="${rest%%|*}"; fi
+    printf '%s' "$rest"
+}
+
+# Emit accumulated results as JSON.
+# jq serializes, NOT string concatenation: the previous hand-rolled escaper
+# only handled \ and ", so a raw control char in a value (TAB, CR, ESC)
+# emitted invalid JSON and every consumer rejected the whole document.
+# --args is byte-exact — one argv element per value, so a newline or pipe
+# inside a value can never be confused with the record separator. jq is a
+# declared dependency of this package (and already used unconditionally by
+# shani-upgrade-adviser). NUL is the one byte class bash strings cannot
+# hold, so neither the old nor the new path can carry it.
+_print_json() {
+    local -a fields=()
+    local entry
+    for entry in "${_REPORT_RESULTS[@]}"; do
+        fields+=("$( _json_field "$entry" 1 4 )" "$( _json_field "$entry" 2 4 )" \
+                 "$( _json_field "$entry" 3 4 )" "$( _json_field "$entry" 4 4 )")
+    done
+    jq -nc --arg timestamp "$(date -Iseconds)" --args '
+        { timestamp: $timestamp,
+          checks: [ $ARGS.positional as $p
+                    | range(0; $p | length; 4) as $i
+                    | { section: $p[$i], key: $p[$i+1],
+                        status: $p[$i+2], message: $p[$i+3] } ] }' \
+        ${fields[@]+"${fields[@]}"}
 }
 
 # Emit accumulated results as Nagios-compatible output
 _print_nagios() {
     local exit_code=0
-    local first=1 entry section key status msg
+    local entry section key status msg
     for entry in "${_REPORT_RESULTS[@]}"; do
         IFS='|' read -r section key status msg <<< "$entry"
         case "$status" in
@@ -274,13 +304,6 @@ _print_prometheus() {
         local safe_key="${key//[^a-zA-Z0-9_]/_}"
         printf 'shani_health_check{section="%s",key="%s",status="%s"} %d\n' "$safe_section" "$safe_key" "$status" "$val"
     done
-}
-
-_json_escape() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    printf '%s' "$s"
 }
 
 _nagios_escape() {
@@ -8064,18 +8087,26 @@ _check_fail() {
 # (see the _log_* definitions near the top of this file), so piping stdout
 # alone gives a clean machine-readable result even though the normal
 # colored report still prints as usual.
+#
+# Serialized by jq, not concatenated, and split with the same
+# shortest-match expansion as _print_json() — this is a second, independent
+# emitter over the same kind of untrusted values, so it would reintroduce the
+# same corruption if it kept its own hand-rolled escaping. `read` is
+# line-oriented and silently truncated a message at its first newline.
 _print_verify_json() {
     local total_errors="$1"
-    local out="{\"ok\":$( (( total_errors == 0 )) && echo true || echo false ),\"errors\":${total_errors},\"checks\":["
-    local first=1 entry name status msg
+    local -a fields=()
+    local entry
     for entry in "${_CHECK_RESULTS[@]}"; do
-        IFS='|' read -r name status msg <<< "$entry"
-        (( first )) || out+=","
-        first=0
-        out+="{\"name\":\"$(_json_escape "$name")\",\"status\":\"${status}\",\"message\":\"$(_json_escape "$msg")\"}"
+        fields+=("$( _json_field "$entry" 1 3 )" "$( _json_field "$entry" 2 3 )" \
+                 "$( _json_field "$entry" 3 3 )")
     done
-    out+="]}"
-    echo "$out"
+    jq -nc --argjson errors "$total_errors" --args '
+        { ok: ($errors == 0), errors: $errors,
+          checks: [ $ARGS.positional as $p
+                    | range(0; $p | length; 3) as $i
+                    | { name: $p[$i], status: $p[$i+1], message: $p[$i+2] } ] }' \
+        ${fields[@]+"${fields[@]}"}
 }
 
 verify_system() {

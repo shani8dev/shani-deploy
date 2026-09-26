@@ -5008,6 +5008,40 @@ _section_email() {
         fi
     fi
 
+    # The image ships exim, not postfix: exim is what provides `smtp-forwarder`
+    # and cronie's `smtp-server`, so a Postfix-only check reported no MTA at all
+    # on a machine whose mail transport was installed. Resolve the UNIT name
+    # first — `is-active`/`is-enabled` are meaningless against a name the system
+    # does not have (some builds call it exim4).
+    local _exim_unit=""
+    local _u
+    for _u in exim exim4; do
+        if systemctl cat "$_u" &>/dev/null 2>&1; then _exim_unit="$_u"; break; fi
+    done
+    if [[ -z "$_exim_unit" ]] && command -v exim &>/dev/null; then
+        _exim_unit="exim"
+    fi
+    if [[ -n "$_exim_unit" ]]; then
+        local _ex_cfg=0
+        # exim's package generates a working default config at install time, so
+        # the file merely existing proves nothing. A non-empty exim4.conf.local
+        # is the honest signal that the local admin actually configured it.
+        if [[ -s /etc/exim4/exim4.conf.local ]]; then _ex_cfg=1; fi
+        if systemctl is-active --quiet "$_exim_unit" 2>/dev/null; then
+            local _ex_queue=""
+            _ex_queue=$(exim -bpc 2>/dev/null | tr -d '[:space:]' || echo "")
+            if [[ ! "$_ex_queue" =~ ^[0-9]+$ ]]; then _ex_queue=""; fi
+            _row "Exim"        "OK  running${_ex_queue:+  (${_ex_queue} message(s) queued)}"
+        elif systemctl is-enabled --quiet "$_exim_unit" 2>/dev/null; then
+            _row "Exim"        "!   enabled but not running — system mail delivery broken"
+            _rec "Exim enabled but not running — cron/pacckey/smartd mail cannot be delivered"
+        elif (( _ex_cfg )); then
+            _srv_opt_row "Exim" "~~  configured, not enabled — to enable: systemctl enable --now ${_exim_unit}"
+        else
+            _srv_opt_row "Exim" "~~  not enabled — to send system mail: systemctl enable --now ${_exim_unit}"
+        fi
+    fi
+
     if _svc_present dovecot; then
         local _dv_cfg=0
         # CLI: doveconf reads all conf.d/ includes and returns the compiled value
@@ -5782,11 +5816,17 @@ _section_audio_display() {
         _row "rtkit"     "!!  not running (PipeWire RT unavailable)"
     fi
     if command -v pipewire &>/dev/null; then
-        local pw_st wp_st
-        pw_st=$(_sysd_user is-active pipewire    2>/dev/null | tr -d '[:space:]' || echo "inactive")
-        wp_st=$(_sysd_user is-active wireplumber 2>/dev/null | tr -d '[:space:]' || echo "inactive")
+        local pw_st wp_st pp_st
+        pw_st=$(_sysd_user is-active pipewire      2>/dev/null | tr -d '[:space:]' || echo "inactive")
+        wp_st=$(_sysd_user is-active wireplumber    2>/dev/null | tr -d '[:space:]' || echo "inactive")
+        pp_st=$(_sysd_user is-active pipewire-pulse 2>/dev/null | tr -d '[:space:]' || echo "inactive")
         if [[ "$pw_st" == "active" && "$wp_st" == "active" ]]; then
-            _row "PipeWire"  "OK  pipewire + wireplumber active"
+            if [[ "$pp_st" == "active" ]]; then
+                _row "PipeWire"  "OK  pipewire + wireplumber + pipewire-pulse active"
+            else
+                _row "PipeWire"  "!   pipewire + wireplumber active but pipewire-pulse is ${pp_st} — PulseAudio apps get no audio"
+                _rec "pipewire-pulse is ${pp_st} — applications using the PulseAudio API have no audio output"
+            fi
         elif [[ "$pw_st" == "active" && "$wp_st" != "active" ]]; then
             _row "PipeWire"  "!   pipewire active but wireplumber is ${wp_st}"
         else

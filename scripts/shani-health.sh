@@ -3439,6 +3439,71 @@ _section_hardware() {
         fi
     fi
 
+    # --- NFC reader -----------------------------------------------------
+    # libnfc owns the nfc-* tools on Arch (there is no nfc-utils) and installs
+    # them in /usr/sbin, not on an unprivileged PATH. nfc-scan-device and
+    # nfc-list print the SAME "No NFC device found." for an absent reader, so
+    # only the exit code discriminates: 1 from scan-device, always 0 from list.
+    local _nfc_bin=""
+    for _d in /usr/sbin /usr/bin /sbin /bin; do
+        [[ -x "$_d/nfc-scan-device" ]] && { _nfc_bin="$_d/nfc-scan-device"; break; }
+    done
+    if [[ -z "$_nfc_bin" ]]; then
+        _row "NFC"        "--  not available — libnfc is not installed, so no reader can be detected"
+    else
+        local _nfc_out _nfc_rc=0
+        _nfc_out=$(timeout 10 "$_nfc_bin" 2>/dev/null) || _nfc_rc=$?
+        if (( _nfc_rc == 0 )); then
+            local _nfc_dev
+            _nfc_dev=$(printf '%s\n' "$_nfc_out" | grep -iE 'PN5|ACR|SCM|SCL|ACS' | head -1)
+            _row "NFC"        "OK  reader present${_nfc_dev:+  (${_nfc_dev#*: })}"
+        else
+            _row "NFC"        "--  no reader detected"
+        fi
+    fi
+
+    # --- GNSS receiver ---------------------------------------------------
+    # Never gpsctl: --list exits 0 printing ~37 compiled-in driver types with
+    # nothing attached (a vendor grep is a guaranteed false positive), and bare
+    # gpsctl SEGFAULTS with rc 139 when gpsd is not running. A crash in a
+    # diagnostic script is worse than no answer. lsusb only enumerates USB, so
+    # a serial/proprietary GNSS is invisible -- hence "on USB", not "absent".
+    if ! command -v lsusb &>/dev/null; then
+        _row "GNSS"       "--  not available — usbutils is not installed"
+    else
+        local _gnss
+        _gnss=$(lsusb 2>/dev/null | grep -iE 'u-blox|quectel|gnss|gps' | head -1)
+        if [[ -n "$_gnss" ]]; then
+            _row "GNSS"       "OK  USB device present  ${_gnss##* }"
+        else
+            _row "GNSS"       "--  no GNSS receiver on USB — a serial-attached module would not appear here"
+        fi
+    fi
+
+    # --- UPS -------------------------------------------------------------
+    # A HID UPS, the laptop battery and a UCSI source (type=USB) all live here.
+    # A UPS is type=Battery WITH scope=Device; the laptop battery has no scope.
+    # Never sum them, and never say "on battery" without naming the device.
+    local _ups_found="" _ups_d
+    for _ups_d in /sys/class/power_supply/*; do
+        [[ -d "$_ups_d" ]] || continue
+        [[ "$(cat "$_ups_d/type" 2>/dev/null)" == "Battery" ]] || continue
+        [[ "$(cat "$_ups_d/scope" 2>/dev/null)" == "Device" ]] || continue
+        _ups_found+="${_ups_found:+ }$(basename "$_ups_d")"
+    done
+    if [[ -n "$_ups_found" ]]; then
+        local _ups_pct=""
+        _ups_cap=$(cat "/sys/class/power_supply/${_ups_found%% *}/capacity" 2>/dev/null) || _ups_cap=""
+        [[ "$_ups_cap" =~ ^[0-9]+$ ]] && _ups_pct=" ${_ups_cap}%"
+        if [[ -e "/sys/class/power_supply/${_ups_found%% *}/online" ]]; then
+            _row "UPS"        "!   ${_ups_found} is on battery${_ups_pct}"
+        else
+            _row "UPS"        "OK  ${_ups_found}${_ups_pct} present — no UPS daemon (nut) is reporting it"
+        fi
+    else
+        _row "UPS"        "--  no UPS detected on /sys/class/power_supply"
+    fi
+
     _optional_end
 }
 

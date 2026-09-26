@@ -1437,21 +1437,64 @@ enroll_tpm2() {
 # tpm2-status --json: what a GUI shows on its encryption page. Read-only.
 tpm2_status_json() {
     local enc=false tpm=false enrolled=false pin=false sb=false slots=0 dev="" dump=""
-    [[ -e "/dev/mapper/${ROOTLABEL}" ]] && enc=true
+    local luks_version="" luks_cipher="" luks_kdf="" luks_keyslots=0
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        enc=true
+    fi
     if command -v systemd-cryptenroll &>/dev/null \
        && { systemd-cryptenroll --tpm2-device=list 2>/dev/null || true; } | grep -q '/dev/'; then
         tpm=true
     fi
     if [[ $enc == true ]]; then
         dev=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: *//p' | awk '{print $NF}' || true)
-        [[ -n "$dev" ]] && dump=$(cryptsetup luksDump "$dev" 2>/dev/null || true)
+        if [[ -n "$dev" ]]; then
+            dump=$(cryptsetup luksDump "$dev" 2>/dev/null || true)
+        fi
         slots=$(grep -cE '^[[:space:]]+[0-9]+: systemd-tpm2' <<<"$dump" || true)
-        (( slots > 0 )) && enrolled=true
-        grep -qE 'tpm2-pin:[[:space:]]+true' <<<"$dump" && pin=true
+        if (( slots > 0 )); then
+            enrolled=true
+        fi
+        if grep -qE 'tpm2-pin:[[:space:]]+true' <<<"$dump"; then
+            pin=true
+        fi
+        # Cipher/KDF/keyslot detail for the same encryption page, read out of
+        # the luksDump text already collected above -- no extra cryptsetup
+        # invocation, so the AUTH_SELF, wheel-gated pkexec exec rule for
+        # gen-efi still covers the whole path. LUKS2 states "Cipher:"/"PBKDF:"
+        # per keyslot, LUKS1 states "Cipher name:"/"Hash spec:"; first match
+        # wins, and whatever the dump does not state stays ""/0. A guessed
+        # cipher or KDF would be worse than an empty one: a GUI cannot tell a
+        # reported value from a real one.
+        luks_version=$(awk '/^Version:/ { sub(/^Version:[[:space:]]*/, ""); print; exit }' <<<"$dump")
+        luks_cipher=$(awk '/^Cipher name:|^[[:space:]]+Cipher:/ { sub(/^[[:space:]]*(Cipher name|Cipher):[[:space:]]*/, ""); print; exit }' <<<"$dump")
+        luks_kdf=$(awk '/^Hash spec:|^[[:space:]]+PBKDF:/ { sub(/^[[:space:]]*(Hash spec|PBKDF):[[:space:]]*/, ""); print; exit }' <<<"$dump")
+        luks_keyslots=$(awk '/^Keyslots:[[:space:]]*$/ { in_ks=1; next }
+            /^[A-Za-z][A-Za-z ]*:[[:space:]]*$/ { in_ks=0 }
+            in_ks && /^[[:space:]]+[0-9]+: luks[0-9]/ { n++ }
+            END { print n+0 }' <<<"$dump")
     fi
-    [[ "$(mokutil --sb-state 2>/dev/null || true)" == *"SecureBoot enabled"* ]] && sb=true
-    printf '{"encrypted":%s,"tpm2_present":%s,"tpm2_enrolled":%s,"tpm2_slots":%s,"tpm2_pin":%s,"secure_boot":%s,"luks_device":"%s"}\n' \
-        "$enc" "$tpm" "$enrolled" "${slots:-0}" "$pin" "$sb" "$dev"
+    if [[ "$(mokutil --sb-state 2>/dev/null || true)" == *"SecureBoot enabled"* ]]; then
+        sb=true
+    fi
+    # jq, not printf concatenation: the values above are slices of
+    # free-form cryptsetup text, and a TAB, quote or backslash in any of them
+    # would otherwise emit a document no parser accepts.
+    jq -nc \
+        --argjson encrypted "$enc" \
+        --argjson tpm2_present "$tpm" \
+        --argjson tpm2_enrolled "$enrolled" \
+        --argjson tpm2_slots "${slots:-0}" \
+        --argjson tpm2_pin "$pin" \
+        --argjson secure_boot "$sb" \
+        --arg luks_device "$dev" \
+        --arg luks_version "$luks_version" \
+        --arg luks_cipher "$luks_cipher" \
+        --arg luks_kdf "$luks_kdf" \
+        --argjson luks_keyslots_in_use "${luks_keyslots:-0}" \
+        '{encrypted: $encrypted, tpm2_present: $tpm2_present, tpm2_enrolled: $tpm2_enrolled,
+          tpm2_slots: $tpm2_slots, tpm2_pin: $tpm2_pin, secure_boot: $secure_boot,
+          luks_device: $luks_device, luks_version: $luks_version, luks_cipher: $luks_cipher,
+          luks_kdf: $luks_kdf, luks_keyslots_in_use: $luks_keyslots_in_use}'
 }
 
 case "${1:-}" in

@@ -2714,6 +2714,107 @@ list_backups() {
     return 0
 }
 
+# --list-backups --json: machine-readable backup listing for Shani Cassini's
+# Updates & Rollback page. One entry per slot, each carrying the slot's own
+# OS version so the UI can answer "what can I roll back to, and what is each
+# slot running" without a second privileged call.
+#
+# The version comes from the slot's /etc/shani-version — the same file
+# rollback_system() reads, the same `tr -cd '0-9'` parse — so the listing and
+# the rollback logic can never disagree about a slot's version. It is
+# deliberately NOT folded into --status --json: that one is dispatched before
+# check_root and the deploy lock (a read-only, unprivileged contract that
+# tests/test-status-json.sh pins), and a slot's version is only reachable
+# through the subvolid=5 mount this function takes.
+#
+# The document is assembled with `jq -nc --arg`, never by printf
+# concatenation: `btrfs subvolume show`'s "Creation time:" value is free-form
+# and routinely contains spaces, colons, quotes and backslashes, any of which
+# would produce an unparseable document if interpolated into a printf template.
+#
+# The mount is exception-safe. The RETURN trap covers the normal return, and
+# every failure path unmounts explicitly before dying — because bash does NOT
+# run a RETURN trap on `exit` (verified: f(){ trap 'echo T' RETURN; exit 1; }
+# prints nothing), so the trap alone would leak the subvolid=5 mount. That is
+# exactly what list_backups() does today: it has no trap at all.
+list_backups_json() {
+    check_root
+    if ! command -v jq >/dev/null 2>&1; then
+        die "jq is required for --list-backups --json"
+    fi
+
+    mkdir -p "$MOUNT_DIR"
+    if ! mount -o subvolid=5 "$ROOT_DEV" "$MOUNT_DIR" 2>/dev/null; then
+        die "Could not mount root filesystem"
+    fi
+    # Self-clear: a RETURN trap re-fires on every ANCESTOR function's return
+    # too, not just this one's (see AGENTS.md), and $MOUNT_DIR is global here.
+    trap 'safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true; trap - RETURN' RETURN
+
+    local _json
+    if ! _json=$(_list_backups_json_collect); then
+        safe_umount "$MOUNT_DIR" 2>/dev/null || force_umount_all "$MOUNT_DIR" || true
+        trap - RETURN
+        die "Could not build the --list-backups --json document"
+    fi
+    printf '%s\n' "$_json"
+    return 0
+}
+
+# Body of list_backups_json(), run in a command substitution so a failure
+# kills only this subshell while the caller still owns (and releases) the
+# mount. Writes the finished document to stdout and nothing else.
+#
+# Failures are returned explicitly rather than left to `set -e`: a command
+# substitution on the right of `if !` inherits the *suppressed* errexit, so a
+# `set -e`-only guard here would silently produce a truncated document.
+_list_backups_json_collect() {
+    local _svol_list _slots="" _slot _ver _bk _created _size
+    local _bk_objs _slot_json _obj _out
+
+    _svol_list=$(btrfs subvolume list "$MOUNT_DIR" 2>/dev/null || echo "")
+
+    for _slot in blue green; do
+        _ver=$(tr -cd '0-9' 2>/dev/null < "$MOUNT_DIR/@${_slot}/etc/shani-version" || true)
+        _bk_objs=""
+        while IFS= read -r _bk; do
+            if [[ -z "$_bk" ]]; then continue; fi
+            if [[ ! "$_bk" =~ ^@${_slot}_backup_[0-9]{10,14}$ ]]; then continue; fi
+            # Strip everything up to and including the label's trailing
+            # whitespace rather than picking a fixed field: btrfs pads this
+            # line with a variable number of tabs, so `-F'\t' ... $2` — the
+            # idiom the human listings use — silently yields "" for some of
+            # them. Free-form value after the label is passed to jq --arg
+            # untouched, quotes and backslashes included.
+            _created=$(btrfs subvolume show "$MOUNT_DIR/${_bk}" 2>/dev/null \
+                | awk '/Creation time:/{sub(/^.*Creation time:[[:space:]]*/, ""); print; exit}' \
+                || echo "unknown")
+            if [[ -z "$_created" ]]; then _created="unknown"; fi
+            if [[ -d "$MOUNT_DIR/${_bk}" ]]; then
+                _size=$(du -sh "$MOUNT_DIR/${_bk}" 2>/dev/null | awk '{print $1}' || echo "?")
+            else
+                _size="?"
+            fi
+            if ! _obj=$(jq -nc --arg name "$_bk" --arg created "$_created" --arg size "$_size" \
+                '{name:$name, created:$created, size:$size}'); then
+                return 1
+            fi
+            _bk_objs+="$_obj"$'\n'
+        done < <(printf '%s\n' "$_svol_list" | awk -v s="${_slot}_backup_" '$NF ~ s {print $NF}' | sort)
+
+        if ! _slot_json=$(printf '%s' "$_bk_objs" | jq -s -c --arg slot "$_slot" --arg version "$_ver" \
+            '{slot:$slot, version:$version, backups:.}'); then
+            return 1
+        fi
+        _slots+="$_slot_json"$'\n'
+    done
+
+    if ! _out=$(printf '%s' "$_slots" | jq -s -c '{slots:.}'); then
+        return 1
+    fi
+    printf '%s\n' "$_out"
+}
+
 #####################################
 ### Channel Status                ###
 #####################################
@@ -4016,6 +4117,9 @@ Options:
   --set-channel           permanently set channel in /etc/shani-channel (latest|stable)
   --verify-existing       Verify current deployment integrity without updating
   --list-backups          List available rollback backups with timestamps
+  --list-backups --json   ...as {"slots":[{slot,version,backups:[{name,created,size}]}]};
+                          also reports each slot's own OS version. Needs root (mounts
+                          subvolid=5). See list_backups_json() for the field contract.
   --channel-status        Show latest/stable versions available remotely
   --status --json         Machine-readable state (slots, version, channel, boot/recovery
                           markers); no root. See status_json() for the field contract.
@@ -4083,7 +4187,18 @@ main() {
         status_json "$STATUS_CHECK"
         exit 0
     fi
-    [[ "$STATUS_CHECK" == "yes" || "$STATUS_JSON" == "yes" ]] && die "--check/--json go with --status"
+    # --json is a per-mode flag, not a global one: it belongs to --status and
+    # now to --list-backups, and to nothing else. --check is NOT relaxed — it
+    # is meaningless without --status (it asks the remote version pointers).
+    # Bare --json or --check with neither mode still dies, exactly as before.
+    if [[ "$STATUS_CHECK" == "yes" || "$STATUS_JSON" == "yes" ]]; then
+        if [[ "$STATUS_CHECK" == "yes" && "$STATUS_ONLY" != "yes" ]]; then
+            die "--check/--json go with --status"
+        fi
+        if [[ "$STATUS_JSON" == "yes" && "$STATUS_ONLY" != "yes" && "$LIST_BACKUPS" != "yes" ]]; then
+            die "--check/--json go with --status (--json is also valid with --list-backups)"
+        fi
+    fi
 
     check_root
     acquire_deploy_lock
@@ -4100,7 +4215,11 @@ main() {
     fi
 
     if [[ "$LIST_BACKUPS" == "yes" ]]; then
-        list_backups
+        if [[ "$STATUS_JSON" == "yes" ]]; then
+            list_backups_json
+        else
+            list_backups
+        fi
         exit 0
     fi
 

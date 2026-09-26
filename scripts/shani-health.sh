@@ -812,7 +812,9 @@ _section_os_slots() {
     # Previous slot — what was booted before the last deploy/rollback
     local _prev_slot
     _prev_slot=$(cat "$DATA_PREV_SLOT" 2>/dev/null | tr -d '[:space:]' || echo "")
-    [[ -n "$_prev_slot" ]] && _row "Previous"  "--  @${_prev_slot}"
+    if [[ -n "$_prev_slot" ]]; then
+        _row "Previous"  "--  @${_prev_slot}"
+    fi
 }
 
 _section_boot_health() {

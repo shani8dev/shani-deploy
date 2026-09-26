@@ -81,7 +81,8 @@ target_mode() {
 
 # Every target gets the same two-phase shape, which is the whole safety
 # property: validate the fragment, commit atomically, then check the LIVE
-# config the daemon actually reads, and roll back if that check complains.
+# config the daemon actually read - twice, as a baseline and again after -
+# and roll back if the second check finds something the first did not.
 #
 # An array, not a string: "${PRE_VALIDATOR_CMD[@]}" "$file" is ONE argv
 # element per element, so a string makes bash look for a program literally
@@ -188,6 +189,13 @@ backup=""
 had_previous=0
 commit_started=0
 committed=0
+# the two passes of the live check, below: $live_* is whichever pass ran
+# last, $baseline_* is frozen before the commit. Declared here so the
+# helpers that fill them can never trip `set -u`.
+live_out=""
+live_rc=0
+baseline_out=""
+baseline_rc=0
 
 # A scratch file in a config directory must be invisible to every consumer,
 # in case this script is killed between mktemp and the commit. All three
@@ -323,6 +331,94 @@ if [[ ${#PRE_VALIDATOR_CMD[@]} -gt 0 ]]; then
     fi
 fi
 
+# ── the LIVE check, in TWO passes, and the verdict is the DIFFERENCE.
+#
+# A post-check that only asks "is the live config clean?" judges the MACHINE,
+# not the CHANGE - and on a real ShaniOS box that verdict is permanently
+# false. The stock /etc/sudoers.d drop-ins (editor, insults, pwfeedback,
+# wheel) ship mode 0750, so `visudo -c` complains about all four on every
+# run forever, whatever we install, and a perfectly valid save rolled itself
+# back every single time. That is the same false-positive shape as the
+# synthetic sshd probe documented on the pre-validator above, and it made the
+# feature unusable rather than merely noisy.
+#
+# So the same check runs once BEFORE the commit, and its output and exit
+# status are kept as the baseline; then again after. A save succeeds unless
+# the post-check surfaces something the baseline did not.
+#
+# WHICH LINES COUNT AS OURS, i.e. which post-only lines are the expected
+# benign difference rather than a new problem: a line reporting on the
+# target path we just committed that the tool itself did not call a failure -
+# visudo's "<path>: parsed OK", or a line it explicitly labelled a warning.
+# `sshd -t` and `exportfs -ra` print nothing at all for a good save, so for
+# those two targets the set of such lines is simply empty.
+#
+# The "did not call it a failure" half is load-bearing and is NOT cosmetic. A
+# FATAL complaint about our own file - "syntax error", "bad permissions" - is
+# a new problem and must roll the change back, and the only way to tell the
+# two apart is that the tools label their own non-fatal diagnostics: a valid
+# drop-in that trips, say, visudo's "unused Cmnd_Alias" warning is still a
+# valid drop-in, and refusing to install it would be the same dead feature
+# this comparison exists to prevent. A post-only line about any OTHER file is
+# a new problem whatever it says, and so is a check that went from exit 0 to
+# non-zero even if it printed nothing new.
+#
+# Excluding our own file's non-fatal diagnostics does not hand the safety
+# property away, because the two phases above already hold the parts that
+# matter: the pre-validator parsed THIS fragment in isolation, and the
+# readback proved its mode and owner.
+
+# Runs the target's live check, storing its combined output in $live_out and
+# its exit status in $live_rc, and always returning 0: at both call sites a
+# failing check is data to be compared, never an abort.
+run_live_check() {
+    live_out=""
+    live_rc=0
+    live_out="$("${POST_VALIDATOR_CMD[@]}" 2>&1)" || live_rc=$?
+    return 0
+}
+
+is_ours_line() {
+    local rest
+    [[ "$1" == *"$path"* ]] || return 1
+    # the path has to stand there as a whole file name - every one of the
+    # three checks writes "<path>: ..." - not inside some other file's name
+    rest="${1##*"$path"}"
+    [[ -z "$rest" || "$rest" == :* || "$rest" == " "* ]] || return 1
+    [[ "$1" == *"parsed OK"* || "${1,,}" == warning:* ]]
+}
+
+# The lines of one pass that decide the verdict: everything that is not a
+# report on our own drop-in. Compared verbatim, so ordering matters - both
+# passes read the same directories in the same order.
+significant_lines() {
+    local line
+    [[ -n "$1" ]] || return 0
+    while IFS= read -r line; do
+        is_ours_line "$line" || printf '%s\n' "$line"
+    done <<< "$1"
+}
+
+if [[ ${#POST_VALIDATOR_CMD[@]} -gt 0 ]]; then
+    log "taking a baseline of the live config with '${POST_VALIDATOR_CMD[*]}'"
+    run_live_check
+    if (( live_rc == 126 || live_rc == 127 )); then
+        # 126/127 mean the check never ran, so there is no baseline and no
+        # verdict to reach. Fail closed for this target exactly as a missing
+        # binary does above: an uncheckable save is not a safe save, and
+        # skipping the comparison to "be nice" is how this bug came back.
+        die "could not run '${POST_VALIDATOR_CMD[*]}' to take a baseline; refusing to save ${target} uncheckable"
+    fi
+    baseline_out="$live_out"
+    baseline_rc="$live_rc"
+    if [[ -n "$baseline_out" ]]; then printf '%s\n' "$baseline_out" >&2; fi
+    if (( baseline_rc == 0 )); then
+        log "the live config is clean BEFORE the change"
+    else
+        log "the live config ALREADY exits ${baseline_rc} before the change; only NEW complaints are ours"
+    fi
+fi
+
 # ── keep whatever is there now, so a failed apply can be undone. A missing
 #    target is recorded as such rather than backed up as an empty file.
 if [[ -e "$path" ]]; then
@@ -370,19 +466,33 @@ actual_mode="$(stat -c %a "$path")" || die "could not stat ${path}"
 }
 log "installed ${target} -> ${path} (mode ${actual_mode}, readback verified)"
 
-# ── the LIVE check: parse the whole config the daemon will actually read, not
-#    just the fragment. exports has no per-file syntax check at all, so its
-#    verdict only exists here. A complaint means the live config is wrong, so
-#    the backup is restored rather than left in place.
+# ── the LIVE check, second pass, judged against the baseline taken above.
+#    exports has no per-file syntax check at all, so its verdict only exists
+#    here. The settle delay is exportfs' own cache settling after our change
+#    (a race against mountd, not a synchronisation) - the baseline needs no
+#    settle, because nothing had changed yet when it was taken.
 if [[ ${#POST_VALIDATOR_CMD[@]} -gt 0 ]]; then
-    if (( POST_SETTLE > 0 )); then sleep "$POST_SETTLE"; fi
+    # String comparison, not (( )): POST_SETTLE is 0.3 for exports, and bash
+    # arithmetic cannot parse a float -- (( POST_SETTLE > 0 )) raised
+    # "syntax error: invalid arithmetic operator" and silently took the false
+    # branch, so the settle never happened at all.
+    if [[ -n "$POST_SETTLE" && "$POST_SETTLE" != "0" ]]; then sleep "$POST_SETTLE"; fi
     log "checking the live config with '${POST_VALIDATOR_CMD[*]}'"
-    if out="$("${POST_VALIDATOR_CMD[@]}" 2>&1)"; then
-        if [[ -n "$out" ]]; then printf '%s\n' "$out" >&2; fi
-        log "the live config is accepted"
+    run_live_check
+    if [[ -n "$live_out" ]]; then printf '%s\n' "$live_out" >&2; fi
+
+    # Two ways to have made the live config worse: a complaint the baseline
+    # did not have, or a check that used to pass and now does not (a failure
+    # that prints nothing new is still a failure we introduced).
+    if [[ "$(significant_lines "$live_out")" == "$(significant_lines "$baseline_out")" ]] \
+        && ! (( live_rc != 0 && baseline_rc == 0 )); then
+        log "the live config gained no new complaint; the change is accepted"
     else
-        log "the live config was rejected; rolling back"
-        if [[ -n "$out" ]]; then printf '%s\n' "$out" >&2; fi
+        log "the change introduced a NEW complaint in the live config; rolling back"
+        if [[ -n "$baseline_out" ]]; then
+            log "the baseline it must not have made worse was:"
+            printf '%s\n' "$baseline_out" >&2
+        fi
         exit 1
     fi
 fi

@@ -285,6 +285,17 @@ replace the Cassini desktop test above.
   self-update) must fail closed on any verification failure — keep running
   the current, already-trusted copy rather than falling through to
   execution.
+- **`gen-efi.sh`'s dispatcher is located by TEXT, and `tests/test-tpm2-status-json.sh`
+  pulls it out with `sed -n '/^    tpm2-status)$/,/^[[:space:]]*;;$/p'` — the
+  FIRST match in the file.** Adding a second `case` whose arm is also indented
+  `    tpm2-status)` anywhere above the real dispatch silently breaks the test:
+  it extracts that earlier arm instead, and both dispatcher-arm cases fail with
+  `rc=0 out=` (an array assignment, no output) rather than anything that looks
+  like a real failure. Hit this live on 2026-09-27 while making
+  `REQUIRED_CMDS` per-subcommand — 34/0 at `HEAD` became 32/2. The fix was to
+  use `if`/`else` in `gen-efi.sh` so exactly one such line exists, **not** to
+  loosen the test's expectations. If you add a `case` on a subcommand name in
+  any script a test extracts from, check which match the test's `sed` takes.
 
 ## Audit-verified known issues (confirmed present)
 
@@ -342,6 +353,46 @@ replace the Cassini desktop test above.
   are joined by real bytes rather than by hand-written dicts. Not yet proven:
   a live session photographed with those values in the widget tree; the harness
   click/OCR path could not locate the Check button reliably.
+
+- **`gen-efi.sh`'s dependency preflight was unconditional, so the read-only
+  `tpm2-status` demanded the whole write-path toolchain — FIXED (2026-09-27).**
+  `REQUIRED_CMDS` was one flat list of 19 commands checked before dispatch, so
+  `tpm2-status --json` aborted with `Required command 'dracut' not found` on any
+  machine missing `dracut`/`sbsign`/`sbverify`/`bootctl`/`blkid`/`btrfs`/
+  `lsblk`/`findmnt`/`df` — tools that path never calls. `tpm2_status_json()`
+  only reads: `cryptsetup` for the mapper status and LUKS header, `jq` to emit
+  the document, `grep`/`awk`/`sed` to slice those tools' free-form text. The
+  visible failure was the documented "stdout is the JSON alone" contract
+  returning **empty stdout**, because the branch is the one that redirects
+  stdout to stderr and reserves fd 3 for the JSON — so Cassini's encryption
+  page got nothing to parse and the error named a boot tool for an operation
+  that never touches the boot chain. The set is now chosen per subcommand:
+  `tpm2-status` gets `cryptsetup jq grep awk sed date`, and **every other
+  subcommand keeps the original list byte for byte** (verified by md5 of the
+  list line against `HEAD`), because all six of them sign or write boot state.
+  `systemd-cryptenroll` and `mokutil` are deliberately still absent from the
+  reduced set — `tpm2_status_json()` already treats them as optional
+  (`command -v` guard, `|| true`) and reports their absence as a false field,
+  so requiring them would reintroduce the same class of failure.
+
+  Verified with a negative control rather than a positive test alone: the
+  pristine `HEAD` script and the edited one were run against an **identical**
+  stripped `PATH` (only the six read-side tools; no `blkid`, no `dracut`, no
+  `pkexec`/`sudo`). Pre-fix `tpm2-status` failed naming `blkid`; post-fix it
+  passes. All six write subcommands, plus no-args and a bogus subcommand,
+  behaved **identically in both** — still refusing on `blkid`, i.e. nothing was
+  relaxed. Then as real root in a real installed slot (`test enter blue
+  --local-src`), with `dracut`/`bootctl`/`blkid`/`sbverify` all absent from
+  `PATH`: `tpm2-status --json` returned rc=0 with clean sole-stdout
+  `jq`-parseable JSON, all 11 keys present and `luks_keyslots_in_use: null`
+  (not `0`, per the contract above), empty stderr — while all six write
+  subcommands on that same reduced `PATH` still exited 1 naming `blkid`. Full
+  mandatory harness green with the edit in place (`clean → ca → bootstrap -p
+  gnome → upgrade --local-src → rollback --local-src → clean`), the `upgrade`
+  step exercising the real write path: UKI generated and signed for `@green`,
+  "Deployment successful!". Unit gates: `test-deploy-state` 12/0,
+  `test-status-json` 20/0, `test-list-backups-json` 27/0,
+  `test-tpm2-status-json` 34/0, adviser suite pass.
 
 - **`--status --json` boot/recovery fields are a real, marker-derived
   contract (2026-09-25).** Cassini's Updates & Rollback / System views read

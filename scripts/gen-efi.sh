@@ -24,7 +24,18 @@
 set -Eeuo pipefail
 
 # Check for required dependencies.
-REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs" "lsblk" "findmnt" "df")
+#
+# tpm2-status is the one read-only subcommand, so it gets the only reduced set.
+# The `*)` list is load-bearing, not verbose: every other subcommand signs or
+# writes boot state, and relaxing it is how a machine stops booting. Keep it.
+# systemd-cryptenroll and mokutil are absent from tpm2-status on purpose --
+# tpm2_status_json() already treats them as optional and reports their absence
+# as a false field, so requiring them would reintroduce the failure being fixed.
+if [[ "${1:-}" == "tpm2-status" ]]; then
+    REQUIRED_CMDS=("cryptsetup" "jq" "grep" "awk" "sed" "date")
+else
+    REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs" "lsblk" "findmnt" "df")
+fi
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Required command '$cmd' not found. Please install it." >&2

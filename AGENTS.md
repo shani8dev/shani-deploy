@@ -295,6 +295,54 @@ replace the Cassini desktop test above.
   so the branch redirects it), `gen-efi enroll-tpm2 --stdin [--with-pin]`
   (secrets via stdin -> systemd-cryptenroll's PASSWORD/NEWPIN, never argv).
 
+- **`shani-deploy --list-backups --json` is a contract added 2026-09-27, and it
+  is the one place the `--json` guard was relaxed.** `--json` is otherwise
+  refused without `--status`/`--check`, so the relaxation is deliberately
+  narrow: `--list-backups` only. The JSON is built with `jq -nc`, never by
+  string-concatenating a tool's output. Each entry carries a **per-slot**
+  version — a slot's backups are identified by the slot they came from, not by
+  the current slot. The unmount before the read **refuses to touch subvolid 5**,
+  because that is the filesystem root and unmounting it is how a machine stops
+  booting; a refusal is reported, not forced. `tests/test-list-backups-json.sh`
+  (27 cases) is the contract test. Read-only and unprivileged, like `--status`.
+
+- **`gen-efi tpm2-status --json` gained four LUKS fields on 2026-09-27, and the
+  original seven keys did not change.** `luks_version`, `luks_cipher`,
+  `luks_kdf` and `luks_keyslots_in_use` were added so Cassini would stop
+  asserting "LUKS2" from what LUKS2 usually is. **This was backend-only until
+  the same day** — a field nothing renders is a field nobody has, and it took a
+  renderer in `tabs/encryption.py` plus four tests to make it real; treat
+  adding a JSON key here as unfinished until something consumes it. A field the
+  tool cannot determine is omitted or empty rather than defaulted, because
+  Cassini draws an empty value as "Not available" and a default would be a
+  claim about what protects the disk. **`luks_keyslots_in_use` is JSON `null`
+  when undetermined, never `0`** — fixed 2026-09-27: the count awk matched only
+  LUKS2's `  0: luks2` shape, so a LUKS1 disk (which says `Key Slot 0: ENABLED`
+  and always lists all eight slots, seven DISABLED) reported 0, and `${x:-0}`
+  turned that into a literal 0 the GUI printed as "0 keyslots in use". Both
+  shapes are counted now, LUKS1 counting ENABLED only, and neither matching
+  yields null. `tests/test-tpm2-status-json.sh` (34 cases) is the contract test;
+  its LUKS1 fixture is verbatim real `cryptsetup luksDump` output, because the
+  previous one was LUKS2-shaped fiction and passed against a format LUKS1 never
+  emits.
+- **The POPULATED branch is verified end to end against a real encrypted slot
+  (2026-09-27).** Reaching it needed a test-only unlock: a Shanios install is
+  configured `rd.luks.options=<uuid>=tpm2-device=auto` with no keyfile, so a
+  container with no TPM cannot boot an encrypted root unattended.
+  `shani-testbed/lib/install.sh` `cmd_bootstrap` now drops a throwaway keyfile
+  into the slot, points its `/etc/crypttab` at it, adds both to dracut
+  `install_items` and regenerates the initramfs — guarded on `encrypted`, so
+  default and unencrypted runs are untouched. With that, `dmsetup mknodes` plus a
+  node for the mapping's backing device (read the real major:minor out of
+  `dmsetup table`) makes gen-efi report `luks_version=2`,
+  `luks_cipher=aes-xts-plain64`, `luks_kdf=argon2id`, `luks_keyslots_in_use=1`
+  on a genuinely encrypted slot. That verbatim JSON is checked in as
+  `shani-cassini/tests/fixtures/tpm2-status-encrypted-slot.json` and drives the
+  real `EncryptionTab._on_status` in three tests, so the contract and the GUI
+  are joined by real bytes rather than by hand-written dicts. Not yet proven:
+  a live session photographed with those values in the widget tree; the harness
+  click/OCR path could not locate the Check button reliably.
+
 - **`--status --json` boot/recovery fields are a real, marker-derived
   contract (2026-09-25).** Cassini's Updates & Rollback / System views read
   `boot_failure`, `boot_hard_failure`, `auto_rollback_done`,

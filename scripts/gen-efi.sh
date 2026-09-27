@@ -1437,7 +1437,12 @@ enroll_tpm2() {
 # tpm2-status --json: what a GUI shows on its encryption page. Read-only.
 tpm2_status_json() {
     local enc=false tpm=false enrolled=false pin=false sb=false slots=0 dev="" dump=""
-    local luks_version="" luks_cipher="" luks_kdf="" luks_keyslots=0
+    # luks_keyslots starts EMPTY, not 0. On the unencrypted path the whole
+    # parsing block below is skipped, so an initialiser of 0 was emitted
+    # verbatim as a real count for a disk with no LUKS header at all. Empty
+    # flows into ${luks_keyslots:-null} and reports "not determined", which is
+    # what an absent header actually means.
+    local luks_version="" luks_cipher="" luks_kdf="" luks_keyslots=""
     if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
         enc=true
     fi
@@ -1468,10 +1473,20 @@ tpm2_status_json() {
         luks_version=$(awk '/^Version:/ { sub(/^Version:[[:space:]]*/, ""); print; exit }' <<<"$dump")
         luks_cipher=$(awk '/^Cipher name:|^[[:space:]]+Cipher:/ { sub(/^[[:space:]]*(Cipher name|Cipher):[[:space:]]*/, ""); print; exit }' <<<"$dump")
         luks_kdf=$(awk '/^Hash spec:|^[[:space:]]+PBKDF:/ { sub(/^[[:space:]]*(Hash spec|PBKDF):[[:space:]]*/, ""); print; exit }' <<<"$dump")
+        # LUKS2 lists keyslots as "  0: luks2", and only ones that exist.
+        # LUKS1 uses a different heading - "Key Slot 0: ENABLED" - and ALWAYS
+        # lists all eight slots, seven of them DISABLED, so counting the lines
+        # would report 8 keyslots on a volume with one. Only ENABLED counts.
+        # Counting only the LUKS2 form reported 0 on a LUKS1 disk that had one,
+        # and `${x:-0}` turned that into a literal 0 the GUI printed as "0
+        # keyslots in use": a claim about what protects the disk, derived from a
+        # field never read. So both shapes are counted, and NEITHER matching
+        # prints nothing, which becomes JSON null and reads as "Not available".
         luks_keyslots=$(awk '/^Keyslots:[[:space:]]*$/ { in_ks=1; next }
             /^[A-Za-z][A-Za-z ]*:[[:space:]]*$/ { in_ks=0 }
             in_ks && /^[[:space:]]+[0-9]+: luks[0-9]/ { n++ }
-            END { print n+0 }' <<<"$dump")
+            /^Key Slot [0-9]+: ENABLED/ { l1++ }
+            END { if (n > 0) print n; else if (l1 > 0) print l1; else print "" }' <<<"$dump")
     fi
     if [[ "$(mokutil --sb-state 2>/dev/null || true)" == *"SecureBoot enabled"* ]]; then
         sb=true
@@ -1490,7 +1505,7 @@ tpm2_status_json() {
         --arg luks_version "$luks_version" \
         --arg luks_cipher "$luks_cipher" \
         --arg luks_kdf "$luks_kdf" \
-        --argjson luks_keyslots_in_use "${luks_keyslots:-0}" \
+        --argjson luks_keyslots_in_use "${luks_keyslots:-null}" \
         '{encrypted: $encrypted, tpm2_present: $tpm2_present, tpm2_enrolled: $tpm2_enrolled,
           tpm2_slots: $tpm2_slots, tpm2_pin: $tpm2_pin, secure_boot: $secure_boot,
           luks_device: $luks_device, luks_version: $luks_version, luks_cipher: $luks_cipher,

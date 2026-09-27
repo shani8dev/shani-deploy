@@ -140,17 +140,28 @@ Tokens:
 Segments:
   1: crypt'
 
-DUMP_LUKS1='LUKS header information
+# Verbatim shape from `cryptsetup luksDump` on a real LUKS1 image (cryptsetup
+# 2.7.0). The previous fixture here was fiction: it put "0: luks1" lines under a
+# "Keyslots:" header, which is the LUKS2 shape, so the test passed against a
+# format LUKS1 never emits. Real LUKS1 says "Key Slot N: ENABLED" and ALWAYS
+# lists all eight slots with seven DISABLED.
+DUMP_LUKS1='LUKS header information for luks1.img
 Version:	1
-Cipher name:	xts-plain64
+Cipher name:	aes
 Cipher mode:	xts-plain64
-Hash spec:	sha512
+Hash spec:	sha256
 Payload offset:	4096
-Key slots area:	8M [bytes]
-Mode:	read/write
-Keyslots:
-  0: luks1
-  1: luks1
+MK bits:	512
+UUID:	c902803a-750a-4271-8853-9814fdc91a5f
+Key Slot 0: ENABLED
+	Iterations:          	1551146
+Key Slot 1: DISABLED
+Key Slot 2: DISABLED
+Key Slot 3: DISABLED
+Key Slot 4: DISABLED
+Key Slot 5: DISABLED
+Key Slot 6: DISABLED
+Key Slot 7: DISABLED
 '
 
 # No LUKS header whatsoever: an unlocked-but-not-encrypted, or a failed dump.
@@ -297,20 +308,25 @@ fi
 # ---- 4. LUKS1 dump: legacy field names must still be understood ------------
 machine 1 /dev/nvme0n1p3 "$DUMP_LUKS1" "" ""
 run_status
-if [[ $(jqf "$JSON" '.luks_cipher') == "xts-plain64" ]]; then
-    ok "luks_cipher == xts-plain64 (LUKS1 'Cipher name:' line)"
+if [[ $(jqf "$JSON" '.luks_cipher') == "aes" ]]; then
+    ok "luks_cipher == aes (LUKS1 'Cipher name:' line)"
 else
-    fail "luks_cipher == xts-plain64 (LUKS1 'Cipher name:' line)" "got '$(jqf "$JSON" '.luks_cipher')'"
+    fail "luks_cipher == aes (LUKS1 'Cipher name:' line)" "got '$(jqf "$JSON" '.luks_cipher')'"
 fi
-if [[ $(jqf "$JSON" '.luks_kdf') == "sha512" ]]; then
-    ok "luks_kdf == sha512 (LUKS1 'Hash spec:' line)"
+if [[ $(jqf "$JSON" '.luks_kdf') == "sha256" ]]; then
+    ok "luks_kdf == sha256 (LUKS1 'Hash spec:' line)"
 else
-    fail "luks_kdf == sha512 (LUKS1 'Hash spec:' line)" "got '$(jqf "$JSON" '.luks_kdf')'"
+    fail "luks_kdf == sha256 (LUKS1 'Hash spec:' line)" "got '$(jqf "$JSON" '.luks_kdf')'"
 fi
-if [[ $(jqf "$JSON" '.luks_keyslots_in_use') == "2" ]]; then
-    ok "luks_keyslots_in_use == 2 on a LUKS1 dump"
+if [[ $(jqf "$JSON" '.luks_keyslots_in_use') == "1" ]]; then
+    ok "luks_keyslots_in_use == 1 on a real LUKS1 dump (8 slots listed, 1 ENABLED)"
 else
-    fail "luks_keyslots_in_use == 2 on a LUKS1 dump" "got '$(jqf "$JSON" '.luks_keyslots_in_use')'"
+    fail "luks_keyslots_in_use == 1 on a real LUKS1 dump" "got '$(jqf "$JSON" '.luks_keyslots_in_use')'"
+fi
+if [[ $(jqf "$JSON" '.luks_keyslots_in_use') != "8" ]]; then
+    ok "DISABLED LUKS1 keyslots are not counted as in use"
+else
+    fail "DISABLED LUKS1 keyslots are not counted as in use" "reported all 8 slots"
 fi
 
 # ---- 4b. keyslot count is scoped to the Keyslots: section -----------------
@@ -334,10 +350,10 @@ else
 fi
 if [[ $(jqf "$JSON" '.luks_cipher') == "" && $(jqf "$JSON" '.luks_kdf') == "" \
    && $(jqf "$JSON" '.luks_version') == "" \
-   && $(jqf "$JSON" '.luks_keyslots_in_use') == "0" ]]; then
-    ok "headerless dump: new fields empty/0, nothing invented"
+   && $(jqf "$JSON" '.luks_keyslots_in_use') == "null" ]]; then
+    ok "headerless dump: new fields empty and keyslots null, nothing invented"
 else
-    fail "headerless dump: new fields empty/0, nothing invented" \
+    fail "headerless dump: new fields empty and keyslots null" \
          "cipher='$(jqf "$JSON" '.luks_cipher')' kdf='$(jqf "$JSON" '.luks_kdf')' ver='$(jqf "$JSON" '.luks_version')' slots='$(jqf "$JSON" '.luks_keyslots_in_use')'"
 fi
 
@@ -345,8 +361,8 @@ fi
 machine 1 /dev/nvme0n1p3 NONE "" ""
 run_status
 if (( RC == 0 )) && printf '%s' "$JSON" | jq -e . &>/dev/null \
-   && [[ $(jqf "$JSON" '.luks_cipher') == "" && $(jqf "$JSON" '.luks_keyslots_in_use') == "0" ]]; then
-    ok "failed luksDump: rc 0, valid JSON, empty new fields"
+   && [[ $(jqf "$JSON" '.luks_cipher') == "" && $(jqf "$JSON" '.luks_keyslots_in_use') == "null" ]]; then
+    ok "failed luksDump: rc 0, valid JSON, empty fields, keyslots null (not a false 0)"
 else
     fail "failed luksDump: rc 0, valid JSON, empty new fields" "rc=$RC out=$JSON"
 fi
@@ -361,8 +377,8 @@ else
 fi
 if [[ $(jqf "$JSON" '.encrypted') == "false" && $(jqf "$JSON" '.luks_device') == "" \
    && $(jqf "$JSON" '.luks_cipher') == "" && $(jqf "$JSON" '.luks_kdf') == "" \
-   && $(jqf "$JSON" '.luks_keyslots_in_use') == "0" ]]; then
-    ok "unencrypted root: no LUKS field is invented"
+   && $(jqf "$JSON" '.luks_keyslots_in_use') == "null" ]]; then
+    ok "unencrypted root: no LUKS field is invented (keyslots null, never a bare 0)"
 else
     fail "unencrypted root: no LUKS field is invented" "out=$JSON"
 fi

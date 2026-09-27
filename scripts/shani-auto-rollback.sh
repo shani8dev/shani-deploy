@@ -64,6 +64,32 @@ BOOT_FAILURE_ACKED="${deploy_boot_failure_acked:-${DEFAULT_deploy_boot_failure_a
 BOOT_HARD_FAILURE_FILE="${deploy_boot_hard_failure:-${DEFAULT_deploy_boot_hard_failure}}"
 AUTO_ROLLBACK_DONE_FILE="${deploy_auto_rollback_done:-${DEFAULT_deploy_auto_rollback_done}}"
 
+# These four are marker paths this script reads and `touch`es as root, and the
+# parser accepts any value for them. Same narrow rule and same reason as the
+# _vc_bad_path in check-boot-failure.sh, gen-efi.sh and shani-deploy.sh:
+# absolute, not the filesystem root, no '..', so a legitimate path under /data
+# or /run keeps working and only a hand-edited shani.conf pointing `touch`/`rm`
+# somewhere else is stopped.
+_vc_bad_path() { # $1=value var  $2=default var  $3=label
+    local val="${!1}" why=""
+    [[ -n "$val" ]] || return 0
+    if [[ "$val" != /* ]]; then
+        why="${3}='${val}' is not an absolute path"
+    elif [[ "$val" == "/" ]]; then
+        why="${3}=/ is not a usable marker path"
+    elif [[ "$val" == *..* ]]; then
+        why="${3}='${val}' contains '..'"
+    fi
+    [[ -n "$why" ]] || return 0
+    echo "$(date "+%Y-%m-%d %H:%M:%S") [AUTOROLLBACK][WARN] shani.conf: ${why}; using ${!2}" >&2
+    printf -v "$1" '%s' "${!2}"
+}
+
+_vc_bad_path BOOT_FAILURE_FILE      DEFAULT_deploy_boot_failure        boot_failure
+_vc_bad_path BOOT_FAILURE_ACKED     DEFAULT_deploy_boot_failure_acked  boot_failure_acked
+_vc_bad_path BOOT_HARD_FAILURE_FILE DEFAULT_deploy_boot_hard_failure   boot_hard_failure
+_vc_bad_path AUTO_ROLLBACK_DONE_FILE DEFAULT_deploy_auto_rollback_done auto_rollback_done
+
 # Idempotency: this unit can fire more than once per boot (once early to
 # catch a hard failure quickly, once again after check-boot-failure.timer's
 # 15-minute check) — skip if already processed this boot. Cleared by

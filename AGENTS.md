@@ -442,15 +442,24 @@ replace the Cassini desktop test above.
   there and not a check folded into the assignments; the test pins that order,
   because correcting an already-`readonly` variable would fail outright.
 
-  **`shani-health.sh` was never exposed, and the other two are the remainder.**
-  Tracing which config-derived variables each script actually assigns shows
-  `shani-health.sh` has **none** — it reads the config and resolves nothing from
-  it, so it was never in scope and should not be "fixed" by copying code into it.
-  That leaves `check-boot-failure.sh` (six marker-file paths) and
-  `shani-auto-rollback.sh` (four), which write and remove marker files rather
-  than mounting anything. They are the remaining gap, and they are lower
-  consequence than the two that are done: a bad marker path corrupts a marker,
-  it does not mount or execute.
+  **All four consumers are now done (2026-09-27), and the fifth was never
+  exposed.** `check-boot-failure.sh` (six marker paths) and
+  `shani-auto-rollback.sh` (four) also `rm -f` / `>` / `touch` their values as
+  root, so they get the same narrow rule — absolute, not `/`, no `..` — with the
+  width chosen so a legitimate marker under `/data` **or `/run`** keeps working.
+  `/run` is not hypothetical: `reboot_needed=/run/shanios/reboot-needed` is
+  shipped in the sample config, and a rule tightened to "must be under /data"
+  would break it. `shani-health.sh` resolves **no** config-derived variable at
+  all — it reads the file and uses none of it — so it was never in scope and
+  should not be "fixed" by copying code into it.
+
+  **Four copies of `_vc_bad_path`, deliberately independent**, matching the
+  existing 5-copy `get_booted_subvol()` convention: these are separately
+  packaged executables with no shared-library mechanism, and a sourcing change
+  is a packaging change. What guards against them drifting apart is in the test,
+  not in a shared file: `tests/test-config-validation.sh` counts the guarded
+  variables against the assigned ones **per script**, so adding a marker without
+  guarding it fails.
 
 - **`gen-efi.sh`'s dependency preflight was unconditional, so the read-only
   `tpm2-status` demanded the whole write-path toolchain — FIXED (2026-09-27).**

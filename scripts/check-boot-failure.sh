@@ -56,6 +56,34 @@ BOOT_HARD_FAILURE_FILE="${deploy_boot_hard_failure:-${DEFAULT_deploy_boot_hard_f
 BOOT_OK_FILE="${deploy_boot_ok:-${DEFAULT_deploy_boot_ok}}"
 BOOT_IN_PROGRESS_FILE="${deploy_boot_in_progress:-${DEFAULT_deploy_boot_in_progress}}"
 
+# These six are marker paths that this script `rm -f`s and `>`s as root, and the
+# parser accepts any value for them. The rule is deliberately narrow - absolute,
+# not the filesystem root, no '..' - so a legitimate path under /data or /run
+# (both are used) keeps working; what it stops is a hand-edited shani.conf
+# pointing `rm -f` somewhere else. Same shape and the same reason as the
+# _validate_config in gen-efi.sh and shani-deploy.sh.
+_vc_bad_path() { # $1=value var  $2=default var  $3=label
+    local val="${!1}" why=""
+    [[ -n "$val" ]] || return 0
+    if [[ "$val" != /* ]]; then
+        why="${3}='${val}' is not an absolute path"
+    elif [[ "$val" == "/" ]]; then
+        why="${3}=/ is not a usable marker path"
+    elif [[ "$val" == *..* ]]; then
+        why="${3}='${val}' contains '..'"
+    fi
+    [[ -n "$why" ]] || return 0
+    echo "$(date "+%Y-%m-%d %H:%M:%S") [CHECKBOOT][WARN] shani.conf: ${why}; using ${!2}" >&2
+    printf -v "$1" '%s' "${!2}"
+}
+
+_vc_bad_path CURRENT_SLOT_FILE     DEFAULT_deploy_current_slot      current_slot
+_vc_bad_path BOOT_FAILURE_FILE    DEFAULT_deploy_boot_failure     boot_failure
+_vc_bad_path BOOT_FAILURE_ACKED   DEFAULT_deploy_boot_failure_acked boot_failure_acked
+_vc_bad_path BOOT_HARD_FAILURE_FILE DEFAULT_deploy_boot_hard_failure boot_hard_failure
+_vc_bad_path BOOT_OK_FILE         DEFAULT_deploy_boot_ok           boot_ok
+_vc_bad_path BOOT_IN_PROGRESS_FILE DEFAULT_deploy_boot_in_progress boot_in_progress
+
 # Serialize marker read+write with flock — same pattern used for the
 # subid-allocation lock in shani-user-setup.sh. This script reads then
 # conditionally writes/removes /data/boot_failure, /data/boot_failure.acked,

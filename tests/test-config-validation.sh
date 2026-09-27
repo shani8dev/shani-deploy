@@ -328,4 +328,140 @@ else
     fail "deploy: the call comes before the readonly block" "call=$D_CALL readonly=$D_READONLY — correcting a readonly value would fail outright"
 fi
 
+# --- the two marker-path scripts ---------------------------------------------
+#
+# Same rule, less consequence: these rm -f / touch / > marker paths rather than
+# mounting or executing anything. Covered here because a bad marker path is
+# still `rm -f` as root, and because the two copies are byte-identical to each
+# other, so a drift between them would be invisible.
+#
+# The values asserted as KEPT matter as much as the rejected ones: a legitimate
+# marker under /data or /run must survive, or this "fix" breaks a working
+# machine. /run in particular is a real case here.
+
+check_marker() { # $1=script  $2=var  $3=default var  $4=config key  $5=label  $6=config  $7=expected
+    local script="$1" var="$2" def="$3" key="$4"
+    printf '%s\n' "$6" > "$TMP/shani.conf"
+    local got
+    got=$(
+        set +u
+        # The DEFAULT_ values come from the shipped script rather than being
+        # restated here, so this cannot drift from the real defaults.
+        eval "$(sed -n '/^DEFAULT_deploy_[a-z_]*=/p' "$script")"
+        eval "$(sed -n '/^_load_ini_config() {/,/^}/p;/^_vc_bad_path() {/,/^}/p' "$script")"
+        # The config key is passed in, NOT derived from the variable name. Three
+        # attempts at this helper were wrong before it worked, and all three
+        # failed the same way - by reading a variable that was never set, so the
+        # value under test was always the DEFAULT:
+        #   1. never copying the parsed value into the variable at all;
+        #   2. lowercasing the variable name, which gives
+        #      `auto_rollback_done_file` where the key is `auto_rollback_done`;
+        #   3. forgetting that the parser stores `${section}_${key}`, i.e.
+        #      `deploy_auto_rollback_done`, not the bare key.
+        # Every "is rejected" case passed through all of that because the
+        # default happened to equal the expected answer. A /run path is in the
+        # set precisely because it DIFFERS from the default, which is the only
+        # reason any of this surfaced. Do not "tidy" the explicit key argument
+        # back into derivation.
+        _load_ini_config "$TMP/shani.conf" 2>/dev/null
+        # Declared and assigned in SEPARATE statements on purpose: `local
+        # full=x raw="${!full:-}"` expands the indirection before `local` has
+        # created `full`, which is "invalid indirect expansion".
+        local full="deploy_${key}"
+        local raw="${!full:-}"
+        [[ -n "$raw" ]] || raw="${!def}"
+        printf -v "$var" '%s' "$raw"
+        _vc_bad_path "$var" "$def" "$2" 2>/dev/null
+        printf '%s' "${!var}"
+    )
+    if [[ "$got" == "$7" ]]; then ok "$5"; else fail "$5" "got '$got', want '$7'"; fi
+}
+
+CBF=scripts/check-boot-failure.sh
+ARB=scripts/shani-auto-rollback.sh
+
+check_marker "$CBF" BOOT_FAILURE_FILE DEFAULT_deploy_boot_failure boot_failure \
+    "check-boot-failure: the real /data marker path is kept" \
+    '[deploy]
+boot_failure=/data/boot_failure' "/data/boot_failure"
+
+check_marker "$CBF" BOOT_FAILURE_FILE DEFAULT_deploy_boot_failure boot_failure \
+    "check-boot-failure: a relative marker path is rejected" \
+    '[deploy]
+boot_failure=data/boot_failure' "/data/boot_failure"
+
+check_marker "$CBF" BOOT_FAILURE_FILE DEFAULT_deploy_boot_failure boot_failure \
+    "check-boot-failure: marker=/ is rejected" \
+    '[deploy]
+boot_failure=/' "/data/boot_failure"
+
+check_marker "$CBF" BOOT_FAILURE_ACKED DEFAULT_deploy_boot_failure_acked boot_failure_acked \
+    "check-boot-failure: a '..' in the acked marker is rejected" \
+    '[deploy]
+boot_failure_acked=/data/../etc/passwd' "/data/boot_failure.acked"
+
+check_marker "$ARB" AUTO_ROLLBACK_DONE_FILE DEFAULT_deploy_auto_rollback_done auto_rollback_done \
+    "auto-rollback: the real marker path is kept" \
+    '[deploy]
+auto_rollback_done=/data/auto_rollback_done' "/data/auto_rollback_done"
+
+check_marker "$ARB" AUTO_ROLLBACK_DONE_FILE DEFAULT_deploy_auto_rollback_done auto_rollback_done \
+    "auto-rollback: a /run marker path is KEPT (a real case, and the one that differs from the default)" \
+    '[deploy]
+auto_rollback_done=/run/shanios/auto_rollback_done' "/run/shanios/auto_rollback_done"
+
+check_marker "$ARB" AUTO_ROLLBACK_DONE_FILE DEFAULT_deploy_auto_rollback_done auto_rollback_done \
+    "auto-rollback: a relative marker path is rejected" \
+    '[deploy]
+auto_rollback_done=data/auto_rollback_done' "/data/auto_rollback_done"
+
+check_marker "$ARB" BOOT_HARD_FAILURE_FILE DEFAULT_deploy_boot_hard_failure boot_hard_failure \
+    "auto-rollback: a '..' in the hard-failure marker is rejected" \
+    '[deploy]
+boot_hard_failure=/data/../../etc/shadow' "/data/boot_hard_failure"
+
+# The two marker scripts must carry the same number of guarded variables each,
+# so a future edit that adds a marker without guarding it is visible here.
+CBF_GUARDED=$(grep -c '^_vc_bad_path [A-Z]' "$CBF")
+ARB_GUARDED=$(grep -c '^_vc_bad_path [A-Z]' "$ARB")
+CBF_VARS=$(grep -cE '^(BOOT_FAILURE_FILE|BOOT_FAILURE_ACKED|BOOT_HARD_FAILURE_FILE|BOOT_OK_FILE|BOOT_IN_PROGRESS_FILE|CURRENT_SLOT_FILE)=' "$CBF")
+ARB_VARS=$(grep -cE '^(BOOT_FAILURE_FILE|BOOT_FAILURE_ACKED|BOOT_HARD_FAILURE_FILE|AUTO_ROLLBACK_DONE_FILE)=' "$ARB")
+
+if [[ "$CBF_GUARDED" -eq "$CBF_VARS" ]]; then
+    ok "check-boot-failure: all $CBF_VARS marker variables are guarded"
+else
+    fail "check-boot-failure: all marker variables are guarded" "guarded=$CBF_GUARDED assigned=$CBF_VARS"
+fi
+
+if [[ "$ARB_GUARDED" -eq "$ARB_VARS" ]]; then
+    ok "auto-rollback: all $ARB_VARS marker variables are guarded"
+else
+    fail "auto-rollback: all marker variables are guarded" "guarded=$ARB_GUARDED assigned=$ARB_VARS"
+fi
+
+# Order, because a guard placed before the assignments validates an unset
+# variable and silently does nothing. The negative control is why this exists:
+# disabling the guards failed ONLY the two count assertions above, because the
+# value assertions eval _vc_bad_path out of the script and call it themselves.
+# That is fine for proving the guard works and useless for proving the script
+# uses it -- exactly the vacuity already found and fixed in the gen-efi and
+# shani-deploy halves, and it is why the wiring is asserted here separately.
+order_check() { # $1=script  $2=label  $3=last-assignment line
+    local script="$1" label="$2" last="$3"
+    local helper first
+    helper=$(grep -n '^_vc_bad_path()' "$script" | cut -d: -f1)
+    first=$(grep -n '^_vc_bad_path [A-Z]' "$script" | head -1 | cut -d: -f1)
+    if [[ -n "$first" && -n "$last" && -n "$helper" && "$helper" -gt "$last" && "$first" -gt "$helper" ]]; then
+        ok "$label: every guard runs after the assignments and after it is defined ($last < $helper < $first)"
+    else
+        fail "$label: guards run after the assignments and after the definition" \
+             "last_assign=$last helper=$helper first_call=$first"
+    fi
+}
+
+order_check "$CBF" "check-boot-failure" \
+    "$(grep -nE '^BOOT_IN_PROGRESS_FILE=' "$CBF" | cut -d: -f1)"
+order_check "$ARB" "auto-rollback" \
+    "$(grep -nE '^AUTO_ROLLBACK_DONE_FILE=' "$ARB" | cut -d: -f1)"
+
 summary

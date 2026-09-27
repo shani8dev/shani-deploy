@@ -171,4 +171,161 @@ else
     fail "the call comes before \$ESP is assigned from it" "call=$CALL_LINE ESP=$ESP_LINE — validating after assignment is too late"
 fi
 
+# --- the same contract in shani-deploy.sh, which has more of it --------------
+#
+# shani-deploy.sh resolves the same config into 22 variables and feeds three
+# more dangerous sinks than gen-efi does: MOUNT_DIR (mount/umount of the
+# chroot root), GENEFI_SCRIPT (handed to `chroot` to run as root) and five
+# thresholds that land in $(( )) / (( )). Its assignments are already
+# DEFAULT_-resolved and are made readonly further down, so the validator has to
+# run in between -- which the order assertions below pin.
+#
+# The wiring lesson from the gen-efi half applies here too and is why these
+# exist: a test that extracts the functions and calls them itself says nothing
+# about whether the shipped script calls them.
+
+DEPLOY=scripts/shani-deploy.sh
+[[ -f "$DEPLOY" ]] || { echo "missing $DEPLOY"; exit 1; }
+
+eval "$(sed -n '/^_load_ini_config() {/,/^}/p;/^_vc_bad_path() {/,/^}/p;/^_vc_num() {/,/^}/p;/^_validate_config() {/,/^}/p' "$DEPLOY")"
+declare -F _validate_config >/dev/null || { echo "could not extract _validate_config() from $DEPLOY"; exit 1; }
+
+DEFAULT_deploy_esp_path="/boot/efi"
+DEFAULT_deploy_mount_dir="/mnt"
+DEFAULT_deploy_genefi_script="/usr/local/bin/gen-efi"
+DEFAULT_deploy_rootlabel="shani_root"
+DEFAULT_deploy_max_inhibit_depth="2"
+DEFAULT_deploy_max_download_attempts="5"
+DEFAULT_deploy_extraction_timeout="1800"
+DEFAULT_deploy_min_free_space_mb="10240"
+DEFAULT_deploy_min_file_size="10485760"
+
+# Apply a config through the real parser, resolve the uppercase variables the
+# way the script does, then validate. Reports the values that reach sinks.
+apply_deploy() {
+    printf '%s\n' "$1" > "$TMP/shani.conf"
+    (
+        set +u
+        unset ESP MOUNT_DIR GENEFI_SCRIPT ROOTLABEL MAX_INHIBIT_DEPTH \
+              MAX_DOWNLOAD_ATTEMPTS EXTRACTION_TIMEOUT MIN_FREE_SPACE_MB MIN_FILE_SIZE 2>/dev/null || true
+        _load_ini_config "$TMP/shani.conf" 2>/dev/null
+        ESP="${deploy_esp_path:-$DEFAULT_deploy_esp_path}"
+        MOUNT_DIR="${deploy_mount_dir:-$DEFAULT_deploy_mount_dir}"
+        GENEFI_SCRIPT="${deploy_genefi_script:-$DEFAULT_deploy_genefi_script}"
+        ROOTLABEL="${deploy_rootlabel:-$DEFAULT_deploy_rootlabel}"
+        MAX_INHIBIT_DEPTH="${deploy_max_inhibit_depth:-$DEFAULT_deploy_max_inhibit_depth}"
+        MAX_DOWNLOAD_ATTEMPTS="${deploy_max_download_attempts:-$DEFAULT_deploy_max_download_attempts}"
+        EXTRACTION_TIMEOUT="${deploy_extraction_timeout:-$DEFAULT_deploy_extraction_timeout}"
+        MIN_FREE_SPACE_MB="${deploy_min_free_space_mb:-$DEFAULT_deploy_min_free_space_mb}"
+        MIN_FILE_SIZE="${deploy_min_file_size:-$DEFAULT_deploy_min_file_size}"
+        _validate_config 2>/dev/null
+        printf '%s|%s|%s|%s|%s|%s|%s|%s' "$ESP" "$MOUNT_DIR" "$GENEFI_SCRIPT" "$ROOTLABEL" \
+               "$MAX_INHIBIT_DEPTH" "$MAX_DOWNLOAD_ATTEMPTS" "$EXTRACTION_TIMEOUT" "$MIN_FREE_SPACE_MB"
+    )
+}
+
+# $1=label  $2=config  $3..$10=expected esp,mnt,gen,label,depth,attempts,timeout,minspace
+check_deploy() {
+    local label="$1" cfg="$2"; shift 2
+    local -a want=("$@")
+    local -a got=()
+    local IFS='|'
+    read -r -a got <<< "$(apply_deploy "$cfg")"
+    local bad=""
+    local names=(ESP MOUNT_DIR GENEFI_SCRIPT ROOTLABEL MAX_INHIBIT_DEPTH \
+                 MAX_DOWNLOAD_ATTEMPTS EXTRACTION_TIMEOUT MIN_FREE_SPACE_MB)
+    local i
+    for i in "${!want[@]}"; do
+        [[ "${got[$i]}" == "${want[$i]}" ]] || bad+="${names[$i]}=${got[$i]}(want ${want[$i]}) "
+    done
+    if [[ -z "$bad" ]]; then ok "$label"; else fail "$label" "$bad"; fi
+}
+
+check_deploy "deploy: the shipped defaults survive untouched" \
+    '[deploy]
+esp_path=/boot/efi
+mount_dir=/mnt
+genefi_script=/usr/local/bin/gen-efi
+rootlabel=shani_root' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: /efi is a real ESP and is kept" \
+    '[deploy]
+esp_path=/efi' \
+    /efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: esp_path=/ is rejected" \
+    '[deploy]
+esp_path=/' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: a relative mount_dir is rejected" \
+    '[deploy]
+mount_dir=mnt' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: a relative genefi_script is rejected before chroot runs it" \
+    '[deploy]
+genefi_script=bin/gen-efi' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: a '..' in genefi_script is rejected" \
+    '[deploy]
+genefi_script=/usr/local/bin/../bin/gen-efi' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: a traversal in rootlabel is rejected" \
+    '[deploy]
+rootlabel=../etc/shadow' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: a non-numeric threshold falls back to the default, not into arithmetic" \
+    '[deploy]
+extraction_timeout=30m' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+check_deploy "deploy: a threshold below its floor is raised to the floor" \
+    '[deploy]
+extraction_timeout=5' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 60 10240
+
+check_deploy "deploy: max_download_attempts=0 is raised to 1 (a zero retry loop is not a choice)" \
+    '[deploy]
+max_download_attempts=0' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 1 1800 10240
+
+check_deploy "deploy: max_inhibit_depth=0 is a legitimate zero and is KEPT" \
+    '[deploy]
+max_inhibit_depth=0' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 0 5 1800 10240
+
+check_deploy "deploy: an undocumented but live key still parses (no allowlist)" \
+    '[deploy]
+genefi_bin=/usr/local/bin/gen-efi' \
+    /boot/efi /mnt /usr/local/bin/gen-efi shani_root 2 5 1800 10240
+
+# --- and the wiring, which is the part the value assertions cannot see -------
+
+D_CALL=$(grep -n '^_validate_config$' "$DEPLOY" | head -1 | cut -d: -f1)
+D_LAST_ASSIGN=$(grep -n '^MAX_INHIBIT_DEPTH="' "$DEPLOY" | head -1 | cut -d: -f1)
+D_READONLY=$(grep -n '^readonly ESP=' "$DEPLOY" | head -1 | cut -d: -f1)
+
+if [[ -n "$D_CALL" ]]; then
+    ok "deploy: the script calls _validate_config (not merely defining it)"
+else
+    fail "deploy: the script calls _validate_config (not merely defining it)" "no top-level call"
+fi
+
+if [[ -n "$D_CALL" && -n "$D_LAST_ASSIGN" && "$D_CALL" -gt "$D_LAST_ASSIGN" ]]; then
+    ok "deploy: the call comes after every config assignment (line $D_CALL > $D_LAST_ASSIGN)"
+else
+    fail "deploy: the call comes after every config assignment" "call=$D_CALL last_assign=$D_LAST_ASSIGN"
+fi
+
+if [[ -n "$D_CALL" && -n "$D_READONLY" && "$D_CALL" -lt "$D_READONLY" ]]; then
+    ok "deploy: the call comes before the readonly block (line $D_CALL < $D_READONLY)"
+else
+    fail "deploy: the call comes before the readonly block" "call=$D_CALL readonly=$D_READONLY — correcting a readonly value would fail outright"
+fi
+
 summary

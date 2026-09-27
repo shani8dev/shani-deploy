@@ -428,12 +428,29 @@ replace the Cassini desktop test above.
   upgrade --local-src → rollback --local-src → clean`), the `upgrade` step
   doing the real UKI generate-and-sign for `@green`.
 
-  **Still open:** the same unvalidated parser in the other four scripts. Only
-  `gen-efi.sh` is fixed, because it is the one that mounts and writes, and a
-  partial rollout that changed all five at once in a boot-critical path is not
-  a change to make blind. `shani-deploy.sh` and `shani-health.sh` also consume
-  config paths (marker files, log and lock files) and deserve the same
-  treatment on their own re-verification.
+  **Now fixed in `shani-deploy.sh` as well (2026-09-27), which is the one that
+  mattered most.** It resolves the same config into 22 variables and feeds
+  three sinks `gen-efi.sh` does not: `MOUNT_DIR` (mount/umount of the chroot
+  root), `GENEFI_SCRIPT` (handed to `chroot` to be **run as root**), and five
+  thresholds that land in `$(( ))`/`(( ))`, where a non-numeric value is an
+  arithmetic error rather than a diagnosis of the typo. Same shape of
+  validation, with the numeric cases clamped to a **floor** rather than to the
+  default — `max_inhibit_depth=0` and `min_free_space_mb=0` are deliberate
+  choices and are kept, while `max_download_attempts=0` is raised to 1 because
+  a zero-retry loop is not a choice anyone means to make. It has to run between
+  the assignments and the `readonly` block that follows them, so it is a call
+  there and not a check folded into the assignments; the test pins that order,
+  because correcting an already-`readonly` variable would fail outright.
+
+  **`shani-health.sh` was never exposed, and the other two are the remainder.**
+  Tracing which config-derived variables each script actually assigns shows
+  `shani-health.sh` has **none** — it reads the config and resolves nothing from
+  it, so it was never in scope and should not be "fixed" by copying code into it.
+  That leaves `check-boot-failure.sh` (six marker-file paths) and
+  `shani-auto-rollback.sh` (four), which write and remove marker files rather
+  than mounting anything. They are the remaining gap, and they are lower
+  consequence than the two that are done: a bad marker path corrupts a marker,
+  it does not mount or execute.
 
 - **`gen-efi.sh`'s dependency preflight was unconditional, so the read-only
   `tpm2-status` demanded the whole write-path toolchain — FIXED (2026-09-27).**

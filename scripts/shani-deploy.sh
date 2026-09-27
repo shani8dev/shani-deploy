@@ -84,6 +84,76 @@ if [[ -f "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf" ]]; then
     _load_ini_config "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf"
 fi
 
+# Validate the config values that become a mount target, a chroot-executed file,
+# a device-mapper name, or an operand in bash arithmetic. The parser accepts any
+# value -- printf -v '%s' does not expand it, so there is no injection -- but
+# nothing downstream checked one: ESP and MOUNT_DIR reach mount/umount,
+# GENEFI_SCRIPT is handed to `chroot` to be run as root, ROOTLABEL is
+# interpolated into /dev/disk/by-label/<label> and into /dev/mapper/<label> for
+# cryptsetup, and the five thresholds land in $(( )) / (( )) where a
+# non-numeric value is an arithmetic error rather than a diagnosis of the typo.
+#
+# A bad value falls back to the default (or the floor) and says so on stderr.
+# It must run before the readonly block below, which is why it is a call here
+# and not a check folded into the assignments. Deliberately no key allowlist:
+# the shipped sample documents 34 keys while the scripts read 38, so an
+# allowlist built from it would silently drop keys that are live today.
+#
+# This is robustness, not a privilege boundary. Every privileged invocation
+# reads a root-owned config -- sudo sets HOME=/root, a system service has no
+# HOME, pkexec sanitises the environment -- so a user's own ~/.config copy is
+# never read, and only a root-written /etc/shani/shani.conf can produce a bad
+# value. (Measured, not assumed: see AGENTS.md.)
+_vc_bad_path() { # $1=value var  $2=default var  $3=label
+    local val="${!1}" why=""
+    [[ -n "$val" ]] || return 0
+    if [[ "$val" != /* ]]; then
+        why="${3}='${val}' is not an absolute path"
+    elif [[ "$val" == "/" ]]; then
+        why="${3}=/ is not a usable path"
+    elif [[ "$val" == *..* ]]; then
+        why="${3}='${val}' contains '..'"
+    fi
+    [[ -n "$why" ]] || return 0
+    echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY][WARN] shani.conf: ${why}; using ${!2}" >&2
+    printf -v "$1" '%s' "${!2}"
+}
+
+_vc_num() { # $1=value var  $2=default var  $3=label  $4=floor
+    local val="${!1}"
+    [[ -n "$val" ]] || return 0
+    if [[ ! "$val" =~ ^[0-9]+$ ]]; then
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY][WARN] shani.conf: ${3}='${val}' is not a non-negative integer; using ${!2}" >&2
+        printf -v "$1" '%s' "${!2}"
+        return 0
+    fi
+    if (( val < $4 )); then
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY][WARN] shani.conf: ${3}=${val} is below the floor of ${4}; using ${4}" >&2
+        printf -v "$1" '%s' "$4"
+    fi
+}
+
+_validate_config() {
+    # mount/umount targets and the script chroot(8) executes as root. /efi and a
+    # trailing slash are deliberately still accepted: /efi is a real ESP on this
+    # image, so a rule that rejected it would break a working machine.
+    _vc_bad_path ESP             DEFAULT_deploy_esp_path    esp_path
+    _vc_bad_path MOUNT_DIR       DEFAULT_deploy_mount_dir   mount_dir
+    _vc_bad_path GENEFI_SCRIPT   DEFAULT_deploy_genefi_script genefi_script
+    if [[ -n "${ROOTLABEL:-}" && ! "$ROOTLABEL" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY][WARN] shani.conf: rootlabel='${ROOTLABEL}' is not a plain device-mapper name; using ${DEFAULT_deploy_rootlabel}" >&2
+        ROOTLABEL="$DEFAULT_deploy_rootlabel"
+    fi
+    # Floors, not the defaults: a deliberate 0 is a legitimate choice for
+    # max_inhibit_depth and min_free_space_mb, but a negative or non-numeric
+    # value is a typo and must not reach arithmetic.
+    _vc_num MAX_INHIBIT_DEPTH      DEFAULT_deploy_max_inhibit_depth     max_inhibit_depth      0
+    _vc_num MAX_DOWNLOAD_ATTEMPTS  DEFAULT_deploy_max_download_attempts max_download_attempts  1
+    _vc_num EXTRACTION_TIMEOUT     DEFAULT_deploy_extraction_timeout    extraction_timeout     60
+    _vc_num MIN_FREE_SPACE_MB      DEFAULT_deploy_min_free_space_mb     min_free_space_mb      0
+    _vc_num MIN_FILE_SIZE          DEFAULT_deploy_min_file_size         min_file_size          1
+}
+
 # Resolve config variables with DEFAULT_ fallbacks
 DEPLOY_CHANNEL="${deploy_channel:-${DEFAULT_deploy_channel}}"
 DOWNLOAD_DIR="${deploy_download_dir:-${DEFAULT_deploy_download_dir}}"
@@ -110,6 +180,10 @@ GENEFI_SCRIPT_URL="${deploy_genefi_script_url:-${DEFAULT_deploy_genefi_script_ur
 GPG_KEY_ID="${deploy_gpg_key_id:-${DEFAULT_deploy_gpg_key_id}}"
 ROOTLABEL="${deploy_rootlabel:-${DEFAULT_deploy_rootlabel}}"
 MAX_INHIBIT_DEPTH="${deploy_max_inhibit_depth:-${DEFAULT_deploy_max_inhibit_depth}}"
+
+# Must run here: after every assignment above, and before the readonly block,
+# which would refuse the correction.
+_validate_config
 
 declare -a ORIGINAL_ARGS=("$@")
 declare DEPLOYMENT_START_TIME

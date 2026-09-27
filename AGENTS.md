@@ -354,6 +354,87 @@ replace the Cassini desktop test above.
   a live session photographed with those values in the widget tree; the harness
   click/OCR path could not locate the Check button reliably.
 
+- **shani.conf's values reached `mount`, `umount`, `mkdir` and `cryptsetup`
+  unvalidated — FIXED in `gen-efi.sh` (2026-09-27); the other four copies are
+  still open, deliberately.** `_load_ini_config()` accepts any value: the key
+  and section regexes already constrain the *variable name* to `[A-Za-z0-9_]`
+  and `printf -v '%s'` does not expand the value, so there is no injection —
+  but nothing checked the value either. `deploy_esp_path` becomes `ESP`, which
+  reaches `mount "$ESP"`, `umount "$ESP"`, `mkdir -p "${ESP}/EFI/BOOT"` and a
+  `cp` of `MOK.der` onto the ESP; `deploy_rootlabel` is interpolated into
+  `/dev/mapper/<label>` and handed to `cryptsetup status`/`luksDump`. A
+  mistyped or hand-edited `/etc/shani/shani.conf` could point any of those
+  somewhere unintended — `esp_path=/` and `esp_path=boot/efi` were both
+  accepted verbatim. The parser is **byte-identical in five scripts** (md5
+  `b180d40b…` in `gen-efi.sh`, `shani-deploy.sh`, `shani-health.sh`,
+  `check-boot-failure.sh`, `shani-auto-rollback.sh`), the same shape as the
+  documented 5-copy `get_booted_subvol()`.
+
+  `_validate_config()` now runs after both config loads and before `ESP` is
+  assigned: `esp_path` must be absolute, must not be `/`, must not contain
+  `..`; `rootlabel` must match `^[A-Za-z0-9_-]+$`. A rejected value falls back
+  to the default and warns on stderr — it is not used, and not silently
+  dropped either. `/efi` and a trailing slash are deliberately still accepted:
+  `/efi` is a real ESP on this image, so a rule that rejected it would break a
+  working machine.
+
+  **Severity, stated honestly: this is robustness, not a privilege boundary.**
+  Measured, not assumed: a `sudo`-invoked root process gets `HOME=/root`, not
+  the invoking user's home, so that path resolves to `/root/.config/shani/shani.conf`;
+  under a system service `HOME` is unset and it collapses to
+  `/.config/shani/shani.conf`; `pkexec` sanitises the environment. All three are
+  root-owned, so a user's own `~/.config` copy is never read by a privileged
+  invocation. Only a root-written `/etc/shani/shani.conf` (or `/root/.config/…`)
+  can produce a bad value. Do not "upgrade" this into a security fix without new
+  evidence about the invocation context — the obvious escalation here was
+  investigated and does not exist.
+
+  **The one genuinely self-referential thing nearby, also not a vulnerability.**
+  Under `--update-genefi`, `shani-deploy` downloads `gen-efi.sh` from
+  `deploy_genefi_script_url`, fetches `${URL}.sha256` and `${URL}.asc` **from the
+  same origin**, and verifies the signature against `deploy_gpg_key_id` — so all
+  four (URL, checksum, signature, verifying key) come from the same config file,
+  and the SHA256+GPG check proves nothing against someone who can write that
+  file. It looks alarming and is not an escalation, for the reason above: the
+  config is root-owned, and pointing a mirror at your own host and key is a
+  legitimate thing for an operator to do. Two things are still worth knowing:
+  the default path does **not** download anything (it copies the host's
+  installed `gen-efi`, and only `--update-genefi` reaches the download branch),
+  and the comment above that block claims the verification protects the
+  "code that will run as root inside the chroot", which is true of its
+  fail-closed fallback to the host copy but not of its trust anchor. If
+  `deploy_gpg_key_id` is ever meant to be operator-independent, it has to stop
+  being read from the same file as the URL.
+
+  **Do not add a key allowlist to this parser.** It is the obvious completion
+  of this fix and it would be a live regression. The shipped
+  `etc/shani/shani.conf` documents **34** keys while the scripts read **38**;
+  an allowlist built from the sample silently drops 12 keys that are in use
+  today (`deploy_booted`, `deploy_state`, `deploy_auto_rollback_done`,
+  `deploy_genefi_bin`, `deploy_user_setup_bin`, …), and 9 documented keys are
+  read by nothing. The sample is documentation, not an inventory.
+  `tests/test-config-validation.sh` asserts both directions of that, so the
+  next person to try gets a red test rather than a broken image.
+
+  **The first version of that test was vacuous, and the negative control is
+  what caught it.** It extracted `_load_ini_config`/`_validate_config` and
+  called them itself, so it proved the validator works while saying nothing
+  about whether the script *uses* it — commenting out the single
+  `_validate_config` call still reported 12/12. The test now also asserts the
+  wiring and its **order** (after the loads, before `ESP=`), because order is
+  what makes it a protection; with the call removed it reports 3 failures and
+  exits 1. 15 assertions, all six unit gates green, and the full mandatory
+  harness green with the edit in place (`clean → ca → bootstrap -p gnome →
+  upgrade --local-src → rollback --local-src → clean`), the `upgrade` step
+  doing the real UKI generate-and-sign for `@green`.
+
+  **Still open:** the same unvalidated parser in the other four scripts. Only
+  `gen-efi.sh` is fixed, because it is the one that mounts and writes, and a
+  partial rollout that changed all five at once in a boot-critical path is not
+  a change to make blind. `shani-deploy.sh` and `shani-health.sh` also consume
+  config paths (marker files, log and lock files) and deserve the same
+  treatment on their own re-verification.
+
 - **`gen-efi.sh`'s dependency preflight was unconditional, so the read-only
   `tpm2-status` demanded the whole write-path toolchain — FIXED (2026-09-27).**
   `REQUIRED_CMDS` was one flat list of 19 commands checked before dispatch, so

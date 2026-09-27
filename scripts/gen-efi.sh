@@ -108,12 +108,55 @@ _load_ini_config() {
 DEFAULT_deploy_esp_path="/boot/efi"
 DEFAULT_deploy_rootlabel="shani_root"
 
+# Check the two config values that this script turns into a mount target, a
+# device path or a write destination. The parser itself accepts any value --
+# printf -v '%s' does not expand it, so there is no injection, but nothing
+# downstream checks it either: deploy_esp_path reaches `mount "$ESP"`,
+# `umount "$ESP"`, `mkdir -p "$ESP/EFI/BOOT"` and a `cp` onto the ESP, and
+# deploy_rootlabel is interpolated into /dev/mapper/<label> and handed to
+# cryptsetup. A mistyped or hand-edited shani.conf should not be able to point
+# any of those somewhere unintended.
+#
+# A rejected value falls back to the default and says so on stderr, rather than
+# being used or silently ignored. This deliberately does NOT gate on a key
+# allowlist: the shipped sample config documents 34 keys while the scripts read
+# 38, so an allowlist built from the sample would silently drop 12 keys that are
+# live today (deploy_booted, deploy_state, deploy_auto_rollback_done,
+# deploy_genefi_bin, ...). The sample is documentation, not an inventory.
+#
+# Note this is a robustness fix, not a privilege boundary. The user-override
+# path resolves to /.config/shani/shani.conf when HOME is unset, which is the
+# case under pkexec and under a system service, so a user's ~/.config copy is
+# not read by the privileged paths that matter. Only a root-written
+# /etc/shani/shani.conf can produce a bad value here.
+_validate_config() {
+    local bad=""
+    if [[ -n "${deploy_esp_path:-}" ]]; then
+        if [[ "$deploy_esp_path" != /* ]]; then
+            bad="esp_path='${deploy_esp_path}' is not an absolute path"
+        elif [[ "$deploy_esp_path" == "/" ]]; then
+            bad="esp_path=/ is not a usable ESP mountpoint"
+        elif [[ "$deploy_esp_path" == *..* ]]; then
+            bad="esp_path='${deploy_esp_path}' contains '..'"
+        fi
+        if [[ -n "$bad" ]]; then
+            echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][WARN] shani.conf: ${bad}; using ${DEFAULT_deploy_esp_path}" >&2
+            deploy_esp_path="$DEFAULT_deploy_esp_path"
+        fi
+    fi
+    if [[ -n "${deploy_rootlabel:-}" && ! "$deploy_rootlabel" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][WARN] shani.conf: rootlabel='${deploy_rootlabel}' is not a plain device-mapper name; using ${DEFAULT_deploy_rootlabel}" >&2
+        deploy_rootlabel="$DEFAULT_deploy_rootlabel"
+    fi
+}
+
 if [[ -f /etc/shani/shani.conf ]]; then
     _load_ini_config /etc/shani/shani.conf
 fi
 if [[ -f "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf" ]]; then
     _load_ini_config "${XDG_CONFIG_HOME:-${HOME:-}/.config}/shani/shani.conf"
 fi
+_validate_config
 
 readonly OS_NAME="shanios"
 # ESP and EFI_DIR are intentionally NOT readonly: ensure_esp_mounted() may

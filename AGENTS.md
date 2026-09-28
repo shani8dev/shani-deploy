@@ -25,8 +25,8 @@ before you start.
 - `Testing Shani Cassini and harness compatibility`
 
 **On-demand reference — do not page through speculatively:**
-- `Audit-verified known issues (confirmed present)` — ~1080 of this file's
-  1477 lines. Dated postmortems. **Grep it for the subsystem you are
+- `Audit-verified known issues (confirmed present)` — ~1080 lines. Dated
+  postmortems. **Grep it for the subsystem you are
   changing**; read a hit in full, skip the rest. Per-bug verification
   methodology lives in `AUDIT-HISTORY.md`.
 - `Garuda Cross-Reference Findings (added 2026-09-17)` — comparative survey,

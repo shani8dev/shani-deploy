@@ -20,15 +20,23 @@ before you start.
 - `Cross-repo impact — check before calling a fix complete`
 
 **Read when your change touches them:**
+- `If you have Superpowers / oh-my-opencode / ultrawork / similar available`
+  — use parallel subagents for the positive-test/negative-control pairing
 - `For anything touching boot entries, signing, self-update, or chroot detection`
 - `Known sharp edges (already found once — don't reintroduce)`
 - `Testing Shani Cassini and harness compatibility`
 
-**On-demand reference — do not page through speculatively:**
+**Current known issues — read this before you start:**
 - `Audit-verified known issues (confirmed present)` — ~1080 lines. Dated
   postmortems. **Grep it for the subsystem you are
   changing**; read a hit in full, skip the rest. Per-bug verification
   methodology lives in `AUDIT-HISTORY.md`.
+
+  This section mixes fixed history with issues that are **still open**,
+  including Critical security ones. Grep it for `not fixed`,
+  `still open`, and your subsystem name before you touch anything.
+
+**Background reference — skippable, pure survey material:**
 - `Garuda Cross-Reference Findings (added 2026-09-17)` — comparative survey,
   not a requirement.
 

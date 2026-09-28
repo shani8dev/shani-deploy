@@ -5,6 +5,36 @@ This file applies to any AI coding assistant working in this repository
 before editing, and follow the verification steps before calling any change
 done.
 
+## Start here (fast path)
+
+This file is long because it holds both the rules you must follow and a
+dated record of every bug ever found here. You do not need to read all of it
+before you start.
+
+**Always read these first:**
+- `What this repo is` — what a bug here actually costs
+- `Empirical verification (mandatory)` — the workspace standard
+- `This is safety-critical code — treat it that way`
+- `Required verification for any change` — the commands
+- `MANDATORY: Full Real Test Harness (non-negotiable)` — not skippable
+- `Cross-repo impact — check before calling a fix complete`
+
+**Read when your change touches them:**
+- `For anything touching boot entries, signing, self-update, or chroot detection`
+- `Known sharp edges (already found once — don't reintroduce)`
+- `Testing Shani Cassini and harness compatibility`
+
+**On-demand reference — do not page through speculatively:**
+- `Audit-verified known issues (confirmed present)` — ~1080 of this file's
+  1477 lines. Dated postmortems. **Grep it for the subsystem you are
+  changing**; read a hit in full, skip the rest. Per-bug verification
+  methodology lives in `AUDIT-HISTORY.md`.
+- `Garuda Cross-Reference Findings (added 2026-09-17)` — comparative survey,
+  not a requirement.
+
+**Never skip:** the full harness. Nothing here is verified until the real
+blue-green switch has been executed and observed.
+
 ## What this repo is
 
 The blue-green deployment, health/diagnostics, and system-recovery tooling

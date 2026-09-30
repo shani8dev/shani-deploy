@@ -42,6 +42,19 @@ RemainAfterExit=yes
 # entry state under /boot/efi.
 NoNewPrivileges=yes
 PrivateTmp=yes
+ProtectHome=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=~@mount @raw-io @debug @reboot
+UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+LogLevelMax=warning
 
 [Install]
 WantedBy=multi-user.target

@@ -172,7 +172,9 @@ Do NOT skip it. Do NOT say "it probably works." Investigate the failure:
 
 ```bash
 # Syntax check ALL scripts
-for script in scripts/*.sh bin/*.sh; do bash -n "$script"; done
+# NOTE: there is no bin/ any more — shani-upgrade-adviser moved to
+# scripts/ on 2026-09-18, so a `bin/*.sh` glob here silently matches nothing.
+for script in scripts/*.sh; do bash -n "$script"; done
 
 # Unit tests
 bash tests/test-deploy-state.sh     # expect: ✓ N passed, 0 failed
@@ -343,6 +345,214 @@ replace the Cassini desktop test above.
   tpm2-status --json` (stdout is the JSON alone: `log()` writes to stdout,
   so the branch redirects it), `gen-efi enroll-tpm2 --stdin [--with-pin]`
   (secrets via stdin -> systemd-cryptenroll's PASSWORD/NEWPIN, never argv).
+
+- **TPM2 pcrlock support (2026-09-30) — enrollment, status, and health are all
+  pcrlock-aware, and the fallback is a literal PCR pin, never a dropped pin.**
+  `enroll_tpm2()` prefers a pcrlock policy when one exists
+  (`_tpm2_pcrlock_policy_path()` searches `/run/systemd/pcrlock.json` then
+  `/var/lib/systemd/pcrlock.json`, systemd v255's own order) and passes
+  `--tpm2-pcrlock=PATH --tpm2-public-key-pcrs=`. The empty
+  `--tpm2-public-key-pcrs=` is **load-bearing**: without it systemd applies its
+  default pubkey PCR mask and returns `EOPNOTSUPP` for a policy that selects no
+  PCRs there. The two flags are mutually exclusive — `--tpm2-pcrlock` and
+  `--tpm2-pcrs` together are a hard error — so the choice is an `if/else`, never
+  two branches that can both run. With no policy the literal pin is used
+  unchanged, so a machine is never left with auto-unlock and no PCR binding.
+
+  **Every existing TPM2 entry token is re-enrolled, not just a new one.**
+  Token ids come from `_tpm2_entry_token_ids()` (a `cryptsetup luksDump` parse),
+  and each is passed with `--entry-token`. A single plain enrollment would leave
+  a second, stale token behind — still valid, still unlocking the disk under the
+  *old* policy, which is the exact thing a PCR-hardening change is meant to
+  eliminate.
+
+  **That helper is portable awk, not gawk.** It originally used `gensub()`,
+  which mawk (the awk on Arch) does not implement; the call failed, `|| true`
+  swallowed it, and the function reported **zero** tokens — so cleanup
+  silently did nothing and enrollment silently skipped re-enrolling the old
+  tokens, while every test still passed. A static assertion in
+  `tests/test-tpm2-pcrlock.sh` now fails if `gensub` reappears, and the
+  negative control restores it to prove the assertion bites. This also fixed a
+  pre-existing bug in `cleanup_tpm2()`: it had the same `gensub`, so TPM2
+  cleanup had never actually removed a token.
+
+  **Three new contract suites, 69 assertions, all under negative control.**
+  - `tests/test-tpm2-pcrlock.sh` (17) — enrollment: policy discovery and search
+    order, pcrlock/literal exclusivity, the empty pubkey mask, all-token
+    re-enrollment, fresh enrollment, mawk portability.
+  - `tests/test-tpm2-pcrlock-status.sh` (32) — `gen-efi pcrlock-status --json`,
+    a NEW read-only subcommand. `enrolled_mode` is `"pcrlock"`, `"literal"`, or
+    `null`; an undeterminable field is `null`, never `""` and never a default,
+    because this field asserts what protects the disk. It also asserts the
+    subcommand is **reachable** — see the whitelist trap below.
+  - `tests/test-tpm2-pcrlock-health.sh` (20) — the `shani-health` TPM2 row.
+
+  **`pcrlock-status` shipped UNREACHABLE, and every unit test passed anyway —
+  read this before adding any subcommand.** `gen-efi.sh` gates subcommands
+  **twice**: a hand-written whitelist `if [[ "${1:-}" != "configure" && … ]]`
+  near the top of the file, and the `case` dispatcher at the bottom.
+  `pcrlock-status` was added to the dispatcher but not the whitelist, so the
+  guard printed usage and `exit 1` before the dispatcher was ever reached —
+  `gen-efi pcrlock-status --json` returned rc=1 on a real installed slot while
+  all 21 unit assertions were green. **They were green because every suite
+  extracts the function and calls it directly, which bypasses the guard
+  entirely**: no amount of asserting on `pcrlock_status_json`'s behaviour can
+  detect a reachability bug. Only the mandatory harness caught it.
+  `tests/test-tpm2-pcrlock-status.sh` now asserts whitelist↔dispatcher parity —
+  every dispatcher arm must also be whitelisted — so the *next* subcommand
+  cannot repeat this. **When you add a subcommand, add it to both lists.**
+
+  Note this is a sibling of the `sed`-extraction trap in "Known sharp edges"
+  below, but the opposite failure: there, a second `case` arm made a test
+  extract the wrong text; here there is no `case` at all on the path taken, so
+  the test passes while the real command never runs.
+
+  **The status reporter shipped with three defects that all produced a
+  well-formed, confidently-wrong JSON document**, which is why none of them
+  would have been caught by reading the output:
+  1. It enumerated entry tokens with `cryptsetup token list`. **That subcommand
+     does not exist** — cryptsetup 2.7.0's token verbs are
+     add|remove|import|export only (checked against `cryptsetup --help`, not
+     assumed). The call always failed and `|| true` swallowed it, so
+     `entry_tokens` was `[]` on every machine.
+  2. It parsed `tpm2-policy-hash` with a same-line field split. tok255.c:241
+     prints `"tpm2-policy-hash:" CRYPT_DUMP_LINE_SEP "%s\n"` — the value is on
+     the **following** line — so the hash was always `null`. Both layouts are
+     now handled.
+  3. `enrolled_mode` was passed with `--arg` as the string `"true"`, so the
+     document claimed `enrolled_mode: "true"` and a literal token was
+     indistinguishable from an unknown one.
+
+  **Health had the more serious one.** The Secure-Boot cross-check ran on
+  pcrlock tokens. systemd v255 renders `tpm2-hash-pcrs` unconditionally
+  (tok255.c:235) from the token JSON, *not* from the sealed policy — so a
+  correctly pcrlock-enrolled volume whose header list was not exactly `0+7` was
+  reported as "PCR policy mismatch" and told to **re-enroll**, i.e. to replace a
+  working pcrlock enrollment with a weaker literal pin. That is a security
+  *downgrade* recommended by the health check. The cross-check is now guarded
+  with `-z "$_pcrlock"`, and the negative control drops that guard to prove the
+  suite catches the fabricated mismatch and the downgrade recommendation.
+
+  **Do not add pcrlock fields to `tpm2_status_json()`.** Its 11 keys are a
+  documented contract with Shani Cassini, and the repo's own rule is that a
+  field nothing renders is a field nobody has. `pcrlock-status` is a separate
+  subcommand precisely so the existing contract stays byte-stable.
+
+  **Not verified, and it is the part that matters:** no real pcrlock enroll +
+  unseal has been run. Measured in a real `test enter blue` slot on 2026-09-30,
+  pcrlock is inert for **three independent** reasons — any one of which alone
+  would be enough. An earlier version of this entry blamed a missing package
+  and a missing plugin; both of those turned out to be present, so the reasons
+  below are the ones actually observed:
+
+  1. **The cryptsetup token plugin IS shipped** —
+     `/usr/lib/cryptsetup/libcryptsetup-token-systemd-tpm2.so` is present in the
+     built image, and `/usr/lib/systemd/systemd-pcrlock` plus the full
+     `/usr/lib/pcrlock.d/` fragment set (`750-enter-initrd`, `800-leave-initrd`,
+     `900-ready`, the `400-`/`500-`/`700-` separator variants) are all there.
+     `systemd-pcrlock list-components` runs clean (rc=0) and enumerates them.
+     So the packaging is fine and "add the package" is not the fix.
+  2. **pcrlock does not reach the initramfs.**
+     `lsinitrd /boot/initramfs-linux.img | grep -c pcrlock` returns **0**.
+     The fragments are location-keyed to the boot sequence, and nothing pulls
+     `systemd-pcrlock@.service` / `systemd-pcrlock.socket` into the initrd, so
+     no policy is ever made early enough to matter. `systemd-pcrlock@.service`
+     is `static` (socket-activated, which is normal) — the socket is simply not
+     in the initrd. Adding that is initramfs/dracut work in
+     `shani-settings`/`shani-install-media`, not here.
+  3. **`systemd-pcrlock make-policy --location=770` exits 1** in a real slot:
+     `Failed to create TPM2 context: State not recoverable`, because there is no
+     `/dev/tpmrm0`. `systemd-pcrlock is-supported` reports `partial` (rc=107).
+     `predict` fails identically. **Note the failure is loud** — exit 1, no
+     `/run/systemd/pcrlock.json` written — so a boot chain that trusted the
+     exit status would not silently proceed without a policy.
+
+  A fourth, design-level blocker sits behind those, and it is the one that
+  actually decides the matter. The policy-producing unit carries
+  `ConditionSecurity=measured-uki`. **Corrected 2026-09-30 — the earlier wording
+  here said the condition is satisfied by a `.pcrs` section, which is the wrong
+  link in the chain.** `efi_measured_uki()` (v262 `src/shared/efi-loader.c`,
+  called from `src/shared/condition.c:857`) consults **no PE section at all**. It
+  reads the `StubPcrKernelImage` EFI variable, requires it to exist, parses it
+  as a PCR number, and requires it to equal `TPM2_PCR_KERNEL_BOOT` — which is
+  **11** (`src/fundamental/tpm2-pcr.h:28`). It also returns 0 outright unless
+  `efi_has_tpm2()`. Note a third state: a stub that measured into a
+  *different* PCR returns `-EREMOTE`, i.e. an error rather than a clean false.
+  `.pcrs` is the upstream **cause** of that variable, not the condition itself —
+  the section is what makes sd-stub measure the kernel image and publish
+  `StubPcrKernelImage=11` in the first place. So the doc's original inference
+  was sound but mis-stated: `.pcrs` absent ⇒ stub never measures ⇒ variable
+  absent ⇒ condition false. Shanios' UKI has no `.pcrs`, verified three
+  independent ways: `generate_uki()` invokes only `dracut`, `generate_cmdline`,
+  `sign_efi_binary`, `_stage_mok_enrollment` and `update_bootloader` (no
+  `ukify`, no `objcopy`, no `systemd-measure`, no `.pcrs` handling — it re-signs
+  the kernel package's prebuilt UKI rather than assembling one); and `objdump -h`
+  on the real `/boot/efi/EFI/shanios/shanios-blue.efi` lists `.text .rodata
+  .data .sdmagic .reloc .osrel .cmdline .splash .sbat .linux .initrd` — a
+  genuine UKI, with `.pcrs` absent. **So the condition is unsatisfiable, not
+  merely likely false**, and no amount of TPM or swtpm will make the pcrlock
+  policy phase run. Making pcrlock usable needs measured-UKI/`systemd-measure`
+  work in `gen-efi.sh` first — a materially larger change than the
+  enrollment/status/health work above, touching how UKIs are built and signed,
+  and a decision for a human rather than a mechanical follow-on. (Audit §12
+  currently records `systemd-measure` as "SKIP for now" precisely because it
+  wants a signing key; pcrlock was meant to cover the need without one, but
+  pcrlock itself now turns out to require the measurement.)
+
+  **Two traps in testing any of this, both hit for real on 2026-09-30.**
+
+  1. **`SYSTEMD_TPM2_DEVICE` cannot redirect systemd to an emulator.**
+     `tpm2-util.c:617` reads it with `secure_getenv()`, so it is deliberately
+     ignored in any privileged (`AT_SECURE`) context — which includes a root
+     process in a container. The variable looks like the obvious way to aim
+     `systemd-cryptenroll` at a `swtpm` TCTI (`swtpm:host=…,port=…`, and the
+     image does ship `libtss2-tcti-swtpm.so.0`), and it silently has no effect:
+     the code falls through to its hardcoded `device:/dev/tpmrm0`. A test that
+     sets it and sees no error is not testing what it thinks it is.
+  2. **`systemd-cryptenroll --tpm2-device=list` succeeding does NOT mean the
+     TPM works.** It enumerates devices without opening an ESAPI context, so it
+     printed a real chip (`/dev/tpmrm0 NTC0702:00 tpm_tis`, rc=0) on a host where
+     `make-policy` then failed with `Failed to open specified TCTI device file
+     /dev/tpmrm0`. This is the same "a check that cannot fail" shape as the
+     nonexistent `cryptsetup token list` and the `--tpm2-argon2id` flag: always
+     use something that actually opens the TPM.
+
+  This host does have **real TPM hardware** (Nuvoton NCT, `/dev/tpm0` +
+  `/dev/tpmrm0`). The `root:tss 0660` node is **not** the wall it looks like:
+  a container run as uid 0 with `--device /dev/tpmrm0 --device /dev/tpm0`
+  gets the node with correct ownership and systemd-cryptenroll enumerates it
+  (`NTC0702:00 tpm_tis`). Only an *unprivileged* host process is blocked, and
+  only by group membership (there are no ACLs on the node to exploit). So the
+  TPM is reachable — that is **not** the blocker.
+
+  The actual blockers to a real enrollment here are two, and both are
+  environmental:
+
+  1. **Loop devices are exhausted.** A LUKS2 volume needs a block device, and
+     all 31 loop devices on this host are held by snapd. `losetup --show -f`
+     inside a `--privileged` container fails ("failed to set up loop device"),
+     and the fix — detaching a snapd loop — would break the user's installed
+     snaps, so it is not ours to do. (A container run here also leaked a
+     loop device; `losetup -d` needs root, so it needs clearing by hand.)
+  2. **`systemd-pcrlock` is absent from `shrinivasvkumbhar/shani-builder`.**
+     The builder image has `systemd-cryptenroll`, `cryptsetup`, `losetup` and
+     `libcryptsetup-token-systemd-tpm2.so`, so a *literal*-PCR enrollment would
+     work given a loop device — but there is no `systemd-pcrlock` to
+     `make-policy` with, so the pcrlock path cannot be set up from that image
+     without copying the binary in from the built rootfs.
+
+  `swtpm` is apt-installable and runs fine as a non-root user, but per (1) it
+  cannot be substituted for systemd. `systemd-vmspawn` is absent from host and
+  image, so the clean route — a VM with a virtual TPM, which also solves the
+  loop-device problem because the guest gets its own devices — is unavailable;
+  testbed `vmspawn` support is the intended one.
+
+  **Conclusion: TPM2 enrollment cannot be exercised on this host** (pcrlock or
+  literal) because of loop-device exhaustion and a missing builder binary, not
+  because of TPM permissions and not because of anything in this code. The
+  reasoning is recorded because the first two conclusions reached here were
+  both wrong: "no TPM exists" and "the TPM is unopenable" were each refuted by
+  the next experiment.
 
 - **`shani-deploy --list-backups --json` is a contract added 2026-09-27, and it
   is the one place the `--json` guard was relaxed.** `--json` is otherwise
@@ -1151,6 +1361,298 @@ replace the Cassini desktop test above.
   unsandboxed (see "Systemd hardening" below), so no recommendation is
   raised. Shows "not available" when there is no running systemd (plain
   `enter`).
+- **`shani-health --boot` runs `systemd-sysctl --verify` — NEW (2026-09-29),
+  and the first version of it was a check that could not fail.**
+  The row proves shani-settings' sysctl.d values are APPLIED at boot, not
+  merely shipped on disk. It shipped with two defects, both of which made it
+  permanently silent, so it had never once reported anything on any machine:
+  - It was gated on `command -v systemd-sysctl`. That binary is a systemd
+    private helper at `/usr/lib/systemd/systemd-sysctl` and is **not on
+    PATH** (confirmed: `command -v` finds nothing, the file exists at both
+    `/usr/lib/systemd/` and `/lib/systemd/`). The gate was always false, so
+    the row never rendered at all — dead code, not a passing check.
+  - It counted findings with `grep -c '^not applied'`. Upstream never emits
+    that string: from `src/sysctl/sysctl.c` a failure goes through
+    `log_error_errno` on **stderr**, and a healthy run prints **nothing at
+    all**. The count was therefore always 0, and the second branch reported
+    "no shipped-vs-live mismatches reported" for every real mismatch. This
+    is the exact shape of a control that cannot fail, and the host's real
+    systemd 255 proves the diagnostic text is neither of those strings
+    (`unrecognized option '--verify'`).
+  Now: the binary is located by absolute path (`command -v` first, then
+  `/usr/lib/systemd/`, then `/lib/systemd/`); **any** non-empty output is a
+  finding, with no string matching, so an unrecognised diagnostic can never
+  read as healthy; and an unsupported `--verify` is reported as `--  not
+  available` rather than as a fault, because otherwise every pre-262 image
+  would raise a permanent, meaningless recommendation. Healthy is defined as
+  *silent*, so a non-zero exit with no output is not a fault either.
+
+  **`tests/test-sysctl-verify.sh` (17 cases) is the contract test.** It
+  extracts the block from the shipped script and runs it verbatim; only the
+  two hardcoded binary paths are repointed at fixtures, because the real path
+  cannot be shadowed without root (`unshare` is denied in this environment —
+  confirmed, not assumed). The real paths are pinned separately by static
+  assertions so the repointing cannot hide a path regression. Extraction is
+  anchored on the block's own comments and both anchors are asserted to match
+  exactly once: anchoring on `^    fi$` instead extracts only the
+  binary-discovery conditional (there are two bare 4-space `fi` lines in the
+  region and the first closes that one), which silently tests a block
+  containing no rows at all.
+
+  **Verified with a negative control, not a positive test alone.** The same
+  14-case suite was run against a copy of the script with the pre-fix block
+  restored: 11 of 14 fail, including both defects above, and every
+  behavioural case reproduces the original symptom (no row emitted, because
+  the `command -v` gate is false with `PATH` stripped — which is the real
+  condition). Post-fix: 14/0.
+
+  **The "unavailable" branch is now verified against the real binary, not just
+  fixtures (2026-09-30).** Everything above was previously reasoned about the
+  real binary; only the fixture-shaped halves were exercised. A real booted
+  `@blue` slot (systemd 261.2) now settles the two things that actually decide
+  what a user sees today:
+
+  - The helper **is** present at the absolute path —
+    `/usr/lib/systemd/systemd-sysctl`, 23496 bytes, with `/lib/systemd/` a
+    copy. The bare name is not on `PATH` (that is what the `command -v` gate
+    discovers, and why it must not be the only lookup), but the absolute-path
+    branch is the one that fires in the image. Verified by running the real
+    binary, not by reading the fallback chain.
+  - `systemd-sysctl --verify` on that real binary exits **rc=1 with 47 bytes:
+    `systemd-sysctl: unrecognized option '--verify'`.** That exact string
+    matches the shipped `unrecognized option|unknown option|invalid option`
+    alternation, so real 261.x images take the "not available" branch.
+    Rendered live: `Sysctl verify — not available (needs systemd 262; this is
+    older)`, and `shani-health --boot --json` reports **zero** sysctl
+    recommendations. That is the failure this design exists to prevent —
+    without the branch, every real image in the field would raise a permanent,
+    meaningless "run systemd-sysctl --verify" recommendation for a flag it
+    cannot support. It does not.
+
+  **What is still unverified, and it is now a much narrower claim:** the
+  262-only *runtime* behaviour — "healthy prints nothing" and "real mismatch is
+  reported". Note the version claim is no longer pinned from below only: the
+  v262 source confirms 262 accepts `--verify` (`src/sysctl/sysctl.c` declares
+  `OPTION_LONG("verify", …)` setting `arg_verify` and calls
+  `sysctl_write_verify()`; v261's copy of that file contains **zero**
+  occurrences of "verify"). That is source-level confirmation, not an executed
+  262 binary, so "needs 262" stands, but the 262 paths below still need a real
+  one. The host is systemd 255 and installed images are 261.2, so neither the
+  host nor the harness can close this.
+
+  **`--strict` is LOAD-BEARING, and bare `--verify` was a false green (fixed
+  2026-09-30).** `--verify` reads each value back and returns a negative errno
+  on mismatch or refusal, but the caller swallows one whole failure class.
+  `sysctl_write_or_warn()` is literally
+  `if (ignore_failure || (!arg_strict && ERRNO_IS_NEG_FS_WRITE_REFUSED(r))) log_debug_errno(…)`
+  followed by `return 0`, and `ERRNO_IS_NEG_FS_WRITE_REFUSED(r)` is
+  `r == -EROFS || ERRNO_IS_NEG_PRIVILEGE(r)` (`src/basic/errno-util.h:191`) —
+  so EROFS/EACCES/EPERM are logged at **debug** level and the tool **succeeds**.
+  Since this row defines healthy as *silent*, bare `--verify` would render
+  "OK all shipped sysctl.d values are live" on exactly the read-only or
+  hardened sysctls the row exists to police, including
+  `90-security-hardening.conf`. Upstream says the same in v262 NEWS: "Call it
+  with `--strict` and targeted configuration when exact verification is
+  desired." A *mismatch* is `-EINVAL`, which is not write-refused, so it is
+  reported either way — it is the refusal class that only `--strict` unmasks.
+  The invocation is now `--verify --strict`.
+
+  **Proved inert on 261.2, live, before editing** (it must be: the flag is
+  useless on an image that rejects `--verify` anyway). A real booted `@blue`
+  slot: both `--verify --strict` and `--strict --verify` return rc=1 with
+  `systemd-sysctl: unrecognized option '--verify'` — getopt fails on the first
+  unknown option, so ordering is irrelevant — and both are still classified by
+  the shipped regex as "unavailable". No permanent recommendation on any
+  pre-262 image, which is the failure this design exists to prevent.
+
+  **The suite is 17 cases now (was 14), and the new guard is not vacuous.** All
+  six behavioural fixtures require `$2 == --strict`, not just `$1 == --verify`.
+  A new static assertion greps **comment-stripped** code for `--verify --strict`
+  — the block's own comments deliberately name the flag, so a raw grep matches
+  that documentation and goes green even with the flag dropped from the command
+  (same trap as the runtime-only suite's assertions). New case 9 emulates
+  upstream's swallow path directly: the same simulated EROFS fault is **silent
+  without** `--strict` and **reported with** it, so the test proves the flag
+  changes the row's verdict rather than merely matching an argv. Negative
+  control: reverting the invocation to bare `--verify` gives **9 passed, 8
+  failed**, exit 1 (captured without a pipe masking it), and reproduces the
+  false-green verbatim —
+  `ROW|Sysctl verify|OK|all shipped sysctl.d values are live` on a fixture that
+  is failing.
+
+  **Read NEWS and the source, not man7, for anything recent.** The man7
+  `systemd-sysctl` page is a `262~devel` snapshot obtained 2026-08-04, which
+  **predates the merge**: it documents no `--verify` whatsoever, and describes
+  `--strict` only as the 252 "return non-zero on failure" flag. Reasoning from
+  it — as this session initially did — concludes `--strict` is an unrelated
+  exit-code option and that the shipped code ignoring the exit code makes the
+  flag pointless. That conclusion is wrong on both counts. The behaviour lives
+  in `arg_strict` inside systemd's C, and the man page does not describe it.
+
+  **Accepted trade-off, stated rather than hidden:** `--strict` also makes
+  failures in sysctl.d files shani-settings does not ship visible, since a bare
+  invocation processes all of `/etc`, `/run` and `/usr/lib` sysctl.d. That can
+  produce a noisy recommendation; a false green on security hardening is the
+  worse outcome, so noise is the safe direction. Upstream's "targeted
+  configuration" (explicit config paths or `--prefix=`) would narrow the scope,
+  and is deliberately **not** done: it would hardcode shani-settings' file list
+  into shani-deploy, a cross-repo coupling that will drift. Revisit only with a
+  262 image in hand.
+- **`shani-health` reports runtime-only enabled units — NEW (2026-09-30), and
+  the obvious implementation of it is a check that cannot fail.** A unit enabled
+  with `--runtime` (or by a package that did so) runs now and is gone after the
+  next reboot — and on this OS every reboot is *also* a blue-green slot switch,
+  so a runtime-only enable is precisely how a service silently disappears one
+  update later with nothing in the journal to explain it. **No other row in
+  this script can catch it**, which is why it needed its own: `systemctl
+  list-units --state=failed` cannot see an absent unit, and an absent unit has
+  no `systemd-analyze security` exposure score to report. It is emitted as
+  `Runtime-only units` in the Units section, `--` (informational, not a fault),
+  with a `_rec` naming the fix (`systemctl enable <unit>`, drop `--runtime`).
+
+  **Read from `systemctl list-unit-files --no-legend --plain` (state filtered by
+  awk), NOT `systemd-analyze unit-files`.** The latter's documented output is
+  a `UNIT FILE / STATE / PRESET` table, but that is not what it emits when piped
+  on systemd 255: measured on this host, 941 lines and **zero** `UNIT FILE`
+  headers, every row in the form `ids: NAME → PATH`. There is no state column,
+  so a column scrape matches nothing and reports a permanent, confident "all
+  clear" — indistinguishable from healthy. The negative control in
+  `tests/test-runtime-only-units.sh` reproduces exactly that: swapping the
+  command in yields rows reading `gone after reboot: ids:`, i.e. the literal
+  `ids:` prefix parsed as a unit name. Note the division of labour, measured in
+  a `test enter` session: `list-unit-files` needs no bus (rc=0, 768 lines), but
+  the `enabled-runtime` *state* lives in `/run/systemd/system`, which does not
+  exist there — so the command works offline and still has nothing to report.
+  `--state=enabled-runtime` collapses both into a single rc=1, which is why the
+  state is filtered by awk instead.
+
+  **The fsck/remount generators are excluded and that exclusion is
+  load-bearing.** `systemd-fsck-root.service` and `systemd-remount-fs.service`
+  are `enabled-runtime` **by design** (they are generator-produced), so
+  reporting them would fire on every machine and train the user to ignore the
+  row. The suite's case 2 is exactly that fixture and must stay silent; its case
+  4 is the control, re-running the same fixture through the pipeline with the
+  exclusion removed (15/17, 2 failures) so the guard is proven to be able to
+  fail rather than merely passing.
+
+  **`tests/test-runtime-only-units.sh` (17 cases) is the contract test.** It
+  extracts the block from the shipped script and runs it verbatim with only
+  `systemctl` stubbed, so the parsing pipeline, the exclusion and the
+  `_row`/`_rec` wiring under test are the real ones. Covers: a genuine
+  third-party enable reported, by-design generators alone staying silent, a
+  mixed fixture counted correctly (2, not 4), a failing `systemctl` neither
+  crashing the run nor emitting a row (the script is `set -Eeuo pipefail`).
+  A third mutant control reinstates `--state=enabled-runtime` and must fail
+  (15/17, 2 failures) — it is the regression guard for the whole reason the
+  awk filter exists.
+
+  **The static assertions grep comment-stripped code, and that is not
+  cosmetic.** The block's own comments deliberately *name* the forbidden
+  `systemd-analyze unit-files`, so grepping the raw block matches the
+  documentation and the guard would happily pass on a regression reintroducing
+  the very call it forbids. Note the stripping must drop only comment-*only*
+  lines (`s/^[[:space:]]*#.*$//`): a looser `[[:space:]]*#` also eats the `#`
+  inside `${#_runtime_only[@]}`, truncating the line the count assertion reads.
+
+  **Verified:** the full mandatory harness green with the row in place
+  (`clean → ca → bootstrap -p gnome → upgrade --local-src → rollback
+  --local-src → clean`, 6/6 RC=0), all 12 unit suites green (278 assertions —
+  the twelfth is `test_upgrade_adviser.sh`, whose underscore name means a
+  `tests/test-*.sh` glob silently skips it, so "11 suites" here was a glob
+  artifact rather than a count anyone verified), `bash -n` and
+  shellcheck `-S error` clean, and `shani-health` + `shani-health --json` both
+  rc=0 with valid JSON when run for real in a `test enter` slot.
+
+  **Verified live, in a real boot.** A `probe` (real PID 1 — `bus=yes`,
+  `/run/systemd/system` present) with two planted third-party units, differing
+  only in how they were enabled:
+
+  | unit | `list-unit-files` state | named by the row? |
+  |---|---|---|
+  | `zz-runtime-probe.service` | `enabled-runtime` | **yes** |
+  | `zz-persist-probe.service` | `enabled`         | no — correctly excluded |
+
+  The persistent unit is the real negative control: same service, same
+  `[Install]`, so the row is proven to discriminate on *state*, not on name or
+  on "is there any unit file at all". Before that control, an unplanted probe
+  boot had the row report a genuine `console-getty.service` on its own.
+
+  **The JSON contract is verified too, because a field nothing renders is a
+  field nobody has.** Same probe, `shani-health --json` (rc=0, `jq -e` valid,
+  23872 bytes) with the runtime unit planted. The verbatim check object:
+
+  ```json
+  {"section":"units","key":"Runtime-only units","status":"info",
+   "message":"2 enabled for this boot only, gone after reboot: console-getty.service zz-json-probe.service"}
+  ```
+
+  All three fields Cassini's generic renderer reads are present and correctly
+  named, and the message names the offending unit. Worth recording because the
+  obvious way to query for this row is wrong: the label `Runtime-only units` is
+  in **`key`**, not in `message` (the message is the unit list), so a
+  `select(.message|test("Runtime-only"))` silently matches nothing and reads as
+  "the row is missing". Select on `.key`, or test `.message` for the unit name.
+
+  **The row is silent in a `test enter` slot, and that is correct — not a
+  defect.** A non-boot `enter` session has no `/run/systemd/system` at all, so
+  `list-unit-files` returns no `enabled-runtime` rows to report. Confirmed by
+  isolation in that same session: plain `list-unit-files` returns 768 lines,
+  while `--state=enabled-runtime` returns rc=1 with no output. That is exactly
+  why the state is filtered with awk rather than `--state=` — with `--state=`
+  the row would be silently empty in the sessions where a slot is inspected.
+  Do not "simplify" the awk back into `--state=`.
+
+  **The 6/6 harness run above was done with the awk filter in place, not with
+  the earlier `--state=` form.** When this was changed, the comment in the
+  block, this paragraph, and the suite's case count were all wrong at the same
+  time; the harness was then re-run in full (`clean → ca → bootstrap -p gnome →
+  upgrade --local-src → rollback --local-src → clean`, 6/6 RC=0) specifically so
+  this claim covers the code that actually ships. `rollback` took the
+  same-slot-direction path (booted `@green` newer → default switched back to
+  `@blue`, `@green` left untouched), which is the branch most at risk from a
+  stray behaviour change anywhere in the deploy path.
+- **`oomctl` adoption was investigated and deliberately NOT implemented — the
+  harness cannot execute the code path at all, so a row would ship
+  permanently silent.** This is the "a check that cannot fail" class again, one
+  level worse than the `systemd-sysctl` case above, and it is recorded so the
+  next person does not write a parser against an output format nobody has seen.
+
+  What is real, measured in a real `probe` boot (real PID 1, `bus=yes`) on
+  2026-09-30: `oomctl` **is** present (`/usr/sbin/oomctl`), and
+  `systemd-oomd` **is** enabled (`systemctl is-enabled` → `enabled`; it is
+  enabled by `shani-pkgbuilds/shani-settings/shani-settings.install:39`). But
+  `systemd-oomd` never actually runs, so `oomctl dump` can never produce
+  output. Both halves, verbatim:
+
+  ```
+  systemctl start systemd-oomd   → unit failed
+  oomctl dump                    → rc=1, 0 bytes,
+      "Failed to dump context: Could not activate remote peer
+       'org.freedesktop.oom1': unit failed"
+  ```
+
+  The cause is in the unit's own journal, not an inference:
+  `Userspace Out-Of-Memory (OOM) Killer skipped, unmet condition check
+  ConditionControlGroupController=memory`. A container does not expose the
+  memory cgroup controller, so the unit skips itself. This holds for `enter`
+  **and** for a real `--boot` `probe` — a boot is still a container, so the
+  memory controller is still absent. There is therefore **no environment in
+  this harness where an `oomctl` code path executes even once**, and the real
+  `oomctl dump` output format (including its kill-report shape) could not be
+  captured at all. Writing a parser now would mean inventing a format from
+  memory and proving it only against self-authored fixtures — a fixture that
+  passes against a format the tool never emits is the exact trap already
+  recorded for `tests/test-tpm2-status-json.sh`'s LUKS1 fixture.
+
+  So the existing `oomd` row (`OK running` / `! enabled but not running` /
+  `! not enabled`) is left exactly as it is, and the genuine gap it has — it
+  never says *what oomd killed*, only that it is running — stays open and
+  recorded rather than half-solved. **If this is picked up, the first step is
+  not code: it is getting one real `oomctl dump` transcript from a machine
+  with a working memory cgroup controller, then parsing that.** Note also that
+  the row's `OK running` is itself untrustworthy inside the harness, since
+  oomd never starts there — a harness run will not show that branch.
+
 - **CI: `unit-files` job — NEW (2026-09-23).** `tests/verify-units.sh` runs
   `systemd-analyze verify` over every unit here inside `archlinux:latest`
   (real Arch systemd). It stubs only what ShaniOS provides at runtime (its
@@ -1380,16 +1882,74 @@ replace the Cassini desktop test above.
   shared-lib mechanism; adding one is a real packaging change, out of
   proportion here. Verified against the real installed binaries in a
   real systemd-nspawn container with real GNU grep.
-- **Systemd hardening — added, per-unit not blanket.** All 10 units get
-  `NoNewPrivileges=yes`/`PrivateTmp=yes`; 6 (confirmed `/data`/`$HOME`-only
-  writers) also get `ProtectSystem=full`. 3 deliberately don't
-  (`beesd-setup`/`shani-user-setup` write `/etc`; `bless-boot` matches
-  systemd's own unhardened upstream template — needs `/boot/efi` write).
-  `shani-update.service` (user) deliberately gets **none of this** — its
-  real deploy path re-execs via `pkexec` (setuid), and `NoNewPrivileges`/
-  mount-namespacing would silently break that escalation. Verified
-  against the real kernel mechanism (`unshare --mount` + real read-only
-  bind mounts), not just `systemd-analyze verify`.
+- **Systemd hardening — extended to seccomp/namespace level, per-unit, and the
+  omissions are load-bearing (2026-09-30).** The earlier pass stopped at
+  `NoNewPrivileges`/`PrivateTmp`/`ProtectSystem`. 10 units now also get
+  `SystemCallArchitectures=native`, `SystemCallFilter=~@mount @raw-io @debug
+  @reboot`, `RestrictNamespaces=yes`, `LockPersonality=yes`,
+  `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`,
+  `RestrictRealtime=yes`, `RemoveIPC=yes`, `KeyringMode=private`,
+  `ProtectControlGroups=yes`, `ProtectKernelTunables/Modules/Logs=yes`,
+  `ProtectHome=yes`, `ProtectProc=invisible`, `UMask=`, and
+  `LogRateLimitIntervalSec=`/`LogRateLimitBurst=`/`LogLevelMax=`.
+
+  **Read the `ExecStart` before adding a directive — four of these break the
+  boot-safety chain if applied blanket, and all four were caught by reading the
+  scripts first, not by `systemd-analyze verify` (which only proves the
+  directive is *recognised*):**
+  - **`ProcSubset=pid` must NOT be used anywhere.** `boot-success-cleanup.sh`
+    and `check-boot-failure.sh` both derive the booted slot from
+    **`/proc/cmdline`**; `pid` subsets hide it, so slot detection silently
+    returns empty. `ProtectProc=invisible` is used instead (it only hides other
+    users' processes).
+  - **`PrivateDevices=yes` must NOT be used on any unit that calls `logger`.**
+    It exposes only null/zero/full/random/urandom/tty, so **`/dev/log` is
+    gone** and `shani-boot-safety-failed@.service` (the unit that records boot
+    *safety* failures) cannot report anything.
+  - **`@raw-io` is safe to exclude even though `check-boot-failure.sh` runs
+    `btrfs subvolume get-default`.** That needs `ioctl`, and `ioctl` is in
+    **`@default`** ("system calls that are always permitted",
+    `src/shared/seccomp-util.c` v261), not `@raw-io` — `@raw-io` is
+    `ioperm`/`iopl`/`pciconfig_*`, raw *port* I/O.
+  - **`bless-boot` gets neither `ProtectKernelTunables` nor `ProtectSystem`.**
+    It writes EFI variables through `/sys/firmware/efi/efivars` and renames
+    loader entries under `/boot/efi`, so making `/sys` or `/boot` read-only
+    stops it doing the one thing it exists to do.
+  - `MemoryDenyWriteExecute`/`LockPersonality` are **omitted from the
+    flatpak units** (C++ + dbus) and `shani-download-only` (curl/aria2/rclone).
+  - `shani-user-setup` keeps **no** `ProtectSystem` (it writes `/etc/passwd`,
+    `/etc/group`); `flatpak-update-user` keeps **no** `ProtectHome` (it needs
+    `~/.local`).
+  - `RestrictAddressFamilies=AF_UNIX` only — `logger` and `systemctl` need
+    AF_UNIX, and the download/user-setup units add `AF_INET AF_INET6`.
+    `@network-io` covers local AF_UNIX, so it is *not* excluded.
+
+  **`shani-auto-rollback.service` is still deliberately unhardened** (it does
+  losetup/mount/chroot/btrfs; `SystemCallFilter=~@mount`, `ProtectProc`,
+  `ReadWritePaths=` and `PrivateDevices` would all break it). Same for
+  `shani-update.service`, whose real deploy path re-execs via `pkexec`
+  (setuid) — `NoNewPrivileges`/mount-namespacing would silently break that
+  escalation.
+
+  **What is verified and what is not.** Verified: all 17 units load under real
+  Arch systemd **261.3** with no unknown-key warnings (`tests/verify-units.sh`,
+  rc=0); the full mandatory harness `clean → ca → bootstrap → upgrade →
+  rollback → clean` is green; `verify-boot` PASSED, and `/data/boot-ok` being
+  present with `boot_in_progress` removed proves the hardened
+  `mark-boot-success.service` actually **ran and succeeded** in a real boot; no
+  hardened unit appears in `systemctl list-units --state=failed`; and the
+  captured boot console has **zero** seccomp/`EPERM` denials. The 13-14 failed
+  units in a harness boot are pre-existing and environmental (auditd,
+  qemu-guest-agent, `/var/log` unmount), not these units.
+
+  **Not verified:** `check-boot-failure.service`'s *service* body never fires in
+  a 90 s `verify-boot` window (its timer is `OnBootSec=15min`), so its
+  `btrfs`-under-`SystemCallFilter` path rests on the `@default`/`ioctl` source
+  fact above, not on an observed run. An attempt to prove it with
+  `systemd-run` under the same property set was **invalid** — a non-boot
+  `enter` session has no systemd PID 1, so every invocation failed with
+  "Host is down" regardless of the sandbox. Do not trust a `systemd-run`
+  result from a non-boot session.
 - **CI status — corrected, was stale.** `.github/workflows/ci.yml` has
   three jobs: `lint` (shellcheck via the shared `shani-ci-commons`
   template), `unit-tests` (`test-deploy-state.sh` 9/9 +

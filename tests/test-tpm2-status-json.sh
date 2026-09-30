@@ -113,11 +113,11 @@ Keyslots:
 	PBKDF:	argon2id
 Tokens:
   1: systemd-tpm2
-	tpm2-pcrs:	7
+	tpm2-hash-pcrs:   0+7
 	tpm2-public-key:	rsa2048
 	tpm2-pin:	false
   2: systemd-tpm2
-	tpm2-pcrs:	7
+	tpm2-hash-pcrs:   0+7
 	tpm2-public-key:	rsa2048
 	tpm2-pin:	false
 Segments:
@@ -135,7 +135,7 @@ Keyslots:
 	PBKDF:	pbkdf2
 Tokens:
   1: systemd-tpm2
-	tpm2-pcrs:	7
+	tpm2-hash-pcrs:   0+7
 	tpm2-pin:	true
 Segments:
   1: crypt'

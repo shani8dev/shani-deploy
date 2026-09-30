@@ -36,6 +36,24 @@ jobs:
       - name: Run upgrade-adviser tests
         run: bash tests/test_upgrade_adviser.sh
 
+      - name: Run sysctl-verify contract tests
+        run: bash tests/test-sysctl-verify.sh
+
+      - name: Run TPM2 PCR policy contract tests
+        run: bash tests/test-tpm2-pcr-policy.sh
+
+      - name: Run TPM2 pcrlock enrollment contract tests
+        run: bash tests/test-tpm2-pcrlock.sh
+
+      - name: Run TPM2 pcrlock status contract tests
+        run: bash tests/test-tpm2-pcrlock-status.sh
+
+      - name: Run TPM2 pcrlock health contract tests
+        run: bash tests/test-tpm2-pcrlock-health.sh
+
+      - name: Run runtime-only units contract tests
+        run: bash tests/test-runtime-only-units.sh
+
   unit-files:
     name: Unit files (systemd-analyze verify)
     runs-on: ubuntu-latest

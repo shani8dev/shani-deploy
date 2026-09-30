@@ -19,6 +19,26 @@ Type=oneshot
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=~@mount @raw-io @debug @reboot
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+LogLevelMax=warning
 ExecStart=/usr/bin/logger -p daemon.crit -t shani-boot-safety "%i failed: boot-failure detection or automatic rollback may not have run this boot (journalctl -u %i)"
 # Last 20 failures, newest last: "<ISO-8601 time> <unit>". Cleared by
 # shani-reset along with the other /data/boot_* markers.

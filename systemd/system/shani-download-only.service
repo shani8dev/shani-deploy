@@ -16,6 +16,25 @@ IOSchedulingPriority=7
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=~@mount @raw-io @debug @reboot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0022
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=500
+LogLevelMax=info
 
 ExecStart=/usr/local/bin/shani-deploy --download-only
 

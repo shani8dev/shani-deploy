@@ -12,6 +12,26 @@ Type=oneshot
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=~@mount @raw-io @debug @reboot
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+LogLevelMax=warning
 # Mark boot successful
 ExecStart=touch /data/boot-ok
 

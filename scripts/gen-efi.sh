@@ -25,17 +25,20 @@ set -Eeuo pipefail
 
 # Check for required dependencies.
 #
-# tpm2-status is the one read-only subcommand, so it gets the only reduced set.
-# The `*)` list is load-bearing, not verbose: every other subcommand signs or
-# writes boot state, and relaxing it is how a machine stops booting. Keep it.
-# systemd-cryptenroll and mokutil are absent from tpm2-status on purpose --
+# The read-only subcommands get the reduced set. The `*)` list is load-bearing,
+# not verbose: every other subcommand signs or writes boot state, and relaxing
+# it is how a machine stops booting. Keep it.
+# systemd-cryptenroll and mokutil are absent from the read-only set on purpose --
 # tpm2_status_json() already treats them as optional and reports their absence
 # as a false field, so requiring them would reintroduce the failure being fixed.
-if [[ "${1:-}" == "tpm2-status" ]]; then
-    REQUIRED_CMDS=("cryptsetup" "jq" "grep" "awk" "sed" "date")
-else
-    REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs" "lsblk" "findmnt" "df")
-fi
+case "${1:-}" in
+    tpm2-status|pcrlock-status)
+        REQUIRED_CMDS=("cryptsetup" "jq" "grep" "awk" "sed" "date")
+        ;;
+    *)
+        REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs" "lsblk" "findmnt" "df")
+        ;;
+esac
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(date "+%Y-%m-%d %H:%M:%S") [GENEFI][ERROR] Required command '$cmd' not found. Please install it." >&2
@@ -55,13 +58,14 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" && "${1:-}" != "tpm2-status" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" && "${1:-}" != "tpm2-status" && "${1:-}" != "pcrlock-status" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     echo "  $0 enroll-tpm2 --stdin [--with-pin]  — same, no prompts: passphrase (then PIN) on stdin"
     echo "  $0 tpm2-status --json        — encryption / TPM2 / Secure Boot state as JSON"
+    echo "  $0 pcrlock-status --json     — which PCR policy the volume is locked against (pcrlock or literal)"
     echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
     echo "  $0 cleanup-tpm2              — remove stale TPM2 LUKS slots after re-enrolment"
     echo "  $0 remove-tpm2               — fully disable TPM2 auto-unlock (wipes all TPM2 slots)"
@@ -892,12 +896,7 @@ cleanup_tpm2() {
     local slot_num
     while IFS= read -r slot_num; do
         [[ -n "$slot_num" ]] && tpm2_slots+=("$slot_num")
-    done < <(cryptsetup luksDump "$underlying" 2>/dev/null \
-        | awk '
-            /^Tokens:/ { in_tokens=1 }
-            in_tokens && /^[[:space:]]+[0-9]+:/ { current=gensub(/^[[:space:]]+([0-9]+):.*/, "\1", 1) }
-            in_tokens && current && /systemd-tpm2|"type".*tpm2/ { print current; current="" }
-        ' 2>/dev/null | sort -n || true)
+    done < <(_tpm2_entry_token_ids "$underlying")
 
     if [[ ${#tpm2_slots[@]} -eq 0 ]]; then
         log "No TPM2 slots found in LUKS header — nothing to clean up"
@@ -1343,6 +1342,49 @@ enroll_mok() {
     cleanup_esp
 }
 
+# _tpm2_pcrlock_policy_path — print the path of a systemd pcrlock policy, if any.
+#
+# The two paths below are systemd's own discovery order
+# (tpm2_pcrlock_search_file(), v255), not a guess — hardcoding anything else
+# would enroll against a different file than cryptenroll would auto-select.
+# Returns 1 rather than error_exit when no policy exists: that is a normal
+# state without a pcrlock phase in the initramfs, and the caller must fall
+# back to the literal PCR pin rather than abort enrollment.
+_tpm2_pcrlock_policy_path() {
+    local candidate
+    for candidate in /run/systemd/pcrlock.json /var/lib/systemd/pcrlock.json; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _tpm2_entry_token_ids <luks-device> — numeric ids of every TPM2 entry token
+# already enrolled, one per line, numerically ordered.
+#
+# Reads luksDump's "Tokens:" block, NOT `cryptsetup token list` — that
+# subcommand does not exist in cryptsetup 2.7.0 (add|remove|import|export only).
+# Its failure was silent: an empty result is indistinguishable from "nothing
+# enrolled", so a re-enrollment would have created a fresh token and stranded
+# the old one still sealed against the previous policy.
+#
+# The id is $1 with the colon stripped, not gensub(): gensub is a gawk
+# extension and awk here is mawk, where an undefined function is FATAL. That
+# same trap shipped in cleanup_tpm2() and made `cleanup-tpm2` report "No TPM2
+# slots found" and exit 0 on every mawk system.
+_tpm2_entry_token_ids() {
+    local dev="$1" current=""
+    [[ -n "$dev" ]] || return 0
+    cryptsetup luksDump "$dev" 2>/dev/null \
+        | awk '
+            /^Tokens:/ { in_tokens=1 }
+            in_tokens && /^[[:space:]]+[0-9]+:/ { current=$1; sub(/:.*/, "", current) }
+            in_tokens && current && /systemd-tpm2|"type".*tpm2/ { print current; current="" }
+        ' 2>/dev/null | sort -n || true
+}
+
 # enroll_tpm2 — enroll the TPM2 chip into the LUKS2 volume for automatic unlock.
 #
 # Must run on the LIVE booted system (not in a chroot) — it talks to real TPM
@@ -1431,9 +1473,24 @@ enroll_tpm2() {
         log "LUKS KDF: ${kdf} ✓"
     fi
 
-    # Choose PCR policy based on Secure Boot state
+    # A pcrlock policy supersedes the literal mask: cryptenroll only installs
+    # its default PCR pin when no policy is present (`auto_hash_pcr_values &&
+    # !arg_tpm2_pcrlock`, v255 cryptenroll.c:552), so --tpm2-pcrlock replaces it
+    # rather than adding to it. Passing --tpm2-pcrs alongside it would defeat
+    # the point, so the two are mutually exclusive below.
+    local pcrlock_policy=""
     local pcrs
     local sb_state
+    if pcrlock_policy="$(_tpm2_pcrlock_policy_path)"; then
+        log "Found systemd pcrlock policy: ${pcrlock_policy} — locking against the policy"
+    else
+        pcrlock_policy=""
+        log_warn "No pcrlock policy found — falling back to a literal PCR mask."
+        log_warn "A policy is more durable (it survives MOK/Secure Boot changes that"
+        log_warn "invalidate a literal PCR 7 pin), but it is produced by systemd's"
+        log_warn "pcrlock phase in the initramfs, which is not installed here."
+    fi
+
     sb_state=$(mokutil --sb-state 2>/dev/null || true)
     if [[ "$sb_state" == *"SecureBoot enabled"* ]]; then
         pcrs="0+7"
@@ -1466,14 +1523,55 @@ enroll_tpm2() {
         log "TPM2 PIN not set — disk will unlock automatically on matching hardware"
     fi
     (( from_stdin )) || log "You will be prompted for your LUKS passphrase"
-    systemd-cryptenroll \
-        --tpm2-device=auto \
-        --tpm2-pcrs="${pcrs}" \
-        ${tpm2_pin_flag:+"$tpm2_pin_flag"} \
-        "$underlying" \
-        || error_exit "TPM2 enrollment failed"
 
-    log "TPM2 enrolled successfully with PCR policy: ${pcrs}"
+    # --tpm2-public-key-pcrs= is required (empty) whenever a pcrlock policy is
+    # used: tpm2_pcr_seal() refuses a pcrlock policy combined with a non-zero
+    # public-key PCR mask (EOPNOTSUPP), and that mask otherwise defaults to PCR
+    # 11. An empty argument clears it (tpm2_parse_pcr_argument_to_mask).
+    local -a pcr_args=()
+    if [[ -n "$pcrlock_policy" ]]; then
+        pcr_args=(--tpm2-pcrlock="$pcrlock_policy" --tpm2-public-key-pcrs=)
+    else
+        pcr_args=(--tpm2-pcrs="$pcrs")
+    fi
+
+    # Re-enroll every existing TPM2 entry token in place. Omitting
+    # --entry-token creates a *new* token and leaves the old one stale, so
+    # blue/green would keep unlocking under the previous policy.
+    local -a entry_tokens=()
+    local tok
+    while IFS= read -r tok; do
+        [[ -n "$tok" ]] && entry_tokens+=("$tok")
+    done < <(_tpm2_entry_token_ids "$underlying")
+
+    if [[ ${#entry_tokens[@]} -eq 0 ]]; then
+        log "No existing TPM2 entry token — enrolling a new one"
+        systemd-cryptenroll \
+            --tpm2-device=auto \
+            "${pcr_args[@]}" \
+            ${tpm2_pin_flag:+"$tpm2_pin_flag"} \
+            "$underlying" \
+            || error_exit "TPM2 enrollment failed"
+        log "TPM2 enrolled successfully"
+    else
+        log "Re-enrolling ${#entry_tokens[@]} existing TPM2 entry token(s): ${entry_tokens[*]}"
+        for tok in "${entry_tokens[@]}"; do
+            log "Enrolling entry token ${tok}..."
+            systemd-cryptenroll \
+                --tpm2-device=auto \
+                --entry-token="$tok" \
+                "${pcr_args[@]}" \
+                ${tpm2_pin_flag:+"$tpm2_pin_flag"} \
+                "$underlying" \
+                || error_exit "TPM2 enrollment failed for entry token ${tok}"
+        done
+        log "TPM2 enrolled successfully in ${#entry_tokens[@]} entry token(s)"
+    fi
+    if [[ -n "$pcrlock_policy" ]]; then
+        log "Locked against pcrlock policy: ${pcrlock_policy}"
+    else
+        log "Locked against literal PCR policy: ${pcrs}"
+    fi
     log "The disk will unlock automatically on next boot"
     log ""
     log "Important reminders:"
@@ -1566,12 +1664,82 @@ tpm2_status_json() {
           luks_kdf: $luks_kdf, luks_keyslots_in_use: $luks_keyslots_in_use}'
 }
 
+# pcrlock_status_json — which PCR policy the volume is actually locked against,
+# and whether a pcrlock policy exists to enroll one. Read-only, like
+# tpm2_status_json. An undeterminable field is null, never a default:
+# enrolled_mode asserts what protects the disk, and a wrong one is worse than
+# an absent one.
+pcrlock_status_json() {
+    local dev="" dump="" policy_path="" literal="" policy_hash="" mode=""
+    local has_policy=false entry_json='[]' tok
+    local -a entry_tokens=()
+
+    if [[ -e "/dev/mapper/${ROOTLABEL}" ]]; then
+        dev=$(cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null \
+            | sed -n 's/^ *device: *//p' | awk '{print $NF}' || true)
+        if [[ -n "$dev" ]]; then
+            dump=$(cryptsetup luksDump "$dev" 2>/dev/null || true)
+        fi
+    fi
+
+    if policy_path="$(_tpm2_pcrlock_policy_path)"; then
+        has_policy=true
+    else
+        policy_path=""
+    fi
+
+    if [[ -n "$dump" ]]; then
+        if grep -qE '^[[:space:]]*tpm2-pcrlock:[[:space:]]*true' <<<"$dump"; then
+            mode="pcrlock"
+        elif grep -qE '^[[:space:]]*tpm2-hash-pcrs:' <<<"$dump"; then
+            mode="literal"
+        fi
+        literal=$(awk -F':[[:space:]]*' '/^[[:space:]]*tpm2-hash-pcrs:/ { print $2; exit }' <<<"$dump")
+        # tok255.c:241 prints "tpm2-policy-hash:" CRYPT_DUMP_LINE_SEP "%s" --
+        # the value is on the FOLLOWING line, so a same-line field split reads
+        # the empty string after the colon and reports the hash as absent.
+        # Both shapes are handled so a future same-line layout still parses.
+        policy_hash=$(awk '
+            /^[[:space:]]*tpm2-policy-hash:[[:space:]]*$/ { getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }
+            /^[[:space:]]*tpm2-policy-hash:[[:space:]]*[^[:space:]]/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+        ' <<<"$dump")
+        while IFS= read -r tok; do
+            [[ -n "$tok" ]] && entry_tokens+=("$tok")
+        done < <(_tpm2_entry_token_ids "$dev")
+        if [[ ${#entry_tokens[@]} -gt 0 ]]; then
+            entry_json=$(printf '%s\n' "${entry_tokens[@]}" | jq -R . | jq -sc .) || entry_json='[]'
+        fi
+    fi
+
+    jq -nc \
+        --argjson pcrlock_policy_available "$has_policy" \
+        --argjson entry_tokens "$entry_json" \
+        --arg pcrlock_policy_path "$policy_path" \
+        --arg enrolled_mode "$mode" \
+        --arg literal_pcrs "$literal" \
+        --arg policy_hash "$policy_hash" \
+        --arg luks_device "$dev" \
+        '{pcrlock_policy_available: $pcrlock_policy_available,
+          pcrlock_policy_path: ($pcrlock_policy_path | if . == "" then null else . end),
+          enrolled_mode: ($enrolled_mode | if . == "" then null else . end),
+          literal_pcrs: ($literal_pcrs | if . == "" then null else . end),
+          policy_hash: ($policy_hash | if . == "" then null else . end),
+          entry_tokens: $entry_tokens,
+          luks_device: ($luks_device | if . == "" then null else . end)}'
+}
+
 case "${1:-}" in
     tpm2-status)
         [[ "${2:-}" == "--json" ]] || error_exit "tpm2-status currently needs --json"
         # log() writes to stdout: keep stdout for the JSON alone
         exec 3>&1 1>&2
         tpm2_status_json >&3
+        ;;
+    pcrlock-status)
+        [[ "${2:-}" == "--json" ]] || error_exit "pcrlock-status currently needs --json"
+        # log() writes to stdout: keep stdout for the JSON alone
+        exec 3>&1 1>&2
+        pcrlock_status_json >&3
         ;;
     configure)
         generate_uki "$TARGET_SLOT"
@@ -1597,6 +1765,8 @@ case "${1:-}" in
         echo "  $0 configure <target_slot>"
         echo "  $0 enroll-mok"
         echo "  $0 enroll-tpm2"
+        echo "  $0 tpm2-status --json"
+        echo "  $0 pcrlock-status --json"
         echo "  $0 cleanup-mok"
         echo "  $0 cleanup-tpm2"
         echo "  $0 remove-tpm2"

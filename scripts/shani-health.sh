@@ -866,6 +866,50 @@ _section_boot_health() {
         _row "Overlay boot" "!!  failed: $(_join "${overlay_boot_failed[@]}")"
         _rec "Overlay boot service(s) failed: $(_join "${overlay_boot_failed[@]}") — run: systemctl status <unit>"
     fi
+    # systemd-sysctl --verify is a 262 feature; it proves shani-settings'
+    # sysctl.d is APPLIED at boot, not merely shipped. Three invariants here
+    # are load-bearing — breaking any of them silently disables the check:
+    #   - systemd-sysctl is a private helper under /usr/lib/systemd (or
+    #     /lib/systemd) and is NOT on PATH, so it must be located by
+    #     absolute path.
+    #   - A healthy run prints nothing; failures go to stderr via
+    #     log_error_errno (src/sysctl/sysctl.c). So ANY non-empty output is a
+    #     finding — never match a guessed string, which can only ever
+    #     false-green. An unrecognised --verify option is "unavailable", not
+    #     a sysctl fault, or older images would raise it permanently.
+    #   - --strict is LOAD-BEARING, not decoration. Upstream's --verify reads
+    #     each value back and returns a negative errno on mismatch or refusal
+    #     (src/basic/sysctl-util.c:sysctl_write_verify), but the caller in
+    #     sysctl_write_or_warn() swallows a write-REFUSED errno (EROFS/EACCES/
+    #     EPERM) through log_debug_errno and returns 0 — invisible at any
+    #     default log level — unless arg_strict is set. Upstream says so too:
+    #     "Call it with --strict and targeted configuration when exact
+    #     verification is desired" (v262 NEWS). Without --strict this row
+    #     would read silent as "OK all shipped sysctl.d values are live" on
+    #     exactly the read-only/hardened sysctls it exists to police, which
+    #     includes 90-security-hardening.conf. A mismatch is -EINVAL, which is
+    #     NOT write-refused, so it is reported either way; it is the refusal
+    #     class that --strict alone makes visible.
+    local _sv_bin="" _sv_out="" _sv_n=0
+    if command -v systemd-sysctl &>/dev/null; then
+        _sv_bin="$(command -v systemd-sysctl)"
+    elif [[ -x /usr/lib/systemd/systemd-sysctl ]]; then
+        _sv_bin="/usr/lib/systemd/systemd-sysctl"
+    elif [[ -x /lib/systemd/systemd-sysctl ]]; then
+        _sv_bin="/lib/systemd/systemd-sysctl"
+    fi
+    if [[ -n "$_sv_bin" ]]; then
+        _sv_out="$("$_sv_bin" --verify --strict 2>&1 || true)"
+        if printf '%s' "$_sv_out" | grep -qE 'unrecognized option|unknown option|invalid option'; then
+            _row "Sysctl verify" "--  not available (needs systemd 262; this is older)"
+        elif [[ -z "$_sv_out" ]]; then
+            _row "Sysctl verify" "OK  all shipped sysctl.d values are live"
+        else
+            _sv_n="$(printf '%s\n' "$_sv_out" | grep -c . || true)"
+            _row "Sysctl verify" "!!  ${_sv_n} shipped value(s) not live"
+            _rec "systemd-sysctl --verify reported ${_sv_n} line(s), meaning shipped sysctl.d value(s) did not take effect at boot — run: systemd-sysctl --verify (first: ${_sv_out%%$'\n'*})"
+        fi
+    fi
     # Written by shani-boot-safety-failed@.service (OnFailure= of the
     # boot-safety units). Unlike is-failed above, this survives a reboot.
     if [[ -s /data/boot_safety_failed ]]; then
@@ -1865,6 +1909,64 @@ _section_encryption() {
 
 }
 
+# Print the enrolled TPM2 PCR set from `cryptsetup luksDump` output, normalised
+# to ascending numeric order ("0+7"). Prints nothing when the field is absent.
+#
+# The field is rendered by systemd's own cryptsetup token plugin and its name
+# and shape both changed upstream:
+#   tpm2-hash-pcrs:   0+7     systemd >= 252
+#   tpm2-pcrs:  0+7           systemd 250/251
+# Both are '+'-separated lists, never a bitmask integer, and no version emits a
+# 'pcr-selection' key. Without the plugin installed the whole field is absent —
+# that is what "prints nothing" means, and callers must not read it as "no PCRs".
+_tpm2_enrolled_pcrs() {
+    local _raw
+    _raw=$(printf '%s\n' "$1" | grep -oP 'tpm2-(hash-)?pcrs:[ \t]*\K[0-9+]+' | head -1) || _raw=""
+    [[ -n "$_raw" ]] || return 0
+    printf '%s\n' "$_raw" | tr '+' '\n' | grep -E '^[0-9]+$' | sort -n | paste -sd+ - || true
+}
+
+# Print "true" when the token is locked against a pcrlock policy, else nothing.
+#
+# This is the ONLY reliable pcrlock signal, because it is the flag systemd sets
+# when it enrolls. A pcrlock token may still carry a tpm2-hash-pcrs field (v255
+# renders that field unconditionally, and its value comes from the token JSON
+# rather than from the sealed policy), so the PCR list is NOT evidence of the
+# mode and must never be used to infer it.
+_tpm2_uses_pcrlock() {
+    printf '%s\n' "$1" \
+        | grep -qE '^[[:space:]]*tpm2-pcrlock:[[:space:]]*true' && printf 'true\n' || true
+}
+
+# Print the path of the pcrlock policy systemd would use, or nothing.
+# Search order matches _tpm2_pcrlock_policy_path() in gen-efi.sh: /run first,
+# then /var/lib. The two are independent copies by design (separately packaged
+# executables, no shared library), so the ORDER is duplicated on purpose and
+# must stay in step — /run wins because a policy written for this boot is
+# more specific than the one systemd persisted.
+_tpm2_pcrlock_policy() {
+    local _c
+    for _c in /run/systemd/pcrlock.json /var/lib/systemd/pcrlock.json; do
+        if [[ -f "$_c" ]]; then
+            printf '%s\n' "$_c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Print the enrolled pcrlock policy hash, or nothing.
+#
+# tok255.c:241 prints "tpm2-policy-hash:" CRYPT_DUMP_LINE_SEP "%s\n", so the
+# value is on the line AFTER the label; a same-line field split reads the empty
+# string after the colon and would report every policy as having no hash.
+_tpm2_policy_hash() {
+    printf '%s\n' "$1" | awk '
+        /^[[:space:]]*tpm2-policy-hash:[[:space:]]*$/ { getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }
+        /^[[:space:]]*tpm2-policy-hash:[[:space:]]*[^[:space:]]/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+    '
+}
+
 _section_tpm2() {
     _set_section "tpm2"
     _head "TPM2"
@@ -1885,27 +1987,54 @@ _section_tpm2() {
         _row "Hardware"  "OK  present${tpm_info:+  (${tpm_info})}"
         if [[ -n "$underlying" ]]; then
             if echo "$enroll_out" | grep -q "tpm2"; then
-                # Show PCR policy — parse from cryptsetup luksDump
-                # gen-efi uses PCR 0+7 with Secure Boot, PCR 0 without
-                local pcr_policy=""
-                pcr_policy=$(cryptsetup luksDump "$underlying" 2>/dev/null \
-                    | grep -A5 "systemd-tpm2" | grep -oP 'pcr-selection.*' \
-                    | head -1 || echo "")
-                [[ -z "$pcr_policy" ]] && \
-                    pcr_policy=$(systemd-cryptenroll "$underlying" 2>/dev/null \
-                        | awk '/tpm2/{print $0}' | head -1 || echo "")
-                _row "Enrolled"  "OK  auto-unlock active${pcr_policy:+  (${pcr_policy})}"
+                # One luksDump read feeds both the displayed policy and the
+                # Secure Boot cross-check below — two reads could disagree if
+                # the header changed between them.
+                local _dump; _dump=$(cryptsetup luksDump "$underlying" 2>/dev/null || true)
+                local _enrolled_pcrs; _enrolled_pcrs=$(_tpm2_enrolled_pcrs "$_dump")
+                local _pcrlock; _pcrlock=$(_tpm2_uses_pcrlock "$_dump")
+                if [[ -n "$_pcrlock" ]]; then
+                    # A pcrlock token is locked against a SEALED policy, not a
+                    # literal PCR list: the PCR selection lives inside the
+                    # policy, so there is nothing in the header to render, and
+                    # comparing it against a Secure-Boot-derived list would be
+                    # comparing two different things. The Secure-Boot
+                    # cross-check below is therefore deliberately not run in
+                    # this branch.
+                    local _pol; _pol=$(_tpm2_pcrlock_policy)
+                    local _hash; _hash=$(_tpm2_policy_hash "$_dump")
+                    if [[ -n "$_pol" ]]; then
+                        _row "Enrolled"  "OK  auto-unlock active  (pcrlock policy: ${_pol})"
+                    else
+                        # The policy is gone from this boot's view. /run is
+                        # tmpfs, so a policy written at boot but not now is a
+                        # real state and is reported rather than as "unknown".
+                        _row "Enrolled"  "OK  auto-unlock active  (pcrlock policy not present on this boot)"
+                    fi
+                    [[ -n "$_hash" ]] && _row2 "   policy hash: ${_hash}"
+                elif [[ -n "$_enrolled_pcrs" ]]; then
+                    _row "Enrolled"  "OK  auto-unlock active  (PCR ${_enrolled_pcrs})"
+                else
+                    # The PCR policy is rendered by systemd's own cryptsetup
+                    # token plugin; without it luksDump omits the field
+                    # entirely. An unreadable policy is reported as
+                    # unavailable, never as an empty one.
+                    _row "Enrolled"  "OK  auto-unlock active  (PCR policy not available)"
+                fi
                 # Check PCR policy matches current Secure Boot state (gen-efi logic:
                 # SB on → PCR 0+7, SB off → PCR 0 only)
+                #
+                # Literal tokens only. A pcrlock token's PCR selection lives
+                # inside the sealed policy, so the header's list is not the
+                # policy and is not comparable to a Secure-Boot-derived one.
                 local _tpm_sb_state=$(mokutil --sb-state 2>/dev/null || echo "")
                 local _sb_on=0
                 [[ "$_tpm_sb_state" == *"SecureBoot enabled"* ]] && _sb_on=1
                 local _expected_pcrs; (( _sb_on )) && _expected_pcrs="0+7" || _expected_pcrs="0"
-                # Detect enrolled PCR set from luksDump token section
-                local _enrolled_pcrs=""
-                _enrolled_pcrs=$(cryptsetup luksDump "$underlying" 2>/dev/null \
-                    | grep -oP '(?<=tpm2-pcrs=)[0-9+]+' | head -1 || echo "")
-                if [[ -n "$_enrolled_pcrs" && "$_enrolled_pcrs" != "$_expected_pcrs" ]]; then
+                # Only a policy we actually read may be compared — an empty
+                # _enrolled_pcrs means "unknown", and reporting a mismatch
+                # against an unread value would be a fabricated fault.
+                if [[ -z "$_pcrlock" && -n "$_enrolled_pcrs" && "$_enrolled_pcrs" != "$_expected_pcrs" ]]; then
                     local _sb_str; (( _sb_on )) && _sb_str="on" || _sb_str="off"
                     _row2 "!   PCR policy ${_enrolled_pcrs} but SB is ${_sb_str} — expected ${_expected_pcrs}"
                     _rec "TPM2 PCR policy mismatch (enrolled: ${_enrolled_pcrs}, expected: ${_expected_pcrs}) — re-enroll: gen-efi enroll-tpm2"
@@ -2220,6 +2349,33 @@ _section_unit_exposure() {
         | awk '{print $1}' | grep -vE '@|^shani-test-')
     if (( ${#_units[@]} == 0 )); then
         _row "Exposure" "--  no ShaniOS service units installed"
+        return 0
+    fi
+    # Prefer the documented --json=short output over scraping the human table.
+    # The table scrape has to match the English string "Overall exposure level
+    # for", fixed column spacing, and tolerate a trailing emoji, so it breaks
+    # on a locale change or a systemd reword. --json=short is a stable contract
+    # (an array of {set, name, json_field, description, exposure}); the scrape
+    # is kept only as a fallback for systemd too old to support it.
+    local _json; _json=$(systemd-analyze security --json=short --no-pager "${_units[@]}" 2>/dev/null) || true
+    if [[ -n "$_json" ]] && jq -e . >/dev/null 2>&1 <<< "$_json"; then
+        # One row per unit: its highest per-setting exposure and the name of
+        # that setting. Naming the weakest directive is what the table could
+        # never give us — it only ever printed a number.
+        local _line
+        while IFS=$'\t' read -r _unit _score _level; do
+            [[ -n "$_unit" ]] || continue
+            _row "${_unit%.service}" "--  ${_score} (weakest: ${_level})"
+        done < <(jq -r '
+              [ .[] | select((.set // "") != "")
+                      | {set: .set,
+                         name: (.name // "?"),
+                         exposure: ((.exposure // "0") | tonumber? // 0) } ]
+              | group_by(.set)
+              | map(sort_by(.exposure) | last)
+              | .[]
+              | [ .set, (.exposure|tostring), .name ] | @tsv
+            ' <<< "$_json" 2>/dev/null)
         return 0
     fi
     local _table; _table=$(systemd-analyze security --no-pager "${_units[@]}" 2>/dev/null) || true
@@ -6064,6 +6220,32 @@ _section_units() {
         if (( _inh_total > 0 )); then
             _row "Inhibitors" "--  ${_inh_block:-0} block, ${_inh_delay:-0} delay — run: systemd-inhibit --list"
         fi
+    fi
+
+    # Runtime-only enables vanish on the next reboot, and here every reboot is
+    # also a slot switch — so this is how a service silently disappears one
+    # update later. No other row can catch it: the unit is absent, not failed.
+    #
+    # `systemctl list-unit-files` reads unit files from disk, so this works
+    # without a running systemd. The state is filtered with awk rather than
+    # `--state=`, because `--state=` is the one form that DOES need the bus: in
+    # a chroot / `test enter` session with no /run/systemd/system it returns
+    # rc=1 and no output, which would silently reduce this row to nothing in
+    # exactly the sessions where a slot is inspected. Do NOT switch to
+    # `systemd-analyze unit-files`: on systemd 255 that prints an
+    # `ids: NAME → PATH` form with no state column when piped, so a column
+    # scrape reports a permanent false "all clear".
+    #
+    # The fsck/remount generators are enabled-runtime by design, not findings.
+    local _runtime_only=()
+    mapfile -t _runtime_only < <(
+        systemctl list-unit-files --no-legend --plain --no-pager 2>/dev/null \
+            | awk '$2 == "enabled-runtime" {print $1}' | grep -v '^$' \
+            | grep -vE '^systemd-(fsck-root|remount-fs)\.service$' || true)
+    if [[ ${#_runtime_only[@]} -gt 0 ]]; then
+        local _ro_str; _ro_str=$(IFS=' '; echo "${_runtime_only[*]}")
+        _row "Runtime-only units" "--  ${#_runtime_only[@]} enabled for this boot only, gone after reboot: ${_ro_str}"
+        _rec "Runtime-only enabled units: ${_ro_str} — make persistent with: systemctl enable <unit> (drop --runtime)"
     fi
 
 }

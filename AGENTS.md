@@ -60,6 +60,49 @@ correct." It is verified by observing the actual behavior of the real
 thing in the real environment — built, served, deployed, signed, running.
 If you haven't seen it work (or fail) for real, it isn't verified.
 
+## Test harness: shani-testbed (use it - and improve it, never invent around it)
+
+The ecosystem's real test harness is the sibling repo **`../shani-testbed`**
+(read its `README.md` and `AGENTS.md`). It installs a real ShaniOS image with
+the real installer, boots its slots (`systemd-nspawn`, and UEFI + TPM VMs),
+runs real deploys and rollbacks, drives GUI apps through their accessibility
+tree, and checks web pages in a real headless browser. Every command runs from
+`../shani-install-media`, which provides the builder container:
+
+```bash
+cd ../shani-install-media
+./run_in_container.sh build.sh test <command> ...   # `... test help` lists them all
+```
+
+**If the check you need does not exist, add it to shani-testbed - do not invent
+around it.** A one-off script in this repo, a scratchpad, or a heredoc piped
+into a container is lost when the session ends, and the next agent re-derives
+it. Extend the harness instead (see "Extend the harness" in its AGENTS.md):
+
+- an in-slot check -> `shani-testbed/slot-tests/<name>.sh` (`# slot-test-mode: boot`,
+  prints `RESULT <name> PASS|FAIL|SKIP` lines), run by `slot-test <slot> <name>`;
+- a GUI interaction or assertion -> an `app` action in `lib/app.sh`, or a walk
+  through a real app as `app-scripts/<app>.actions`;
+- a web check -> `lib/web_client.py`;
+- a new way to boot, drive or observe -> a command or option in `lib/`;
+
+each with a negative control (a check that cannot fail is not a check), its
+self-test (`tests/run-app-actions.sh`, `tests/run-web-client.sh`, ...), and the
+`usage` + README updated. One harness run at a time: disk-touching commands
+take `disk/.testbed.lock` and a second run is refused. Plain nspawn boots see
+the image's whole `/var`; real boots have an empty tmpfs `/var`
+(`systemd.volatile=state`) - use `slot-test --volatile`, or a real UEFI boot
+with `iso-install --boot-only --console-exec=CMD`, for anything touching `/var`.
+
+### What to run for this repo
+
+- The mandatory sequence (`suite -p <profile> --local-src=/opt/shani-deploy/scripts`)
+  is described above.
+- Also: `slot-test <slot> unit-verify config-validators service-start`, both
+  plain and with `--volatile`; `slot-diff` after `upgrade` (what the next
+  reboot changes); `iso-install --boot-only --console-exec=...` for anything
+  only a real boot shows (TPM, the real kernel, the empty `/var`).
+
 ## This is safety-critical code — treat it that way
 
 This repo is the blue-green deployment, boot-entry, and rollback mechanism
@@ -338,6 +381,21 @@ replace the Cassini desktop test above.
   any script a test extracts from, check which match the test's `sed` takes.
 
 ## Audit-verified known issues (confirmed present)
+
+- **`--rollback` overwrote the previous system when the two slots' versions
+  tied - FIXED (2026-10-01).** The 2026-09-25 "go back instead of
+  overwriting" fix (31fffd1) only triggered when the booted slot's version was
+  STRICTLY newer. Versions are build dates, so two images built on one day (a
+  hotfix rebuild) or a redeployed release tie, and the repair path then
+  snapshotted the previous slot from the booted one: the old system gone,
+  replaced by a copy of the one being rolled back from. Now, with no
+  recorded boot failure, a sibling slot with NO backup (a deploy backs up the
+  slot it writes into, `<slot>_backup_<ts>`, so no backup = never deployed
+  onto = the intact previous system) is gone back to, not overwritten. Found
+  by shani-testbed's `suite` (`rollback:restored` FAIL when bootstrap and
+  update were the same release); verified: the suite now PASSES all 8 steps,
+  log line "@blue has no backup (no deploy wrote into it) ... rolling back to
+  it, not overwriting it".
 
 - **Machine-readable interfaces (2026-09-25) — contracts with Shani
   Cassini; change them together:** `shani-deploy --status [--check] --json`

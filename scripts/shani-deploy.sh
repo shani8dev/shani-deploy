@@ -2451,6 +2451,22 @@ rollback_system() {
         switch_to_sibling_slot "$booted" go-back
         return
     fi
+    # Same rule when the versions TIE, which they do whenever two images are
+    # built on one day (the version is the build date) or a release is
+    # redeployed: a deploy backs up the slot it writes into
+    # (<slot>_backup_<ts>), so a sibling with NO backup was never deployed
+    # onto - it is the intact previous system, not a failed candidate. With no
+    # recorded boot failure there is no evidence it is broken, and the repair
+    # path below would snapshot it from @${booted}: the previous system gone,
+    # replaced by a copy of the one being rolled back from. Found by
+    # shani-testbed's suite (rollback:restored) on 2026-10-01, where the
+    # bootstrap and the update were the same release.
+    if [[ -z "$recorded_fail" ]] && ! btrfs subvolume list "$MOUNT_DIR" 2>/dev/null \
+            | awk -v s="${failed_slot}_backup_" '$NF ~ s {f=1} END {exit !f}'; then
+        log "@${failed_slot} has no backup (no deploy wrote into it) and no boot failure is recorded - rolling back to it, not overwriting it"
+        switch_to_sibling_slot "$booted" go-back
+        return
+    fi
 
     CURRENT_SLOT="$booted"
     CANDIDATE_SLOT="$failed_slot"

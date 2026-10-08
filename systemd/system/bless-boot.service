@@ -8,6 +8,13 @@ Wants=data.mount
 # boot counter (+3-0 tries) is only satisfied when the system is truly healthy,
 # not at sysinit time when nothing useful has started yet.
 ConditionPathExists=/data/boot-ok
+# Only when systemd-boot is actually counting this boot - the same gate
+# systemd's own systemd-bless-boot-generator uses. Without it the unit FAILED
+# on every boot that isn't counted ("Not booted with boot counting in effect",
+# exit 1), which is every boot while systemd#40405 stands (below), so every
+# machine ran "degraded". A skipped unit now; it runs again once loaders set
+# the variable.
+ConditionPathExists=/sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 
 [Service]
 Type=oneshot

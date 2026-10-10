@@ -82,12 +82,12 @@ target_path() {
         # prefix). So this file is entirely ours to create, which is why it is a
         # Cassini-owned target rather than an edit of something already there.
         irqbalance_env)    printf '/etc/default/irqbalance' ;;
-        # apcupsd's ONE config file. No drop-in mechanism exists, and unlike the
-        # other three that is not an accident: UPSCABLE, UPSTYPE and DEVICE are
-        # per-machine (which model, which cable, which hiddev index), so a
-        # shipped default would name a device that is not there. This file is
-        # therefore edited where apcupsd's own package put it, in place.
-        apcupsd_conf)      printf '/etc/apcupsd/apcupsd.conf' ;;
+        # NUT's upsmon.conf, the shutdown policy. This is a DIRECTIVE file
+        # (KEY value, no '=' and no sections) - a different shape from the
+        # INI-like ups.conf and upsd.users beside it, which the validator for
+        # each one parses in its own format rather than one parser for both.
+        nut_upsmon_conf)   printf '/etc/nut/upsmon.conf' ;;
+        nut_ups_conf)      printf '/etc/nut/ups.conf' ;;
         *)                 return 1 ;;
     esac
 }
@@ -107,7 +107,8 @@ target_mode() {
         pam_yubico)        printf '0644' ;;
         krb5_conf)         printf '0644' ;;
         irqbalance_env)    printf '0644' ;;
-        apcupsd_conf)      printf '0644' ;;
+        nut_upsmon_conf)   printf '0644' ;;
+        nut_ups_conf)      printf '0644' ;;
         *)                 return 1 ;;
     esac
 }
@@ -225,13 +226,9 @@ target_validators() {
             PRE_VALIDATOR_CMD=("$0" --check-irqbalance-env)
             POST_VALIDATOR_CMD=("$0" --check-irqbalance-env-live)
             ;;
-        # A shell-style conf that apcupsd SOURCES, so this one is checked
-        # against the key set apcupsd actually reads rather than against a
-        # generic KEY=VALUE shape. A file that keeps its 300-odd lines of
-        # documentation but loses a key it needs is the failure worth catching.
-        apcupsd_conf)
-            PRE_VALIDATOR_CMD=("$0" --check-apcupsd-conf)
-            POST_VALIDATOR_CMD=("$0" --check-apcupsd-conf-live)
+        nut_upsmon_conf)
+            PRE_VALIDATOR_CMD=("$0" --check-nut-upsmon-conf)
+            POST_VALIDATOR_CMD=("$0" --check-nut-upsmon-conf-live)
             ;;
         *)                 return 1 ;;
     esac
@@ -298,17 +295,19 @@ check_modules_load_file() {
 # afterwards. They do NOT prove PAM or Kerberos will accept the values, because
 # nothing can check that without the whole stack.
 
-# apcupsd's apcupsd.conf. The only key list that matters is the one apcupsd
-# itself reads, so the keys are lifted from the shipped file rather than guessed:
-# `grep -nE '^[A-Z]' etc/apcupsd/apcupsd.conf` out of apcupsd 3.14.8-2 gives 25
-# live settings and 344 lines, the rest being per-key documentation.
+# NUT's config files. The key lists come from NUT's own documentation rather than
+# from guesswork, and the two shapes are parsed separately: upsmon.conf and
+# upsd.conf are DIRECTIVE files (`KEY value`), while ups.conf and upsd.users are
+# INI-like (`[section]` then `key = value`). Writing one format's parser for the
+# other file is exactly the mistake the apcupsd validator once made - it inherited
+# KEY=VALUE from the systemd EnvironmentFile target beside it and refused
+# apcupsd's real file on its first live line.
 #
 # **The validator's real job is refusing a value that would make the daemon do
-# the wrong thing silently**, not catching a syntax error. BATTERYLEVEL and
-# MINUTES together decide whether the machine shuts down on battery, so a typo
-# there is the difference between "keeps running until the UPS dies" and "shuts
-# down at 90%". Neither is reported by apcupsd as a complaint; the machine just
-# behaves wrongly, which is why each of those is range-checked.
+# the wrong thing silently**, not catching a syntax error. MINSUPPLIES 0, a
+# 5-field MONITOR line, or an unquoted SHUTDOWNCMD are each accepted by NUT as
+# syntactically fine and then never fire - the machine keeps running until the
+# UPS dies and nothing reports a complaint, which is why each is checked.
 # /etc/default/irqbalance - read by SYSTEMD, not by a shell.
 #
 # systemd's EnvironmentFile= parser is not bash, so a bash-shaped check would
@@ -392,83 +391,183 @@ check_irqbalance_env_file() {
 }
 
 
-APCUPSD_CONF="/etc/apcupsd/apcupsd.conf"
+NUT_UPSMON_CONF="/etc/nut/upsmon.conf"
+NUT_UPS_CONF="/etc/nut/ups.conf"
 IRQBALANCE_ENV="/etc/default/irqbalance"
 
-check_apcupsd_conf_file() {
-    local file="$1" where="$2" lineno=0 line key value
+check_nut_upsmon_conf() {
+    local file="$1" where="$2" lineno=0 line key value rest
     [[ -f "$file" ]] || { printf '%s: no such file: %s\n' "$PROG" "$where" >&2; return 1; }
 
-    # The keys apcupsd 3.14.8 reads, from its own shipped file.
-    local known=" APCUPSD UPSCABLE UPSTYPE DEVICE POLLTIME LOCKFILE SCRIPTDIR PWRFAILDIR NOLOGINDIR \
-ONBATTERYDELAY BATTERYLEVEL MINUTES TIMEOUT ANNOY ANNOYDELAY NOLOGON KILLDELAY \
-NETSERVER NISIP NISPORT EVENTSFILE EVENTSFILEMAX UPSCLASS UPSMODE STATTIME STATFILE LOGSTATS DATATIME "
+    # upsmon.conf is a DIRECTIVE file: `KEY value`, one per line, NO `=` and NO
+    # sections. That is a different shape from ups.conf and upsd.users beside it,
+    # which are INI-like `[section]` files - and assuming one format for the other
+    # is exactly how the previous apcupsd validator came to refuse its real file
+    # (it inherited KEY=VALUE from the systemd EnvironmentFile target). So these
+    # two validators parse the shape each real file actually has.
+    local known=" ALARM ALARMCRITICAL CERTHOST CERTIDENT CERTPATH CERTVERIFY COMMBAD COMMOK \
+DEBUG DEADTIME EXEC FINALDELAY FORCESSL FSD HOSTSYNC IGNORE LOWBATT MINSUPPLIES MONITOR \
+NOCOMM NOCOMMWARNTIME NOPARENT NOTE NOTIFY NOTIFYCMD NOTIFYFLAG NOTIFYMSG OBLBDURATION \
+OFFDURATION ONBATT ONLINE OVERDURATION POLLFAIL POLLFREQ POLLFREQALERT POWERDOWNFLAG \
+RBWARNTIME REPLBATT RUN SHUTDOWN SHUTDOWNCMD SHUTDOWNEXIT SYSLOG UPS WALL WARNING "
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$(( lineno + 1 ))
-        # apcupsd.conf is `KEY VALUE`, whitespace-separated. **Not** `KEY=VALUE`:
-        # grep -cE '^[A-Z][A-Z0-9_]*=' on the shipped file returns 0, and all 26
-        # live lines are space-separated. The first version of this validator
-        # assumed KEY=VALUE - imported from the systemd EnvironmentFile target
-        # beside it - and refused the real shipped file on its first live line
-        # (`UPSCABLE usb`), which would have made every legitimate apcupsd save
-        # fail. That is the cost of writing a parser from another tool's format
-        # instead of from the artifact.
         line="${line%%#*}"
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -n "$line" ]] || continue
-        # Key is the first token; value is everything after the whitespace,
-        # so a value containing spaces is not truncated.
+
         key="${line%%[[:space:]]*}"
         value="${line#"$key"}"
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
-        [[ -n "$value" ]] || {
-            printf '%s: %s line %s: %s has no value: %s\n' "$PROG" "$where" "$lineno" "$key" "$line" >&2
-            return 1; }
+
         [[ " $known " == *" $key "* ]] || {
-            printf '%s: %s line %s: %s is not a setting apcupsd reads (refusing; a\n' \
+            printf '%s: %s line %s: %s is not a setting upsmon reads (refusing; a typo\n' \
                 "$PROG" "$where" "$lineno" "$key" >&2
-            printf '  typo in a key name silently disables the setting it was meant to be)\n' >&2
+            printf '  in a key name silently disables the setting it was meant to be)\n' >&2
             return 1; }
 
-        # The shutdown policy. These decide whether the machine goes down when
-        # the power does, so each is bounded rather than merely numeric.
         case "$key" in
-            BATTERYLEVEL)
-                # A percentage. 0 would shut down the moment the UPS is on
-                # battery; apcupsd's own default is 5.
-                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 100 )) || {
-                    printf '%s: %s line %s: BATTERYLEVEL is a percentage 1-100, not %s\n' \
-                        "$PROG" "$where" "$lineno" "${value}" >&2; return 1; }
+            MONITOR)
+                # MONITOR <system> <powervalue> <username> <password> ("primary"|"secondary")
+                # The arity is the load-bearing part: a short line is accepted by
+                # upsmon as a syntax error and the UPS is silently never monitored.
+                read -r _sys _pv _user _pass role rest <<<"$value"
+                [[ -n "$rest" ]] && {
+                    printf '%s: %s line %s: MONITOR takes 6 fields (system powervalue user password master|slave)\n' \
+                        "$PROG" "$where" "$lineno" >&2
+                    return 1; }
+                [[ "$role" == "master" || "$role" == "secondary" ]] || {
+                    printf '%s: %s line %s: MONITOR role must be master or secondary, got %s\n' \
+                        "$PROG" "$where" "$lineno" "${role:-<empty>}" >&2
+                    return 1; }
+                [[ -n "$_pv" ]] || {
+                    printf '%s: %s line %s: MONITOR needs a power value\n' "$PROG" "$where" "$lineno" >&2
+                    return 1; }
                 ;;
-            MINUTES|TIMEOUT|KILLDELAY|ONBATTERYDELAY|ANNOY|ANNOYDELAY|STATTIME|EVENTSFILEMAX|NISPORT|POLLTIME)
+            MINSUPPLIES)
+                # How many supplies must be on battery before shutdown starts. 0
+                # is accepted by upsmon but means nothing can ever trigger it, so
+                # it is refused rather than written as a policy that cannot fire.
                 [[ "$value" =~ ^[0-9]+$ ]] || {
-                    printf '%s: %s line %s: %s takes whole seconds, not %s\n' \
+                    printf '%s: %s line %s: MINSUPPLIES must be a whole number, got %s\n' \
+                        "$PROG" "$where" "$lineno" "$value" >&2; return 1; }
+                (( value >= 1 )) || {
+                    printf '%s: %s line %s: MINSUPPLIES 0 means no supply can ever trigger shutdown\n' \
+                        "$PROG" "$where" "$lineno" >&2; return 1; }
+                ;;
+            POLLFREQ|POLLFREQALERT|DEADTIME|FINALDELAY|HOSTSYNC|RBWARNTIME|NOCOMMWARNTIME|OVERDURATION|OBLBDURATION|OFFDURATION)
+                [[ "$value" =~ ^[0-9]+$ ]] || {
+                    printf '%s: %s line %s: %s must be a whole number of seconds, got %s\n' \
                         "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1; }
                 ;;
-            NETSERVER|NOLOGON|LOGSTATS|UPSMODE)
-                case "$value" in
-                    on|off|disable|enable) ;;
-                    *) printf '%s: %s line %s: %s is on/off or disable, not %s\n' \
-                            "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1 ;;
-                esac
+            SHUTDOWNCMD)
+                # A command, quoted. An unquoted one is still valid to upsmon but
+                # only as far as its first word, so the rest of the intended
+                # command would be arguments upsmon never sees.
+                [[ "$value" == \"*\" ]] || {
+                    printf '%s: %s line %s: SHUTDOWNCMD must be quoted (unquoted, only its\n' \
+                        "$PROG" "$where" "$lineno" >&2
+                    printf '  first word is a command and the rest become arguments nothing reads)\n' >&2
+                    return 1; }
                 ;;
-            LOCKFILE|SCRIPTDIR|PWRFAILDIR|NOLOGINDIR|EVENTSFILE|STATFILE|DEVICE)
+            POWERDOWNFLAG)
                 [[ "$value" == /* ]] || {
-                    printf '%s: %s line %s: %s is an absolute path, not %s\n' \
-                        "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1; }
-                ;;
-            NISIP)
-                [[ -n "$value" ]] || {
-                    printf '%s: %s line %s: NISIP is empty; use 0.0.0.0 or an address\n' \
+                    printf '%s: %s line %s: POWERDOWNFLAG must be an absolute path\n' \
                         "$PROG" "$where" "$lineno" >&2; return 1; }
                 ;;
         esac
     done < "$file"
     return 0
 }
+
+check_nut_ups_conf() {
+    local file="$1" where="$2" lineno=0 line in_section=0 key value section
+    [[ -f "$file" ]] || { printf '%s: no such file: %s\n' "$PROG" "$where" >&2; return 1; }
+
+    # ups.conf is INI-like: a `[name]` header, then `key = value` pairs. NO
+    # device section is shipped by shani-settings, and that is deliberate - what
+    # fills one in is `nut-scanner -U`, not a default describing a UPS that is
+    # not there. So this validator checks a section a user DID add, and an empty
+    # file is a valid, expected state, not an error.
+    local drivers=" usbhid-ups blazer_usb blazer_ser snmp-ups nutdrv_qx apcsmart apcsmart-old \
+netxml-ups dummy-ups adelsystem_cbi al175 apc_modbus bcmxcp bcmxcp_usb belkin belkinunv bestfortress \
+besteups bestuferrups bestups clone-outlet etapro everups gematronic isbmex liebertGXT masterguard \
+metasys mge-shut mge-utalk oldmge-shut oneac optiups powercom powercompps powerman-pdu rhino richcomm_usb \
+riello_pst riello_ser safenet sms solis tripplite tripplite_usb tripplitesu upscode2 victronups \
+usbhid-ups "
+    local keys=" driver port desc maxretry sdorder community synchronous nohang \
+offdelay ondelay pollinterval "
+
+    # Global directives are legal BEFORE the first section and apply to every
+    # device (NUT's own: chroot, driverpath, maxstartdelay, maxretry,
+    # retrydelay, pollinterval, synchronous). Requiring a section first would
+    # refuse the file this repo ships, which has exactly one such line - found by
+    # running the validator against the real ups.conf rather than against a
+    # fixture.
+    local globals=" chroot driverpath maxstartdelay maxretry retrydelay pollinterval synchronous "
+
+    section=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] || continue
+
+        if [[ "$line" == \[*\] ]]; then
+            section="${line:1:${#line}-2}"
+            # A device name becomes part of a path (`/var/state/ups/<name>`), so
+            # it is confined to what cannot escape or collide.
+            [[ "$section" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+                printf '%s: %s line %s: UPS name %s must be letters, digits, dot, dash or underscore\n' \
+                    "$PROG" "$where" "$lineno" "$section" >&2; return 1; }
+            in_section=1
+            continue
+        fi
+
+        # A directive before any section is only valid if it is a global one.
+        if (( ! in_section )); then
+            _gkey="${line%%=*}"
+            _gkey="${_gkey%"${_gkey##*[![:space:]]}"}"
+            if [[ " $globals " != *" ${_gkey:-} "* ]]; then
+                printf '%s: %s line %s: %s is outside any [section] and is not a global\n' \
+                    "$PROG" "$where" "$lineno" "$line" >&2
+                return 1
+            fi
+            continue
+        fi
+
+        [[ "$line" == *=* ]] || {
+            printf '%s: %s line %s: expected key = value, got %s\n' "$PROG" "$where" "$lineno" "$line" >&2
+            return 1; }
+        key="${line%%=*}"; value="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"; value="${value#"${value%%[![:space:]]*}"}"
+
+        [[ " $keys " == *" $key "* ]] || {
+            printf '%s: %s line %s: %s is not a setting nut-driver reads\n' "$PROG" "$where" "$lineno" "$key" >&2
+            return 1; }
+
+        case "$key" in
+            driver)
+                [[ " $drivers " == *" $value "* ]] || {
+                    printf '%s: %s line %s: driver %s is not one nut ships (nut-scanner -U\n' \
+                        "$PROG" "$where" "$lineno" "$value" >&2
+                    printf '  writes the right one for the hardware it found)\n' >&2
+                    return 1; }
+                ;;
+            port)
+                [[ -n "$value" ]] || {
+                    printf '%s: %s line %s: port cannot be empty\n' "$PROG" "$where" "$lineno" >&2
+                    return 1; }
+                ;;
+        esac
+    done < "$file"
+    return 0
+}
+
 
 
 # subject_mapping: one mapping per line, three whitespace-separated fields
@@ -629,8 +728,10 @@ case "${1:-}" in
         [[ $# -ge 2 ]] || usage
         check_modules_load_file "$2" "the fragment"
         exit $? ;;
-    --check-apcupsd-conf)        [[ $# -ge 2 ]] || usage; check_apcupsd_conf_file "$2" "the fragment"; exit $? ;;
-    --check-apcupsd-conf-live)   check_apcupsd_conf_file "$APCUPSD_CONF" "the installed apcupsd.conf"; exit $? ;;
+    --check-nut-upsmon-conf)     [[ $# -ge 2 ]] || usage; check_nut_upsmon_conf "$2" "the fragment"; exit $? ;;
+    --check-nut-upsmon-conf-live)  check_nut_upsmon_conf "$NUT_UPSMON_CONF" "the installed upsmon.conf"; exit $? ;;
+    --check-nut-ups-conf)        [[ $# -ge 2 ]] || usage; check_nut_ups_conf "$2" "the fragment"; exit $? ;;
+    --check-nut-ups-conf-live)   check_nut_ups_conf "$NUT_UPS_CONF" "the installed ups.conf"; exit $? ;;
     --check-irqbalance-env)      [[ $# -ge 2 ]] || usage; check_irqbalance_env_file "$2" "the fragment"; exit $? ;;
     --check-irqbalance-env-live) check_irqbalance_env_file "$IRQBALANCE_ENV" "the installed /etc/default/irqbalance"; exit $? ;;
     --check-subject-mapping)      [[ $# -ge 2 ]] || usage; check_subject_mapping_file "$2" "the fragment"; exit $? ;;

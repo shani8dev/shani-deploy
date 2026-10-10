@@ -508,12 +508,14 @@ check_nut_ups_conf() {
     # fills one in is `nut-scanner -U`, not a default describing a UPS that is
     # not there. So this validator checks a section a user DID add, and an empty
     # file is a valid, expected state, not an error.
-    local drivers=" usbhid-ups blazer_usb blazer_ser snmp-ups nutdrv_qx apcsmart apcsmart-old \
-netxml-ups dummy-ups adelsystem_cbi al175 apc_modbus bcmxcp bcmxcp_usb belkin belkinunv bestfortress \
-besteups bestuferrups bestups clone-outlet etapro everups gematronic isbmex liebertGXT masterguard \
-metasys mge-shut mge-utalk oldmge-shut oneac optiups powercom powercompps powerman-pdu rhino richcomm_usb \
-riello_pst riello_ser safenet sms solis tripplite tripplite_usb tripplitesu upscode2 victronups \
-usbhid-ups "
+    # The driver check below is DERIVED from the filesystem rather than listed.
+    # NUT 2.8.5 ships 73 driver binaries under /usr/lib/nut, and the first
+    # version of this validator hand-kept 48 of them - which refused 25 real
+    # drivers, including `apcupsd-ups`: the bridge to apcupsd-controlled hardware,
+    # and the whole reason apcupsd is still installed. It also misspelled
+    # `gamatronic` as `gematronic`. A hand-kept list of another project's
+    # binaries is wrong the moment upstream adds a driver, and wrong in the
+    # direction of refusing a configuration that would have worked.
     local keys=" driver port desc maxretry sdorder community synchronous nohang \
 offdelay ondelay pollinterval "
 
@@ -568,11 +570,15 @@ offdelay ondelay pollinterval "
 
         case "$key" in
             driver)
-                [[ " $drivers " == *" $value "* ]] || {
-                    printf '%s: %s line %s: driver %s is not one nut ships (nut-scanner -U\n' \
+                # Derived, so it cannot refuse a driver this nut install can
+                # actually run. NUT_DRIVER_DIR is an override for the tests and
+                # defaults to the real path.
+                if [[ ! -x "${NUT_DRIVER_DIR:-/usr/lib/nut}/$value" ]]; then
+                    printf '%s: %s line %s: nut ships no driver named %s (nut-scanner -U\n' \
                         "$PROG" "$where" "$lineno" "$value" >&2
-                    printf '  writes the right one for the hardware it found)\n' >&2
-                    return 1; }
+                    printf '  writes the one your hardware needs)\n' >&2
+                    return 1
+                fi
                 ;;
             port)
                 [[ -n "$value" ]] || {

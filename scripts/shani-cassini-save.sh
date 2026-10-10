@@ -65,6 +65,29 @@ target_path() {
         sudoers)           printf '/etc/sudoers.d/50-shani-cassini' ;;
         sshd_config)       printf '/etc/ssh/sshd_config.d/50-cassini.conf' ;;
         exports)           printf '/etc/exports.d/shani-cassini.exports' ;;
+        # systemd reads /etc/modules-load.d/*.conf in lexical order and the
+        # number is only for ordering, so 50- sits after nothing and before any
+        # future 90- override - the same convention as the other drop-ins.
+        modules_load)      printf '/etc/modules-load.d/50-shani-kvm.conf' ;;
+        # Three files that have NO drop-in mechanism and NO validator of their
+        # own. See target_validators for why they are here at all despite the
+        # "drop-ins only" rule above.
+        subject_mapping)   printf '/etc/pam_pkcs11/subject_mapping' ;;
+        pam_yubico)        printf '/etc/security/pam_yubico.conf' ;;
+        krb5_conf)         printf '/etc/krb5.conf' ;;
+        # irqbalance's whole configuration surface. The package ships NO /etc
+        # directory at all - it ships usr/share/irqbalance/irqbalance.env and
+        # reads that plus an optional /etc/default/irqbalance (verified: the
+        # unit carries both EnvironmentFile= lines, the second with the `-`
+        # prefix). So this file is entirely ours to create, which is why it is a
+        # Cassini-owned target rather than an edit of something already there.
+        irqbalance_env)    printf '/etc/default/irqbalance' ;;
+        # apcupsd's ONE config file. No drop-in mechanism exists, and unlike the
+        # other three that is not an accident: UPSCABLE, UPSTYPE and DEVICE are
+        # per-machine (which model, which cable, which hiddev index), so a
+        # shipped default would name a device that is not there. This file is
+        # therefore edited where apcupsd's own package put it, in place.
+        apcupsd_conf)      printf '/etc/apcupsd/apcupsd.conf' ;;
         *)                 return 1 ;;
     esac
 }
@@ -75,6 +98,16 @@ target_mode() {
         sudoers)           printf '0440' ;;
         sshd_config)       printf '0644' ;;
         exports)           printf '0644' ;;
+        modules_load)      printf '0644' ;;
+        # subject_mapping holds a subject-to-login mapping; 0600 because it is
+        # a principal list and nothing needs to read it but root. The mode the
+        # shipped file already has is preserved by the read-back check, so a
+        # number here that disagrees shows up rather than silently changing it.
+        subject_mapping)   printf '0600' ;;
+        pam_yubico)        printf '0644' ;;
+        krb5_conf)         printf '0644' ;;
+        irqbalance_env)    printf '0644' ;;
+        apcupsd_conf)      printf '0644' ;;
         *)                 return 1 ;;
     esac
 }
@@ -114,13 +147,99 @@ target_validators() {
             POST_VALIDATOR_CMD=(exportfs -ra)
             POST_SETTLE=0.3
             ;;
+        # modules-load.d has no validator of its own - systemd-modules-load has
+        # no check mode, and nothing else claims to judge the file. So the
+        # answer to "would this module load?" is asked of modprobe, which owns
+        # module resolution and will say no rather than warn.
+        #
+        # PRE takes the staged file and checks every module named in it, so a
+        # typo never reaches the target. POST re-checks the LIVE installed file
+        # the same way, which is what makes it a live check rather than a
+        # repeat of the pre-check: it runs after the commit and against what
+        # systemd will actually read at boot.
+        modules_load)
+            # **`$0`, not `$PROG`.** The other validators are external tools
+            # found on PATH, so a bare name is right for them. This one is a
+            # self-reference, and `$PROG` is `${0##*/}` - the bare name - which
+            # `command -v` cannot resolve because the program is not on PATH. The
+            # first version used `$PROG` and every save was refused with
+            # "shani-cassini-save is not installed; refusing to save
+            # modules_load unvalidated": the fail-closed check below ran before
+            # the validator ever did, so the target existed and was still
+            # unusable. `$0` is the path this script was actually started from.
+            PRE_VALIDATOR_CMD=("$0" --check-modules-load)
+            POST_VALIDATOR_CMD=("$0" --check-modules-load-live)
+            ;;
+        # ── the three files with no validator of their own ──────────────────
+        #
+        # **The "drop-ins only" rule above does not apply here, and pretending
+        # otherwise would be worse than the problem.** pam_pkcs11's
+        # subject_mapping, pam_yubico.conf and krb5.conf have no include
+        # mechanism, so there is no drop-in to move the risk into - writing
+        # them is a main-file write whichever route it takes.
+        #
+        # They are here because the alternative was worse: `config_io`'s
+        # `write_staged_privileged` runs `pkexec install` over a temp file the
+        # CALLER owns in a directory the CALLER owns. That is a
+        # wait-for-root-to-read-my-file window, and it has no polkit rule, so it
+        # falls through to admin auth for a generic `install`. Content on stdin
+        # removes the window by removing the name - the caller proposes, the
+        # helper decides.
+        #
+        # So the validator is the same shape as modules_load's: this script
+        # checks the file itself, because no consuming tool offers a check
+        # mode. **That is a weaker guarantee than `visudo -c` and it is stated
+        # as such** - what is enforced is "parses as the format it claims, with
+        # the sections it had before", not "the PAM stack accepts it". Nobody
+        # can check the second thing, and a validator that implied otherwise
+        # would be worse than an honest structural one.
+        subject_mapping)
+            PRE_VALIDATOR_CMD=("$0" --check-subject-mapping)
+            POST_VALIDATOR_CMD=("$0" --check-subject-mapping-live)
+            ;;
+        pam_yubico)
+            PRE_VALIDATOR_CMD=("$0" --check-pam-yubico)
+            POST_VALIDATOR_CMD=("$0" --check-pam-yubico-live)
+            ;;
+        krb5_conf)
+            PRE_VALIDATOR_CMD=("$0" --check-krb5-conf)
+            POST_VALIDATOR_CMD=("$0" --check-krb5-conf-live)
+            ;;
+        # An EnvironmentFile, parsed by SYSTEMD - not by a shell. That
+        # distinction is the whole validator: /etc/default/* is the one place a
+        # file that looks like shell is not read by one, so a bash-shaped
+        # check would approve things systemd refuses.
+        #
+        # IRQBALANCE_ARGS is deliberately NOT an allowed key here, and that is
+        # the interesting part rather than an omission. The unit's line is
+        # `ExecStart=/usr/sbin/irqbalance $IRQBALANCE_ARGS` - UNQUOTED - and
+        # systemd.service(5) says a `$FOO` word "will be erased and replaced by
+        # the exact value of the environment variable (if any) including all
+        # whitespace it contains, always resulting in exactly a single
+        # argument". Only `"$FOO"` splits on whitespace. So a value of
+        # `--banirq=3 --banmod=foo` reaches the daemon as ONE argument and is
+        # rejected as an unknown flag. Accepting that key here would let a save
+        # succeed and leave the daemon refusing its own command line - config
+        # that reads as applied and is not.
+        irqbalance_env)
+            PRE_VALIDATOR_CMD=("$0" --check-irqbalance-env)
+            POST_VALIDATOR_CMD=("$0" --check-irqbalance-env-live)
+            ;;
+        # A shell-style conf that apcupsd SOURCES, so this one is checked
+        # against the key set apcupsd actually reads rather than against a
+        # generic KEY=VALUE shape. A file that keeps its 300-odd lines of
+        # documentation but loses a key it needs is the failure worth catching.
+        apcupsd_conf)
+            PRE_VALIDATOR_CMD=("$0" --check-apcupsd-conf)
+            POST_VALIDATOR_CMD=("$0" --check-apcupsd-conf-live)
+            ;;
         *)                 return 1 ;;
     esac
 }
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG --target <sudoers|sshd_config|exports> [--expect-sha256 <64-hex>] < content
+usage: $PROG --target <sudoers|sshd_config|exports|modules_load|subject_mapping|pam_yubico|krb5_conf> [--expect-sha256 <64-hex>] < content
 
 Reads the new content from stdin and installs it over one known target, after
 validating it. The content is never taken from a caller-named path.
@@ -130,6 +249,432 @@ EOF
 
 log() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 die() { log "REFUSING: $*"; exit 1; }
+
+# ── the modules-load validator ───────────────────────────────────────────────
+# Reached as `$PROG --check-modules-load <file>` (pre) or
+# `$PROG --check-modules-load-live` (post), because modules-load.d has no
+# validator of its own and modprobe is the only thing that knows whether a
+# module exists for the running kernel.
+#
+# The rules being enforced are systemd's, not this script's: blank lines and
+# `#` comments are ignored, and everything else is a module name.
+# `modprobe --show-depends` resolves the name the way a real load would and
+# exits non-zero for a name this kernel cannot provide - which is the answer
+# worth refusing on, because a modules-load.d line that cannot resolve is
+# silently ignored at boot and the user is left believing a module loaded.
+#
+# `command -v modprobe` is checked first: fail closed, never "warn and write".
+check_modules_load_file() {
+    local file="$1" where="$2" module seen=0
+    [[ -f "$file" ]] || { printf '%s: no such file: %s\n' "$PROG" "$file" >&2; return 1; }
+    while IFS= read -r module || [[ -n "$module" ]]; do
+        module="${module%%#*}"
+        module="${module#"${module%%[![:space:]]*}"}"
+        module="${module%"${module##*[![:space:]]}"}"
+        [[ -n "$module" ]] || continue
+        seen=1
+        if ! out="$(modprobe --show-depends -- "$module" 2>&1)"; then
+            printf '%s: %s: cannot load module %s: %s\n' \
+                "$PROG" "$where" "$module" "${out//$'\n'/ }" >&2
+            return 1
+        fi
+    done < "$file"
+    if (( seen == 0 )); then
+        printf '%s: %s: names no modules at all, so it would do nothing\n' \
+            "$PROG" "$where" >&2
+        return 1
+    fi
+    return 0
+}
+
+
+# ── the three structural validators ──────────────────────────────────────────
+#
+# Each is a real parse of the format, not a grep. They exist because no
+# consuming tool offers a check mode (see target_validators), so "will this
+# parse" is the strongest question anybody can actually ask about these files.
+# **What that means, precisely:** these prove the file is well-formed and, for
+# the two INI formats, that the sections present before are still present
+# afterwards. They do NOT prove PAM or Kerberos will accept the values, because
+# nothing can check that without the whole stack.
+
+# apcupsd's apcupsd.conf. The only key list that matters is the one apcupsd
+# itself reads, so the keys are lifted from the shipped file rather than guessed:
+# `grep -nE '^[A-Z]' etc/apcupsd/apcupsd.conf` out of apcupsd 3.14.8-2 gives 25
+# live settings and 344 lines, the rest being per-key documentation.
+#
+# **The validator's real job is refusing a value that would make the daemon do
+# the wrong thing silently**, not catching a syntax error. BATTERYLEVEL and
+# MINUTES together decide whether the machine shuts down on battery, so a typo
+# there is the difference between "keeps running until the UPS dies" and "shuts
+# down at 90%". Neither is reported by apcupsd as a complaint; the machine just
+# behaves wrongly, which is why each of those is range-checked.
+# /etc/default/irqbalance - read by SYSTEMD, not by a shell.
+#
+# systemd's EnvironmentFile= parser is not bash, so a bash-shaped check would
+# approve lines systemd refuses. What systemd does: strip a leading `export`,
+# take everything up to the first `=` as the key, and the rest verbatim. It does
+# NOT word-split, does NOT do command substitution, and does NOT honour quotes
+# the way a shell does - so a value containing `$(...)` is a literal string, and
+# a value containing whitespace is a literal string with whitespace in it.
+#
+# The allowed keys are the ones measured out of the shipped binary's own strings
+# (`strings /usr/sbin/irqbalance | grep IRQBALANCE_`) plus the shipped
+# usr/share/irqbalance/irqbalance.env: BANNED_CPULIST, BANNED_CPUS, ONESHOT,
+# DEBUG, and ARGS.
+#
+# **ARGS is excluded, and that is the point rather than an oversight.** The unit
+# line is `ExecStart=/usr/sbin/irqbalance $IRQBALANCE_ARGS` - UNQUOTED - and
+# systemd.service(5) says a `$FOO` word "will be erased and replaced by the
+# exact value of the environment variable (if any) including all whitespace it
+# contains, always resulting in exactly a single argument"; only `"$FOO"` splits
+# on whitespace into zero or more. So `IRQBALANCE_ARGS="--banirq=3
+# --banmod=foo"` reaches the daemon as ONE argument and is rejected as an
+# unknown flag. Accepting that key would let a save succeed and leave the daemon
+# refusing its own command line - config that reads as applied and is not.
+check_irqbalance_env_file() {
+    local file="$1" where="$2" lineno=0 line key value
+    [[ -f "$file" ]] || { printf '%s: no such file: %s\n' "$PROG" "$where" >&2; return 1; }
+    local allowed=" IRQBALANCE_BANNED_CPULIST IRQBALANCE_BANNED_CPUS IRQBALANCE_ONESHOT IRQBALANCE_DEBUG IRQBALANCE_ARGS "
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ "$line" == \#* || -z "$line" ]] && continue
+        [[ "$line" == *=* ]] || {
+            printf '%s: %s line %s: not KEY=value: %s\n' "$PROG" "$where" "$lineno" "$line" >&2
+            return 1; }
+        key="${line%%=*}"; value="${line#*=}"
+        # systemd strips a leading `export` itself.
+        key="${key#export }"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${line#*=}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        # A quoted empty value is empty. systemd strips the quotes before it
+        # expands the variable, so `IRQBALANCE_ARGS=""` is the shipped state and
+        # must be allowed - comparing the raw text would call it non-empty,
+        # because `""` is two characters.
+        local unquoted="${value%\"}"; unquoted="${unquoted#\"}"
+        # **Only a NON-empty value is refused.** The shipped
+        # usr/share/irqbalance/irqbalance.env contains `IRQBALANCE_ARGS=""`, so
+        # refusing the key outright refuses the distribution's own default file -
+        # which is what the first version of this check did, and it was found by
+        # running the validator against that file rather than against fixtures.
+        # An empty value expands to nothing useful and is the shipped state; a
+        # non-empty one is the single-argument bug described above.
+        if [[ "$key" == "IRQBALANCE_ARGS" && -n "$unquoted" ]]; then
+            printf '%s: %s line %s: IRQBALANCE_ARGS is refused here.\n' "$PROG" "$where" "$lineno" >&2
+            printf '  The unit line is ExecStart=...irqbalance $IRQBALANCE_ARGS - unquoted, and systemd\n' >&2
+            printf '  passes $VAR as exactly ONE argument, so a value holding two flags reaches the\n' >&2
+            printf '  daemon as a single unrecognised option. Bans go on the command line instead.\n' >&2
+            return 1
+        fi
+        # ARGS is allowed when empty, so it must be in the allowed set too.
+        [[ "$allowed " == *" $key "* ]] || {
+            printf '%s: %s line %s: %s is not a setting irqbalance 1.9.5 reads\n' "$PROG" "$where" "$lineno" "$key" >&2
+            return 1; }
+        case "$key" in
+            IRQBALANCE_BANNED_CPULIST|IRQBALANCE_BANNED_CPUS)
+                # A CPU list: 0, 0-3, 0,2,4 or 0-3,5,7-8. Anything else would be
+                # silently ignored by the daemon's own parser.
+                [[ "$value" =~ ^([0-9]+(-[0-9]+)?)(,[0-9]+(-[0-9]+)?)*$ ]] || {
+                    printf '%s: %s line %s: %s wants a CPU list like 0-3 or 0,2,4, not %s\n' \
+                        "$PROG" "$where" "$lineno" "$key" "${value:-<empty>}" >&2; return 1; }
+                ;;
+            IRQBALANCE_ONESHOT|IRQBALANCE_DEBUG)
+                [[ "$value" == 0 || "$value" == 1 ]] || {
+                    printf '%s: %s line %s: %s is 0 or 1, not %s\n' \
+                        "$PROG" "$where" "$lineno" "$key" "${value:-<empty>}" >&2; return 1; }
+                ;;
+        esac
+    done < "$file"
+    return 0
+}
+
+
+APCUPSD_CONF="/etc/apcupsd/apcupsd.conf"
+IRQBALANCE_ENV="/etc/default/irqbalance"
+
+check_apcupsd_conf_file() {
+    local file="$1" where="$2" lineno=0 line key value
+    [[ -f "$file" ]] || { printf '%s: no such file: %s\n' "$PROG" "$where" >&2; return 1; }
+
+    # The keys apcupsd 3.14.8 reads, from its own shipped file.
+    local known=" APCUPSD UPSCABLE UPSTYPE DEVICE POLLTIME LOCKFILE SCRIPTDIR PWRFAILDIR NOLOGINDIR \
+ONBATTERYDELAY BATTERYLEVEL MINUTES TIMEOUT ANNOY ANNOYDELAY NOLOGON KILLDELAY \
+NETSERVER NISIP NISPORT EVENTSFILE EVENTSFILEMAX UPSCLASS UPSMODE STATTIME STATFILE LOGSTATS DATATIME "
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        # apcupsd.conf is `KEY VALUE`, whitespace-separated. **Not** `KEY=VALUE`:
+        # grep -cE '^[A-Z][A-Z0-9_]*=' on the shipped file returns 0, and all 26
+        # live lines are space-separated. The first version of this validator
+        # assumed KEY=VALUE - imported from the systemd EnvironmentFile target
+        # beside it - and refused the real shipped file on its first live line
+        # (`UPSCABLE usb`), which would have made every legitimate apcupsd save
+        # fail. That is the cost of writing a parser from another tool's format
+        # instead of from the artifact.
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] || continue
+        # Key is the first token; value is everything after the whitespace,
+        # so a value containing spaces is not truncated.
+        key="${line%%[[:space:]]*}"
+        value="${line#"$key"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        [[ -n "$value" ]] || {
+            printf '%s: %s line %s: %s has no value: %s\n' "$PROG" "$where" "$lineno" "$key" "$line" >&2
+            return 1; }
+        [[ " $known " == *" $key "* ]] || {
+            printf '%s: %s line %s: %s is not a setting apcupsd reads (refusing; a\n' \
+                "$PROG" "$where" "$lineno" "$key" >&2
+            printf '  typo in a key name silently disables the setting it was meant to be)\n' >&2
+            return 1; }
+
+        # The shutdown policy. These decide whether the machine goes down when
+        # the power does, so each is bounded rather than merely numeric.
+        case "$key" in
+            BATTERYLEVEL)
+                # A percentage. 0 would shut down the moment the UPS is on
+                # battery; apcupsd's own default is 5.
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 100 )) || {
+                    printf '%s: %s line %s: BATTERYLEVEL is a percentage 1-100, not %s\n' \
+                        "$PROG" "$where" "$lineno" "${value}" >&2; return 1; }
+                ;;
+            MINUTES|TIMEOUT|KILLDELAY|ONBATTERYDELAY|ANNOY|ANNOYDELAY|STATTIME|EVENTSFILEMAX|NISPORT|POLLTIME)
+                [[ "$value" =~ ^[0-9]+$ ]] || {
+                    printf '%s: %s line %s: %s takes whole seconds, not %s\n' \
+                        "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1; }
+                ;;
+            NETSERVER|NOLOGON|LOGSTATS|UPSMODE)
+                case "$value" in
+                    on|off|disable|enable) ;;
+                    *) printf '%s: %s line %s: %s is on/off or disable, not %s\n' \
+                            "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1 ;;
+                esac
+                ;;
+            LOCKFILE|SCRIPTDIR|PWRFAILDIR|NOLOGINDIR|EVENTSFILE|STATFILE|DEVICE)
+                [[ "$value" == /* ]] || {
+                    printf '%s: %s line %s: %s is an absolute path, not %s\n' \
+                        "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1; }
+                ;;
+            NISIP)
+                [[ -n "$value" ]] || {
+                    printf '%s: %s line %s: NISIP is empty; use 0.0.0.0 or an address\n' \
+                        "$PROG" "$where" "$lineno" >&2; return 1; }
+                ;;
+        esac
+    done < "$file"
+    return 0
+}
+
+
+# subject_mapping: one mapping per line, three whitespace-separated fields
+# (subject, login, key). A line with the wrong arity is the failure that would
+# silently drop a mapping at login time.
+check_subject_mapping_file() {
+    local file="$1" where="$2" n=0 field_count fields
+    [[ -f "$file" ]] || { printf '%s: %s: no such file: %s\n' "$PROG" "$where" "$file" >&2; return 1; }
+    local lineno=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] || continue
+        read -r -a fields <<< "$line"
+        field_count=${#fields[@]}
+        if (( field_count != 3 )); then
+            printf '%s: %s: line %d has %d fields, expected 3 (subject login key): %s\n' \
+                "$PROG" "$where" "$lineno" "$field_count" "$line" >&2
+            return 1
+        fi
+        n=$((n + 1))
+    done < "$file"
+    if (( n == 0 )); then
+        printf '%s: %s: names no mappings at all\n' "$PROG" "$where" >&2
+        return 1
+    fi
+    return 0
+}
+
+# _check_ini FILE WHERE MIN_SECTIONS
+#   A shared INI parse for the two `key = value` formats. Enforces:
+#     - a `[section]` header is well formed and closed by a newline;
+#     - inside a section, every non-blank, non-comment line is `key = value`
+#       or one of the include forms those formats legitimately carry;
+#     - at least MIN_SECTIONS sections exist, so a write that flattened the file
+#       to bare keys is refused rather than installed.
+_check_ini() {
+    local file="$1" where="$2" min_sections="${3:-1}"
+    [[ -f "$file" ]] || { printf '%s: %s: no such file: %s\n' "$PROG" "$where" "$file" >&2; return 1; }
+    local lineno=0 line sections=0 kv=0 depth=0 in_section=0
+
+    # **krb5.conf is not plain INI, and the stock file proves it.** Arch's
+    # /etc/krb5.conf ships this:
+    #
+    #     [realms]
+    #     ATHENA.MIT.EDU = {
+    #             admin_server = kerberos.mit.edu
+    #     }
+    #
+    # A first version of this parse had no brace handling, so it refused the
+    # stock file with "not a \"key = value\" line: }" — which meant the
+    # baseline check failed on every real machine, so every krb5 save rolled
+    # itself back. A validator that rejects a stock config is worse than no
+    # validator: it disables the feature silently and plausibly.
+    #
+    # So the brace depth is tracked: `NAME = {` opens, `}` closes, and inside a
+    # block only `key = value` is legal. pam_yubico.conf has no blocks and no
+    # required section, which is what min_sections=0 means below.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] || continue
+        [[ "$line" == \#* || "$line" == \;* ]] && continue
+
+        if (( depth > 0 )); then
+            if [[ "$line" == "}" ]]; then
+                depth=0
+                continue
+            fi
+            if [[ "$line" =~ ^[^=]+=[[:space:]]*.*$ ]]; then
+                kv=$((kv + 1))
+                continue
+            fi
+            printf '%s: %s: line %d: inside a block, only "key = value" is legal: %s\n' \
+                "$PROG" "$where" "$lineno" "$line" >&2
+            return 1
+        fi
+
+        if [[ "$line" == \[* ]]; then
+            if [[ ! "$line" =~ ^\[[^]]+\]$ ]]; then
+                printf '%s: %s: line %d: malformed section header: %s\n' \
+                    "$PROG" "$where" "$lineno" "$line" >&2
+                return 1
+            fi
+            sections=$((sections + 1))
+            in_section=1
+            continue
+        fi
+
+        # include / includedir, which krb5.conf carries and a plain INI parse
+        # cannot represent - the page notes the same thing in _INCLUDE_RE.
+        if [[ "$line" =~ ^([Ii]nclude|[Ii]ncludedir)[[:space:]] ]]; then
+            continue
+        fi
+
+        # A realm block opener: `REALM = {` on its own line. krb5 also allows
+        # `REALM = { kdc = x }` on one line, which the key=value branch below
+        # accepts and which needs no depth tracking.
+        if [[ "$line" =~ ^[^=]+=[[:space:]]*\{$ ]]; then
+            depth=1
+            continue
+        fi
+
+        if [[ "$line" =~ ^[^=]+=[[:space:]]*.*$ ]]; then
+            # **A setting before any section header is a flattened file.**
+            # The first version of this check accepted it, because the only
+            # rejection left for an out-of-section line was the generic
+            # "not a key = value" one - and `default_realm = X` IS a valid
+            # key=value. So the one krb5 failure that matters most (a write
+            # that dropped every `[section]`) sailed straight through.
+            if (( in_section == 0 && min_sections > 0 )); then
+                printf '%s: %s: line %d: a setting before any section, so every section was lost: %s\n' \
+                    "$PROG" "$where" "$lineno" "$line" >&2
+                return 1
+            fi
+            kv=$((kv + 1))
+            continue
+        fi
+
+        # A setting outside any section is legal ONLY for the format that
+        # declares sections optional (min_sections=0). kerberos refuses it
+        # outright, because a bare key at the top of krb5.conf parses as
+        # nothing and a write that produced one has lost every section.
+        if (( min_sections > 0 )); then
+            printf '%s: %s: line %d: a setting outside any section: %s\n' \
+                "$PROG" "$where" "$lineno" "$line" >&2
+            return 1
+        fi
+        printf '%s: %s: line %d: not a "key = value" line: %s\n' \
+            "$PROG" "$where" "$lineno" "$line" >&2
+        return 1
+    done < "$file"
+
+    if (( depth != 0 )); then
+        printf '%s: %s: a { block was never closed with }\n' "$PROG" "$where" >&2
+        return 1
+    fi
+    if (( sections < min_sections )); then
+        printf '%s: %s: only %d section(s); this format needs at least %d, so the file was flattened\n' \
+            "$PROG" "$where" "$sections" "$min_sections" >&2
+        return 1
+    fi
+    if (( kv == 0 )); then
+        printf '%s: %s: no settings at all, so it would configure nothing\n' \
+            "$PROG" "$where" >&2
+        return 1
+    fi
+    return 0
+}
+
+live=""
+case "${1:-}" in
+    --check-modules-load)
+        [[ $# -ge 2 ]] || usage
+        check_modules_load_file "$2" "the fragment"
+        exit $? ;;
+    --check-apcupsd-conf)        [[ $# -ge 2 ]] || usage; check_apcupsd_conf_file "$2" "the fragment"; exit $? ;;
+    --check-apcupsd-conf-live)   check_apcupsd_conf_file "$APCUPSD_CONF" "the installed apcupsd.conf"; exit $? ;;
+    --check-irqbalance-env)      [[ $# -ge 2 ]] || usage; check_irqbalance_env_file "$2" "the fragment"; exit $? ;;
+    --check-irqbalance-env-live) check_irqbalance_env_file "$IRQBALANCE_ENV" "the installed /etc/default/irqbalance"; exit $? ;;
+    --check-subject-mapping)      [[ $# -ge 2 ]] || usage; check_subject_mapping_file "$2" "the fragment"; exit $? ;;
+    # **Absent is success, in every -live mode.** This check also runs as the
+    # pre-change BASELINE, on a machine that has never had the drop-in, so the
+    # file is not there yet. Treating that as an error makes the baseline red, so
+    # the post-commit check looks like a NEW complaint and every save rolls
+    # itself back - the target exists in the allowlist and still cannot be
+    # written. modules_load had exactly this bug; three more copies of it were
+    # added here, so it is fixed in all four places at once.
+    --check-subject-mapping-live)
+        live="$(target_path subject_mapping)"
+        [[ -f "$live" ]] || exit 0
+        check_subject_mapping_file "$live" "the live file"; exit $? ;;
+    --check-pam-yubico)           [[ $# -ge 2 ]] || usage; _check_ini "$2" "the fragment" 0; exit $? ;;
+    --check-pam-yubico-live)
+        live="$(target_path pam_yubico)"
+        [[ -f "$live" ]] || exit 0
+        _check_ini "$live" "the live file" 0; exit $? ;;
+    --check-krb5-conf)            [[ $# -ge 2 ]] || usage; _check_ini "$2" "the fragment" 1; exit $? ;;
+    --check-krb5-conf-live)
+        live="$(target_path krb5_conf)"
+        [[ -f "$live" ]] || exit 0
+        _check_ini "$live" "the live file" 1; exit $? ;;
+    --check-modules-load-live)
+        command -v modprobe &>/dev/null \
+            || { printf '%s: modprobe is not installed; cannot check\n' "$PROG" >&2; exit 1; }
+        # Absent is success: this also runs as the pre-change baseline.
+        live="$(target_path modules_load)"
+        # **Absent is not a failure.** This check also runs as the BASELINE,
+        # before anything is installed, and on a machine that has never had a
+        # KVM drop-in the file is simply not there. Treating that as an error
+        # made every save fail: the baseline was red, so the post-commit check
+        # looked like a NEW complaint and rolled the install back - so the
+        # target existed in the allowlist and still could not be written, which
+        # is the same dead end the $PROG bug produced.
+        #
+        # So: no file means nothing to check, and that is success. The post
+        # commit pass runs against the file that now exists, so it still
+        # verifies the installed content.
+        [[ -f "$live" ]] || exit 0
+        check_modules_load_file "$live" "the live file"
+        exit $? ;;
+esac
 
 [[ $# -gt 0 ]] || usage
 target=""

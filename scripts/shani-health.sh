@@ -8861,6 +8861,13 @@ show_journal() {
 show_history() {
     local lines="${1:-50}"
 
+    # Declared so the JSON path has something to group by, and so the rows below
+    # land in _REPORT_RESULTS. Without this the mode printed prose and recorded
+    # nothing, which is why `--history --json` answered `checks: []` and no GUI
+    # ever consumed the deploy event log.
+    _set_section "deploy_history"
+    _REPORT_RESULTS=()
+
     echo ""
     printf "  ${_C_BOLD}┌──────────────────────────────────────────────┐${_C_RESET}\n"
     printf "  ${_C_BOLD}│  %-44s│${_C_RESET}\n" "ShaniOS Deploy History"
@@ -8892,6 +8899,28 @@ show_history() {
     echo ""
     for (( i=start; i<total; i++ )); do
         local ev="${events[$i]}"
+        # One structured row per event. `_scan_log_file` writes
+        # `${ts}  KIND  version-or-reason`, so the timestamp is separated by a
+        # double space and the kind by a single one; `DEPLOY` is padded with
+        # spaces, so the detail is trimmed.
+        local ev_ts ev_body ev_kind ev_detail ev_status
+        ev_ts="${ev%%  *}"
+        ev_body="${ev#*  }"
+        ev_kind="${ev_body%% *}"
+        ev_detail="${ev_body#* }"
+        while [ "${ev_detail# }" != "$ev_detail" ]; do ev_detail="${ev_detail# }"; done
+
+        # The status word matches what the coloured symbol already says: a
+        # deploy is the good outcome, a rollback is a warning, a start is
+        # information. It goes in as the leading sigil, which is how _row and
+        # _record_check spell it.
+        ev_status="--"
+        case "$ev_kind" in
+            DEPLOY)   ev_status="OK" ;;
+            ROLLBACK) ev_status="!"  ;;
+        esac
+        _record_check "$ev_ts" "$ev_status" "${ev_kind}${ev_detail:+ ${ev_detail}}"
+
         if   [[ "$ev" == *"  DEPLOY   "* ]]; then
             ev="${ev//  DEPLOY   /  ${_C_GREEN}+${_C_RESET}  }"
         elif [[ "$ev" == *"  ROLLBACK "* ]]; then

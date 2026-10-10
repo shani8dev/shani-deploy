@@ -405,6 +405,15 @@ check_nut_upsmon_conf() {
     # is exactly how the previous apcupsd validator came to refuse its real file
     # (it inherited KEY=VALUE from the systemd EnvironmentFile target). So these
     # two validators parse the shape each real file actually has.
+    # NUT accepts a quoted value as readily as a bare one, and its own shipped
+    # file uses the quoted form - `POWERDOWNFLAG "/etc/killpower"` is line 319 of
+    # Arch's upsmon.conf and is live. The first version of this validator
+    # demanded a bare path and refused that real file on its first live
+    # directive, so quotes are stripped before any value is judged. Found by
+    # running the validator against the file the distribution ships rather than
+    # against a fixture written from what the docstring says.
+    _unquote() { local v="$1"; v="${v%\"}"; v="${v#\"}"; printf '%s' "$v"; }
+
     local known=" ALARM ALARMCRITICAL CERTHOST CERTIDENT CERTPATH CERTVERIFY COMMBAD COMMOK \
 DEBUG DEADTIME EXEC FINALDELAY FORCESSL FSD HOSTSYNC IGNORE LOWBATT MINSUPPLIES MONITOR \
 NOCOMM NOCOMMWARNTIME NOPARENT NOTE NOTIFY NOTIFYCMD NOTIFYFLAG NOTIFYMSG OBLBDURATION \
@@ -459,8 +468,15 @@ RBWARNTIME REPLBATT RUN SHUTDOWN SHUTDOWNCMD SHUTDOWNEXIT SYSLOG UPS WALL WARNIN
                         "$PROG" "$where" "$lineno" >&2; return 1; }
                 ;;
             POLLFREQ|POLLFREQALERT|DEADTIME|FINALDELAY|HOSTSYNC|RBWARNTIME|NOCOMMWARNTIME|OVERDURATION|OBLBDURATION|OFFDURATION)
-                [[ "$value" =~ ^[0-9]+$ ]] || {
-                    printf '%s: %s line %s: %s must be a whole number of seconds, got %s\n' \
+                # A leading '-' is legal and meaningful: OVERDURATION's NUT
+                # default is -1, and nut.conf's own text says a negative value
+                # means that condition "will never be considered critical".
+                # The first version of this check required an unsigned integer
+                # and therefore refused NUT's own default - found by running it
+                # against the shipped file, which is exactly why the test does
+                # that instead of against a fixture.
+                [[ "$(_unquote "$value")" =~ ^-?[0-9]+$ ]] || {
+                    printf '%s: %s line %s: %s must be a whole number of seconds (a negative is allowed and means "never"), got %s\n' \
                         "$PROG" "$where" "$lineno" "$key" "$value" >&2; return 1; }
                 ;;
             SHUTDOWNCMD)
@@ -474,7 +490,7 @@ RBWARNTIME REPLBATT RUN SHUTDOWN SHUTDOWNCMD SHUTDOWNEXIT SYSLOG UPS WALL WARNIN
                     return 1; }
                 ;;
             POWERDOWNFLAG)
-                [[ "$value" == /* ]] || {
+                [[ "$(_unquote "$value")" == /* ]] || {
                     printf '%s: %s line %s: POWERDOWNFLAG must be an absolute path\n' \
                         "$PROG" "$where" "$lineno" >&2; return 1; }
                 ;;

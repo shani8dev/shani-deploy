@@ -3472,33 +3472,39 @@ _section_hardware() {
     fi
 
     _optional_begin
-    if _svc_present apcupsd; then
-        if systemctl is-active --quiet apcupsd 2>/dev/null; then
+    _optional_begin
+    if _svc_present nut-monitor.service; then
+        if systemctl is-active --quiet nut-monitor.service 2>/dev/null; then
             local ups_status="" ups_bcharge="" ups_timeleft=""
-            if command -v apcaccess &>/dev/null; then
-                local _apc_out; _apc_out=$(apcaccess status 2>/dev/null || echo "")
-                ups_status=$(awk  -F': +' '/^STATUS/{gsub(/ /,"",$2); print $2}' <<< "$_apc_out" | head -1)
-                ups_bcharge=$(awk -F': +' '/^BCHARGE/{print $2}'              <<< "$_apc_out" | head -1)
-                ups_timeleft=$(awk -F': +' '/^TIMELEFT/{print $2}'            <<< "$_apc_out" | head -1)
+            # `upsc` is NUT's own status reader. Its output is `KEY : VALUE`,
+            # which is why this splits on ': ' rather than assuming a shape.
+            if command -v upsc &>/dev/null; then
+                local _nut_name
+                _nut_name=$(grep -m1 -oP '^MONITOR\s+\K[^@\s]+' /etc/nut/upsmon.conf 2>/dev/null || echo "")
+                [[ -n "$_nut_name" ]] || _nut_name="myups"
+                local _nut_out; _nut_out=$(timeout 5 upsc "${_nut_name}@localhost" 2>/dev/null || echo "")
+                ups_status=$(awk -F': +' '/^ups.status/{gsub(/ /,"",$2); print $2}'   <<< "$_nut_out" | head -1)
+                ups_bcharge=$(awk -F': +' '/^battery.charge/{print $2}'               <<< "$_nut_out" | head -1)
+                ups_timeleft=$(awk -F': +' '/^battery.runtime/{print $2}'             <<< "$_nut_out" | head -1)
             fi
             local ups_info=""
             [[ -n "$ups_status"   ]] && ups_info+="status: ${ups_status}"
             [[ -n "$ups_bcharge"  ]] && ups_info+="${ups_info:+  }battery: ${ups_bcharge}"
             [[ -n "$ups_timeleft" ]] && ups_info+="${ups_info:+  }runtime: ${ups_timeleft}"
-            _row "apcupsd"     "OK  running${ups_info:+  (${ups_info})}"
-        elif systemctl is-enabled --quiet apcupsd 2>/dev/null; then
-            local _apc_upstype=""
-            _apc_upstype=$(grep -oP '(?<=^UPSTYPE\s)\S+' /etc/apcupsd/apcupsd.conf 2>/dev/null | head -1 || echo "")
-            local _apc_device=""
-            _apc_device=$(grep -oP '(?<=^DEVICE\s)\S+' /etc/apcupsd/apcupsd.conf 2>/dev/null | head -1 || echo "")
-            if [[ -z "$_apc_upstype" || "$_apc_upstype" == "dumb" ]]; then
-                _row "apcupsd"     "!   enabled but not configured — set UPSTYPE and DEVICE in /etc/apcupsd/apcupsd.conf"
-                _rec "apcupsd enabled but UPSTYPE/DEVICE not configured — edit /etc/apcupsd/apcupsd.conf"
+            _row "nut-monitor" "OK  running${ups_info:+  (${ups_info})}"
+        elif systemctl is-enabled --quiet nut-monitor.service 2>/dev/null; then
+            # The MONITOR line is the one thing that says a UPS is watched at
+            # all: without it upsmon has a policy and nothing to apply it to.
+            local _nut_monitor=""
+            _nut_monitor=$(grep -m1 -oP '^MONITOR\s+\K\S+' /etc/nut/upsmon.conf 2>/dev/null || echo "")
+            if [[ -z "$_nut_monitor" ]]; then
+                _row "nut-monitor" "!   enabled but nothing is monitored — run: sudo nut-scanner -U, then add the section it prints to /etc/nut/ups.conf"
+                _rec "nut-monitor enabled but no MONITOR line in /etc/nut/upsmon.conf — nothing is being watched"
             else
-                _row "apcupsd"     "!   enabled but not running"
+                _row "nut-monitor" "!   enabled but not running"
             fi
         else
-            _row "apcupsd"     "~~  not configured — edit /etc/apcupsd/apcupsd.conf, set UPSTYPE/DEVICE, then systemctl enable --now apcupsd"
+            _row "nut-monitor" "~~  not configured — run: sudo nut-scanner -U, then systemctl enable --now nut-monitor.service"
         fi
     fi
     if [[ -d /sys/bus/thunderbolt ]] && \
@@ -9598,12 +9604,24 @@ clean_logs() {
        ! systemctl cat fail2ban &>/dev/null 2>&1; then
         _cl_remove "${log_dir}/fail2ban.log"
     fi
-    # apcupsd.events — apcupsd not configured; empty or stale event file
-    if [[ -f "${log_dir}/apcupsd.events" ]] && \
-       ! systemctl is-active --quiet apcupsd 2>/dev/null; then
-        local _apc_kb; _apc_kb=$(du -sk "${log_dir}/apcupsd.events" 2>/dev/null | awk '{print $1}' || echo "0")
-        (( _apc_kb > 0 )) && _cl_remove "${log_dir}/apcupsd.events"
-    fi
+    # syslog / upsd events — the daemon that wrote them is not running
+    for _ev in upsd.log; do
+        if [[ -f "${log_dir}/${_ev}" ]] && \
+           ! systemctl is-active --quiet nut-server.service 2>/dev/null; then
+            local _ev_kb; _ev_kb=$(du -sk "${log_dir}/${_ev}" 2>/dev/null | awk '{print $1}' || echo "0")
+            (( _ev_kb > 0 )) && _cl_remove "${log_dir}/${_ev}"
+        fi
+    done
+    # A machine that ran apcupsd before the NUT switch still has that log file.
+    # Nothing writes it now, so it is cleaned up too - but it is matched by NAME
+    # rather than by the service, because the service is gone and can never go
+    # active again on a current install.
+    for _ev in apcupsd.events; do
+        if [[ -f "${log_dir}/${_ev}" ]]; then
+            local _ev_kb; _ev_kb=$(du -sk "${log_dir}/${_ev}" 2>/dev/null | awk '{print $1}' || echo "0")
+            (( _ev_kb > 0 )) && _cl_remove "${log_dir}/${_ev}"
+        fi
+    done
     [[ -f "${log_dir}/passim/audit.log" ]] && (( $(du -sk "${log_dir}/passim/audit.log" 2>/dev/null | awk '{print $1}') > 1024 )) && _cl_trim "${log_dir}/passim/audit.log" 1000
     # private/ is root-only; access via the known log path if readable
     local _dnscrypt_log="${log_dir}/private/dnscrypt-proxy/dnscrypt-proxy.log"

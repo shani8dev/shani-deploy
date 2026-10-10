@@ -121,41 +121,81 @@ out=$(printf 'default_realm = X\n[libdefaults]\n' | "$H" --target krb5_conf 2>&1
 # `printf ... | helper --check-x /dev/stdin` was refused for "no such file"
 # rather than for the bad value - a control that passes without testing anything.
 _f() { printf '%b' "$1" > /tmp/frag.conf; "$H" --check-"$2" /tmp/frag.conf 2>&1; }
-echo "  -- apcupsd_conf: KEY VALUE, not KEY=VALUE --"
-# The shipped apcupsd.conf is `KEY VALUE` with ZERO `=` in it. The first
-# validator assumed KEY=VALUE (imported from the systemd EnvironmentFile target
-# beside it) and refused the distribution's own file on its first live line.
-# These two are the control for that: if the format assumption regresses, both
-# fail and the suite says why.
-pacman -S --noconfirm --needed apcupsd >/dev/null 2>&1
-if [[ -f /etc/apcupsd/apcupsd.conf ]]; then
-    out=$("$H" --check-apcupsd-conf /etc/apcupsd/apcupsd.conf 2>&1)
-    [[ $? -eq 0 ]] && ok "the REAL shipped apcupsd.conf passes" \
-        || no "shipped apcupsd.conf" "$out"
+echo "  -- nut_upsmon_conf: a DIRECTIVE file, not INI --"
+# upsmon.conf is `KEY value` per line: no `=` and no [sections]. The file that
+# really matters here is the one beside it: ups.conf and upsd.users are INI-like,
+# so writing one format's parser for the other file is exactly the mistake the
+# apcupsd validator once made - it inherited KEY=VALUE from the systemd
+# EnvironmentFile target above and refused a file that has no `=` in it at all.
+pacman -S --noconfirm --needed nut >/dev/null 2>&1
+if [[ -f /etc/nut/upsmon.conf ]]; then
+    out=$("$H" --check-nut-upsmon-conf /etc/nut/upsmon.conf 2>&1)
+    [[ $? -eq 0 ]] && ok "the REAL Arch-shipped upsmon.conf passes" \
+        || no "shipped upsmon.conf" "$out"
     # And the property that made it pass, asserted directly rather than assumed.
-    n_eq=$(grep -cE '^[A-Z][A-Z0-9_]*=' /etc/apcupsd/apcupsd.conf || true)
-    n_sp=$(grep -cE '^[A-Z][A-Z0-9_]+[[:space:]]' /etc/apcupsd/apcupsd.conf || true)
-    [[ "$n_eq" == 0 && "$n_sp" -gt 0 ]] \
-        && ok "the format really is KEY VALUE ($n_eq with '=', $n_sp with a space)" \
-        || no "format" "$n_eq lines with '=', $n_sp with a space"
+    n_eq=$(grep -cE '^[A-Z][A-Z0-9_]*=' /etc/nut/upsmon.conf || true)
+    n_sp=$(grep -cE '^[A-Z][A-Z0-9_]+[[:space:]]' /etc/nut/upsmon.conf || true)
+    [[ "$n_eq" == 0 ]] \
+        && ok "the format really is KEY value ($n_eq with '=')" \
+        || no "format" "$n_eq lines with '='"
 else
-    echo "  (apcupsd not installable; the two tests above did not run)"
+    echo "  (nut not installable; those checks did not run)"
 fi
 
-out=$(_f 'BATTERYLEVEL 0\n' apcupsd-conf)
-[[ $? -ne 0 ]] && ok "BATTERYLEVEL 0 is refused"          || no "BATTERYLEVEL 0" "exit 0"
-out=$(_f 'BATTERYLEVEL 101\n' --check-apcupsd-conf)
-[[ $? -ne 0 ]] && ok "BATTERYLEVEL 101 is refused"        || no "BATTERYLEVEL 101" "exit 0"
-out=$(_f 'BATTERYLEVEL five\n' --check-apcupsd-conf)
-[[ $? -ne 0 ]] && ok "a non-numeric BATTERYLEVEL is refused" || no "non-numeric" "exit 0"
-out=$(_f 'MINUTES abc\n' --check-apcupsd-conf)
-[[ $? -ne 0 ]] && ok "MINUTES abc is refused"             || no "MINUTES abc" "exit 0"
-out=$(_f 'BATTERYLVL 5\n' --check-apcupsd-conf)
-[[ $? -ne 0 ]] && ok "a typo'd key name is refused"       || no "typo key" "exit 0"
-out=$(_f 'TIMEOUT 0\nLOCKFILE rel/path\n' apcupsd-conf)
-[[ $? -ne 0 ]] && ok "a relative LOCKFILE is refused"     || no "relative path" "exit 0"
-out=$(_f 'BATTERYLEVEL 5\nMINUTES 3\n' apcupsd-conf)
+# The MONITOR line has FIVE values after the key, and a short one is a syntax
+# error to upsmon - so the UPS is never monitored and nothing says so.
+out=$(_f 'MONITOR myups@localhost 1 monuser pw master\n' nut-upsmon-conf)
+[[ $? -eq 0 ]] && ok "a complete MONITOR line is accepted" || no "complete MONITOR" "$out"
+out=$(_f 'MONITOR myups@localhost monuser\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "a short MONITOR (3 values) is refused" || no "short MONITOR" "exit 0"
+out=$(_f 'MONITOR myups@localhost 1 monuser pw bogus\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "a MONITOR with a bad role is refused" || no "bad role" "exit 0"
+
+out=$(_f 'MINSUPPLIES 0\n' nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "MINSUPPLIES 0 is refused (nothing can trigger)" || no "MINSUPPLIES 0" "exit 0"
+out=$(_f 'MINSUPPLIES many\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "a non-numeric MINSUPPLIES is refused" || no "non-numeric" "exit 0"
+out=$(_f 'DEADTIME often\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "a non-numeric DEADTIME is refused" || no "DEADTIME text" "exit 0"
+out=$(_f 'BOGUSKEY 1\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "an unknown directive is refused" || no "unknown key" "exit 0"
+# Unquoted, only the first word is a command and the rest become arguments
+# nothing reads - a shutdown that never happens.
+out=$(_f 'SHUTDOWNCMD /sbin/shutdown -h now\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "an unquoted SHUTDOWNCMD is refused" || no "unquoted cmd" "exit 0"
+out=$(_f 'POWERDOWNFLAG killpower\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "a relative POWERDOWNFLAG is refused" || no "relative flag" "exit 0"
+# KEY = value is the OTHER format. Accepting it here would mean the parser has
+# drifted into the INI shape and upsmon would read nothing.
+out=$(_f 'MINSUPPLIES = 1\n' --check-nut-upsmon-conf)
+[[ $? -ne 0 ]] && ok "KEY = value is refused (wrong format for this file)" || no "ini shape" "exit 0"
+out=$(_f 'MINSUPPLIES 2\nDEADTIME 15\n' nut-upsmon-conf)
 [[ $? -eq 0 ]] && ok "a valid policy fragment is accepted" || no "valid fragment" "$out"
+
+echo "  -- nut_ups_conf: INI with [sections], and globals before them --"
+out=$(_f '[myups]\n\tdriver = usbhid-ups\n\tport = auto\n' nut-ups-conf)
+[[ $? -eq 0 ]] && ok "a nut-scanner-style section is accepted" || no "scanner section" "$out"
+# maxretry is a GLOBAL directive, legal before any section. Requiring a section
+# first refused the file this repo ships - found by running the validator against
+# the real ups.conf rather than a fixture.
+out=$(_f 'maxretry = 3\n[myups]\n\tdriver = usbhid-ups\n\tport = auto\n' nut-ups-conf)
+[[ $? -eq 0 ]] && ok "a global before the first section is accepted" || no "global directive" "$out"
+out=$(_f 'driver = usbhid-ups\n' --check-nut-ups-conf)
+[[ $? -ne 0 ]] && ok "a non-global key outside a section is refused" || no "outside section" "exit 0"
+out=$(_f '[myups]\n\tdriver = nosuchdriver\n\tport = auto\n' --check-nut-ups-conf)
+[[ $? -ne 0 ]] && ok "an unknown driver is refused" || no "bad driver" "exit 0"
+# A device name becomes part of a path (/var/state/ups/<name>), so it is confined.
+out=$(_f '[../etc]\n\tdriver = usbhid-ups\n\tport = auto\n' --check-nut-ups-conf)
+[[ $? -ne 0 ]] && ok "a path-escaping UPS name is refused" || no "escaping name" "exit 0"
+out=$(_f '[myups]\n\tdriver = usbhid-ups\n\tport =\n' --check-nut-ups-conf)
+[[ $? -ne 0 ]] && ok "an empty port is refused" || no "empty port" "exit 0"
+# upsd.users is deliberately NOT a target: it holds the credential that can force
+# a UPS power-down, generated per-install by shani-settings' hook.
+if "$H" --check-nut-upsd-users /tmp/frag.conf >/dev/null 2>&1; then
+    no "upsd.users target" "the credential file must not be editable"
+else
+    ok "upsd.users is not a save target (the credential is not editable)"
+fi
 
 echo "  -- irqbalance_env: systemd EnvironmentFile, and why ARGS is refused --"
 out=$(_f 'IRQBALANCE_BANNED_CPULIST=0-3
@@ -179,7 +219,7 @@ out=$(_f 'IRQBALANCE_ARGS=""
     || no "empty ARGS" "$out"
 
 echo "  -- the pre-existing targets are unchanged --"
-for t in sudoers sshd_config exports modules_load apcupsd_conf irqbalance_env; do
+for t in sudoers sshd_config exports modules_load nut_upsmon_conf nut_ups_conf irqbalance_env; do
     out=$(printf 'x\n' | "$H" --target "$t" 2>&1)
     case "$out" in
         *"unknown target"*) no "  $t still known" "it vanished from the allowlist" ;;

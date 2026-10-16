@@ -65,8 +65,9 @@ inflate the main file back to unreadable length.
   before any `/etc`/`/boot` write). Deliberately did **not** apply
   `ProtectSystem` to 3 units that genuinely need it off:
   `beesd-setup.service` (writes `/etc/bees/*.conf`, runs `systemctl
-  enable`), `shani-user-setup.service` (syncs `/etc/passwd`/skel for all
-  users — its whole job), `bless-boot.service` (matches systemd's *own*
+  enable`), `shani-user-setup.service` (writes `/etc/passwd` and
+  `/etc/group` for all users — that alone is its whole job),
+  `bless-boot.service` (matches systemd's *own*
   upstream `systemd-bless-boot.service` template, which ships with zero
   hardening — checked the real installed file, almost certainly because
   it needs to write boot-loader state under `/boot/efi`).

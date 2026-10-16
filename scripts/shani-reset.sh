@@ -108,11 +108,24 @@ IMPORTANT: User ACCOUNTS (/etc/passwd entries) are part of the /etc overlay and
   ARE wiped. Home directory FILES in /home survive, but the accounts that own
   them must be re-created after reboot.
 
-  On a desktop system: the KDE (plasma-welcome) or GNOME (gnome-initial-setup)
-  first-run wizard starts automatically and creates a new user account.
+  After the reboot there is NO user account, so nothing can be logged into and
+  no desktop can be reached until one is created. The only way back is the
+  first-run wizard, which runs on its own before the display manager starts:
+
+    plasma profile   plasma-setup.service  (enabled by shani-desktop-plasma)
+    gnome profile    gnome-initial-setup   (shipped by shani-desktop-gnome)
+    cosmic profile   cosmic-initial-setup  (the COSMIC ISO also asks at install)
+
+  That wizard creates the account. It is the ONLY way back: the root password
+  you set at install time lived in the same /etc overlay and is wiped too, so a
+  TTY login is not an alternative. If the wizard does not appear, boot the
+  installation media -- that is the only remaining route onto the machine.
+
   The adduser/useradd wrappers ensure correct group membership, and
-  shani-user-setup then provisions shell, skel, and container namespaces.
-  Files in /home for the re-created username are immediately accessible again.
+  shani-user-setup then provisions groups, shell, flatpak, nix and container
+  namespaces for every account it finds, and seeds any /etc/skel file missing
+  from an existing home. Files in /home for the re-created username are
+  immediately accessible again.
 
 EOF
 }
@@ -378,6 +391,19 @@ fi
 # We do NOT run gen-efi here — the current UKIs are still valid (they embed
 # the cmdline at build time). The next deploy will refresh them.
 
+# Name the first-run wizard that will actually run on THIS image.
+# /etc/shani-profile is written at image build time by build-base-image.sh and
+# names the desktop profile. Naming the wrong one is not a cosmetic slip: it
+# previously said "plasma-welcome", which is an in-session tips app that is
+# installed and never enabled, so a user reading it had no way to know the
+# wizard that creates their account is plasma-setup.
+_reset_profile=$(cat /etc/shani-profile 2>/dev/null || echo "")
+case "$_reset_profile" in
+  plasma) _reset_wizard="plasma-setup.service (the KDE first-run wizard)" ;;
+  cosmic) _reset_wizard="cosmic-initial-setup" ;;
+  *)      _reset_wizard="gnome-initial-setup" ;;
+esac
+
 section "Reset complete"
 echo "" >&2
 log_ok "All persistent state wiped."
@@ -386,12 +412,20 @@ log "  • systemd-tmpfiles recreates /data structure"
 log "  • /etc starts fresh from @${BOOTED_SLOT} read-only root"
 log "  • All services start in initial state (re-run first-time setup)"
 log "  • System boots into @${BOOTED_SLOT} (unchanged)"
-log "After login:"
-log "  • The desktop setup wizard (plasma-welcome / gnome-initial-setup)"
-log "    runs automatically and creates a new user account"
-log "  • Home directory files in /home are intact and accessible once"
-log "    the account is re-created with the same username"
-log "  • Check for updates: Shani Cassini → Updates & Rollback, or sudo shani-deploy"
+log ""
+log_warn "There is NO user account after this reset -- not even root, whose"
+log_warn "  password was set at install time and lived in the same /etc overlay."
+log_warn "  You cannot log in until an account exists."
+log ""
+log "The way back:"
+log "  • ${_reset_wizard} runs on its own and creates the first account."
+log "  • It is the ONLY way back. If it does not appear, boot the installation"
+log "    media -- there is no password to fall back on."
+log "  • Files in /home are intact and become accessible again once an account"
+log "    with the SAME username is created. A different username will not see them."
+log ""
+log "  • Check for updates once you are back: Shani Cassini → Updates & Rollback,"
+log "    or sudo shani-deploy"
 echo "" >&2
 
 ##############################################################################

@@ -31,9 +31,25 @@ Type=oneshot
 # No ProtectSystem/ReadOnlyPaths — this writes /etc (passwd/group/skel sync
 # for all regular users); ProtectSystem=full or =strict would make /etc
 # read-only and defeat the entire purpose of this unit.
+#
+# No ProtectHome either, and this one is NOT an oversight. ProtectHome=yes
+# makes /home read-only for this unit, and the script writes into four
+# different places inside a home:
+#   - ~/.cache/shani/user-setup.stamp (the stamp guard itself)
+#   - the seed_skel pass, which copies /etc/skel into existing homes
+#   - the flatpak remote, added via `runuser` as the user, under ~/.local
+#   - podman system migrate, which reads the user's own storage
+# Every one of those failures is a `|| warn`, so the unit logged a tidy run and
+# exited 0 while having done none of its work inside the user's home — which
+# is the worst combination available: silently wrong, and it looks healthy in
+# `systemctl status`. The symptom that made it visible is a factory-reset
+# machine whose skel defaults were never seeded, found by
+# shani-testbed/slot-tests/post-reset-setup.sh rather than by reading this file.
+#
+# `flatpak-update-user.service` already drops ProtectHome for the same reason
+# (~/.local); this unit needs strictly more of a home than that one does.
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectHome=yes
 ProtectProc=invisible
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

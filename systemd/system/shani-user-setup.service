@@ -1,5 +1,5 @@
 [Unit]
-Description=Sync groups, shell, and skel for all regular users
+Description=Provision groups, shell and /etc/skel for all regular users
 # Triggered by shani-user-setup.path when:
 #   - /data/overlay/etc/upper/passwd is created or changed (user added at runtime)
 #   - /data/user-setup-needed exists (first install or slot switch via shani-deploy)

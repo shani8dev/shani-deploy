@@ -64,6 +64,86 @@ processed=()
 skipped=()
 failed=()
 
+# ── /etc/skel seeding — adds what is MISSING, never overwrites ───────────────
+# `useradd -m` copies /etc/skel only when it CREATES a home directory. After a
+# factory reset the account is gone from /etc but the home survives in @home,
+# so the account the first-run wizard re-creates lands on an existing
+# directory and gets none of the defaults. This is the only thing that runs
+# afterwards, so it is where they have to arrive.
+#
+# The contract is seed-if-missing, never overwrite: a file the user has is
+# theirs. That is the same rule shani-desktop-plasma's shani-theme-sync.sh
+# already applies to Plasma's design files, for the same reason — the skel fix
+# alone only ever reaches new users.
+#
+# Deliberately NOT inside the stamp-guarded block below. The stamp is the
+# script's mtime plus the groups list, so it does not change when a package
+# upgrade adds a file to /etc/skel — and shani-user-setup.path watches
+# PathModified=/etc/skel precisely so that upgrade re-triggers this service.
+# Guarded by the stamp, that watch would fire into a no-op forever.
+seed_skel() {
+    local _home="$1" _uid="$2" _gid="$3"
+    local _src _rel _dst _n=0
+    local _skel="${SKEL_DIR:-/etc/skel}"
+
+    if [[ ! -d "$_skel" ]]; then
+        warn "$_skel is absent — nothing to seed for this user"
+        return 0
+    fi
+    if [[ ! -d "$_home" ]]; then
+        warn "home $_home is not a directory — skipping skel for this user"
+        return 0
+    fi
+
+    while IFS= read -r -d '' _src; do
+        _rel="${_src#"$_skel"/}"
+        _dst="${_home}/${_rel}"
+
+        # The first-login pair is one unit, not two files.
+        # .config/autostart/bashrc-setup.desktop runs
+        #   mv ~/.bashrc_shani ~/.bashrc; rm <itself>
+        # so seeding it into a home that ALREADY has a .bashrc would
+        # overwrite that file on the next graphical login. Seed the pair only
+        # when there is no .bashrc for it to become.
+        case "$_rel" in
+            .bashrc_shani|.config/autostart/bashrc-setup.desktop)
+                if [[ -e "${_home}/.bashrc" ]]; then
+                    continue
+                fi
+                ;;
+        esac
+
+        if [[ -d "$_src" ]]; then
+            if [[ -d "$_dst" ]]; then
+                continue
+            fi
+            if run mkdir -p "$_dst"; then
+                run chmod --reference="$_src" "$_dst" 2>/dev/null || true
+                run chown "$_uid:$_gid" "$_dst" || warn "could not chown $_dst"
+            else
+                warn "could not create $_dst"
+            fi
+            continue
+        fi
+
+        if [[ -e "$_dst" ]]; then
+            continue                      # the user's file — never touched
+        fi
+
+        if run mkdir -p "$(dirname "$_dst")" \
+           && run cp -a "$_src" "$_dst"; then
+            run chown "$_uid:$_gid" "$_dst" || warn "could not chown $_dst"
+            _n=$(( _n + 1 ))
+        else
+            warn "could not seed $_dst"
+        fi
+    done < <(find "$_skel" -mindepth 1 -print0 2>/dev/null)
+
+    if (( _n > 0 )); then
+        log "seeded $_n skel file(s) missing from $_home"
+    fi
+}
+
 # Use getent to enumerate users — safer on an OverlayFS /etc and also picks
 # up LDAP/sssd users.
 while IFS=: read -r username _ uid gid _ home shell; do
@@ -136,6 +216,10 @@ while IFS=: read -r username _ uid gid _ home shell; do
             log "note: $username is currently logged in — group/shell changes require re-login"
         fi
     fi
+
+    # ── /etc/skel into an existing home ───────────────────────────────────────
+    # Outside the stamp guard on purpose — see seed_skel()'s comment.
+    seed_skel "$home" "$uid" "$gid"
 
     # ── One-time bootstrap (stamp-guarded) ───────────────────────────────────
     # Flatpak/nix/subuid/podman bootstrap are expensive to probe and

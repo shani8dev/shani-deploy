@@ -18,8 +18,14 @@ Requires=data.mount
 PathChanged=/data/overlay/etc/upper/passwd
 
 # /etc/skel lives on the read-only root — watch the merged path here since skel
-# changes only happen via a slot switch. After a slot switch shani-deploy writes
-# /data/user-setup-needed instead, so this is a belt-and-suspenders watch.
+# changes only happen via a slot switch or a package upgrade.
+#
+# This is NOT belt-and-suspenders. seed_skel() runs outside the stamp guard
+# precisely so this watch reaches existing homes: the stamp encodes the
+# script's mtime and the groups list, neither of which changes when a skel
+# package upgrade adds a file, so without this trigger a new skel file would
+# only ever reach accounts created from then on. A slot switch additionally
+# writes /data/user-setup-needed, which is what covers that case.
 PathModified=/etc/skel
 
 # Deploy marker — written by shani-deploy on every slot switch and by

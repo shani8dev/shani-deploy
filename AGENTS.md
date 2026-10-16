@@ -444,12 +444,41 @@ replace the Cassini desktop test above.
   `/etc/shani-profile`) and says plainly that no account survives, root
   included, so the install media is the only remaining route.
 
-  **Verification status, stated plainly:** `bash -n` clean, and
-  `tests/test-first-boot.sh` is 27 assertions with three negative controls all
-  verified to fail the code they target. The mandatory harness had not finished
-  at the time of writing, and `shani-first-boot.sh` postdates the harness run
-  that was in flight — so **the unit is green and the slot-test is not yet
-  run**. Do not read this entry as a boot-verified claim.
+  **Verification status, corrected 2026-10-16: the first real run found the
+  repair did not work, and the mechanism described above was wrong.**
+  `tests/test-first-boot.sh` was green (27 assertions, three negative
+  controls), `bash -n` was clean, and the repair was inert. It cleared
+  `/org/gnome/desktop/firstuse/` via `setpriv` to the home's numeric uid plus
+  a private `dbus-run-session`, and **that combination cannot work**:
+  `dbus-daemon` resolves its *own* uid with `getpwuid()` while starting and
+  aborts when there is no entry, and an orphaned home's owner has no entry by
+  definition — which is the only reason the loop exists.
+
+      dbus[1485]: Could not get password database information for UID of
+      current process: Looking up user ID 3999: not found
+      dbus[1485]: Failed to start message bus
+
+  It failed in the most expensive available way: quietly, with the journal
+  full of dbus noise and no change to the key. It now runs as root (which
+  always resolves) with `XDG_CONFIG_HOME` pointed at the orphan's own config
+  directory, then `chown`s the database back — without which every later
+  `dconf write` that user makes fails `EACCES`, so a repair that silently
+  costs them their settings would be worse than no repair. Adding a passwd
+  entry for the uid instead was refused on purpose: that writes to
+  `/etc/passwd` during the one state where `/etc/passwd` has just lost every
+  account.
+
+  **Boot-verified now**, in a real `slot-test boot` slot: 30 checks, rc=0,
+  against a genuinely orphaned home carrying a real GVDB database written by
+  `dconf` (a text fixture is declared corrupt and moved aside, which is what
+  made the first version pass for the wrong reason). The guard is cleared,
+  `/org/gnome/desktop/interface/color-scheme` survives, and **the negative
+  control bites** — widening the reset to `/org/gnome/desktop/` does destroy
+  the innocent key, so the scope check is not vacuous. **Not verified:** a
+  real UEFI boot (the slot is `systemd-nspawn`), and the vendor wizard's own
+  reaction to finding its flag cleared. `tests/test-first-boot.sh` is 28
+  assertions; its `setpriv` guard greps comment-stripped source, because the
+  block explaining why `setpriv` cannot be used necessarily names it.
 
 - **`shani-user-setup` never copied /etc/skel, into any home - FIXED
   (2026-10-16).** The script's entire body is group membership, shell repair, a

@@ -73,6 +73,15 @@ target_path() {
         # modprobe call on the machine - it is the same drop-in shape as
         # modules-load.d above and needs no package to create the directory.
         modprobe_blacklist) printf '/etc/modprobe.d/50-shani-blacklist.conf' ;;
+        # Samba's include drop-in, read in lexical order. The 50- puts it after
+        # any 00- a package ships and before a future 90- override. This path
+        # only works because shani-settings ships a comment-only
+        # 00-shani-readme.conf, so the directory exists: this script refuses to
+        # create a target's parent, on the grounds that creating one would be a
+        # second privileged act and not its business. Deliberately NOT the file
+        # shani-settings ships - pacman replaces a shipped file, which would
+        # delete every share a user had created.
+        smb_share)          printf '/etc/samba/smb.conf.d/50-shani-cassini.conf' ;;
         # Three files that have NO drop-in mechanism and NO validator of their
         # own. See target_validators for why they are here at all despite the
         # "drop-ins only" rule above.
@@ -104,6 +113,7 @@ target_mode() {
         exports)           printf '0644' ;;
         modules_load)      printf '0644' ;;
         modprobe_blacklist) printf '0644' ;;
+        smb_share)          printf '0644' ;;
         # subject_mapping holds a subject-to-login mapping; 0600 because it is
         # a principal list and nothing needs to read it but root. The mode the
         # shipped file already has is preserved by the read-back check, so a
@@ -187,6 +197,26 @@ target_validators() {
             PRE_VALIDATOR_CMD=("$0" --check-modprobe-blacklist)
             POST_VALIDATOR_CMD=("$0" --check-modprobe-blacklist-live)
             ;;
+        # Samba's own parser is the authority here, not a second opinion of it.
+        # `testparm -s <file>` parses a file and exits non-zero on a syntax
+        # error, so the staged fragment is checked before install — and a
+        # fragment of nothing but `[share]` stanzas IS a valid smb.conf, so the
+        # same command that validates the whole file validates the piece.
+        #
+        # The POST check is the stronger one and is why this target is worth
+        # having at all: bare `testparm -s` parses the LIVE /etc/samba/smb.conf,
+        # which now *includes* this drop-in. So it proves the include line is
+        # actually wired and Samba accepts the stanza in context — a fragment
+        # that parses on its own can still be rejected by the file that
+        # includes it (a section redefined by an earlier include, say).
+        #
+        # It does NOT prove the share works. `testparm` parses; it does not
+        # bind, authenticate, or check that `path` exists or is reachable. A
+        # save proves only that Samba accepted the text.
+        smb_share)
+            PRE_VALIDATOR_CMD=(testparm -s)
+            POST_VALIDATOR_CMD=(testparm -s)
+            ;;
         # ── the three files with no validator of their own ──────────────────
         #
         # **The "drop-ins only" rule above does not apply here, and pretending
@@ -252,7 +282,7 @@ target_validators() {
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG --target <sudoers|sshd_config|exports|modules_load|modprobe_blacklist|subject_mapping|pam_yubico|krb5_conf|irqbalance_env|nut_upsmon_conf|nut_ups_conf> [--expect-sha256 <64-hex>] < content
+usage: $PROG --target <sudoers|sshd_config|exports|modules_load|modprobe_blacklist|smb_share|subject_mapping|pam_yubico|krb5_conf|irqbalance_env|nut_upsmon_conf|nut_ups_conf> [--expect-sha256 <64-hex>] < content
 
 Reads the new content from stdin and installs it over one known target, after
 validating it. The content is never taken from a caller-named path.

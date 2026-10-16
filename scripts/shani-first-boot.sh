@@ -59,7 +59,6 @@
 set -uo pipefail   # -e intentionally omitted: one bad home must not abort the rest
 
 LOG_TAG=shani-first-boot
-RUNTIME_ROOT=/run/shani-first-boot
 
 log()  { logger -t "$LOG_TAG" -p user.info "$*" 2>/dev/null || true
          printf '[shani-first-boot] %s\n' "$*" >&2
@@ -141,7 +140,7 @@ warn "found ${#orphaned[@]} home director$([[ ${#orphaned[@]} -eq 1 ]] && echo y
 # The tools are checked once, up front, and their absence is reported rather
 # than swallowed: "nothing happened" and "nothing could be tried" are different
 # states and the operator needs to be able to tell them apart from the console.
-for tool in dconf dbus-run-session setpriv; do
+for tool in dconf dbus-run-session; do
     if ! command -v "$tool" &>/dev/null; then
         warn "'$tool' is not installed — cannot re-arm the GNOME first-boot wizard."
         warn "  Boot the installation media to recover this machine."
@@ -157,29 +156,56 @@ for entry in "${orphaned[@]}"; do
     uid="${rest%%:*}"
     gid="${rest#*:}"
 
-    # dconf needs a runtime dir it owns, and it is reached as the home's owner
-    # by NUMERIC id: there is no passwd entry to name, which is the entire
-    # reason this loop exists.
-    runtime="${RUNTIME_ROOT}/${uid}"
+    # ── Why this runs as ROOT and not as the home's owner ───────────────────
+    # The obvious implementation — `setpriv --reuid=$uid` then
+    # `dbus-run-session` — does not work, and running it is the only way to
+    # find that out. `dbus-daemon` resolves its OWN uid with getpwuid() while
+    # starting, and aborts if there is no entry:
+    #
+    #   dbus[1485]: Could not get password database information for UID of
+    #   current process: Looking up user ID 3999: not found
+    #   dbus[1485]: Failed to start message bus
+    #
+    # An orphaned home's owner has no passwd entry *by definition* — that is
+    # what orphaned means here. So the numeric-uid approach cannot work on the
+    # one case this script exists for, and it fails expensively: quietly,
+    # with the journal full of dbus noise and no change to the key it was sent
+    # to clear. Found by shani-testbed/slot-tests/post-reset-setup.sh, not by
+    # reading this file.
+    #
+    # Root always resolves, so the bus starts. dconf then reads and writes
+    # `$XDG_CONFIG_HOME/dconf/user`, pointed at the ORPHAN's own config
+    # directory, so it edits that user's database and no other. dconf writes
+    # through a temp file and renames, which as root would leave the database
+    # root-owned inside somebody's home — so ownership is restored after.
+    #
+    # Deliberately NOT done: adding a passwd entry for the uid so the setpriv
+    # version would work. That means writing to /etc/passwd during the one
+    # state where /etc/passwd is the thing that just lost every account, and a
+    # script killed midway would leave a stray account behind. Root plus an
+    # explicit chown needs no /etc mutation at all.
     if [[ "$DRY_RUN" == "1" ]]; then
         log "[DRY-RUN] re-arming gnome-initial-setup in ${home} (uid ${uid})"
         continue
     fi
-    install -d -m 0700 -o "$uid" -g "$gid" "$runtime" 2>/dev/null || {
-        warn "could not create a runtime directory for uid ${uid}"; failed=$((failed + 1)); continue; }
 
-    # --clear-groups needs CAP_SETGID, which root has.
-    if setpriv --reuid="$uid" --regid="$gid" --clear-groups \
-        env HOME="$home" XDG_RUNTIME_DIR="$runtime" USER="$home" \
-        dbus-run-session -- dconf reset -f /org/gnome/desktop/firstuse/ \
-        >/dev/null 2>&1; then
+    if HOME="$home" XDG_CONFIG_HOME="${home}/.config" \
+       XDG_CACHE_HOME="${home}/.cache" \
+       dbus-run-session -- dconf reset -f /org/gnome/desktop/firstuse/ \
+       >/dev/null 2>&1; then
+        # Without this the user gets a root-owned dconf database and every
+        # later `dconf write` they make fails EACCES — a repair that silently
+        # costs them their settings.
+        if [[ -d "${home}/.config/dconf" ]]; then
+            chown -R "${uid}:${gid}" "${home}/.config/dconf" 2>/dev/null \
+                || warn "could not restore ownership of ${home}/.config/dconf"
+        fi
         log "re-armed the GNOME first-boot wizard in ${home} (uid ${uid})"
         rearmed=$((rearmed + 1))
     else
         warn "could not re-arm gnome-initial-setup in ${home} (uid ${uid})"
         failed=$((failed + 1))
     fi
-    rm -rf "$runtime" 2>/dev/null || true
 done
 
 if [[ "$rearmed" -gt 0 ]]; then

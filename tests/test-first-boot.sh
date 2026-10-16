@@ -152,33 +152,75 @@ else
          "found '${RESET_PATH:-nothing}' — a wider reset is data loss"
 fi
 
-# ══ 5. The repair runs as the home's owner, by numeric uid ══════════════════
-# There is no passwd entry to name — that is why this loop exists — so a
-# runuser/su by NAME could not work here even in principle.
-if grep -q 'setpriv --reuid="\$uid" --regid="\$gid" --clear-groups' "$SCRIPT"; then
-    ok "the repair runs as the home's owner by numeric uid"
+# ══ 5. How the repair reaches the orphan's own database ═══════════════════
+# This was WRONG the first time, and only a real boot found it. The obvious
+# implementation - setpriv to the home's numeric uid, then dbus-run-session -
+# cannot work: dbus-daemon resolves its OWN uid with getpwuid() while starting
+# and aborts when there is no entry, and an orphaned home's owner has no entry
+# by definition. Measured in a real slot:
+#   dbus[1485]: Could not get password database information for UID of current
+#   process: Looking up user ID 3999: not found
+# So the FIRST assertion here is that the script does not do it: a regression
+# back to setpriv reads identically and is silent at runtime.
+# Comment-stripped source for the behavioural greps below.
+#
+# This is not tidiness. The block that explains WHY setpriv cannot be used
+# necessarily NAMES setpriv, so a grep over the raw script matches this
+# repo's own documentation of the bug it is guarding against and fails on a
+# correct file. Only comment-ONLY lines are stripped: a looser `[[:space:]]*#`
+# also eats the `#` inside `${#arr[@]}`, truncating the line a count reads.
+#
+# The same trap runs the other way — this repo has shipped a test that pinned
+# a module's source text, passed while proving nothing about behaviour, and
+# forbade the next person from sharing the code. So these remain greps over
+# *code*, never over comments, and each names what it is looking for.
+SCRIPT_CODE=$(sed 's/^[[:space:]]*#.*$//' "$SCRIPT")
+
+if printf '%s' "$SCRIPT_CODE" | grep -q 'setpriv --reuid'; then
+    fail "the repair does not setpriv to the orphan's uid" \
+         "setpriv is back in CODE - dbus-daemon cannot start for a uid with no passwd entry"
 else
-    fail "the repair runs as the home's owner by numeric uid" "setpriv call not found"
+    ok "the repair does not setpriv to the orphan's uid (dbus cannot resolve one)"
 fi
 
-if grep -q 'HOME="\$home"' "$SCRIPT"; then
-    ok "HOME points at the orphaned home, not root's"
+if grep -q 'XDG_CONFIG_HOME="\${home}/.config"' "$SCRIPT"; then
+    ok "dconf is pointed at the ORPHAN's own config directory, not root's"
 else
-    fail "HOME points at the orphaned home, not root's" "HOME is not set from \$home"
+    fail "dconf is pointed at the ORPHAN's own config directory, not root's" \
+         "XDG_CONFIG_HOME is not set from the orphan's home"
 fi
 
-# The runtime dir must be owned by that uid or dconf cannot use it.
-if grep -q 'install -d -m 0700 -o "\$uid" -g "\$gid"' "$SCRIPT"; then
-    ok "the dconf runtime directory is created owned by, and private to, the user"
+# Running as root means dconf's write leaves the database root-owned inside a
+# user's home, and every later `dconf write` they make then fails EACCES. A
+# repair that silently costs them their settings is worse than no repair.
+if grep -q 'chown -R "\${uid}:\${gid}" "\${home}/.config/dconf"' "$SCRIPT"; then
+    ok "ownership of the dconf database is restored to the home's owner"
 else
-    fail "the dconf runtime directory is created owned by, and private to, the user" \
-         "install -d with -o/-g/0700 not found"
+    fail "ownership of the dconf database is restored to the home's owner" \
+         "no chown back after the root-run dconf write"
+fi
+
+# Adding a passwd entry for the orphan uid would make setpriv viable and is the
+# tempting fix. Refused on purpose: it writes to /etc/passwd during the one
+# state where /etc/passwd has just lost every account.
+if grep -qE '^[[:space:]]*useradd ' "$SCRIPT"; then
+    fail "no passwd entry is fabricated for the orphan uid" \
+         "the script adds an account - refused on purpose, see its comment"
+else
+    ok "no passwd entry is fabricated for the orphan uid"
+fi
+
+if grep -q 'XDG_CACHE_HOME="\${home}/.cache"' "$SCRIPT"; then
+    ok "dconf's cache is redirected too, so nothing lands in root's home"
+else
+    fail "dconf's cache is redirected too, so nothing lands in root's home" \
+         "XDG_CACHE_HOME not set"
 fi
 
 # ══ 6. Missing tools are reported, not silently swallowed ═══════════════════
 # "Nothing happened" and "nothing could be tried" are different states, and an
 # operator reading a blank screen needs to tell them apart.
-for tool in dconf dbus-run-session setpriv; do
+for tool in dconf dbus-run-session; do
     if grep -q "command -v \"\$tool\"" "$SCRIPT"; then
         ok "a missing ${tool} is detected before any repair is attempted"
     else
@@ -219,10 +261,10 @@ else
     # worse than no repair, so the absence of ProtectSystem/PrivateTmp is
     # deliberate and asserted rather than left to a future reader's judgement.
     if grep -qE '^(ProtectSystem|PrivateTmp|SystemCallFilter)=' "$UNIT"; then
-        fail "the unit is deliberately unsandboxed (it must reach setpriv and a private bus)" \
+        fail "the unit is deliberately unsandboxed (it writes into a home as root)" \
              "a sandbox directive was added — check it cannot break the repair"
     else
-        ok "the unit is deliberately unsandboxed (it must reach setpriv and a private bus)"
+        ok "the unit is deliberately unsandboxed (it writes into a home as root)"
     fi
 fi
 

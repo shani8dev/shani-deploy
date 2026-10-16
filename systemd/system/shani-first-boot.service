@@ -23,14 +23,14 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/shani-first-boot
 
-# Deliberately NOT sandboxed. This needs to setpriv into another uid, chown a
-# runtime directory to it, and start a private D-Bus session on its behalf.
+# Deliberately NOT sandboxed. The script starts a private D-Bus session and
+# writes into a user's home as root, then restores that directory's ownership.
 # ProtectSystem, PrivateTmp and a systemd-call filter all interfere with one or
 # another of those, and a unit that cannot finish its repair while appearing to
 # succeed is the exact failure this script exists to prevent.
-# NoNewPrivileges is deliberately absent too: setpriv drops privileges itself,
-# and the one direction that matters here (root -> the home's uid) is a
-# narrowing, not a widening.
+# NoNewPrivileges is deliberately absent: dconf's service is reached over a
+# session bus it starts itself, and a call filter here has already been seen to
+# break this repo's other boot-safety units silently.
 
 TimeoutStartSec=120s
 

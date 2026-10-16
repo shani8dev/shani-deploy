@@ -69,6 +69,10 @@ target_path() {
         # number is only for ordering, so 50- sits after nothing and before any
         # future 90- override - the same convention as the other drop-ins.
         modules_load)      printf '/etc/modules-load.d/50-shani-kvm.conf' ;;
+        # modprobe.d is read by kmod itself, in lexical order, for every
+        # modprobe call on the machine - it is the same drop-in shape as
+        # modules-load.d above and needs no package to create the directory.
+        modprobe_blacklist) printf '/etc/modprobe.d/50-shani-blacklist.conf' ;;
         # Three files that have NO drop-in mechanism and NO validator of their
         # own. See target_validators for why they are here at all despite the
         # "drop-ins only" rule above.
@@ -99,6 +103,7 @@ target_mode() {
         sshd_config)       printf '0644' ;;
         exports)           printf '0644' ;;
         modules_load)      printf '0644' ;;
+        modprobe_blacklist) printf '0644' ;;
         # subject_mapping holds a subject-to-login mapping; 0600 because it is
         # a principal list and nothing needs to read it but root. The mode the
         # shipped file already has is preserved by the read-back check, so a
@@ -171,6 +176,17 @@ target_validators() {
             PRE_VALIDATOR_CMD=("$0" --check-modules-load)
             POST_VALIDATOR_CMD=("$0" --check-modules-load-live)
             ;;
+        # modprobe.d has no check mode either, and modprobe cannot answer
+        # "is this file valid" - it answers "can you load this name", which is
+        # the wrong question here. A blacklist names modules that must NOT
+        # load, so refusing a name modprobe cannot resolve would be backwards:
+        # the entries a user most wants are frequently ones the running kernel
+        # no longer carries. So this target is checked structurally instead,
+        # which is a real parse of the format rather than a grep.
+        modprobe_blacklist)
+            PRE_VALIDATOR_CMD=("$0" --check-modprobe-blacklist)
+            POST_VALIDATOR_CMD=("$0" --check-modprobe-blacklist-live)
+            ;;
         # ── the three files with no validator of their own ──────────────────
         #
         # **The "drop-ins only" rule above does not apply here, and pretending
@@ -236,7 +252,7 @@ target_validators() {
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG --target <sudoers|sshd_config|exports|modules_load|subject_mapping|pam_yubico|krb5_conf> [--expect-sha256 <64-hex>] < content
+usage: $PROG --target <sudoers|sshd_config|exports|modules_load|modprobe_blacklist|subject_mapping|pam_yubico|krb5_conf|irqbalance_env|nut_upsmon_conf|nut_ups_conf> [--expect-sha256 <64-hex>] < content
 
 Reads the new content from stdin and installs it over one known target, after
 validating it. The content is never taken from a caller-named path.
@@ -281,6 +297,68 @@ check_modules_load_file() {
             "$PROG" "$where" >&2
         return 1
     fi
+    return 0
+}
+
+
+# ── the modprobe.d blacklist validator ────────────────────────────────────────
+# Reached as `$PROG --check-modprobe-blacklist <file>` (pre) or
+# `$PROG --check-modprobe-blacklist-live` (post).
+#
+# **`modprobe -R` is deliberately NOT used here, and the reason is the whole
+# point of the difference from modules_load.** check_modules_load_file refuses a
+# name `modprobe` cannot resolve, because a modules-load.d line that names
+# nothing loadable is silently ignored at boot. A blacklist is the inverse: it
+# names modules that must NOT be loaded, and the entries a user most wants are
+# routinely ones the running kernel does not currently carry (a driver for
+# hardware not plugged in, a module already replaced). Refusing those would make
+# the one save that is always available - the one that removes a last entry -
+# the one that fails.
+#
+# So this is a STRUCTURAL check: every effective line must be exactly
+# `blacklist <name>`. Anything else in the file is refused, because a directive
+# this page never writes is either a mistake or something that would silently
+# do something the user did not ask for.
+#
+# **An empty file is valid, and deliberately so.** check_modules_load_file
+# refuses a file that "names no modules at all"; copying that rule here would
+# break the ordinary case of removing the last blacklisted module, because the
+# result of that removal IS an empty file. An empty (or comment-only) drop-in
+# blacklists nothing, which is exactly what the user asked for.
+#
+# The name charset is module names only: no wildcards, no paths, no spaces. kmod
+# would accept a wildcard in `blacklist`, but this page never writes one and a
+# file that cannot be rendered back to a list is a file Cassini would then be
+# unable to display honestly.
+check_modprobe_blacklist_file() {
+    local file="$1" where="$2" line lineno=0 name
+    [[ -f "$file" ]] || { printf '%s: no such file: %s\n' "$PROG" "$file" >&2; return 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # **Not `(( lineno++ ))`.** Under this file's `set -e` a bare
+        # post-increment aborts the script when the variable is 0, because
+        # `(( 0++ ))` evaluates to the PRE-increment value and 0 is falsy.
+        # The effect is a validator that rejects every non-empty file and
+        # reports nothing at all - this file already records the same defect
+        # for `((issues++))` and `((format_count++))`, both fixed the same way.
+        lineno=$(( lineno + 1 ))
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] || continue
+        if [[ "$line" != blacklist\ * ]]; then
+            printf '%s: %s line %d: only "blacklist MODULE" lines are allowed here, got: %s\n' \
+                "$PROG" "$where" "$lineno" "$line" >&2
+            return 1
+        fi
+        name="${line#blacklist }"
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name%"${name##*[![:space:]]}"}"
+        if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            printf '%s: %s line %d: not a module name: %s\n' \
+                "$PROG" "$where" "$lineno" "$name" >&2
+            return 1
+        fi
+    done < "$file"
     return 0
 }
 
@@ -796,6 +874,18 @@ case "${1:-}" in
         # verifies the installed content.
         [[ -f "$live" ]] || exit 0
         check_modules_load_file "$live" "the live file"
+        exit $? ;;
+    --check-modprobe-blacklist)
+        [[ $# -ge 2 ]] || usage
+        check_modprobe_blacklist_file "$2" "the fragment"
+        exit $? ;;
+    --check-modprobe-blacklist-live)
+        # Absent is success, for the same reason as every other -live mode:
+        # this also runs as the pre-change BASELINE, on a machine that has
+        # never had the drop-in, so the file is not there yet.
+        live="$(target_path modprobe_blacklist)"
+        [[ -f "$live" ]] || exit 0
+        check_modprobe_blacklist_file "$live" "the live file"
         exit $? ;;
 esac
 

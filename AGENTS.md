@@ -551,6 +551,36 @@ replace the Cassini desktop test above.
   `ProtectHome=yes`, and the note described a unit that writes more than it
   said. When a unit's behaviour changes, its line here changes too.
 
+- **`finalize_boot_entries()` writes a `default` that names no entry on disk —
+  open, with the evidence, and do not "fix" it blind. Found 2026-10-16.**
+
+  Read off a real ESP (`install.img`, loop33p1):
+
+      loader.conf:  default shanios-blue.conf
+      entries:      shanios-blue+3-0.conf   shanios-green.conf
+
+  **There is no `shanios-blue.conf`.** The writer sets `default` to the base
+  entry ID while the file on disk carries the `+3-0` tries suffix, and
+  systemd-boot's `default=` is a glob over entry IDs.
+
+  The code does not look accidental. It carries a confident comment rejecting
+  the alternative by name: *"Using the exact filename (shanios-blue+3-0.conf) or
+  a glob (shanios-blue+*.conf) will not match because neither equals the ID.
+  The base ID always resolves correctly to the tries-suffixed file on disk."*
+
+  **Not proven here, and that is the point.** The real boot of this same image
+  rendered a menu listing both entries and then auto-booted, but the console
+  log does not record WHICH entry was taken, so the claim is untested. It needs
+  one real boot that records the selected entry. Two things make it worth
+  testing rather than assuming either way: the comment's reasoning is exactly
+  the kind that has been wrong repeatedly in this repo, **and** the fallback is
+  not benign — a `default=` matching nothing leaves systemd-boot to its own
+  ordering, which is why this image happened to boot at all.
+
+  **This also bounds the dracut failover added alongside it.** That hook only
+  acts when `default` carries a tries suffix, because that is how it recognises
+  an unproven candidate. On an ESP in this state it would not fire at all.
+
 - **`--rollback` overwrote the previous system when the two slots' versions
   tied - FIXED (2026-10-01).** The 2026-09-25 "go back instead of
   overwriting" fix (31fffd1) only triggered when the booted slot's version was

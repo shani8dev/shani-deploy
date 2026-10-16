@@ -551,35 +551,43 @@ replace the Cassini desktop test above.
   `ProtectHome=yes`, and the note described a unit that writes more than it
   said. When a unit's behaviour changes, its line here changes too.
 
-- **`finalize_boot_entries()` writes a `default` that names no entry on disk —
-  open, with the evidence, and do not "fix" it blind. Found 2026-10-16.**
+- **RETRACTED, then re-confirmed by measurement — `f8adca4` got this wrong and
+  `bootctl list` proved it (2026-10-16).**
 
-  Read off a real ESP (`install.img`, loop33p1):
+  An earlier commit recorded a "bug" here: read off a real ESP, `loader.conf`
+  says `default shanios-blue.conf` while the only blue file on disk is
+  `shanios-blue+3-0.conf`, and systemd-boot's `default=` is a glob over entry
+  IDs — so it looked like the default matched nothing and the boot was falling
+  back to systemd-boot's own ordering.
 
-      loader.conf:  default shanios-blue.conf
-      entries:      shanios-blue+3-0.conf   shanios-green.conf
+  **That was wrong, and `bootctl --esp-path=... list --json=short` settles it:**
 
-  **There is no `shanios-blue.conf`.** The writer sets `default` to the base
-  entry ID while the file on disk carries the `+3-0` tries suffix, and
-  systemd-boot's `default=` is a glob over entry IDs.
+      {"type":"type1","id":"shanios-blue.conf",
+       "path":".../loader/entries/shanios-blue+3-0.conf",
+       "title":"shanios-blue (Active)","triesLeft":3,"triesDone":0,
+       "isDefault":true}
 
-  The code does not look accidental. It carries a confident comment rejecting
-  the alternative by name: *"Using the exact filename (shanios-blue+3-0.conf) or
-  a glob (shanios-blue+*.conf) will not match because neither equals the ID.
-  The base ID always resolves correctly to the tries-suffixed file on disk."*
+  systemd-boot reports the entry's **ID as `shanios-blue.conf`** even though the
+  file is `shanios-blue+3-0.conf`, and marks it **`isDefault: true`**. So the
+  base ID does resolve to the tries-suffixed file, exactly as the comment in
+  `finalize_boot_entries()` argues — including its rejection of the glob
+  alternative. **The comment is correct. Do not "fix" it.**
 
-  **Not proven here, and that is the point.** The real boot of this same image
-  rendered a menu listing both entries and then auto-booted, but the console
-  log does not record WHICH entry was taken, so the claim is untested. It needs
-  one real boot that records the selected entry. Two things make it worth
-  testing rather than assuming either way: the comment's reasoning is exactly
-  the kind that has been wrong repeatedly in this repo, **and** the fallback is
-  not benign — a `default=` matching nothing leaves systemd-boot to its own
-  ordering, which is why this image happened to boot at all.
+  **How the wrong claim was made, because the shape is the reusable part.** The
+  evidence was real and the reasoning was wrong: a filename listing shows
+  `+3-0`, `default` shows no `+3-0`, and the inference "so the default matches
+  nothing" skipped the one question that decides it — what does systemd-boot
+  consider an entry's ID. It was answerable on the spot with `bootctl list`
+  against the mounted ESP, and the answer was the opposite. A boot log that did
+  not record *which* entry was chosen was treated as neutral when it was really
+  just an absence of evidence.
 
-  **This also bounds the dracut failover added alongside it.** That hook only
-  acts when `default` carries a tries suffix, because that is how it recognises
-  an unproven candidate. On an ESP in this state it would not fire at all.
+  **The measurement that came out of it is worth more than the error.** That
+  same output shows **`triesDone: 0` with `triesLeft: 3` after a real boot of
+  this image** — the tries counter was not decremented, which is the upstream
+  behaviour recorded above and the reason the `+3-0` fallback is not a safety
+  net on this systemd. That is why the dracut failover hook exists, and it is
+  now supported by an observation rather than by a source reading.
 
 - **`--rollback` overwrote the previous system when the two slots' versions
   tied - FIXED (2026-10-01).** The 2026-09-25 "go back instead of

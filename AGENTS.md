@@ -485,6 +485,43 @@ replace the Cassini desktop test above.
   file the runner owns and the runtime assertion cannot fail there — the third
   control skips for the same reason rather than reporting a green lie.
 
+- **`shani-user-setup.service` had `ProtectHome=yes`, so it never wrote inside
+  a home — FIXED (2026-10-16).** Found by
+  `shani-testbed/slot-tests/post-reset-setup.sh`, not by reading the unit.
+  `ProtectHome=yes` makes `/home` read-only for the unit, and the script writes
+  into four places inside a home: the `~/.cache/shani/user-setup.stamp` guard,
+  the `seed_skel()` pass, the flatpak remote added via `runuser` under
+  `~/.local`, and `podman system migrate` reading the user's own storage.
+
+  **Every one of those is a `|| warn`.** So the unit logged a tidy run and
+  exited 0 having done none of its work inside the user's home — silently
+  wrong *and* indistinguishable from a good run in `systemctl status`. That is
+  why it survived: the stamp write failing means the stamp guard never
+  engages, which is merely wasteful, and the flatpak remote failing is a line
+  nobody reads until a user notices.
+
+  **It made the skel fix above untestable in the strongest way.** The first
+  slot-test run after `seed_skel()` was added reported three failures, and two
+  of them (`user-file-is-never-reverted`, `first-login-pair-not-seeded-over-`
+  `bashrc`) were *passes* — passes that could only occur because the seeding
+  never ran. The third control is what exposed it: it removed the
+  never-overwrite guard and the file came back unchanged, which is the correct
+  result for a seeding pass that is not happening. **A negative control that
+  fails to fail is the most valuable assertion in this file**; without it the
+  suite reported four greens over a completely inert code path.
+
+  `flatpak-update-user.service` already dropped `ProtectHome` for the same
+  reason. The stale-policy trap — a sandbox decided when the unit did one thing,
+  kept long after the unit started doing four — is now written into the unit
+  itself, since that is where the next person editing it will look.
+
+- **Sandbox policy entries are only as good as their last review.** The list
+  below records *which* unit gets which exception and *why*. That list is the
+  mechanism that would have caught the above: `shani-user-setup` was already
+  noted as "keeps no `ProtectSystem` (it writes `/etc`)" while keeping
+  `ProtectHome=yes`, and the note described a unit that writes more than it
+  said. When a unit's behaviour changes, its line here changes too.
+
 - **`--rollback` overwrote the previous system when the two slots' versions
   tied - FIXED (2026-10-01).** The 2026-09-25 "go back instead of
   overwriting" fix (31fffd1) only triggered when the booted slot's version was
@@ -2079,8 +2116,11 @@ replace the Cassini desktop test above.
   - `MemoryDenyWriteExecute`/`LockPersonality` are **omitted from the
     flatpak units** (C++ + dbus) and `shani-download-only` (curl/aria2/rclone).
   - `shani-user-setup` keeps **no** `ProtectSystem` (it writes `/etc/passwd`,
-    `/etc/group`); `flatpak-update-user` keeps **no** `ProtectHome` (it needs
-    `~/.local`).
+    `/etc/group`) **and no `ProtectHome`** (it writes the setup stamp, the
+    `seed_skel()` pass, the flatpak remote under `~/.local`, and reads the
+    user's storage for podman); `flatpak-update-user` keeps **no**
+    `ProtectHome` (it needs `~/.local`). The `ProtectHome` half of this was
+    wrong until 2026-10-16 and cost the skel fix above its first test run.
   - `RestrictAddressFamilies=AF_UNIX` only — `logger` and `systemctl` need
     AF_UNIX, and the download/user-setup units add `AF_INET AF_INET6`.
     `@network-io` covers local AF_UNIX, so it is *not* excluded.

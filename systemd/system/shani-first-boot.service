@@ -1,0 +1,38 @@
+[Unit]
+Description=Make sure this machine is not stranded with no way in
+Documentation=man:shani-reset(8)
+# Runs before the display manager on EVERY boot, and does nothing at all on a
+# healthy system. The reason it is early rather than on-demand is that the
+# state it repairs is only observable before something tries to use it: once
+# GDM or plasmalogin has shown a login screen with no users, the wizard's own
+# guard has already been consulted and found stale.
+After=data.mount home.mount systemd-user-sessions.service
+# Before=display-manager.service is the vendor wizards' own ordering claim
+# (plasma-setup.service declares it). Matching it here is what puts the repair
+# ahead of the thing it repairs — if the alias is not what this image's greeter
+# unit is called, the ordering is simply not applied and this unit runs as an
+# ordinary multi-user one, which is harmless rather than wrong.
+Before=display-manager.service
+# Wants, not Requires: a missing home.mount must not fail the unit outright —
+# the stranded case is precisely the one where /home may be empty or odd, and
+# that is when this needs to reach the console most.
+Wants=home.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/shani-first-boot
+
+# Deliberately NOT sandboxed. This needs to setpriv into another uid, chown a
+# runtime directory to it, and start a private D-Bus session on its behalf.
+# ProtectSystem, PrivateTmp and a systemd-call filter all interfere with one or
+# another of those, and a unit that cannot finish its repair while appearing to
+# succeed is the exact failure this script exists to prevent.
+# NoNewPrivileges is deliberately absent too: setpriv drops privileges itself,
+# and the one direction that matters here (root -> the home's uid) is a
+# narrowing, not a widening.
+
+TimeoutStartSec=120s
+
+[Install]
+WantedBy=multi-user.target

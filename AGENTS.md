@@ -382,6 +382,109 @@ replace the Cassini desktop test above.
 
 ## Audit-verified known issues (confirmed present)
 
+- **A factory reset left GNOME machines unrecoverable, and four places in this
+  repo documented the repair that did not exist. Added 2026-10-16.**
+
+  `shani-reset` wipes `/data`, which takes the `/etc` overlay UPPER layer with
+  it. `/etc/passwd` and `/etc/shadow` only ever lived there, so **every account
+  disappears** — including the root password set at install time — while
+  `/home` survives untouched, `@home` being a separate subvolume. Nothing can
+  then be logged into, by any route.
+
+  **On Plasma this self-heals.** `plasma-setup.service` guards on
+  `ConditionPathExists=!/etc/plasma-setup-done`, and that flag is written at
+  RUNTIME into the upper layer — the exact layer the reset deletes — so the
+  guard re-arms and the wizard runs again. Verified from the built package
+  (`shani-pkgbuilds/plasma-setup-git`, commit `3cbe755`), and
+  `shani-desktop-plasma.install:79-80` enables both `plasmalogin.service` and
+  `plasma-setup.service`.
+
+  **On GNOME it did not, and nothing recovered.** `gnome-initial-setup` is not
+  a system service; it runs inside a user session and records that it has
+  already run in that user's dconf database as
+  `org.gnome.desktop.firstuse.gnome-initial-setup`. That database is in
+  `~/.config/dconf/user`, inside `@home`, which a reset does not touch. So
+  after a plain reset the machine had no account AND a wizard that still
+  believed it was finished, with no password to fall back on.
+
+  The repair is **`scripts/shani-first-boot.sh`** + a `multi-user.target` unit
+  ordered `Before=display-manager.service`, enabled by the packaging hook.
+  When — and only when — no regular account exists *and* a `/home` directory's
+  owner uid has no passwd entry, it clears `/org/gnome/desktop/firstuse/` in
+  that home via `setpriv` + a private `dbus-run-session` (there is no passwd
+  entry to name, which is why the uid is numeric). On a healthy machine the
+  loop never runs and the script changes nothing.
+
+  **The dconf technique was verified before anything was built on it**, against
+  a real GVDB database written by `dconf` rather than a text fixture — a text
+  fixture is declared corrupt and moved aside, which would have made the first
+  version of the check pass for the wrong reason. The firstuse key is gone
+  after `dconf reset -f`; `/org/gnome/desktop/interface/color-scheme`, written
+  in the same breath, survives. **That scoping is the load-bearing property** —
+  a reset of `/org/gnome/desktop`, or of `/`, would also satisfy every check
+  that only asks "was the guard cleared", while wiping the user's theme,
+  wallpaper and keybindings. `tests/test-first-boot.sh` pins the exact path and
+  `shani-testbed/slot-tests/post-reset-setup.sh` proves the scope against a
+  real orphaned home, with a negative control that widens the reset and
+  requires the innocent key to disappear.
+
+  **Four places in this repo claimed a repair that did not exist**, which is
+  how this stayed invisible: the `shani-user-setup.service` `Description`, its
+  `.path` unit's `PathModified=/etc/skel` watch, `shani-reset`'s own usage text
+  ("provisions shell, skel, and container namespaces"), and
+  `AUDIT-HISTORY.md:68`. All four now describe what actually happens.
+
+  **`shani-reset` also named the wrong wizard**, in both `usage()` and its
+  post-reset summary: *"The desktop setup wizard (plasma-welcome /
+  gnome-initial-setup) runs automatically"*. **`plasma-welcome` is not what
+  creates the account** — it is an in-session tips app, installed by
+  `shani-desktop-plasma/PKGBUILD:36` and referenced nowhere else in the
+  workspace. The reader was sent looking for a wizard that never runs, on the
+  one profile where recovery works. The summary is now profile-aware (via
+  `/etc/shani-profile`) and says plainly that no account survives, root
+  included, so the install media is the only remaining route.
+
+  **Verification status, stated plainly:** `bash -n` clean, and
+  `tests/test-first-boot.sh` is 27 assertions with three negative controls all
+  verified to fail the code they target. The mandatory harness had not finished
+  at the time of writing, and `shani-first-boot.sh` postdates the harness run
+  that was in flight — so **the unit is green and the slot-test is not yet
+  run**. Do not read this entry as a boot-verified claim.
+
+- **`shani-user-setup` never copied /etc/skel, into any home - FIXED
+  (2026-10-16).** The script's entire body is group membership, shell repair, a
+  flatpak remote, a nix channel, subuid/subgid ranges and a podman migrate. The
+  only file it ever wrote inside a home was
+  `~/.cache/shani/user-setup.stamp`.
+
+  That matters because `useradd -m` copies skel **only when it creates a home
+  directory**. A factory reset leaves exactly the case where that is not true:
+  the home survives in `@home`, the account does not, so the account the
+  first-run wizard creates lands on an existing directory and receives none of
+  the defaults. `seed_skel()` now walks `/etc/skel` per user and adds what is
+  **missing**, never overwriting.
+
+  **The one destructive case is guarded explicitly.**
+  `.config/autostart/bashrc-setup.desktop` runs `mv ~/.bashrc_shani
+  ~/.bashrc; rm <itself>`, so seeding that pair into a home that already has a
+  `.bashrc` would replace it on the next graphical login — from a pass whose
+  whole contract is that it cannot touch what the user has. The pair is seeded
+  only when there is no `.bashrc` for it to become.
+
+  **It sits outside the stamp guard on purpose.** The stamp is the script's
+  mtime plus the groups list, neither of which changes when a package upgrade
+  adds a file to `/etc/skel` — and `shani-user-setup.path` watches
+  `PathModified=/etc/skel` precisely so that upgrade re-triggers the service.
+  Inside the stamp, that watch would fire into a no-op forever, which is what it
+  did.
+
+  **`SKEL_DIR` exists only so the test can drive it**; the shipped default is
+  `/etc/skel`. `tests/test-skel-seed.sh` is 21 assertions (2 skip without root,
+  with the reason) plus three negative controls. The ownership property is
+  asserted statically as well, because unprivileged `cp -a` already produces a
+  file the runner owns and the runtime assertion cannot fail there — the third
+  control skips for the same reason rather than reporting a green lie.
+
 - **`--rollback` overwrote the previous system when the two slots' versions
   tied - FIXED (2026-10-01).** The 2026-09-25 "go back instead of
   overwriting" fix (31fffd1) only triggered when the booted slot's version was

@@ -54,6 +54,12 @@ jobs:
       - name: Run runtime-only units contract tests
         run: bash tests/test-runtime-only-units.sh
 
+      - name: Run skel-seed contract tests
+        run: bash tests/test-skel-seed.sh
+
+      - name: Run first-boot stranding-repair contract tests
+        run: bash tests/test-first-boot.sh
+
   unit-files:
     name: Unit files (systemd-analyze verify)
     runs-on: ubuntu-latest

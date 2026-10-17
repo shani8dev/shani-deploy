@@ -11,6 +11,13 @@ Conflicts=shutdown.target
 [Timer]
 OnBootSec=15m
 Unit=check-boot-failure.service
+# This timer WRITES the soft failure marker; shani-auto-rollback.timer's 16m
+# pass exists only to act on it. The default AccuracySec=1min lets this fire up
+# to a minute late, independently of the consumer's, so 15m can land after
+# 16m has already looked and found nothing — the failure is then recorded and
+# never acted on for the rest of that boot, with no error anywhere. Both timers
+# need it; pinning only the consumer leaves half the window open.
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

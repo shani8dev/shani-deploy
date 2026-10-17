@@ -19,6 +19,31 @@ OnBootSec=1min
 # see that unit's own comment.
 OnBootSec=16m
 Unit=shani-auto-rollback.service
+# The second pass CONSUMES a marker that check-boot-failure WRITES, so their
+# relative firing order is load-bearing — and it was never guaranteed.
+#
+# Neither timer sets AccuracySec= or RandomizedDelaySec=, so systemd's default
+# AccuracySec=1min applies: each may fire up to a minute LATE, independently.
+# check-boot-failure's OnBootSec=15m can therefore land at 16m00s, after this
+# unit's OnBootSec=16m has already run and found no marker. Nothing runs
+# afterwards, so a soft failure — the exact case the 15m timer exists to detect,
+# and the only one the 16m pass can act on — is recorded and then never acted
+# on for the rest of that boot. The machine stays on the failed slot until
+# someone reboots or runs --rollback by hand, which is precisely what the
+# unattended recovery exists to avoid.
+#
+# The directive below pins the coalescing window to ~1s, so the 1-minute gap in
+# OnBootSec is the ordering guarantee rather than a coincidence. RandomizedDelaySec
+# is deliberately left unset: extra jitter on a recovery timer can only make
+# this worse. This is not a substitute for systemd-boot's own tries counter,
+# which is inert on this systemd version (upstream #40405) — the marker chain
+# is the mechanism that has to work.
+#
+# The value is deliberately written ONLY here and not repeated in this prose:
+# a duplicate literal in a comment is what a text-based mutation reaches first,
+# so a control that removes "the directive" can silently edit the documentation
+# instead and report green.
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

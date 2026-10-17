@@ -194,7 +194,21 @@ ensure_mok_keys() {
         key_pub=$(openssl rsa  -in "$MOK_KEY" -pubout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}') || true
         cert_pub=$(openssl x509 -in "$MOK_CRT" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null | awk '{print $2}') || true
         if [[ -z "$key_pub" || -z "$cert_pub" || "$key_pub" != "$cert_pub" ]]; then
+            # Regenerating here is correct - sbsign cannot use a mismatched
+            # pair - but it is NOT a local repair. It replaces the key every
+            # existing UKI was signed with, so the next boot needs the user to
+            # accept a MokManager prompt for a key they never asked to rotate,
+            # and if that prompt is missed Secure Boot refuses the new UKI
+            # while the old one has already been overwritten (generate_uki
+            # `mv`s the new UKI over the live one). So the rotation is called
+            # out as ACTION REQUIRED, the same way enrollment is, rather than
+            # logged as a warning that reads like a tidied-up detail.
             log_warn "MOK.key and MOK.crt do not match (key=$key_pub cert=$cert_pub) — regenerating keypair"
+            log_warn "ACTION REQUIRED: this ROTATES the Secure Boot signing key."
+            log_warn "  Every UKI signed with the old key stops booting, and the"
+            log_warn "  firmware must enrol the new one at the next reboot."
+            log_warn "  Confirm the MokManager prompt, or run 'gen-efi cleanup-mok'"
+            log_warn "  afterwards to remove the superseded key."
             rm -f "$MOK_KEY" "$MOK_CRT" /etc/secureboot/keys/MOK.der
             # Fall through to the generation path below.
         else
@@ -226,6 +240,9 @@ ensure_mok_keys() {
     fi
 
     log_warn "Generating new MOK keypair"
+    log_warn "ACTION REQUIRED: this is a NEW Secure Boot signing key. The next"
+    log_warn "  reboot must be confirmed at the MokManager prompt, or Secure Boot"
+    log_warn "  will refuse UKIs signed with it."
     mkdir -p /etc/secureboot/keys
     openssl req -newkey rsa:2048 -nodes \
         -keyout "$MOK_KEY" \

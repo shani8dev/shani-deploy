@@ -2089,6 +2089,44 @@ EOF
     # truth for the default entry. Suppressed entirely — failure is non-fatal and
     # must not affect the deployment result (EFI vars may be read-only, or the
     # ESP may not be writable via bootctl on all firmware).
+    #
+    # BUT set-default only writes LoaderEntryDefault, and systemd-boot's
+    # config_select_default_entry() (boot.c) checks, in order, returning on the
+    # FIRST match: LoaderEntrySysFail, LoaderEntryOneShot,
+    # LoaderEntryPreferred, the saved entry, LoaderEntryDefault, and only then
+    # `default` in loader.conf. LoaderEntryDefault is FIFTH.
+    #
+    # So on a machine where an earlier boot failed, LoaderEntrySysFail is still
+    # set and still names the dead candidate: this function writes the correct
+    # new default, the correct new default loses, and the machine boots the slot
+    # that failed. Measured on real efivarfs, `bootctl set-default` is also NOT
+    # enough on its own for the same reason the dracut hook's zero-byte write was
+    # not: the fix has to clear the higher-precedence variables, and it has to
+    # verify they are gone rather than trust an exit status (both the empty write
+    # and `truncate -s 0` are silent no-ops on efivarfs - see
+    # shani-testbed/tests/efivar-proof.sh and shani-install-media's AGENTS.md).
+    #
+    # Cleared BEFORE the set-default, so the variable this function is about to
+    # write is the only one that can decide the next boot.
+    # Overridable so a test can point it at a scratch directory, exactly as the
+    # dracut hook's SHANIOS_EFIVARS_DIR. It must NEVER point at a real efivarfs
+    # in a test: this deletes three variables, and a systemd-boot host that lost
+    # LoaderEntrySysFail mid-deploy would lose its own escape hatch. Only the
+    # three names above are touched, so a GRUB host is unaffected by an
+    # accidental run - which is also why one could go unnoticed.
+    local _efivarfs="${SHANIOS_EFIVARS_DIR:-/sys/firmware/efi/efivars}"
+    local _efv _cleared_efv=()
+    if [[ -d "$_efivarfs" ]]; then
+        for _efv in LoaderEntrySysFail LoaderEntryOneShot LoaderEntryPreferred; do
+            local _f
+            for _f in "$_efivarfs"/${_efv}-*; do
+                [[ -e "$_f" ]] || continue
+                rm -f "$_f" 2>/dev/null
+                [[ -e "$_f" ]] || _cleared_efv+=("$_efv")
+            done
+        done
+    fi
+    [[ ${#_cleared_efv[@]} -gt 0 ]] && log_verbose "Cleared stale EFI variables that outrank the default: ${_cleared_efv[*]}"
     bootctl set-default "${loader_default}" &>/dev/null || true
 
     if [[ $esp_mounted -eq 1 ]]; then

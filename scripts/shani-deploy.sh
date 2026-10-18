@@ -2692,8 +2692,15 @@ rollback_system() {
             _rb_efi_ok=1
         else
             log_warn "UKI generation failed — attempting to copy @${booted} UKI as fallback"
+            # Staged and renamed, not copied onto the live path. `cp` onto an
+            # existing file truncates it before writing, so a power cut mid-copy
+            # leaves a truncated UKI at a path the bootloader reads on the next
+            # boot - and this is the ROLLBACK path, so the moment it matters most
+            # is the moment the machine is already in trouble.
             if cp "$ESP/EFI/${OS_NAME}/${OS_NAME}-${booted}.efi" \
-                  "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi" 2>/dev/null; then
+                  "$ESP/EFI/${OS_NAME}/.${OS_NAME}-${failed_slot}.efi.tmp" 2>/dev/null \
+               && mv -f "$ESP/EFI/${OS_NAME}/.${OS_NAME}-${failed_slot}.efi.tmp" \
+                         "$ESP/EFI/${OS_NAME}/${OS_NAME}-${failed_slot}.efi"; then
                 log_warn "Fallback EFI copy succeeded — @${failed_slot} will boot with @${booted} kernel"
                 _rb_efi_ok=1
             else

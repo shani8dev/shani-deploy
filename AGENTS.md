@@ -551,6 +551,30 @@ replace the Cassini desktop test above.
   `ProtectHome=yes`, and the note described a unit that writes more than it
   said. When a unit's behaviour changes, its line here changes too.
 
+- **Keep writing the BASE ID — `loader_default="${OS_NAME}-${active_slot}.conf"`
+  is correct, and a comment in `shani-install-media`'s dracut hook says the
+  opposite (cross-reference, 2026-10-18).**
+
+  The entry immediately below measured this exactly: `bootctl list --json=short`
+  reports `"id":"shanios-blue.conf"` for the file
+  `shanios-blue+3-0.conf`. That is systemd commit `4301ad0` ("Strip boot counter
+  from entry id", fixes #38813, 2025-09-11) — `boot_entry_parse_tries()` sets
+  `entry->id` with the counter **removed** — so on v262 the marked file's ID is
+  the plain one and `loader.conf`'s default is matched against that.
+
+  The dracut boot-failover hook in `shani-install-media` carried a comment
+  asserting the ID is the full filename and that naming the stem "matches
+  NOTHING", describing **pre-`4301ad0` behaviour as current**. That comment led
+  to a change to `os-installer-config`'s `loader.conf` write which was wrong and
+  has been reverted, and it is corrected in place at the hook. **Do not "fix"
+  this repo's base-ID `default` write on the strength of that comment** — this
+  file's measurement is the one that holds.
+
+  The same marker also turned out to be load-bearing rather than decorative: the
+  hook's failover guard is "the current default carries a tries counter", so the
+  `+3-0` suffix is how an unproven candidate is recognised. That is a second
+  reason not to strip it.
+
 - **RETRACTED, then re-confirmed by measurement — `f8adca4` got this wrong and
   `bootctl list` proved it (2026-10-16).**
 

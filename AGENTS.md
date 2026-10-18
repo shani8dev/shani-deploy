@@ -2463,3 +2463,73 @@ Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap
   variables and not others. `bootctl set-default` itself rewrites exactly this
   variable, so *something* can modify it — which is why this is recorded as
   "cannot be unlinked by the hook" rather than "cannot be changed".
+
+- **`bootctl set-preferred` is the correct verb for this, and it exists because
+  systemd added it for exactly this defect (2026-10-18). `finalize_boot_entries()`
+  used `set-default`, which is documented as ignoring boot assessment.**
+
+  systemd v262 NEWS, verbatim, under "Changes in systemd-boot and the stub":
+
+      A new LoaderEntryPreferred setting has been added to systemd-boot that is
+      similar to LoaderEntryDefault, but that takes into the account boot
+      assessment logic, and will skip entries that have the tries-left counter
+      set to zero.
+
+  PR systemd/systemd#40324 ("add a preferred setting that's similar to default
+  but avoids booting known-bad entries", milestone **v260**, merged 2026-02-17)
+  states the problem in terms that are a description of this system:
+
+      when an explicit boot entry is configured as the default entry using an
+      EFI var, **as is common for instance in A/B boot schemes, the configured
+      entry will be booted indefinitly, regardless of the entry's boot
+      assessment status**
+
+  That is `finalize_boot_entries()`: the candidate is named by both
+  `LoaderEntryDefault` and loader.conf's `default`, and systemd-boot's spec
+  says of the former: *"This **ignores** boot assessment and can select boot
+  entries that have been marked as bad."* So the one mechanism the `+3-0`
+  suffix exists to provide is bypassed by the very act of pinning the default.
+
+  `LoaderEntryPreferred` is third in `config_select_default_entry()`, above both
+  the EFI default and loader.conf, and is the one that honours the counter.
+  `finalize_boot_entries()` now calls `bootctl set-preferred` first and keeps
+  `set-default` as belt-and-braces for loaders that predate the verb.
+
+  **LoaderEntryPreferred was dropped from the clearing loop for this reason:**
+  it is what `set-preferred` *writes*, so clearing it and setting it inside one
+  function is two operations racing over one variable, and clearing it
+  afterwards undoes the call outright. Only `LoaderEntrySysFail` and
+  `LoaderEntryOneShot` remain above it, and both are transient — OneShot is
+  "removed automatically after being read by the boot loader", SysFail is set
+  only on actual firmware failure.
+
+  **Measured on this image (systemd 262, one `iso-install --boot-only` boot):**
+
+      set-preferred: recognised
+      bootctl set-preferred shanios-blue.conf -> rc=0
+      value read back: shanios-blue.conf
+      LoaderEntryPreferred-4a67b082-...  immutable=----i-----
+        bare rm        -> FAILED (Operation not permitted)
+        chattr -i + rm -> REMOVED
+
+  So the verb works here, and Preferred is immutable in exactly the way Default
+  and Selected were — which is why the `chattr -i` is load-bearing for it too.
+
+  **How this was nearly got wrong twice, and the trap worth recording.** The
+  prose in `systemd.io/BOOT_LOADER_INTERFACE/` describes Preferred as honouring
+  boot assessment, and `src/shared/bootspec.c`'s `boot_config_find()` plainly
+  does **not** filter `tries_left`. Reading only that, the call looks like it
+  pins the candidate at third priority with none of the protection — i.e. the
+  same defect at a better priority — and the change was nearly reverted on that
+  basis. `bootspec.c` is the **userspace** copy used by `bootctl list`; entry
+  selection happens in `src/boot/boot.c`, which is where the v260 change
+  landed. **A grep of the wrong copy of a function is not evidence about the
+  one that runs.**
+
+  **Still unverified, and it is the last link:** boot counting has never been
+  observed engaging on this image. Every measurement so far booted an entry with
+  *no* tries counter, which is why `LoaderBootCountPath` read absent — that is
+  the expected result for a plain entry and is not evidence of a broken
+  counter. Settling it needs one boot of an entry that actually carries `+3-0`:
+  does `LoaderBootCountPath` appear, does the counter decrement, and does
+  `set-preferred` then hand over to the fallback.

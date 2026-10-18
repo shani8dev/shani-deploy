@@ -2375,3 +2375,70 @@ Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap
 4. **Shared CI Templates, Renovate, Conventional Commits** (P1, cross-repo) — Create `shani-ci-commons` with reusable CI templates (master #7 alone is a 2-3 day build; the Renovate #8 and commitizen #9 add-ons are short per-repo adoptions), and commitizen for conventional commit enforcement. These affect all 15 shani repos. Source: IMPLEMENTATION-ROADMAP.md #7, #8, #9.
 
 5. **Explicit: Do NOT Port Boot-Entry/Deploy Logic from Garuda** — Shani's blue-green Btrfs deployment, automated rollback, UKI signing, and chroot detection safety are all superior to anything garuda-tools provides. The table in "What shani-deploy has that Garuda lacks" above documents this clearly. Only the **config layer** (INI config pattern) and the **upgrade-adviser pattern** (pre-flight safety check) are worth adopting from garuda — everything else in garuda's deploy/boot space would be a downgrade.
+
+- **A `LoaderEntry*` EFI variable (`LoaderEntrySelected`) cannot be unlinked on
+  this platform, while an inert variable is deleted in the same invocation —
+  CONFIRMED on a real firmware boot (2026-10-18). The hook's four actual targets
+  are NOT among them, so this does NOT show the hook's clearing failing. Read the
+  scope before using this.**
+
+  The hook clears `LoaderEntrySysFail` / `OneShot` / `Preferred` / `Default` from
+  the initramfs because `config_select_default_entry()` reads `default` in
+  loader.conf **seventh** of eight sources. `shani-install-media/AGENTS.md`
+  records that the original clearing (`printf '' > $node`) was measured on real
+  efivarfs, found to be a silent no-op, and fixed by switching to `rm -f` —
+  implying the clearing then worked.
+
+  **It does not.** `shani-testbed/tests/efivar-proof.sh`, run inside one
+  `iso-install --boot-only` boot, measured both classes **in the same
+  invocation** — same uid, capabilities, namespace and firmware:
+
+      victim=ConOut-8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+      op=unlink rc=0 exists-after=false              <- INERT variable: deleted
+
+      loader-victim=LoaderEntrySelected-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+      loader-mode=644 root:root   loader-size-before=40
+      loader-unlink-rc=1
+      loader-unlink-errno=rm: cannot remove '...': Operation not permitted
+      loader-exists-after=true                      <- LoaderEntry*: survives
+
+  A single class cannot answer this: "this shell cannot delete anything" and
+  "this class cannot be deleted" print identically from one class. Measuring both
+  together is what separates them, and **the class is the variable.**
+
+  **Consequence, and it is a design one.** On any machine where
+  `finalize_boot_entries()` has run `bootctl set-default` — i.e. **every deployed
+  machine** — `LoaderEntryDefault` names the candidate, outranks the `loader.conf`
+  line the hook rewrites, and **cannot be removed**. So the hook will rewrite
+  `loader.conf`, emit its warning, and the next boot will still select the
+  candidate. The hook's `loader.conf` half is real and useful; its efivarfs half
+  is dead code on this platform, and should be reported as unavailable rather than
+  attempted-and-hoped-for.
+
+  **What this does NOT establish, stated because the temptation is to overread
+  it.** The hook clears `LoaderEntrySysFail` / `OneShot` / `Preferred` /
+  `Default`. **None of those four existed in the measured NVRAM**, so none of them
+  was measured — the victim here is `LoaderEntrySelected`, a different
+  `LoaderEntry*` variable that systemd-boot owns. And there is direct
+  counter-evidence for the four that matter: **`bootctl set-default` rewrites
+  `LoaderEntryDefault`**, so at least that one is modifiable by something on this
+  platform. So the claim "the hook's clearing can never work" is **NOT**
+  established, and an earlier version of this entry asserted it. The honest
+  statement is: *some* `LoaderEntry*` variables are undeletable, and whether the
+  four the hook needs are among them is unmeasured.
+
+  Settling it is cheap and is the next thing to run: have `finalize_boot_entries`
+  run first (so the four exist), then re-run `efivar-proof.sh`. Until then the
+  clear-the-variable path stays **unproven and unrefuted**, and the atomicity fix
+  below is justified on its own merits — it removes the failure mode rather than
+  depending on any recovery mechanism working.
+
+  **On its own merits, atomicity is the robust option regardless of the above:**
+  build the new slot in a staging subvolume and publish it with a single
+  `btrfs subvolume snapshot` as the last step, so `finalize_boot_entries()` only
+  ever runs against a slot that is already complete.
+
+  **Not explained, and not guessed at:** why the kernel permits `unlink` on some
+  variables and not others. `bootctl set-default` itself rewrites exactly this
+  variable, so *something* can modify it — which is why this is recorded as
+  "cannot be unlinked by the hook" rather than "cannot be changed".

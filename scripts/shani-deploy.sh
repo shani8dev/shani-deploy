@@ -2115,18 +2115,60 @@ EOF
     # three names above are touched, so a GRUB host is unaffected by an
     # accidental run - which is also why one could go unnoticed.
     local _efivarfs="${SHANIOS_EFIVARS_DIR:-/sys/firmware/efi/efivars}"
-    local _efv _cleared_efv=()
+    local _efv _cleared_efv=() _survived_efv=()
     if [[ -d "$_efivarfs" ]]; then
         for _efv in LoaderEntrySysFail LoaderEntryOneShot LoaderEntryPreferred; do
             local _f
             for _f in "$_efivarfs"/${_efv}-*; do
                 [[ -e "$_f" ]] || continue
+                # `chattr -i` FIRST, and this is not optional. Since the kernel's
+                # "efi: Make efivarfs entries immutable by default" (ed8b0de,
+                # 2016), every efivarfs node that is not on a small allowlist of
+                # standardised variables is created S_IMMUTABLE - see
+                # fs/efivarfs/inode.c:
+                #
+                #   inode->i_flags = is_removable ? 0 : S_IMMUTABLE;
+                #
+                # and unlinking an immutable inode is EPERM. systemd-boot's
+                # LoaderEntry* variables are vendor-specific, so they are
+                # immutable. Measured on real efivarfs in a real firmware boot,
+                # same invocation and same uid/capabilities:
+                #
+                #   ConOut-8BE4DF61-...         rm -f -> rc 0, GONE
+                #   LoaderEntryDefault-4a67b082-...  lsattr -> ----i-----
+                #                                   rm -f -> EPERM, survives
+                #                                   chattr -i + rm -f -> REMOVED
+                #
+                # So without this line the clearing below is a guaranteed no-op,
+                # and `bootctl set-default` then writes LoaderEntryDefault into
+                # a store whose higher-precedence variables were never removed -
+                # the deploy reports success and the machine boots the slot that
+                # already failed. `chattr` is in this repo's package deps; the
+                # identical fix is applied to the dracut pre-mount hook.
+                chattr -i "$_f" 2>/dev/null || true
                 rm -f "$_f" 2>/dev/null
-                [[ -e "$_f" ]] || _cleared_efv+=("$_efv")
+                if [[ -e "$_f" ]]; then
+                    _survived_efv+=("${_efv}")
+                else
+                    _cleared_efv+=("$_efv")
+                fi
             done
         done
     fi
     [[ ${#_cleared_efv[@]} -gt 0 ]] && log_verbose "Cleared stale EFI variables that outrank the default: ${_cleared_efv[*]}"
+    # The failure case needs saying out loud. The block above VERIFIES that the
+    # node is gone and then, before this line, threw the failure away: it only
+    # reported when something had been cleared, so a total no-op printed nothing
+    # and exited 0. A deploy that cannot clear the outranking variables still
+    # says "Boot default set to: @..." - the exact silent-fails-open shape this
+    # repo's AGENTS.md keeps finding, and it is what made the zero-byte-write bug
+    # invisible for a day.
+    if [[ ${#_survived_efv[@]} -gt 0 ]]; then
+        log_error "Could not clear EFI variable(s) that outrank loader.conf: ${_survived_efv[*]}"
+        log_error "These persist across reboots and systemd-boot reads them BEFORE loader.conf's default."
+        log_error "The boot default written below may be ignored — this machine can boot the wrong slot."
+        log_error "Fix on the host: lsattr \${_efivarfs}/LoaderEntry*   then   chattr -i <node> && rm <node>"
+    fi
     bootctl set-default "${loader_default}" &>/dev/null || true
 
     if [[ $esp_mounted -eq 1 ]]; then

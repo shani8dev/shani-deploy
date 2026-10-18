@@ -2114,10 +2114,16 @@ EOF
     # LoaderEntrySysFail mid-deploy would lose its own escape hatch. Only the
     # three names above are touched, so a GRUB host is unaffected by an
     # accidental run - which is also why one could go unnoticed.
+    # Only the two that genuinely outrank `set-preferred` and are NOT set by it.
+    #
+    # LoaderEntryPreferred used to be in this list and must not be any more: it is
+    # what `bootctl set-preferred` WRITES below, so clearing it and then setting
+    # it in the same function would be two operations racing over one variable,
+    # and clearing it after would undo the call entirely.
     local _efivarfs="${SHANIOS_EFIVARS_DIR:-/sys/firmware/efi/efivars}"
     local _efv _cleared_efv=() _survived_efv=()
     if [[ -d "$_efivarfs" ]]; then
-        for _efv in LoaderEntrySysFail LoaderEntryOneShot LoaderEntryPreferred; do
+        for _efv in LoaderEntrySysFail LoaderEntryOneShot; do
             local _f
             for _f in "$_efivarfs"/${_efv}-*; do
                 [[ -e "$_f" ]] || continue
@@ -2168,6 +2174,48 @@ EOF
         log_error "These persist across reboots and systemd-boot reads them BEFORE loader.conf's default."
         log_error "The boot default written below may be ignored — this machine can boot the wrong slot."
         log_error "Fix on the host: lsattr \${_efivarfs}/LoaderEntry*   then   chattr -i <node> && rm <node>"
+    fi
+    # `set-preferred` FIRST, and it is the important call here.
+    #
+    # bootctl has four verbs and all four are the same function - `verb_set_efivar`
+    # - which writes exactly one variable and clears nothing. So "let bootctl do
+    # it" was never available for the clearing, but it IS available for the
+    # setting, and this verb is the one that was being missed:
+    #
+    #   bootctl(1): "set-preferred ID - like set-default, but is aware of boot
+    #                assessment and will skip boot entries that have their
+    #                tries-left counter set to zero"
+    #
+    # Boot Loader Interface spec, on why that matters:
+    #
+    #   LoaderEntryDefault   - "This IGNORES boot assessment and can select boot
+    #                          entries that have been marked as bad"
+    #   LoaderEntryPreferred - "takes boot assessment into account by NOT
+    #                          selecting boot entries that have been marked bad"
+    #
+    # and boot_entries_select_default()'s order is OneShot -> Preferred ->
+    # Default -> loader.conf preferred -> loader.conf default -> first entry.
+    #
+    # So `set-default` (used alone until now) is FIFTH and explicitly bypasses
+    # boot assessment - it can name the very entry the counter marked bad. This
+    # call writes the THIRD, which outranks it AND respects the assessment.
+    #
+    # `set-default` is kept below as well: `set-preferred` is newer than some
+    # loaders, and Default is what the dracut pre-mount hook's loader.conf
+    # rewrite is ultimately fighting. Setting both is belt and braces, and
+    # Preferred being set is what makes the pair correct rather than merely
+    # consistent.
+    #
+    # Order matters and is the whole point: the clearing above must run BEFORE
+    # this, and LoaderEntryPreferred must NOT be in the clearing list, or the
+    # two would fight over one variable.
+    if bootctl set-preferred "${loader_default}" 2>/dev/null; then
+        log_verbose "bootctl set-preferred ${loader_default} (3rd priority, honours boot assessment)"
+    else
+        # Not fatal on its own - set-default and loader.conf both still follow -
+        # but it is the difference between a default that respects the tries
+        # counter and one that overrides it, so it is worth saying.
+        log_warn "bootctl set-preferred failed - falling back to set-default, which IGNORES boot assessment"
     fi
     bootctl set-default "${loader_default}" &>/dev/null || true
 

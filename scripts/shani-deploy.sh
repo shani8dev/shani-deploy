@@ -2099,9 +2099,27 @@ EOF
     local loader_default="${OS_NAME}-${active_slot}.conf"
     local loader_conf="$ESP/loader/loader.conf"
     if [[ -f "$loader_conf" ]]; then
-        grep -v "^default " "$loader_conf" > "${loader_conf}.tmp" || true
-        echo "default ${loader_default}" >> "${loader_conf}.tmp"
-        mv "${loader_conf}.tmp" "$loader_conf"
+        # NO `|| true` on the grep. The line below renames this file OVER the
+        # live loader.conf, so a failed grep does not merely produce no output -
+        # it commits a truncated (or empty) default over a working one, and the
+        # machine boots whatever systemd-boot picks instead.
+        #
+        # This is a mid-deploy power cut made deterministic: the state a cut
+        # between the truncate and the write leaves behind is exactly this file,
+        # and nothing downstream ever noticed.
+        #
+        # Same directory for the temp, so the rename is atomic - the ESP holds
+        # either the old loader.conf or the new one, never a partial one.
+        if grep -v "^default " "$loader_conf" > "${loader_conf}.tmp"; then
+            echo "default ${loader_default}" >> "${loader_conf}.tmp"
+            if ! mv -f "${loader_conf}.tmp" "$loader_conf"; then
+                rm -f "${loader_conf}.tmp"
+                log_warn "could not install the new loader.conf - the existing one is untouched"
+            fi
+        else
+            rm -f "${loader_conf}.tmp"
+            log_warn "could not stage the new loader.conf - the existing one is untouched"
+        fi
     else
         printf 'default %s\ntimeout 5\nconsole-mode max\neditor 0\nauto-entries 0\nbeep 0\n' \
             "${loader_default}" > "$loader_conf"

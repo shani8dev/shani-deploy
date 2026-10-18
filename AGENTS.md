@@ -2433,10 +2433,31 @@ Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap
   below is justified on its own merits — it removes the failure mode rather than
   depending on any recovery mechanism working.
 
-  **On its own merits, atomicity is the robust option regardless of the above:**
-  build the new slot in a staging subvolume and publish it with a single
-  `btrfs subvolume snapshot` as the last step, so `finalize_boot_entries()` only
-  ever runs against a slot that is already complete.
+  **An atomicity fix was proposed here and is NOT needed — `deploy_update()`
+  already does it, and I did not read it before recommending it.** The candidate
+  slot is never written in place. `shani-deploy.sh:4006-4039`:
+
+      btrfs receive "$temp"                                     # extract into temp/
+      ...
+      btrfs_subvolume_delete_safe "$MOUNT_DIR/@${CANDIDATE_SLOT}"
+      run_cmd btrfs subvolume snapshot "$temp/shanios_base" \
+              "$MOUNT_DIR/@${CANDIDATE_SLOT}"                   # atomic publish
+      run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
+
+  So a power cut during extraction leaves `@CANDIDATE_SLOT` untouched, and the
+  slot is published by a single `subvolume snapshot` from an already-complete
+  one. **`finalize_boot_entries()` therefore only ever runs against a complete
+  slot**, and the "half-written candidate" failure mode does not exist here.
+  `temp_update` cleanup at `:2209`, `:2549` and `:2612` corroborates that
+  `temp/` is the staging volume.
+
+  **So the black screen is not a half-written subvolume, and the remaining
+  window is narrower:** between that atomic publish (`:4039`) and
+  `finalize_boot_entries` (`:4069`) sits `generate_uki()`. If the UKI it writes
+  does not match the subvolume just published — wrong kernel, stale initramfs,
+  a sign step that "succeeds" — then the default is pointed at a *complete but
+  unbootable* slot, and with the tries counter inert nothing ever moves it back.
+  That window is where to look next, and it is unexamined.
 
   **Not explained, and not guessed at:** why the kernel permits `unlink` on some
   variables and not others. `bootctl set-default` itself rewrites exactly this

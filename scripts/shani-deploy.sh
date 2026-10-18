@@ -2008,8 +2008,32 @@ finalize_boot_entries() {
     # On rollback/restore both slots are known-good so no tries are needed.
     local active_filename active_conf
     if [[ "$use_tries" == "yes" ]]; then
-        # +3-0: 3 tries allowed, 0 done. systemd-boot decrements tries-left on
-        # each boot attempt; when it reaches 0 it boots the fallback entry instead.
+        # +3-0 IS NOT A WORKING COUNTER ON THIS PLATFORM. Measured 2026-10-18 on
+        # a real firmware boot of a machine whose ESP carried this exact suffix:
+        #
+        #   entries on ESP: shanios-blue.conf, shanios-green+3-0.conf
+        #   booted:          rootflags=subvol=@green      <- the +3-0 entry
+        #   LoaderBootCountPath: ABSENT
+        #
+        # systemd-boot does not decrement tries-left here (systemd/systemd#40405),
+        # and LoaderBootCountPath - which systemd-bless-boot requires to seal the
+        # entry, and which systemd-boot sets only for an entry booted WITH counting
+        # in effect - is absent even for an entry that carries the counter. So the
+        # counter is FROZEN: it never falls back, and bless-boot never runs.
+        #
+        # Every earlier measurement of this said "no counter present" because it
+        # read a PLAIN entry, which told us nothing. This one booted the
+        # counter-bearing entry and still shows nothing - that is the difference
+        # between a real result and an absence that looks like one.
+        #
+        # **It is nevertheless load-bearing, as a MARKER.** The dracut pre-mount
+        # hook's failover guard is precisely "the current default carries a tries
+        # counter, which is exactly how a deploy marks an unproven candidate"
+        # (shani-boot-failure-hook.sh). Removing this suffix would silently
+        # disarm the hook - and the hook is currently the only recovery mechanism
+        # observed to do anything. Read the suffix as "this slot is unproven",
+        # NOT as "three tries remain", and do not remove it without changing that
+        # guard in the same change.
         active_filename="${OS_NAME}-${active_slot}+3-0.conf"
     else
         active_filename="${OS_NAME}-${active_slot}.conf"

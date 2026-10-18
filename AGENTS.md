@@ -1562,11 +1562,11 @@ replace the Cassini desktop test above.
   unchanged through the same rewritten function.
   `tests/test-deploy-state.sh` (9/9) still pass.
 
-- **`finalize_boot_entries()`'s `+3-0` tries-counted candidate entry for a
-  fresh deploy likely provides no real automatic hard-failure fallback on
-  this systemd version (High, not independently re-confirmed this
-  session — inferred from existing evidence, needs a dedicated real
-  QEMU+OVMF hard-failure test to close out).** The function's own comment
+- **`finalize_boot_entries()`'s `+3-0` tries-counted candidate entry provides
+  no bootloader-level automatic hard-failure fallback on this systemd version
+  (High). Confirmed by a real firmware boot — but the recovery that happened came
+  from the dracut hook, *not* from `+3-0`, so this mechanism's own safety net is
+  still inert and the underlying defect is unfixed.** The function's own comment
   claims "systemd-boot automatically falls back to the fallback entry if
   it fails to reach multi-user.target" via the `+3-0` tries suffix. But
   `bless-boot.service`'s own comment (already verified via a real
@@ -1583,19 +1583,53 @@ replace the Cassini desktop test above.
   candidate slot would not trigger any bootloader-level fallback —
   systemd-boot would keep retrying the same broken `+3-0` entry
   indefinitely, since `loader.conf`'s `default=` still names it and the
-  file is never aged out. This session verified the marker-file
+  file is never aged out.
+
+  **Run for real since the note above was written**, and the outcome is
+  narrower than it looks (`shani-testbed` scenario C, `vmspawn --commit`,
+  two real firmware boots of `install.img`, candidate made genuinely
+  unbootable by pointing its UKI's own `.cmdline` at `subvol=@no-such-slot`
+  — an entry's `options` line does **not** override an embedded UKI cmdline,
+  which is why an earlier attempt produced a candidate that mounted fine and
+  read as a broken hook):
+
+      boot 1: FAIL: Entering emergency mode (33s)
+              hook: previous boot also failed (@blue); boot default switched
+                    shanios-green+3-0.conf -> shanios-blue.conf
+      ESP:    loader.conf default: shanios-blue.conf      (read back off disk)
+      boot 2: hook: boot_hard_failure cleared — root mount succeeded
+              shanios login:
+
+  So a hard-failing candidate **is** recovered from, on real firmware, with
+  nothing selected by hand — the black screen a power cut produces should not
+  be permanent. **But read what did the recovering:** the `dracut` pre-mount
+  hook rewrote `loader.conf`. The `+3-0` counter was never involved, and on a
+  machine whose EFI state differs that rewrite is itself outranked by
+  `LoaderEntryDefault` (fifth of seven sources in
+  `config_select_default_entry()`), which only the hook's efivarfs clearing
+  removes. **The boot therefore confirms a second, independent mechanism and
+  says nothing about the first** — the `+3-0` net is still inert and this
+  entry's underlying complaint is unfixed.
+
+  This session verified the marker-file
   chain (`mark-boot-in-progress`/`mark-boot-success`/`check-boot-failure`)
   thoroughly via `systemd-nspawn` (`enter`/`verify-boot`), but nspawn
   cannot exercise real UEFI firmware/bootloader entry selection at all —
-  confirming or refuting this specific claim needs an actual QEMU+OVMF
-  boot cycle with a genuinely hard-failing candidate slot, which is slow
-  (no `/dev/kvm` on this host) and was not run this session. Until that's
-  done, treat "automated rollback on boot failure" (touted in this
-  repo's own garuda-comparison table) as unverified for the hard-failure
-  case specifically — the marker/timer path is real and verified, but it
-  only ever *records* a failure; it does not itself switch the default
-  boot entry (see the `--rollback` entry above for what does, and its own
-  gap).
+  which is why the QEMU+OVMF hard-failure cycle above was needed, and why
+  the `+3-0` question could not be settled from the marker/timer tests
+  however thorough they were.
+
+  The marker/timer path is real and verified, but it only ever *records* a
+  failure; **it does not itself switch the default boot entry.** What does is
+  the `dracut` pre-mount hook, and it has now been seen doing so on real
+  firmware with a genuinely unbootable candidate (the two-boot transcript is
+  above) — so "automated recovery from a power cut" is **verified for the
+  hard-failure case** via that path, while remaining **unverified for the
+  `+3-0` path**, which is the mechanism `finalize_boot_entries()` actually
+  relies on. Both statements are worth keeping separate: the first is about
+  the symptom being survivable, the second is about the advertised design
+  working. See the `--rollback` entry above for what else switches the
+  default, and its own gap.
 
 - **Boot-safety units now record their own failure — NEW (2026-09-23).**
   `mark-boot-in-progress`, `mark-boot-success`, `check-boot-failure` and

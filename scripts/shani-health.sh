@@ -224,7 +224,21 @@ _record_check() {
         *)    status="unknown" ;;
     esac
     # Store: section|key|status|message
-    _REPORT_RESULTS+=("${_RECORD_SECTION}|${key}|${status}|${rest}")
+    local entry="${_RECORD_SECTION}|${key}|${status}|${rest}"
+    # A row printed twice files the SAME fact twice - measured live: the slot
+    # showed bees once in the storage-analysis summary and again as a reclaim
+    # hint, and the JSON consumer (shani-cassini's Storage page) then counted
+    # "3 check(s) shani-health flagged" and drew the second check's wording as
+    # two identical rows; the Nagios and Prometheus renderers below would have
+    # raised one condition twice as well. Identical section, key, status AND
+    # message is not two findings, so only the first is recorded; a differing
+    # key, status or message - a real re-check that found something else -
+    # still lands.
+    local _seen
+    for _seen in ${_REPORT_RESULTS[@]+"${_REPORT_RESULTS[@]}"}; do
+        [[ "$_seen" == "$entry" ]] && return 0
+    done
+    _REPORT_RESULTS+=("$entry")
 }
 
 # Set current section for recording
@@ -4078,11 +4092,16 @@ _section_storage() {
     # Device error stats — shared helper
     _stor_check_device_errors /
     local qgroup_out; qgroup_out=$(btrfs qgroup show / 2>&1 || true)
-    if ! echo "$qgroup_out" | grep -q 'ERROR\|quota system is not enabled'; then
-        if echo "$qgroup_out" | grep -qi 'inconsistent\|stale'; then
-            _row "Quotas"    "!!  qgroup inconsistency detected — may cause phantom ENOSPC"
-            _rec "Btrfs qgroup inconsistent — fix: btrfs quota rescan /"
-        fi
+    if echo "$qgroup_out" | grep -q 'ERROR\|quota system is not enabled'; then
+        # Same as analyze_storage below: the not-enabled case gets its own
+        # info row rather than vanishing, so a structured consumer sees the
+        # gap as a state, not as a missing check. --info records no
+        # "consistent" row (that line exists only in --storage-info's deep
+        # analysis); the inconsistency branch stays recommendation-backed.
+        _row "Quotas"    "--  quota system not enabled (no qgroup accounting to check)"
+    elif echo "$qgroup_out" | grep -qi 'inconsistent\|stale'; then
+        _row "Quotas"    "!!  qgroup inconsistency detected — may cause phantom ENOSPC"
+        _rec "Btrfs qgroup inconsistent — fix: btrfs quota rescan /"
     fi
 
     local scrub_st scrub_res
@@ -9019,12 +9038,18 @@ analyze_storage() {
 
     # Qgroup consistency
     local qgroup_out; qgroup_out=$(btrfs qgroup show "$STOR_MNT" 2>&1 || true)
-    if ! echo "$qgroup_out" | grep -q 'ERROR\|quota system is not enabled'; then
-        if echo "$qgroup_out" | grep -qi 'inconsistent\|stale'; then
-            _row "Quotas"    "!!  qgroup inconsistency detected — may cause phantom ENOSPC"
-        else
-            _row "Quotas"    "OK  consistent"
-        fi
+    if echo "$qgroup_out" | grep -q 'ERROR\|quota system is not enabled'; then
+        # A check that cannot run is said rather than skipped: "quota system
+        # not enabled" was invisible before (no row at all), and a consumer
+        # cannot tell a system without qgroup accounting from a tool that
+        # forgot to look - shani-cassini's Storage page rendered this as
+        # "Not reported by shani-health" on every machine with quotas off.
+        # Info, not a recommendation: quotas OFF is an opt-out, not a defect.
+        _row "Quotas"    "--  quota system not enabled (no qgroup accounting to check)"
+    elif echo "$qgroup_out" | grep -qi 'inconsistent\|stale'; then
+        _row "Quotas"    "!!  qgroup inconsistency detected — may cause phantom ENOSPC"
+    else
+        _row "Quotas"    "OK  consistent"
     fi
 
     # Scrub status

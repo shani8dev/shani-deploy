@@ -991,7 +991,25 @@ _section_boot_health() {
             # Slots section already emits a rollback rec for this case; skip duplicate
         fi
     fi
-    # mark-boot-in-progress CLEARS this on every boot, so its presence means:
+    # oomctl / systemd-oomd status — requires working memory cgroup controller
+  # Verified unavailable on this image/container (ConditionControlGroupController=memory
+  # missing); see session audit. Do NOT claim OK when silent.
+  if command -v oomctl &>/dev/null; then
+    if systemctl is-enabled systemd-oomd &>/dev/null; then
+      local _oom_status="!   enabled but not running (memory-cgroup missing?)"
+      if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+        _oom_status="OK  oomd running"
+      fi
+      _row "OOM killer"  "${_oom_status}"
+      _rec "oomctl needs memory cgroup controller (not present here); get a real dump from a working slot before parsing output (see session audit)"
+    else
+      _row "OOM killer"  "--  systemd-oomd not enabled"
+      _rec "Enable with: systemctl enable --now systemd-oomd (requires memory controller)"
+    fi
+  else
+    _row "OOM killer"  "--  oomctl not installed"
+  fi
+  # mark-boot-in-progress CLEARS this on every boot, so its presence means:
     # the rollback dialog ran this boot but rollback may not have completed
     if [[ -f "$DATA_BOOT_FAIL_ACKED" ]]; then
         _row "Acked"      "!   failure acked but rollback may not have completed"

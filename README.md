@@ -13,6 +13,24 @@ writes the new state, `shani-health` inspects and reports on it,
 `shani-reset` and the boot-failure/rollback machinery recover from it going
 wrong.
 
+## Demo
+
+[![shani-deploy demo: a real update to @green, reboot, and rollback to @blue](docs/media/shani-deploy-demo.jpg)](docs/media/shani-deploy-demo.mp4)
+
+[Watch the 2-minute demo](docs/media/shani-deploy-demo.mp4). It opens with a
+tour of this repository, then shows a real run on an installed ShaniOS GNOME
+system booted in shani-testbed (October 2026):
+
+1. `--status --check --json` on @blue (v20260925) reports stable v20261010.
+2. `shani-deploy --channel stable` downloads the image, verifies SHA256 and
+   GPG, backs up and writes @green, and signs its UKI.
+3. After the reboot, @green runs v20261010.
+4. `shani-deploy --rollback` makes @blue the default again, and the next boot
+   is back on v20260925.
+
+The command output is real. The update log is shortened: download-tool
+progress, retries and container-only messages are left out.
+
 ## The blue-green model, in short
 
 Shanios keeps two root subvolumes, `@blue` and `@green`. Exactly one is

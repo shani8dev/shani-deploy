@@ -3603,6 +3603,8 @@ reclaim_swap_space() {
     fi
     if [[ "${DRY_RUN}" == "yes" ]]; then
         log_warn "[DRY-RUN] Would shrink the swapfile ${size_mb}MB -> ${new}MB to make room for the update"
+        # Nothing was freed, so let check_space count what a real run would free
+        DRY_RUN_RECLAIMED_MB=$(( size_mb - new ))
         return 0
     fi
     log_warn "Shrinking the swapfile ${size_mb}MB -> ${new}MB to make room for the update (zram still provides swap)"
@@ -3634,8 +3636,9 @@ check_space() {
     # never had room (28 GB disk: 8230 MB free, 10240 needed). Give the
     # update the space from the swapfile instead; zram still provides swap.
     if (( free_mb < MIN_FREE_SPACE_MB )) && [[ -f /swap/swapfile ]]; then
+        DRY_RUN_RECLAIMED_MB=0
         reclaim_swap_space "$free_mb" || true
-        free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 ))
+        free_mb=$(( $(df --output=avail "/data" | tail -1) / 1024 + DRY_RUN_RECLAIMED_MB ))
         log "Available space now: ${free_mb}MB"
     fi
 

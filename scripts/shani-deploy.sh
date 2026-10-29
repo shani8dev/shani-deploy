@@ -433,12 +433,19 @@ log_section() {
 #####################################
 
 run_cmd() {
+    local IFS=' '   # the global IFS=$'\n\t' would log one argument per line
     if [[ "${DRY_RUN}" == "yes" ]]; then
         log "[DRY-RUN] $*"
         return 0
     fi
     log_verbose "Executing: $*"
     "$@" || { log_error "Command failed: $*"; return 1; }
+}
+
+# log, but only before the systemd-inhibit re-exec: the re-exec'd copy runs
+# the same startup steps again and would print every line twice.
+log_startup() {
+    if [[ -n "${SYSTEMD_INHIBITED:-}" ]]; then log_verbose "$@"; else log "$@"; fi
 }
 
 validate_nonempty() {
@@ -903,6 +910,12 @@ discover_mirror() {
     echo ""
 }
 
+# Status code of the last HTTP response in wget -S / curl -IL output
+# (HTTP/1.1 and HTTP/2 alike), so redirects are judged by where they end.
+_final_http_status() {
+    grep -oE 'HTTP/[0-9.]+ [0-9]{3}' <<< "$1" | tail -1 | awk '{print $2}'
+}
+
 validate_mirror() {
     local mirror_url="$1"
 
@@ -918,18 +931,19 @@ validate_mirror() {
 
         log_verbose "Wget validation response: ${response:0:200}"
 
-        if echo "$response" | grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:"; then
+        # Judge the LAST status line: a mirror that 301s to a 404 is not valid
+        if [[ "$(_final_http_status "$response")" == 2* ]]; then
             log_verbose "Mirror validation: PASS (wget)"
             return 0
         fi
     elif (( HAS_CURL )); then
         local response
-        response=$(timeout 20 curl -sI --connect-timeout 8 --max-time 15 \
+        response=$(timeout 20 curl -sIL --connect-timeout 8 --max-time 15 \
             "$mirror_url" 2>&1 || echo "")
 
         log_verbose "Curl validation response: ${response:0:200}"
 
-        if echo "$response" | grep -qi "HTTP/[12].[01] [23][0-9][0-9]\|Content-Length:"; then
+        if [[ "$(_final_http_status "$response")" == 2* ]]; then
             log_verbose "Mirror validation: PASS (curl)"
             return 0
         fi
@@ -948,8 +962,9 @@ get_mirror_url() {
         local cached
         cached=$(cat "$mirror_cache" 2>/dev/null | head -1 | tr -d '\r\n' | xargs)
         if [[ -n "$cached" ]]; then
-            # Reconstruct full URL from cached base
-            local full_url="${cached}/${filename}"
+            # The cache holds the mirror root (.../project/<name>), so every
+            # filepath (gnome vs gnome/<version>) gets its own directory
+            local full_url="${cached}/${filepath}/${filename}"
             log_verbose "Testing cached mirror: $(echo "$cached" | sed -E 's|https://([^/]+).*|\1|')"
 
             if validate_mirror "$full_url"; then
@@ -996,8 +1011,11 @@ get_mirror_url() {
             local mirror_host
             mirror_host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|')
             log_success "Mirror validated: $mirror_host"
-            mkdir -p "$DOWNLOAD_DIR"
-            echo "$base_url" > "$mirror_cache"
+            # Cache only the root; skip caching if the layout is unexpected
+            if [[ "$base_url" == */"$filepath" ]]; then
+                mkdir -p "$DOWNLOAD_DIR"
+                echo "${base_url%/"$filepath"}" > "$mirror_cache"
+            fi
             echo "$full_url"
             return 0
         else
@@ -1470,7 +1488,7 @@ acquire_deploy_lock() {
 }
 
 check_internet() {
-    log "Checking internet connectivity..."
+    log_startup "Checking internet connectivity..."
     # Try ICMP first (fastest), then fall back to HTTP HEAD for environments
     # where ICMP is blocked (corporate firewalls, VPNs, containers).
     if ping -c1 -W2 8.8.8.8 &>/dev/null; then
@@ -1505,8 +1523,8 @@ set_environment() {
     validate_nonempty "$LOCAL_VERSION" "LOCAL_VERSION"
     validate_nonempty "$LOCAL_PROFILE" "LOCAL_PROFILE"
 
-    log "Running system: v${LOCAL_VERSION} profile=${LOCAL_PROFILE}"
-    log "Update channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"
+    log_startup "Running system: v${LOCAL_VERSION} profile=${LOCAL_PROFILE}"
+    log_startup "Update channel: ${UPDATE_CHANNEL} (source: ${UPDATE_CHANNEL_SOURCE})"
 }
 
 #####################################
@@ -1516,7 +1534,7 @@ set_environment() {
 self_update() {
     [[ -n "${SELF_UPDATE_DONE:-}" ]] && { log_verbose "Script self-update already done this session, skipping"; return 0; }
     if [[ "${SKIP_SELF_UPDATE}" == "yes" ]]; then
-        log "Script self-update skipped (--skip-self-update)"
+        log_startup "Script self-update skipped (--skip-self-update)"
         return 0
     fi
     if [[ -f "$DEPLOY_PENDING" ]]; then
@@ -2916,11 +2934,16 @@ verify_existing_deployment() {
             has_backup=$(echo "$_svol_list" | awk -v s="${slot}_backup_" '$NF ~ s {print $NF; exit}' || echo "")
             if [[ -n "$has_backup" ]]; then
                 local bk_created
-                bk_created=$(btrfs subvolume show "$MOUNT_DIR/@${has_backup}" 2>/dev/null | awk -F'\t' '/Creation time:/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || true)
+                bk_created=$(btrfs subvolume show "$MOUNT_DIR/${has_backup}" 2>/dev/null | awk '/Creation time:/{sub(/^.*Creation time:[[:space:]]*/, ""); print; exit}' || true)
                 _row "Backup @${slot}" "OK  ${has_backup} (created: ${bk_created:-unknown})"
+            elif [[ "$slot" == "$booted" ]]; then
+                # A backup is taken of the slot an update overwrites, never
+                # of the running one - its absence is the normal state
+                _row "Backup @${slot}" "--  none (the running slot needs none)"
             else
-                _row "Backup @${slot}" "!!  no backup snapshot available"
-                issues=$(( issues + 1 ))
+                # Only an overwritten slot has one: none yet on a fresh
+                # install, and rollback by boot-default switch still works
+                _row "Backup @${slot}" "!   none yet (taken when the next update overwrites it)"
             fi
         done
         safe_umount "$MOUNT_DIR" || force_umount_all "$MOUNT_DIR" || true
@@ -2963,13 +2986,13 @@ list_backups() {
             found=1
             local bk_path="$MOUNT_DIR/${backup}"
             local bk_created bk_size
-            bk_created=$(btrfs subvolume show "$MOUNT_DIR/${backup}" 2>/dev/null | awk -F'\t' '/Creation time:/{gsub(/^[[:space:]]+/,"",$2); print $2}' | head -1 || echo "unknown")
+            bk_created=$(btrfs subvolume show "$MOUNT_DIR/${backup}" 2>/dev/null | awk '/Creation time:/{sub(/^.*Creation time:[[:space:]]*/, ""); print; exit}' || true)
             if [[ -d "$bk_path" ]]; then
                 bk_size=$(du -sh "$bk_path" 2>/dev/null | awk '{print $1}' || echo "?")
             else
                 bk_size="?"
             fi
-            printf "  └─ %s  (created: %s, size: %s)\n" "${backup#@}" "$bk_created" "$bk_size"
+            printf "  └─ %s  (created: %s, size: %s)\n" "${backup#@}" "${bk_created:-unknown}" "$bk_size"
         done < <(echo "$_svol_list" | awk -v s="${slot}_backup_" '$NF ~ s {print $NF}' | sort)
 
         if [[ $found -eq 0 ]]; then
@@ -4184,13 +4207,19 @@ deploy_update() {
     CANDIDATE_MODIFIED="yes"
     run_cmd btrfs property set -f -ts "$MOUNT_DIR/@${CANDIDATE_SLOT}" ro true
 
-    btrfs_subvol_exists "$temp/shanios_base" && \
-        { btrfs_subvolume_delete_safe "$temp/shanios_base" || log_warn "Could not delete temp_update/shanios_base — will be cleaned on next deploy"; }
-    btrfs_subvolume_delete_safe "$temp" || log_warn "Could not delete temp_update — will be cleaned on next deploy"
-    btrfs_sync "$MOUNT_DIR"
+    if [[ "${DRY_RUN}" == "no" ]]; then   # a dry run created no temp_update
+        btrfs_subvol_exists "$temp/shanios_base" && \
+            { btrfs_subvolume_delete_safe "$temp/shanios_base" || log_warn "Could not delete temp_update/shanios_base — will be cleaned on next deploy"; }
+        btrfs_subvolume_delete_safe "$temp" || log_warn "Could not delete temp_update — will be cleaned on next deploy"
+        btrfs_sync "$MOUNT_DIR"
+    fi
 
     [[ "${DRY_RUN}" == "no" ]] && touch "$DEPLOY_PENDING"
-    log_success "Image deployed to @${CANDIDATE_SLOT} (v${REMOTE_VERSION}) — pending finalization"
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[DRY-RUN] Would deploy v${REMOTE_VERSION} to @${CANDIDATE_SLOT}"
+    else
+        log_success "Image deployed to @${CANDIDATE_SLOT} (v${REMOTE_VERSION}) — pending finalization"
+    fi
 }
 
 finalize_update() {
@@ -4472,7 +4501,7 @@ main() {
 
     check_root
     acquire_deploy_lock
-    [[ "${DRY_RUN}" == "yes" ]] && log_warn "[DRY-RUN] Simulation mode active — no changes will be made to the system"
+    [[ "${DRY_RUN}" == "yes" && -z "${SYSTEMD_INHIBITED:-}" ]] && log_warn "[DRY-RUN] Simulation mode active — no changes will be made to the system"
 
     if [[ "$SET_CHANNEL" == "yes" ]]; then
         set_channel_persistent "$SET_CHANNEL_VAL"
@@ -4579,7 +4608,9 @@ main() {
     fi
 
     deploy_update || die "Deployment failed"
-    if [[ -f "$DEPLOY_PENDING" ]]; then
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log_success "[DRY-RUN] Simulation complete — nothing was changed"
+    elif [[ -f "$DEPLOY_PENDING" ]]; then
         finalize_update
     else
         log_warn "Deployment pipeline completed but no pending flag was found — state may be inconsistent"

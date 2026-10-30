@@ -82,6 +82,11 @@ target_path() {
         # shani-settings ships - pacman replaces a shipped file, which would
         # delete every share a user had created.
         smb_share)          printf '/etc/samba/smb.conf.d/50-shani-cassini.conf' ;;
+        # /etc/hosts is the static name table. The drop-in convention does not
+        # apply here - there is no include mechanism for hosts - so this is a
+        # direct write to the one file, the same shape as subject_mapping above.
+        # Mode 0644: hosts is world-readable by design, every resolver reads it.
+        hosts)              printf '/etc/hosts' ;;
         # Three files that have NO drop-in mechanism and NO validator of their
         # own. See target_validators for why they are here at all despite the
         # "drop-ins only" rule above.
@@ -114,7 +119,7 @@ target_mode() {
         modules_load)      printf '0644' ;;
         modprobe_blacklist) printf '0644' ;;
         smb_share)          printf '0644' ;;
-        # subject_mapping holds a subject-to-login mapping; 0600 because it is
+        hosts)              printf '0644' ;;        # subject_mapping holds a subject-to-login mapping; 0600 because it is
         # a principal list and nothing needs to read it but root. The mode the
         # shipped file already has is preserved by the read-back check, so a
         # number here that disagrees shows up rather than silently changing it.
@@ -276,13 +281,20 @@ target_validators() {
             PRE_VALIDATOR_CMD=("$0" --check-nut-upsmon-conf)
             POST_VALIDATOR_CMD=("$0" --check-nut-upsmon-conf-live)
             ;;
+        # /etc/hosts has no validator of its own. Check structurally: every
+        # non-blank, non-comment line must start with an IP address (IPv4 or
+        # IPv6) followed by at least one name.
+        hosts)
+            PRE_VALIDATOR_CMD=("$0" --check-hosts)
+            POST_VALIDATOR_CMD=("$0" --check-hosts-live)
+            ;;
         *)                 return 1 ;;
     esac
 }
 
 usage() {
     cat >&2 <<EOF
-usage: $PROG --target <sudoers|sshd_config|exports|modules_load|modprobe_blacklist|smb_share|subject_mapping|pam_yubico|krb5_conf|irqbalance_env|nut_upsmon_conf|nut_ups_conf> [--expect-sha256 <64-hex>] < content
+usage: $PROG --target <sudoers|sshd_config|exports|modules_load|modprobe_blacklist|smb_share|subject_mapping|pam_yubico|krb5_conf|irqbalance_env|nut_upsmon_conf|nut_ups_conf|hosts> [--expect-sha256 <64-hex>] < content
 
 Reads the new content from stdin and installs it over one known target, after
 validating it. The content is never taken from a caller-named path.
@@ -700,6 +712,39 @@ offdelay ondelay pollinterval "
 
 
 
+# hosts: every non-blank, non-comment line must start with an IP address
+# (IPv4 or IPv6) followed by at least one name. A line that does not is
+# refused before anything is written.
+check_hosts_file() {
+    local file="$1" where="$2" lineno=0 line ip names
+    [[ -f "$file" ]] || { printf '%s: %s: no such file: %s\n' "$PROG" "$where" "$file" >&2; return 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ "$line" == \#* || -z "$line" ]] && continue
+        local body="$line"
+        if [[ "$body" == *"#"* ]]; then
+            body="${body%%#*}"
+            body="${body%"${body##*[![:space:]]}"}"
+        fi
+        [[ -z "$body" ]] && continue
+        read -r ip names <<< "$body"
+        [[ -n "$ip" && -n "$names" ]] || {
+            printf '%s: %s line %s: expected IP and at least one name: %s\n' \
+                "$PROG" "$where" "$lineno" "$line" >&2; return 1; }
+        if [[ "$ip" == *:* ]]; then
+            [[ "$ip" == *:*:* ]] || {
+                printf '%s: %s line %s: not a valid IPv6 address: %s\n' \
+                    "$PROG" "$where" "$lineno" "$ip" >&2; return 1; }
+        else
+            [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                printf '%s: %s line %s: not a valid IPv4 address: %s\n' \
+                    "$PROG" "$where" "$lineno" "$ip" >&2; return 1; }
+        fi
+    done < "$file"
+    return 0
+}
+
 # subject_mapping: one mapping per line, three whitespace-separated fields
 # (subject, login, key). A line with the wrong arity is the failure that would
 # silently drop a mapping at login time.
@@ -876,6 +921,11 @@ case "${1:-}" in
         live="$(target_path subject_mapping)"
         [[ -f "$live" ]] || exit 0
         check_subject_mapping_file "$live" "the live file"; exit $? ;;
+    --check-hosts)               [[ $# -ge 2 ]] || usage; check_hosts_file "$2" "the fragment"; exit $? ;;
+    --check-hosts-live)
+        live="$(target_path hosts)"
+        [[ -f "$live" ]] || exit 0
+        check_hosts_file "$live" "the live file"; exit $? ;;
     --check-pam-yubico)           [[ $# -ge 2 ]] || usage; _check_ini "$2" "the fragment" 0; exit $? ;;
     --check-pam-yubico-live)
         live="$(target_path pam_yubico)"

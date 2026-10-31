@@ -22,6 +22,13 @@ from grepping `shani-backup`, `shani-deploy`, `shani-settings`,
 
 ### Corrections found by that verification
 
+6. **`@data` pre-deploy snapshot implemented and then reverted** (2026-10-31).
+   Architectural check: `@data` snapshots would live inside `@data`, which
+   `shani-reset --hard` wipes, and rollback does not restore `@data`, so there
+   is no durable home and no automatic restore path. Home snapshots survive
+   reset because they live under `@home`. The etc-factory overlay already
+   handles default upgrades for `@data`. Only the `/home` half ships.
+
 1. **"The deploy path never calls the home snapshot" is no longer true.**
    It did when the analysis was written. As of commit `109d81b`
    (`shani-deploy` pkgrel 108) `deploy_update()` calls

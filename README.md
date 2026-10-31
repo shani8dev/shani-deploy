@@ -48,6 +48,28 @@ tries) falls back to the previous slot automatically, and the
 that state through `shani-deploy --status --check --json` and surfaces it
 in Updates & Rollback.
 
+## Pre-deploy `/home` snapshot
+
+Before `deploy_update()` mounts the disk or writes to the standby slot,
+`shani-deploy` runs `shani-snapshot-home` (root, system-wide) to take a
+fresh read-only snapshot of every home under `/home/.snapshots/`. The
+update only replaces `@blue`/`@green`; the snapshot covers the files it
+does not replace, so a bad release, an in-place state migration, or a
+rollback still has a same-minute copy. The newest two pre-deploy
+snapshots are kept; daily and manual snapshots are untouched.
+
+It is taken by the system as root, not by each user: a btrfs snapshot
+needs root, an unattended update has no session, and the snapshot must
+cover accounts that are not logged in. Opt out with `home_snapshot=no`
+in `/etc/shani/shani.conf` (or `--no-home-snapshot` for one run); tune
+retention with `home_snapshot_keep` (`0` keeps all). A failure or skip is
+logged as a warning and never blocks the update.
+
+`@data` is **not** snapshotted: its snapshots would live inside `@data`,
+which `shani-reset --hard` wipes, and rollback does not restore `@data`,
+so there is no durable home and no automatic restore path. Home
+snapshots survive reset because they live under `@home`.
+
 ## Scripts
 
 ### `scripts/shani-deploy.sh`
@@ -62,6 +84,9 @@ Key flags:
 - `--download-only` — fetch and verify the image, don't deploy it yet
 - `-d`, `--dry-run` — simulate without making changes
 - `--set-channel` — persist a channel choice to `/etc/shani-channel`
+- `--no-home-snapshot` — skip the pre-deploy `/home` snapshot for this run
+- `--profile NAME` — deploy a different profile's image into the standby slot
+  (updates `/etc/shani-profile` only after a successful deploy)
 
 Auto-reboot is opt-in (`AUTO_REBOOT=yes`, default `no`). The candidate slot is fully deployed and bootable the moment the script finishes — nothing about correctness depends on rebooting promptly.
 
@@ -149,7 +174,9 @@ update or perform rollback. `shani-download-only.timer`/`.service`
 (system-level) is a separate opt-in pre-fetch-only timer.
 `flatpak-update-system.timer`/`.service` and the user-level
 `flatpak-update-user.timer`/`.service` handle Flatpak updates independently
-of the OS slot update cycle.
+of the OS slot update cycle. Each run starts with a best-effort
+`flatpak repair` (system or user) before updating and pruning unused
+runtimes.
 
 **User provisioning:** `shani-user-setup.path`/`.service` — see above.
 
@@ -246,6 +273,10 @@ and the blog reference posts mirror this README's flag tables.
   failure" as unverified for the hard-failure case specifically — the
   marker/timer path is real and verified, but it only ever *records* a
   failure; it does not itself switch the default boot entry.
+- `lockdown=confidentiality` added to the UKI cmdline (2026-10-31) but
+  not yet exercised under a real boot for NVIDIA/kexec/hibernation.
+- sched-ext default scheduler (`scx_lavd` via `scx_loader --auto`) enabled
+  in shani-settings 0.0.5-58 but not yet exercised under a real boot.
 
 **Cross-repo impact:**
 - `shani-fleet`'s `check_selfupdate()` independently re-implements this

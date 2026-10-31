@@ -132,10 +132,10 @@ wrong.
 | Profile/edition swap | Manifest carries profile; deploy warns on mismatch but has no `--profile` | Take — small |
 | `lockdown=confidentiality` | Absent; `shani-health` already recommends it (line ~1870) | Take — one token |
 | `MODULE_SIG_FORCE` | Absent | Reject — custom kernel |
-| Gaming/input gaps | gamescope, mangohud, game-devices-udev present; **vkBasalt present as a Flatpak Vulkan layer**; xpadneo/xone/scx absent | Take the missing pacman packages; vkBasalt needs no work |
-| Virtualisation gaps | libvirt + qemu-base present; swtpm/edk2-ovmf/virtiofsd absent | Take packages |
+| Gaming/input gaps | gamescope, mangohud, game-devices-udev present; **vkBasalt present as a Flatpak Vulkan layer**; scx-scheds + scx-tools now in `shani-core` (2026-10-31); xpadneo/xone are AUR-only and need their own PKGBUILDs | Partially done |
+| Virtualisation gaps | libvirt + qemu-base present; swtpm/edk2-ovmf/virtiofsd now in `shani-core` (2026-10-31) | Done |
 | Waydroid | waydroid + waydroid-helper present; no `binder_linux` module found anywhere | Fix/verify |
-| Flatpak maintenance | `flatpak update` + `flatpak uninstall --unused --delete-data` (system and user units in `shani-deploy`); no runtime `flatpak repair` | Take one line |
+| Flatpak maintenance | `flatpak update` + `flatpak uninstall --unused --delete-data` (system and user units in `shani-deploy`); `flatpak repair` now runs as a best-effort `ExecStartPre` on both units (2026-10-31), plus a generous `TimeoutStartSec` | Done |
 | Browser RAM cache | No `profile-sync-daemon` | Take |
 | ddcutil | Installed via `shani-tools-extra` (in `Packages-Extras`); no `i2c-dev` / PowerDevil integration | Small take |
 | Weekly btrfs defrag | Present (`BTRFS_DEFRAG_PERIOD="weekly"`), which breaks reflinks/dedup and adds wear; balance/scrub/trim also weekly | Review — ShaniOS-specific, not from Dragon |
@@ -169,13 +169,15 @@ wrong.
 
 6. **Rescue UKI in the 1 GiB ESP** — measured, not 450 MB by assumption; keep
    it compatible with existing 1 GiB installs.
-7. **Package gaps** — xpadneo, xone, scx-scheds, swtpm, edk2-ovmf, virtiofsd;
-   verify/fix `binder_linux` for Waydroid. (vkBasalt is already delivered as
-   a Flatpak layer.)
+7. **Package gaps** — scx-scheds/scx-tools, swtpm, edk2-ovmf, virtiofsd now
+   shipped in `shani-core` (2026-10-31). xpadneo and xone are AUR-only and
+   need their own PKGBUILDs (ChimeraOS packages them; DKMS). `binder_linux`
+   for Waydroid still unverified. (vkBasalt is already delivered as a Flatpak
+   layer.)
 8. **Profile swap into the standby slot** — `shani-deploy --profile <name>`;
    the artifact and slot mechanism already exist.
-9. **`flatpak repair` + `profile-sync-daemon`** — one line for repair (the
-   update/uninstall units already exist), one package/config for psd.
+9. **`flatpak repair`** — done (best-effort `ExecStartPre` on both update
+   units, 2026-10-31). `profile-sync-daemon` still open.
 10. **Review btrfsmaintenance:** weekly defrag is actively harmful to reflinks
     and dedup; weekly balance is more aggressive than needed. Reduce both,
     keep weekly scrub/trim.

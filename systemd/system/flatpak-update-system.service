@@ -30,7 +30,15 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=500
 LogLevelMax=info
+# Repair + update + unused-removal can take well over the default 90s on a
+# large installation; never time the unit out mid-operation.
+TimeoutStartSec=0
 
+# Repair first: a power cut or partial write during an update can leave the
+# OSTree repo with dangling objects or wrong permissions. `flatpak repair`
+# checks every object and fixes what it can; a failure here must not block
+# the subsequent update, hence the leading '-'.
+ExecStartPre=-/usr/bin/flatpak repair --system
 ExecStart=/usr/bin/flatpak update --noninteractive --assumeyes --system
 ExecStartPost=/usr/bin/flatpak uninstall --unused --delete-data --noninteractive --assumeyes --system
 

@@ -365,9 +365,10 @@ Findings are ordered by severity.
 | 1 | **scx schedulers installed but dormant.** `shani-core` pulls `scx-scheds` + `scx-tools` (added 2026-10-31) but no unit enables a scheduler; `shani-settings` has no scx reference. The "Next-Gen Kernel Scheduling" claim is unfulfilled. | `grep scx shani-settings/` → empty | Gaming boosters inert | Add a `scx-scheduler.service` (scx_bpfland default) enabled in `shani-settings.install`, or document manual `scxctl` |
 | 2 | **LSM `lockdown` in "none" mode while health recommends confidentiality.** UKI cmdline enforces `lsm=...lockdown...` but no `lockdown=confidentiality`; `shani-health.sh:~1870` recommends it. Contradictory posture. | `configure.sh:911` cmdline; health row | Security claim overstated | Either set `lockdown=confidentiality` (testbed run) or stop recommending it |
 | 3 | **Weekly btrfs defrag fights dedup.** `BTRFS_DEFRAG_PERIOD="weekly"` in shared/server overlays; defrag breaks reflinks/dedup and adds wear, while beesd dedups. Contradictory goals. | overlay `btrfsmaintenance` | Wear + dedup loss | Defrag → monthly or `none`; keep scrub (monthly) + trim (weekly) |
-| 4 | **`shani-settings` manifest in volatile `/var`.** `install_nut_baseline()` writes `/var/lib/shani-settings/nut-baseline.sha256`; `/var/lib/shani-settings` is **not** in the `varlib_dirs` bind list, so `/var` is tmpfs at runtime → manifest lost on reboot. | `configure.sh` varlib_dirs (no `shani*`); install hook | Baseline re-evaluated every boot | Store manifest under `/data` (persistent) |
+| 4 | **`shani-settings` manifest in volatile `/var`.** `install_nut_baseline()` writes `/var/lib/shani-settings/nut-baseline.sha256`; `/var/lib/shani-settings` is **not** in the `varlib_dirs` bind list, so `/var` is tmpfs at runtime → manifest lost on reboot. | `configure.sh` varlib_dirs (no `shani*`); install hook | Baseline re-evaluated every boot | **Fixed 2026-10-31:** manifest path moved to `/data/varlib/shani-settings/nut-baseline.sha256` (persistent, no bind mount needed) |
 | 5 | **gamescope profile lacks home snapshots.** `shani-backup` is in gnome/plasma/niri/cosmic `Packages-Desktop` but not gamescope. A gaming profile has no automated `/home` snapshots. | profile Packages-Desktop grep | Inconsistent coverage | Add `shani-backup` to gamescope Packages-Desktop |
 | 6 | **shim MOK password is the well-known literal `shanios`** on every install. Documented, but any attacker who knows it can enroll their own MOK at first boot if they win the race. | `configure.sh:1105` | Documented risk | Acceptable (documented); consider randomizing per-install if higher assurance wanted |
+| 7 | **plasmalogin greeter branding lost on reboot.** `provision_plasmalogin()` writes theme/kdeglobals/kvantum to `/var/lib/plasmalogin/.config/kdedefaults`, but `/var/lib/plasmalogin` was not in `varlib_dirs`, so `/var` tmpfs wipes it → stock Breeze greeter at runtime. | `shani-desktop-plasma.install` provision_plasmalogin; varlib_dirs | Visible regression | **Fixed 2026-10-31:** branding now shipped under `/usr/share/shani/plasmalogin/` and re-applied at boot by `shani-plasmalogin-branding.service`; `plasmalogin` added to `varlib_dirs` (install.sh + configure.sh) for persistence |
 
 ### B.2 Architectural gaps / unfulfilled claims (not bugs, but "claimed and not delivered")
 
@@ -392,6 +393,13 @@ Findings are ordered by severity.
 - Hibernate wired (`resume=` in configure.sh and gen-efi.sh).
 - Profile swap (`--profile`) writes identity only after successful deploy.
 - shani-reset wipes `/data` but preserves @home/@root/@blue/@green/ESP; accounts recreated by first-run wizard. Coherent with the overlay model.
+
+### Fixed in this pass (2026-10-31)
+
+- **btrfs defrag** `BTRFS_DEFRAG_PERIOD="weekly"` → `"none"` in shared + server overlays (defrag breaks reflinks/dedup and adds wear; scrub/trim/balance cadence left as-is pending a separate decision).
+- **gamescope profile** gained `shani-backup` in `Packages-Desktop` (home snapshots now cover the gaming profile).
+- **nut baseline manifest** moved from `/var/lib/shani-settings/` to `/data/varlib/shani-settings/` (persistent).
+- **plasmalogin greeter branding** no longer lost on reboot (shipped under `/usr/share/shani/plasmalogin/`, re-applied by `shani-plasmalogin-branding.service`, `plasmalogin` added to `varlib_dirs`).
 
 ### B.4 Recommended improvement order (lowest risk first)
 

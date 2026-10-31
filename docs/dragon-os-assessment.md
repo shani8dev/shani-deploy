@@ -349,3 +349,56 @@ is either already present in ShaniOS, a rearchitecture that has been ruled
 out (dm-verity/EROFS, reflink/chunk deltas, mkosi, custom kernel signing,
 aarch64, whole-disk ownership, single DE, no-pacman runtime), or a
 downgrade (7 GB ESP, assistant rewrite).
+
+---
+
+## Appendix B: ShaniOS internal architecture consistency audit (2026-10-31)
+
+Checked: subvolume layout vs. bind mounts, volatile `/var` vs. persisted state,
+security posture, scheduling claims, profile coverage, and reset durability.
+Findings are ordered by severity.
+
+### B.1 Real inconsistencies (shipped code contradicts the claim or breaks on reboot)
+
+| # | Finding | Evidence | Impact | Fix |
+|---|---|---|---|---|
+| 1 | **scx schedulers installed but dormant.** `shani-core` pulls `scx-scheds` + `scx-tools` (added 2026-10-31) but no unit enables a scheduler; `shani-settings` has no scx reference. The "Next-Gen Kernel Scheduling" claim is unfulfilled. | `grep scx shani-settings/` → empty | Gaming boosters inert | Add a `scx-scheduler.service` (scx_bpfland default) enabled in `shani-settings.install`, or document manual `scxctl` |
+| 2 | **LSM `lockdown` in "none" mode while health recommends confidentiality.** UKI cmdline enforces `lsm=...lockdown...` but no `lockdown=confidentiality`; `shani-health.sh:~1870` recommends it. Contradictory posture. | `configure.sh:911` cmdline; health row | Security claim overstated | Either set `lockdown=confidentiality` (testbed run) or stop recommending it |
+| 3 | **Weekly btrfs defrag fights dedup.** `BTRFS_DEFRAG_PERIOD="weekly"` in shared/server overlays; defrag breaks reflinks/dedup and adds wear, while beesd dedups. Contradictory goals. | overlay `btrfsmaintenance` | Wear + dedup loss | Defrag → monthly or `none`; keep scrub (monthly) + trim (weekly) |
+| 4 | **`shani-settings` manifest in volatile `/var`.** `install_nut_baseline()` writes `/var/lib/shani-settings/nut-baseline.sha256`; `/var/lib/shani-settings` is **not** in the `varlib_dirs` bind list, so `/var` is tmpfs at runtime → manifest lost on reboot. | `configure.sh` varlib_dirs (no `shani*`); install hook | Baseline re-evaluated every boot | Store manifest under `/data` (persistent) |
+| 5 | **gamescope profile lacks home snapshots.** `shani-backup` is in gnome/plasma/niri/cosmic `Packages-Desktop` but not gamescope. A gaming profile has no automated `/home` snapshots. | profile Packages-Desktop grep | Inconsistent coverage | Add `shani-backup` to gamescope Packages-Desktop |
+| 6 | **shim MOK password is the well-known literal `shanios`** on every install. Documented, but any attacker who knows it can enroll their own MOK at first boot if they win the race. | `configure.sh:1105` | Documented risk | Acceptable (documented); consider randomizing per-install if higher assurance wanted |
+
+### B.2 Architectural gaps / unfulfilled claims (not bugs, but "claimed and not delivered")
+
+| # | Claim | Reality | Action |
+|---|---|---|---|
+| 7 | "Encrypted hibernation" via `@swap` | `@swap` + nodatacow exists and `resume=` is wired in `configure.sh`/`gen-efi.sh` | OK, verified wired |
+| 8 | `+3-0` tries counter as automatic fallback | Inert on this systemd (documented); dracut hook is the real recovery | Documented; no code change (advertised design is misleading though) |
+| 9 | Waydroid (binderfs) | `waydroid` + `waydroid-helper` shipped; no `binder_linux` module reference anywhere | Verify kernel has `CONFIG_ANDROID_BINDER_IPC` and auto-load; test in slot |
+| 10 | `@data` pre-deploy snapshot | Reverted (no durable home / no auto-restore). Documented. | Keep reverted |
+| 11 | `fs-verity` per-file hardening | Available (kernel 6.2+), not used | Optional, low priority |
+| 12 | Virtual devices (v4l2loopback, vhba) | Not referenced in pkgbuilds | Verify or drop claim |
+
+### B.3 Things that are consistent and correct (no action)
+
+- Subvolume layout (`@blue`/`@green`/`@home`/`@root`/`@data`/`@nix`/`@cache`/`@log`/`@flatpak`/`@snapd`/`@waydroid`/`@containers`/`@machines`/`@lxc`/`@lxd`/`@qemu`/`@libvirt`/`@swap`) matches the persistent-state bind-mount strategy; volatile `/var` base + persistent subvolumes on top is coherent.
+- `/etc` overlay (etc-factory) over `/usr/share/factory/etc` with `@data/overlay/etc/{upper,work}` is correct and matches the factory-reset semantics.
+- `/home` snapshots live under `@home/.snapshots` → survive `shani-reset`, per-user ACLs, 14-day retention + restic off-disk. Coherent.
+- Slot markers (`/data/current-slot`, `/data/previous-slot`) + `shani-profile` identity are both in `@data` and persist across slot switches. Coherent.
+- Flatpak maintenance: 12 h system+user timers + best-effort repair (2026-10-31) matches the intended cadence.
+- beesd dedup present; zram + swappiness 133 + priority 100 paired correctly.
+- systemd-oomd enabled via shani-settings.install.
+- Hibernate wired (`resume=` in configure.sh and gen-efi.sh).
+- Profile swap (`--profile`) writes identity only after successful deploy.
+- shani-reset wipes `/data` but preserves @home/@root/@blue/@green/ESP; accounts recreated by first-run wizard. Coherent with the overlay model.
+
+### B.4 Recommended improvement order (lowest risk first)
+
+1. **scx scheduler enablement** (B.1 #1) — small, fulfills an existing claim.
+2. **btrfsmaintenance defrag cadence** (B.1 #3) — one-line overlay edit.
+3. **lockdown=confidentiality** (B.1 #2) — one token, needs testbed.
+4. **shani-settings manifest → /data** (B.1 #4) — small, correctness.
+5. **gamescope home snapshots** (B.1 #5) — one line in Packages-Desktop.
+6. **Waydroid binder auto-load** (B.2 #9) — verify + modprobe.d if needed.
+7. **Drop or qualify the "+3-0 automatic fallback" and "Next-Gen Scheduling" claims** in docs until the mechanisms actually run.

@@ -127,7 +127,7 @@ wrong.
 | ENOSPC ballast, squota, 1.5× preflight | No ballast, no squota config, fixed 10 GiB gate; health checks qgroup consistency only | Take ballast + 1.5×; squota optional |
 | systemd-sysext | Absent | Take |
 | systemd-homed | Absent (health mentions only) | Defer — identity change, not additive |
-| dm-verity / EROFS | Absent | Reject — rearchitecture |
+| dm-verity / EROFS | Absent. Research: dm-verity is a block-level target over a *read-only* image (EROFS/ext4/squashfs) — it cannot cover a mutable, in-place-updated btrfs root, so adopting it means rearchitecting `/usr` into a sealed image (mkosi, no pacman at runtime). `fs-verity` (file-level, btrfs since kernel 6.2) is available and could harden individual read-only files, but is not whole-filesystem. ShaniOS instead gets integrity from btrfs checksums + scrub and authenticity from GPG-signed updates + UKI signing at deploy time | Reject (rearchitecture); fs-verity noted as optional per-file hardening |
 | Reflink slot seeding / chunk deltas | Absent; zsync2 download only | Reject — depends on EROFS image |
 | Profile/edition swap | Manifest carries profile; deploy warns on mismatch but has no `--profile` | Take — small |
 | `lockdown=confidentiality` | Absent; `shani-health` already recommends it (line ~1870) | Take — one token |

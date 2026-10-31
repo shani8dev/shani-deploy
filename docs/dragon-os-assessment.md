@@ -206,3 +206,136 @@ shipped, a rearchitecture that has been ruled out, or a downgrade.
 
 The suggested start is items **1 (`@data` half) and 3**: both are small, both
 are testable in `shani-testbed`, and neither touches the boot flip.
+
+---
+
+## Appendix: full spec (ARCH-DRAGON-005) claim-by-claim verification
+
+Every claim below was checked against the working trees on 2026-10-31 (grep,
+file reads, and `pacman`/Arch-package lookups), not accepted from the spec.
+Rows marked **Match** mean ShaniOS already does it; **Take** = worth adding;
+**Reject** = rearchitecture or downgrade; **Defer** = design decision needed.
+
+### §1 Topology & guarantees
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| Whole-disk ownership, 100% of the drive | `os-installer-config` supports a pre-partitioned device (`OSI_DEVICE_IS_PARTITION`) and multiple profiles; dual-boot/pre-partitioned installs are a feature | Reject |
+| Two-partition GPT, write-once geometry | `bits/part.sfdisk` is exactly 2 partitions (1 GiB ESP + root); `install.sh` runs `sfdisk` once | Match |
+| Hermetic `/usr` (EROFS + dm-verity) | `/usr` lives in a Btrfs subvolume `@blue`/`@green`, not EROFS; `gen-efi.sh` re-signs the kernel's prebuilt UKI; no verity anywhere | Reject (rearchitecture) |
+| Infinite slot elasticity (shared pool) | `@blue`/`@green` share one Btrfs pool; `deploy_update()` snapshots into the candidate slot | Match |
+| Double dedup (reflink CoW + beesd) | No reflink slot seeding; `beesd-setup.sh`/`shani-deploy` dedup exists; `btrfsmaintenance` runs balance/scrub | Partial (no reflink seeding) |
+| ENOSPC immunity (squota, 2 GB ballast, 1.5× preflight) | No ballast, no squota; fixed 10 GiB gate (`DEFAULT_deploy_min_free_space_mb`); health checks qgroup consistency only | Take ballast + 1.5×; squota optional |
+| 4-stage rollback watchdog | dracut pre-mount hook rewrites `loader.conf`; `shani-auto-rollback.service` (1 min + 16 min); `+3-0` tries counter is inert on this systemd (documented) | Partial (marker path verified; `+3-0` path unverified) |
+| Unbrickable offline+delta updates | zsync2 differential download from R2/SF; offline bundle not shipped | Take (offline bundle) |
+
+### §2 Base & desktop
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| Arch rolling via mkosi, pacman stripped at runtime | ShaniOS ships pacman and is Arch-based; `shani-core` pulls `base` etc. | Reject (rearchitecture) |
+| aarch64 (Archports) | x86_64 only (`build.sh` writes `x86_64/`) | Reject (already) |
+| Single DE: minimal KDE Plasma 6 | gnome/plasma/niri/cosmic/gamescope/kiosk/server profiles | Reject (single-DE downgrade) |
+| ddcutil + i2c-dev in PowerDevil | `ddcutil` via `shani-tools-extra` (in `Packages-Extras`); no `i2c-dev`/PowerDevil integration | Take (small) |
+
+### §3 Storage & space guard
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| 7 GB FAT32 ESP | `bits/part.sfdisk`: `size=1G` | Reject (measured; 1 GiB) |
+| ESP automount, 60 s idle timeout | `gen-efi.sh`/mount uses `LABEL=shani_boot`; no automount timeout logic found | Take (optional) |
+| LUKS2 aes-xts-plain64, 512-bit, Argon2id | `configure.sh` generates `rd.luks.uuid=... rd.luks.name=...` LUKS2 entries; cipher/KDF not pinned in code (LUKS defaults) | Match (default) |
+| `@slots`/`@data`/`@home`/`@root`/`@snapshots`/`@nix`/`@swap` | ShaniOS: `@blue`/`@green`/`@data`/`@home` (and `@root`?); no `@nix`/`@swap`/`@snapshots` named; home snapshots are subvolume snapshots, not `@snapshots` | Partial |
+| `@data/.emergency_ballast` (2 GB, truncates <512 MB) | None | Take |
+| squota, 25 % ceiling on `@snapshots` | No squota config; health checks qgroup consistency only | Take (optional) |
+| beesd dedup | `beesd-setup.sh` + `shani-deploy` dedup path exists | Match |
+| Volatile `/var` (systemd.volatile=state) + selective bind mounts | `cmdline` includes `systemd.volatile=state`; bind mounts for flatpak/containers/waydroid/libvirt/NM/bluetooth/tailscale/fprint/colord/journal not verified in code | Partial |
+| profile-sync-daemon (browser RAM sync) | No `profile-sync-daemon` anywhere | Take |
+| btrfs-balance monthly, scrub monthly, trim weekly, cleanup daily | `BTRFS_*_PERIOD="weekly"` for defrag/balance/scrub/trim in shared overlay | Review (weekly is aggressive) |
+| 4-layer ENOSPC immunity | Initramfs sweeper not found; squota no; ballast no; preflight fixed 10 GiB | Take (ballast + 1.5×) |
+
+### §4 Boot chain, TPM, LSM
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| pcrlock + signed PCR 11 (`.pcrsig`) | `gen-efi.sh` detects pcrlock policy and passes `--tpm2-pcrlock=`; no `systemd-measure`/`.pcrsig` anywhere; no pcrlock phase in initramfs (script says so) | Take (pcrlock phase) |
+| 6 LSMs in confidentiality mode | UKI cmdline enforces `lsm=landlock,lockdown,yama,integrity,apparmor,bpf`; `shani-health.sh:1870` recommends `lockdown=confidentiality` but the cmdline uses `lockdown=none`-equivalent (no confidentiality token) | Take (one token) |
+| MODULE_SIG_FORCE=y | Absent | Reject (custom kernel) |
+| 4-stage boot watchdog table | mark-boot-in-progress/success + check-boot-failure + auto-rollback; `systemd-bless-boot`/try-counter renaming inert on this systemd (documented) | Partial (marker path real) |
+| dm-verity on `/usr` | Absent | Reject (rearchitecture) |
+
+### §5 State reconciliation & reset
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| systemd-sysusers / tmpfiles self-heal | Standard Arch/systemd; `shani-user-setup` re-seeds skel; factory reset wipes `@data` | Match-ish |
+| etc-factory OverlayFS (`/etc` over `/usr/share/factory/etc`) | `/etc` is an overlay over `@data` (upper) + lower; `configure.sh` sets it up | Match |
+| systemd-homed (accounts survive reset) | Absent; health mentions only | Defer |
+| Factory reset keeps `@home` | `shani-reset` wipes `/data` (and thus `/etc` upper) but keeps `@home` | Match |
+
+### §6 Sandboxes & package delivery
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| Flatpak (active), AppImage (active), Snap (dormant socket), Nix (optional), sysext (active) | Flatpak active (system+user update units); snapd present via `shani-core`; Nix via `shani-core`; AppImage not explicitly; sysext absent | Partial (sysext take; snapd already there) |
+| systemd-sysext + `/var/lib/extensions` | Absent | Take |
+
+### §7 Dev/virt/container plumbing
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| Podman/Buildah/Skopeo/Distrobox/Toolbx | All in `shani-core` | Match |
+| Waydroid (binderfs + lxc + dnsmasq) | `waydroid` + `waydroid-helper` in `shani-core`; no `binder_linux` module found anywhere | Fix/verify |
+| KVM/QEMU: swtpm, edk2-ovmf, virtiofsd | Now in `shani-core` (2026-10-31) | Done |
+| udev rules (adb/fastboot/MCU) | `android-udev` in `shani-peripherals`; MCU rules not verified | Partial |
+| Core CLI suite (zsh, git, etc.) | Standard Arch packages | Match |
+
+### §8 Gaming/input
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| ntsync (`/dev/ntsync`) | Mainline kernel ships it; no explicit enable needed | Match (via kernel) |
+| sched-ext (scx_lavd, scx_bpfland) | `scx-scheds` + `scx-tools` now in `shani-core` (2026-10-31) | Done |
+| gamescope, mangohud, vkBasalt in `/usr` | gamescope + mangohud via `shani-desktop-gamescope`; vkBasalt only as a Flatpak Vulkan layer | Partial (vkBasalt not a pacman pkg) |
+| xpadneo, xone | AUR-only; not in official repos | Need own PKGBUILDs |
+| game-devices-udev | Present (`shani-peripherals`) | Match |
+| GameMode (Feral) | Present in `shani-settings` | Match |
+| PipeWire realtime, NFS/SMB/WireGuard/Tailscale, Noto fonts | `shani-multimedia`/`shani-network`/`shani-fonts` | Match |
+
+### §9 Update engine
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| 4-phase atomic update (inhibit, space guard 1.5×, reflink seed, desync chunks, verity verify, atomic rename, pcrlock refresh) | ShaniOS: download → SHA256+GPG verify → extract to temp → atomic `subvolume snapshot` publish → UKI gen/sign → boot entry write; no reflink/chunk deltas; no dm-verity; pcrlock refresh not done | Reject deltas/verity; take 1.5× preflight; pcrlock refresh with pcrlock phase |
+| Edition swapping (Full vs Lite) | Profile is baked at install; deploy warns on mismatch but no `--profile` | Take `--profile` swap |
+| Pre-deploy snapshot of `@home` + `@data` | `/home` done (2026-10-31); `@data` not yet | `@data` half open |
+
+### §10 Maintenance suite
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| beesd (continuous dedup) | `beesd-setup.sh` + dedup in `shani-deploy` | Match |
+| btrfs-scrub (monthly) | weekly (shared overlay) | Review cadence |
+| btrfs-balance (monthly, <20 % usage) | weekly | Review cadence |
+| btrfs-trim (weekly) | weekly | Match |
+| btrfs-cleanup (daily, squota) | `shani-backup` prunes snapshots on low space; no daily timer by that name | Partial |
+| flatpak-maint (12 h, update + prune + repair) | `flatpak-update-{system,user}.timer` (12 h); repair now added (2026-10-31) | Match |
+| systemd-oomd (cgroup PSI) | `systemd-oomd-defaults` + enabled in `shani-settings.install` | Match |
+
+### §11 Assistant & build pipeline
+
+| Dragon claim | ShaniOS reality | Verdict |
+|---|---|---|
+| Privileged daemon `dragon-managerd` (Rust, D-Bus, polkit) + Flutter/Qt6 GUI | Cassini (GTK, 73 tabs) + Chronoa (AI assistant); actuator paths via pkexec + CLI; polkit policy in `shani-settings` | Reject rewrite (already covered) |
+| mkosi reproducible build, 7 GB ESP recovery UKI (~450 MB) | `shani-install-media/build.sh` (archiso-based, not mkosi); 1 GiB ESP; no rescue UKI | Reject mkosi; take rescue UKI (measure size) |
+| SBOM / provenance | Not found in `shani-builder` | Take (later) |
+
+### Net assessment
+
+Dragon's genuinely additive ideas remain five: **pcrlock phase, rescue UKI,
+ENOSPC ballast + 1.5× preflight, systemd-sysext, and the `@data` pre-deploy
+snapshot** (the `/home` half is already shipped). Everything else in the spec
+is either already present in ShaniOS, a rearchitecture that has been ruled
+out (dm-verity/EROFS, reflink/chunk deltas, mkosi, custom kernel signing,
+aarch64, whole-disk ownership, single DE, no-pacman runtime), or a
+downgrade (7 GB ESP, assistant rewrite).

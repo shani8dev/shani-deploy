@@ -2333,6 +2333,14 @@ would make either untrue, treat that as the regression, regardless of
 whether existing tests still pass. `AUDIT-HISTORY.md` has the full
 narrative behind every entry in "Audit-verified known issues" above.
 
+`docs/dragon-os-assessment.md` is the Dragon OS vs ShaniOS comparison and
+the take/reject roadmap. It was written 2026-10-31 and every claim in it was
+re-checked against the working trees before it was committed; its own
+verification section records the corrections (notably that the deploy path
+does now take a pre-deploy `/home` snapshot). Read it before implementing
+pcrlock, the ENOSPC ballast, sysext, or the `@data` pre-deploy snapshot, so
+the reasoning is not re-derived.
+
 ## Garuda Cross-Reference Findings (added 2026-09-17)
 
 Based on a full scan of 29 garuda-linux repos mapped against shani (see `../garuda-catalog.md` — 29 repos, not 34; several user-listed names don't exist). See `../garuda-mapping-analysis.md` and `../deep-analysis.md` for full details. Garuda-tools is the most directly comparable repo — both handle system deployment and boot management.

@@ -403,7 +403,7 @@ Findings are ordered by severity.
 - **Waydroid binder** verified present (rust_binder built into Arch `linux`); added `binder.conf` modules-load.d (harmless, explicit).
 - **Virtual devices** (v4l2loopback, vhba): added `v4l2loopback-dkms` + `v4l2loopback-utils` + `vhba-module-dkms` to `shani-video`, and `linux-headers` to `shani-core` (DKMS prerequisite).
 - **LSM lockdown**: `lockdown=confidentiality` added to the UKI cmdline (needs testbed verification for NVIDIA/kexec/hibernation).
-- **scx schedulers**: added `scx_loader.service.d/10-shani.conf` drop-in (`--auto`) and `/etc/scx_loader/config.toml` (default `scx_lavd`); enabled in `shani-settings.install` (guarded by `command -v scx_loader`). Added `ntsync.conf` modules-load.d. Needs testbed verification.
+- **scx schedulers**: added `scx_loader.service.d/10-shani.conf` drop-in (`--auto`) and `/etc/scx_loader.toml` (default `scx_lavd`); enabled in `shani-settings.install` (guarded by `command -v scx_loader`). Added `ntsync.conf` modules-load.d. Needs testbed verification.
 
 ### B.4 Recommended improvement order (lowest risk first)
 

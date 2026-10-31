@@ -396,7 +396,7 @@ Findings are ordered by severity.
 
 ### Fixed in this pass (2026-10-31)
 
-- **btrfs defrag** `BTRFS_DEFRAG_PERIOD="weekly"` → `"none"` in shared + server overlays (defrag breaks reflinks/dedup and adds wear; scrub/trim/balance cadence left as-is pending a separate decision).
+- **btrfs defrag** `BTRFS_DEFRAG_PERIOD="weekly"` → `"none"` in shared + server overlays; `btrfs-defrag.timer` no longer enabled in `shani-settings.install` (defrag remains available on demand via `btrfs filesystem defragment`). Scrub/trim/balance cadence left as-is pending a separate decision.
 - **gamescope profile** gained `shani-backup` in `Packages-Desktop` (home snapshots now cover the gaming profile).
 - **nut baseline manifest** moved from `/var/lib/shani-settings/` to `/data/varlib/shani-settings/` (persistent).
 - **plasmalogin greeter branding** no longer lost on reboot (shipped under `/usr/share/shani/plasmalogin/`, re-applied by `shani-plasmalogin-branding.service`, `plasmalogin` added to `varlib_dirs`).

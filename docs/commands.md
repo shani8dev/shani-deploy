@@ -29,6 +29,7 @@ Core deployment engine. Typical flow: self-update check, fetch manifest, verify 
 | `--status --check --json` | Add remote stable/latest versions and `update_available` to the JSON status; read-only and no root | — |
 | `--skip-self-update` | Skip auto-update of `shani-deploy` itself | — |
 | `--no-home-snapshot` | Do not snapshot `/home` before deploying (see below) | snapshot taken |
+| `--no-data-snapshot` | Do not snapshot `@data` before deploying (see below) | snapshot taken |
 | `--update-genefi` | Download latest `gen-efi` from upstream and use it in the chroot (not installed to host) | — |
 
 ### Pre-deploy `/home` snapshot

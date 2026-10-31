@@ -129,7 +129,7 @@ wrong.
 | systemd-homed | Absent (health mentions only) | Defer — identity change, not additive |
 | dm-verity / EROFS | Absent. Research: dm-verity is a block-level target over a *read-only* image (EROFS/ext4/squashfs) — it cannot cover a mutable, in-place-updated btrfs root, so adopting it means rearchitecting `/usr` into a sealed image (mkosi, no pacman at runtime). `fs-verity` (file-level, btrfs since kernel 6.2) is available and could harden individual read-only files, but is not whole-filesystem. ShaniOS instead gets integrity from btrfs checksums + scrub and authenticity from GPG-signed updates + UKI signing at deploy time | Reject (rearchitecture); fs-verity noted as optional per-file hardening |
 | Reflink slot seeding / chunk deltas | Absent; zsync2 download only | Reject — depends on EROFS image |
-| Profile/edition swap | Manifest carries profile; deploy warns on mismatch but has no `--profile` | Take — small |
+| Profile/edition swap | `--profile NAME` now implemented (2026-10-31): overrides the download profile and rewrites `/etc/shani-profile` only after a successful deploy; needs a testbed run before calling done | Implemented, unverified |
 | `lockdown=confidentiality` | Absent; `shani-health` already recommends it (line ~1870) | Take — one token |
 | `MODULE_SIG_FORCE` | Absent | Reject — custom kernel |
 | Gaming/input gaps | gamescope, mangohud, game-devices-udev present; **vkBasalt present as a Flatpak Vulkan layer**; scx-scheds + scx-tools now in `shani-core` (2026-10-31); xpadneo/xone are AUR-only and need their own PKGBUILDs | Partially done |
@@ -147,11 +147,13 @@ wrong.
 
 ### Immediate (small, testable, independent)
 
-1. **Wire `shani-backup` into deploy.** Call a pre-deploy snapshot for
-   `/home` **and `@data`** with its own retention class (not the idempotent
-   daily), so an update always has a same-minute undo.
-   **`/home` is done (2026-10-31, `109d81b` + `0daa24d`, pkgrels 108/9).
-   `@data` is still open.**
+1. **Wire `shani-backup` into deploy (home half).** `/home` done (`109d81b` +
+   `0daa24d`, pkgrels 108/9) via shani-backup, non-fatal and opt-out.
+   **`@data` not shipped** after an architectural check: @data snapshots would
+   live inside @data, which `shani-reset --hard` wipes, and rollback does not
+   restore @data, so there is no durable home and no automatic restore path.
+   Home snapshots survive reset because they live under @home. The etc-factory
+   overlay already handles default upgrades for @data.
 2. **pcrlock phase.** `systemd-measure` → `.pcrsig` in the UKI; forward
    loader/credentials/`pcrlock.cred` into the initramfs via
    `module-setup.sh`; keep the literal PCR pin as fallback. Health already
@@ -174,8 +176,9 @@ wrong.
    need their own PKGBUILDs (ChimeraOS packages them; DKMS). `binder_linux`
    for Waydroid still unverified. (vkBasalt is already delivered as a Flatpak
    layer.)
-8. **Profile swap into the standby slot** — `shani-deploy --profile <name>`;
-   the artifact and slot mechanism already exist.
+8. **Profile swap into the standby slot** — implemented (2026-10-31) as
+   `shani-deploy --profile <name>`: overrides the download profile and rewrites
+   `/etc/shani-profile` only after a successful deploy. Needs a testbed run.
 9. **`flatpak repair`** — done (best-effort `ExecStartPre` on both update
    units, 2026-10-31). `profile-sync-daemon` still open.
 10. **Review btrfsmaintenance:** weekly defrag is actively harmful to reflinks
@@ -308,7 +311,7 @@ Rows marked **Match** mean ShaniOS already does it; **Take** = worth adding;
 |---|---|---|
 | 4-phase atomic update (inhibit, space guard 1.5×, reflink seed, desync chunks, verity verify, atomic rename, pcrlock refresh) | ShaniOS: download → SHA256+GPG verify → extract to temp → atomic `subvolume snapshot` publish → UKI gen/sign → boot entry write; no reflink/chunk deltas; no dm-verity; pcrlock refresh not done | Reject deltas/verity; take 1.5× preflight; pcrlock refresh with pcrlock phase |
 | Edition swapping (Full vs Lite) | Profile is baked at install; deploy warns on mismatch but no `--profile` | Take `--profile` swap |
-| Pre-deploy snapshot of `@home` + `@data` | `/home` done (2026-10-31); `@data` not yet | `@data` half open |
+| Pre-deploy snapshot of `@home` + `@data` | `/home` done (2026-10-31, shani-backup). `@data` **not shipped**: @data snapshots would live inside @data, which `shani-reset --hard` wipes, and rollback does not restore @data — so there is no durable home and no automatic restore path. Kept as manual recovery only if ever needed; not a default | Partial (home only) |
 
 ### §10 Maintenance suite
 

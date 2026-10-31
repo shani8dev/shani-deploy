@@ -73,6 +73,7 @@ DEFAULT_deploy_genefi_script_url="https://raw.githubusercontent.com/shani8dev/sh
 DEFAULT_deploy_home_snapshot="yes"
 DEFAULT_deploy_home_snapshot_keep="2"
 DEFAULT_deploy_snapshot_home_script="/usr/local/bin/shani-snapshot-home"
+
 DEFAULT_deploy_gpg_key_id="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 DEFAULT_deploy_rootlabel="shani_root"
 DEFAULT_deploy_max_inhibit_depth="2"
@@ -4309,6 +4310,17 @@ finalize_update() {
     echo "$CANDIDATE_SLOT" > /data/current-slot || die "Failed to write current-slot"
     log_verbose "Slot markers written: current=@${CANDIDATE_SLOT}, previous=@${CURRENT_SLOT}"
 
+    # Profile swap: if this deploy was started with --profile, the running
+    # system's identity now follows the deployed profile. Written only after
+    # the slot markers flip, so a failed deploy leaves identity untouched.
+    if [[ -n "${PROFILE_OVERRIDE:-}" ]]; then
+        if printf '%s\n' "$PROFILE_OVERRIDE" > /etc/shani-profile 2>/dev/null; then
+            log "Profile identity updated: ${PROFILE_OVERRIDE}"
+        else
+            log_warn "Could not write /etc/shani-profile — profile identity not updated"
+        fi
+    fi
+
     if rm -f "$DEPLOY_PENDING"; then
         log_verbose "Deployment pending flag cleared"
     else
@@ -4491,6 +4503,9 @@ Options:
   --skip-self-update      Skip auto-update of shani-deploy
   --no-home-snapshot      Do not snapshot /home before deploying (default: snapshot,
                           newest 2 kept; also deploy_home_snapshot=no in shani.conf)
+  --profile NAME          Deploy a different profile's image into the standby slot
+                          (e.g. gnome -> plasma). Updates /etc/shani-profile on
+                          success. Default: the installed profile
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
 
 Note: the new slot is fully deployed and bootable as soon as this script
@@ -4536,11 +4551,26 @@ main() {
             -v|--verbose) VERBOSE="yes"; shift ;;
             --skip-self-update) SKIP_SELF_UPDATE="yes"; shift ;;
             --no-home-snapshot) HOME_SNAPSHOT="no"; shift ;;
+            --profile)
+                [[ $# -ge 2 ]] || die "Missing argument for --profile"
+                if [[ ! "$2" =~ ^[a-z0-9_-]+$ ]]; then
+                    die "Invalid profile name: $2 (use lowercase letters, digits, - or _)"
+                fi
+                PROFILE_OVERRIDE="$2"; shift 2 ;;
             --update-genefi) UPDATE_GENEFI="yes"; shift ;;
             --) shift; break ;;
             *) die "Invalid option: $1" ;;
         esac
     done
+
+    # --profile: override the download profile for this run. The running
+    # system's identity file is still required (see the startup check); it is
+    # updated in finalize_update() only after a successful deploy, so a failed
+    # or aborted deploy leaves the machine's identity untouched.
+    if [[ -n "${PROFILE_OVERRIDE:-}" ]]; then
+        log "Profile override: ${LOCAL_PROFILE} -> ${PROFILE_OVERRIDE}"
+        LOCAL_PROFILE="$PROFILE_OVERRIDE"
+    fi
 
     if [[ "$DOWNLOAD_ONLY" == "yes" ]]; then
         if [[ "$ROLLBACK" == "yes" || "$CLEANUP" == "yes" || "$STORAGE_OPTIMIZE" == "yes" || "$SET_CHANNEL" == "yes" || "$VERIFY_EXISTING" == "yes" || "$LIST_BACKUPS" == "yes" || "$CHANNEL_STATUS" == "yes" ]]; then

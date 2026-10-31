@@ -98,7 +98,7 @@ wrong.
 | `os-installer-config` | Installer: GPT, LUKS, fstab, entries, cmdline | 1 GiB ESP (`bits/part.sfdisk`), optional LUKS, six LSMs (`lsm=landlock,lockdown,yama,integrity,apparmor,bpf`), `ro` root; no rescue, no verity |
 | `shani-install-media` | Image/ISO builder, profiles, signing, upload | x86_64 only; GPG `.asc` + `.sha256`; zsync2 (`zsyncmake2`); profiles are the "edition" mechanism; flatpak/snap images are bundled send-streams |
 | `shani-deploy` | Deploy, rollback, health, reset | The strongest area; no pcrlock *phase*, pre-deploy `/home` snapshot now wired, fixed 10 GiB preflight; flatpak update units live here |
-| `shani-pkgbuilds` | Custom packages and meta-packages | Ships waydroid/nix/flatpak/podman/distrobox/gamescope/mangohud; missing xpadneo/xone/scx/vkBasalt-as-package/swtpm/edk2/virtiofsd (vkBasalt is present as a Flatpak layer) |
+| `shani-pkgbuilds` | Custom packages and meta-packages | Pulls in waydroid/nix/flatpak/podman/distrobox/gamescope/mangohud (mostly as `shani-core`/desktop deps); missing xpadneo/xone/scx/vkBasalt-as-package/swtpm/edk2/virtiofsd (vkBasalt is present as a Flatpak layer) |
 | `shani-settings` | `/etc` + `/usr` defaults | Polkit tiers (`99-shani.rules`), btrfsmaintenance (weekly defrag/balance/scrub/trim, all enabled), zram, systemd-oomd (via `systemd-oomd-defaults`), sysctl |
 | `shani-backup` | Home snapshots + restic | Already solves the `@home` half; now wired into deploy for `/home` |
 | `shani-cassini` | GTK management UI, 73 tab modules | Updates, boot recovery, TPM, firewall, backup pages; actuator paths via pkexec + CLI |

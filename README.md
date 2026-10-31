@@ -273,8 +273,9 @@ and the blog reference posts mirror this README's flag tables.
   failure" as unverified for the hard-failure case specifically — the
   marker/timer path is real and verified, but it only ever *records* a
   failure; it does not itself switch the default boot entry.
-- `lockdown=confidentiality` added to the UKI cmdline (2026-10-31) but
-  not yet exercised under a real boot for NVIDIA/kexec/hibernation.
+- `lockdown=confidentiality` added to the UKI cmdline (2026-10-31) and
+  verified to boot cleanly under the real testbed (`verify-boot` passed).
+  Remaining caveat: NVIDIA/kexec/hibernation on real hardware.
 - sched-ext default scheduler (`scx_lavd` via `scx_loader --auto`) enabled
   in shani-settings 0.0.5-58 but not yet exercised under a real boot.
 

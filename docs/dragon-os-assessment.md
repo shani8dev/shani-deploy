@@ -362,8 +362,8 @@ Findings are ordered by severity.
 
 | # | Finding | Evidence | Impact | Fix |
 |---|---|---|---|---|
-| 1 | **scx schedulers installed but dormant.** `shani-core` pulls `scx-scheds` + `scx-tools` (added 2026-10-31) but no unit enables a scheduler; `shani-settings` has no scx reference. The "Next-Gen Kernel Scheduling" claim is unfulfilled. | `grep scx shani-settings/` → empty | Gaming boosters inert | Add a `scx-scheduler.service` (scx_bpfland default) enabled in `shani-settings.install`, or document manual `scxctl` |
-| 2 | **LSM `lockdown` in "none" mode while health recommends confidentiality.** UKI cmdline enforces `lsm=...lockdown...` but no `lockdown=confidentiality`; `shani-health.sh:~1870` recommends it. Contradictory posture. | `configure.sh:911` cmdline; health row | Security claim overstated | Either set `lockdown=confidentiality` (testbed run) or stop recommending it |
+| 1 | **scx schedulers installed but dormant.** | `grep scx shani-settings/` → empty | Gaming boosters inert | **Fixed 2026-10-31:** `scx_loader.service` enabled (guarded) with `--auto` drop-in and `/etc/scx_loader.toml` (default `scx_lavd`); `ntsync.conf` modules-load.d added. Needs testbed verification (replaces CFS) |
+| 2 | **LSM `lockdown` in "none" mode while health recommends confidentiality.** | `configure.sh:911` cmdline; health row | Security claim overstated | **Fixed 2026-10-31:** `lockdown=confidentiality` added to the UKI cmdline (needs testbed verification for NVIDIA/kexec/hibernation) |
 | 3 | **Weekly btrfs defrag fights dedup.** `BTRFS_DEFRAG_PERIOD="weekly"` in shared/server overlays; defrag breaks reflinks/dedup and adds wear, while beesd dedups. Contradictory goals. | overlay `btrfsmaintenance` | Wear + dedup loss | Defrag → monthly or `none`; keep scrub (monthly) + trim (weekly) |
 | 4 | **`shani-settings` manifest in volatile `/var`.** `install_nut_baseline()` writes `/var/lib/shani-settings/nut-baseline.sha256`; `/var/lib/shani-settings` is **not** in the `varlib_dirs` bind list, so `/var` is tmpfs at runtime → manifest lost on reboot. | `configure.sh` varlib_dirs (no `shani*`); install hook | Baseline re-evaluated every boot | **Fixed 2026-10-31:** manifest path moved to `/data/varlib/shani-settings/nut-baseline.sha256` (persistent, no bind mount needed) |
 | 5 | **gamescope profile lacks home snapshots.** `shani-backup` is in gnome/plasma/niri/cosmic `Packages-Desktop` but not gamescope. A gaming profile has no automated `/home` snapshots. | profile Packages-Desktop grep | Inconsistent coverage | Add `shani-backup` to gamescope Packages-Desktop |
@@ -376,10 +376,10 @@ Findings are ordered by severity.
 |---|---|---|---|
 | 7 | "Encrypted hibernation" via `@swap` | `@swap` + nodatacow exists and `resume=` is wired in `configure.sh`/`gen-efi.sh` | OK, verified wired |
 | 8 | `+3-0` tries counter as automatic fallback | Inert on this systemd (documented); dracut hook is the real recovery | Documented; no code change (advertised design is misleading though) |
-| 9 | Waydroid (binderfs) | `waydroid` + `waydroid-helper` shipped; no `binder_linux` module reference anywhere | Verify kernel has `CONFIG_ANDROID_BINDER_IPC` and auto-load; test in slot |
+| 9 | Waydroid (binderfs) | `rust_binder` is built into the Arch `linux` package (modules.builtin); no DKMS or modprobe needed. Added `binder.conf` modules-load.d anyway (harmless). Claim holds. | Verified (no action) |
 | 10 | `@data` pre-deploy snapshot | Reverted (no durable home / no auto-restore). Documented. | Keep reverted |
 | 11 | `fs-verity` per-file hardening | Available (kernel 6.2+), not used | Optional, low priority |
-| 12 | Virtual devices (v4l2loopback, vhba) | Not referenced in pkgbuilds | Verify or drop claim |
+| 12 | Virtual devices (v4l2loopback, vhba) | Not shipped. Added `v4l2loopback-dkms` + `v4l2loopback-utils` + `vhba-module-dkms` to `shani-video`, plus `linux-headers` to `shani-core` (DKMS prerequisite). | Fixed 2026-10-31 |
 
 ### B.3 Things that are consistent and correct (no action)
 
@@ -400,6 +400,10 @@ Findings are ordered by severity.
 - **gamescope profile** gained `shani-backup` in `Packages-Desktop` (home snapshots now cover the gaming profile).
 - **nut baseline manifest** moved from `/var/lib/shani-settings/` to `/data/varlib/shani-settings/` (persistent).
 - **plasmalogin greeter branding** no longer lost on reboot (shipped under `/usr/share/shani/plasmalogin/`, re-applied by `shani-plasmalogin-branding.service`, `plasmalogin` added to `varlib_dirs`).
+- **Waydroid binder** verified present (rust_binder built into Arch `linux`); added `binder.conf` modules-load.d (harmless, explicit).
+- **Virtual devices** (v4l2loopback, vhba): added `v4l2loopback-dkms` + `v4l2loopback-utils` + `vhba-module-dkms` to `shani-video`, and `linux-headers` to `shani-core` (DKMS prerequisite).
+- **LSM lockdown**: `lockdown=confidentiality` added to the UKI cmdline (needs testbed verification for NVIDIA/kexec/hibernation).
+- **scx schedulers**: added `scx_loader.service.d/10-shani.conf` drop-in (`--auto`) and `/etc/scx_loader/config.toml` (default `scx_lavd`); enabled in `shani-settings.install` (guarded by `command -v scx_loader`). Added `ntsync.conf` modules-load.d. Needs testbed verification.
 
 ### B.4 Recommended improvement order (lowest risk first)
 

@@ -6,7 +6,7 @@ Production blue-green Btrfs deployment system for Shanios, an immutable Arch Lin
 
 ## shani-deploy
 
-Core deployment engine. Typical flow: self-update check, fetch manifest, verify GPG signature, `btrfs receive` into candidate slot, generate/sign UKI, update boot entries, write reboot-needed marker.
+Core deployment engine. Typical flow: self-update check, fetch manifest, verify GPG signature, snapshot `/home`, `btrfs receive` into candidate slot, generate/sign UKI, update boot entries, write reboot-needed marker.
 
 ### Flags
 
@@ -28,7 +28,14 @@ Core deployment engine. Typical flow: self-update check, fetch manifest, verify 
 | `--status --json` | Print local deployment state as JSON (slots, version, channel, boot and recovery markers); read-only and no root | — |
 | `--status --check --json` | Add remote stable/latest versions and `update_available` to the JSON status; read-only and no root | — |
 | `--skip-self-update` | Skip auto-update of `shani-deploy` itself | — |
+| `--no-home-snapshot` | Do not snapshot `/home` before deploying (see below) | snapshot taken |
 | `--update-genefi` | Download latest `gen-efi` from upstream and use it in the chroot (not installed to host) | — |
+
+### Pre-deploy `/home` snapshot
+
+Before `deploy_update()` mounts the disk or writes to the standby slot, `shani-deploy` runs `shani-snapshot-home` (`scripts/shani-snapshot-home.sh`), which asks `shani-backup home predeploy --keep 2` for a fresh read-only snapshot of every home under `/home/.snapshots/`. The update only replaces `@blue`/`@green`; the snapshot covers the files it does not replace, so a bad release, a service that migrates its state in place, or a rollback still has a same-minute copy. The newest two pre-deploy snapshots are kept, and no daily or manual snapshot is touched.
+
+It is taken by the system as root, not by each user, because a btrfs snapshot needs root, an unattended update has no session, and the snapshot must cover accounts that are not logged in. Opt out with `home_snapshot=no` in `/etc/shani/shani.conf` (or `--no-home-snapshot` for one run); tune retention with `home_snapshot_keep` (`0` keeps all). A failure or a skip is logged as a warning and never blocks the update.
 
 ### Notes
 
@@ -173,6 +180,8 @@ User accounts (`/etc/passwd` entries) are part of the `/etc` overlay and ARE wip
 | `UPDATE_GENEFI` | Update gen-efi flag (`yes`/`no`) | `no` |
 | `FORCE_UPDATE` | Force update flag (`yes`/`no`) | `no` |
 | `DOWNLOAD_ONLY` | Download only flag (`yes`/`no`) | `no` |
+| `HOME_SNAPSHOT` | Take a pre-deploy snapshot of `/home` (`yes`/`no`) | `yes` |
+| `HOME_SNAPSHOT_KEEP` | How many pre-deploy snapshots to keep per home (`0` keeps all) | `2` |
 | `CANDIDATE_MODIFIED` | Candidate modified flag (`yes`/`no`) | `no` |
 
 ### Shani Cassini agent

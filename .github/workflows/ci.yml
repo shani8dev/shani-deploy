@@ -60,6 +60,9 @@ jobs:
       - name: Run first-boot stranding-repair contract tests
         run: bash tests/test-first-boot.sh
 
+      - name: Run pre-deploy /home snapshot contract tests
+        run: bash tests/test-home-snapshot.sh
+
   unit-files:
     name: Unit files (systemd-analyze verify)
     runs-on: ubuntu-latest

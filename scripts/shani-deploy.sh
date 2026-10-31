@@ -70,6 +70,9 @@ DEFAULT_deploy_current_slot="/data/current-slot"
 DEFAULT_deploy_prev_slot="/data/previous-slot"
 DEFAULT_deploy_genefi_script="/usr/local/bin/gen-efi"
 DEFAULT_deploy_genefi_script_url="https://raw.githubusercontent.com/shani8dev/shani-deploy/refs/heads/main/scripts/gen-efi.sh"
+DEFAULT_deploy_home_snapshot="yes"
+DEFAULT_deploy_home_snapshot_keep="2"
+DEFAULT_deploy_snapshot_home_script="/usr/local/bin/shani-snapshot-home"
 DEFAULT_deploy_gpg_key_id="7B927BFFD4A9EAAA8B666B77DE217F3DA8014792"
 DEFAULT_deploy_rootlabel="shani_root"
 DEFAULT_deploy_max_inhibit_depth="2"
@@ -133,6 +136,16 @@ _vc_num() { # $1=value var  $2=default var  $3=label  $4=floor
     fi
 }
 
+_vc_bool() { # $1=value var  $2=default var  $3=label
+    local val="${!1}"
+    [[ -n "$val" ]] || return 0
+    case "$val" in
+        yes|no) return 0 ;;
+    esac
+    echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY][WARN] shani.conf: ${3}='${val}' is not yes|no; using ${!2}" >&2
+    printf -v "$1" '%s' "${!2}"
+}
+
 _validate_config() {
     # mount/umount targets and the script chroot(8) executes as root. /efi and a
     # trailing slash are deliberately still accepted: /efi is a real ESP on this
@@ -140,6 +153,7 @@ _validate_config() {
     _vc_bad_path ESP             DEFAULT_deploy_esp_path    esp_path
     _vc_bad_path MOUNT_DIR       DEFAULT_deploy_mount_dir   mount_dir
     _vc_bad_path GENEFI_SCRIPT   DEFAULT_deploy_genefi_script genefi_script
+    _vc_bad_path SNAPSHOT_HOME_SCRIPT DEFAULT_deploy_snapshot_home_script snapshot_home_script
     if [[ -n "${ROOTLABEL:-}" && ! "$ROOTLABEL" =~ ^[A-Za-z0-9_-]+$ ]]; then
         echo "$(date "+%Y-%m-%d %H:%M:%S") [DEPLOY][WARN] shani.conf: rootlabel='${ROOTLABEL}' is not a plain device-mapper name; using ${DEFAULT_deploy_rootlabel}" >&2
         ROOTLABEL="$DEFAULT_deploy_rootlabel"
@@ -152,6 +166,8 @@ _validate_config() {
     _vc_num EXTRACTION_TIMEOUT     DEFAULT_deploy_extraction_timeout    extraction_timeout     60
     _vc_num MIN_FREE_SPACE_MB      DEFAULT_deploy_min_free_space_mb     min_free_space_mb      0
     _vc_num MIN_FILE_SIZE          DEFAULT_deploy_min_file_size         min_file_size          1
+    _vc_num HOME_SNAPSHOT_KEEP     DEFAULT_deploy_home_snapshot_keep    home_snapshot_keep     0
+    _vc_bool HOME_SNAPSHOT         DEFAULT_deploy_home_snapshot         home_snapshot
 }
 
 # Resolve config variables with DEFAULT_ fallbacks
@@ -180,6 +196,11 @@ GENEFI_SCRIPT_URL="${deploy_genefi_script_url:-${DEFAULT_deploy_genefi_script_ur
 GPG_KEY_ID="${deploy_gpg_key_id:-${DEFAULT_deploy_gpg_key_id}}"
 ROOTLABEL="${deploy_rootlabel:-${DEFAULT_deploy_rootlabel}}"
 MAX_INHIBIT_DEPTH="${deploy_max_inhibit_depth:-${DEFAULT_deploy_max_inhibit_depth}}"
+# `--no-home-snapshot` sets HOME_SNAPSHOT after the read-only block, so the
+# environment is allowed to win here (AUTO_REBOOT works the same way).
+HOME_SNAPSHOT="${HOME_SNAPSHOT:-${deploy_home_snapshot:-${DEFAULT_deploy_home_snapshot}}}"
+HOME_SNAPSHOT_KEEP="${HOME_SNAPSHOT_KEEP:-${deploy_home_snapshot_keep:-${DEFAULT_deploy_home_snapshot_keep}}}"
+SNAPSHOT_HOME_SCRIPT="${deploy_snapshot_home_script:-${DEFAULT_deploy_snapshot_home_script}}"
 
 # Must run here: after every assignment above, and before the readonly block,
 # which would refuse the correction.
@@ -210,7 +231,7 @@ if [[ -n "${SHANIOS_DEPLOY_STATE_FILE:-}" ]] && [[ -f "$SHANIOS_DEPLOY_STATE_FIL
 
         if [[ -n "$state_content" ]]; then
             _restore_state() {
-                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY DEPLOYMENT_START_TIME CANDIDATE_MODIFIED LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
+                local _whitelist="LOCAL_VERSION LOCAL_PROFILE BACKUP_NAME CURRENT_SLOT CANDIDATE_SLOT REMOTE_VERSION REMOTE_PROFILE IMAGE_NAME UPDATE_CHANNEL UPDATE_CHANNEL_SOURCE VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE FORCE_UPDATE DOWNLOAD_ONLY HOME_SNAPSHOT DEPLOYMENT_START_TIME CANDIDATE_MODIFIED LOCK_ACQUIRED _BEES_PAUSE_COUNT _BEES_PAUSED _BEES_SERVICE"
                 local _line _var _val
                 while IFS= read -r _line; do
                     if [[ $_line =~ ^declare\ -[-a-z]*\ ([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
@@ -255,6 +276,7 @@ readonly MIN_FREE_SPACE_MB="${MIN_FREE_SPACE_MB}"
 readonly MIN_FILE_SIZE="${MIN_FILE_SIZE}"
 readonly GENEFI_SCRIPT="${GENEFI_SCRIPT}"
 readonly GENEFI_SCRIPT_URL="${GENEFI_SCRIPT_URL}"
+readonly SNAPSHOT_HOME_SCRIPT="${SNAPSHOT_HOME_SCRIPT}"
 readonly DEPLOY_PENDING="${DEPLOY_PENDING}"
 readonly BOOT_FAILURE_FILE="${BOOT_FAILURE_FILE}"
 readonly BOOT_HARD_FAILURE_FILE="${BOOT_HARD_FAILURE_FILE}"
@@ -295,6 +317,12 @@ declare -g SELF_UPDATE_DONE="${SELF_UPDATE_DONE:-}"
 declare -g UPDATE_GENEFI="${UPDATE_GENEFI:-no}"
 declare -g FORCE_UPDATE="${FORCE_UPDATE:-no}"
 declare -g DOWNLOAD_ONLY="${DOWNLOAD_ONLY:-no}"
+# A pre-deploy snapshot of /home: "yes" unless the config or
+# --no-home-snapshot says otherwise. Declared, not readonly, because the flag
+# is parsed in main(); the value is carried across a self-update re-exec
+# (persist_state/_whitelist) so a --no-home-snapshot is not lost halfway.
+declare -g HOME_SNAPSHOT="${HOME_SNAPSHOT:-yes}"
+declare -g HOME_SNAPSHOT_KEEP="${HOME_SNAPSHOT_KEEP:-2}"
 declare -g DEPLOYMENT_START_TIME="${DEPLOYMENT_START_TIME:-$(date +%s)}"
 declare -g CANDIDATE_MODIFIED="${CANDIDATE_MODIFIED:-no}"
 # Auto-reboot: opt-in. The new slot is fully deployed and bootable the
@@ -352,6 +380,7 @@ persist_state() {
         declare -p VERBOSE DRY_RUN SKIP_SELF_UPDATE UPDATE_GENEFI 2>/dev/null || true
         declare -p HAS_ARIA2C HAS_WGET HAS_CURL HAS_PV SELF_UPDATE_DONE 2>/dev/null || true
         declare -p FORCE_UPDATE DOWNLOAD_ONLY 2>/dev/null || true
+        declare -p HOME_SNAPSHOT 2>/dev/null || true
         declare -p DEPLOYMENT_START_TIME CANDIDATE_MODIFIED 2>/dev/null || true
         # not AUTO_REBOOT/AUTO_REBOOT_DELAY: they are set only through the
         # environment, which the re-exec keeps. Carrying them in the state
@@ -4103,8 +4132,44 @@ download_update() {
     log_success "Download and verification complete"
 }
 
+# A snapshot of /home taken before the update writes anything. Never fatal:
+# the update does not touch /home, so refusing to update because the insurance
+# could not be issued would be worse than the risk it covers. The helper
+# reports 0 taken / 10 skipped / 11 failed; see scripts/shani-snapshot-home.sh.
+take_predeploy_home_snapshot() {
+    if [[ "${HOME_SNAPSHOT}" != "yes" ]]; then
+        log "Pre-deploy /home snapshot disabled (deploy_home_snapshot=no / --no-home-snapshot)"
+        return 0
+    fi
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log "[DRY-RUN] Would snapshot /home before deploying"
+        return 0
+    fi
+    if [[ ! -x "$SNAPSHOT_HOME_SCRIPT" ]]; then
+        log_warn "No pre-deploy /home snapshot — ${SNAPSHOT_HOME_SCRIPT} is not installed"
+        return 0
+    fi
+
+    local out rc=0 line
+    out=$(SHANI_SNAPSHOT_KEEP="$HOME_SNAPSHOT_KEEP" "$SNAPSHOT_HOME_SCRIPT" 2>&1) || rc=$?
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log "  home snapshot: ${line}"
+    done <<< "$out"
+    case "$rc" in
+        0)  log_success "Pre-deploy snapshot of /home taken (newest ${HOME_SNAPSHOT_KEEP} kept)" ;;
+        10) log_warn "Pre-deploy /home snapshot skipped — ${out//$'\n'/; }" ;;
+        *)  log_warn "Pre-deploy /home snapshot FAILED (exit ${rc}) — ${out//$'\n'/; }; continuing; the update does not touch /home" ;;
+    esac
+    return 0
+}
+
 deploy_update() {
     log_section "Deployment Phase"
+
+    # Insurance first, before the mount: this is the only thing here that
+    # protects the files the update does not replace, and a machine that
+    # fails a later step should still have a same-minute copy of /home.
+    take_predeploy_home_snapshot
 
     mkdir -p "$MOUNT_DIR"
     safe_mount "$ROOT_DEV" "$MOUNT_DIR" "subvolid=5"
@@ -4424,6 +4489,8 @@ Options:
                           markers); no root. See status_json() for the field contract.
   --status --check --json  ...plus the remote stable/latest and update_available
   --skip-self-update      Skip auto-update of shani-deploy
+  --no-home-snapshot      Do not snapshot /home before deploying (default: snapshot,
+                          newest 2 kept; also deploy_home_snapshot=no in shani.conf)
   --update-genefi         Download latest gen-efi from upstream and use it in the chroot (not installed to host)
 
 Note: the new slot is fully deployed and bootable as soon as this script
@@ -4468,6 +4535,7 @@ main() {
             -d|--dry-run) DRY_RUN="yes"; shift ;;
             -v|--verbose) VERBOSE="yes"; shift ;;
             --skip-self-update) SKIP_SELF_UPDATE="yes"; shift ;;
+            --no-home-snapshot) HOME_SNAPSHOT="no"; shift ;;
             --update-genefi) UPDATE_GENEFI="yes"; shift ;;
             --) shift; break ;;
             *) die "Invalid option: $1" ;;

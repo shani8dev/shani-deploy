@@ -9792,7 +9792,7 @@ main() {
     local NAGIOS_OUTPUT="no"
     local PROMETHEUS_OUTPUT="no"
     local FIX_MODE="no"
-    local TREND_FILE="/var/lib/shani-health/trend.json"
+    local TREND_FILE="/data/varlib/shani-health/trend.json"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -9906,7 +9906,9 @@ main() {
         export-logs)         export_logs "$EXPORT_DIR" ;;
     esac
 
-    # Save trend data for next run
+    # Save trend data for next run (persistent under /data so it survives the
+    # volatile /var tmpfs and reboots — /var/lib/shani-health would be wiped).
+    mkdir -p "$(dirname "$TREND_FILE")" 2>/dev/null || true
     _save_trend "$TREND_FILE"
 
     # Restore the real stdout (saved above) before emitting the one

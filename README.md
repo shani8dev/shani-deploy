@@ -76,17 +76,27 @@ snapshots survive reset because they live under `@home`.
 
 Core deployment engine. Typical flow: self-update check, fetch manifest, verify GPG signature, `btrfs receive` into candidate slot, generate/sign UKI, update boot entries, write reboot-needed marker.
 
-Key flags:
+Flags (see `docs/commands.md` for the full reference):
+- `-h`, `--help` — show help and exit
 - `-r`, `--rollback` — restore the non-booted slot from its most recent backup snapshot
 - `-c`, `--cleanup` — remove old backup snapshots and cached downloads
 - `-o`, `--optimize` — manual maintenance dedup pass
 - `-t`, `--channel <chan>` — `latest` or `stable`
+- `-f`, `--force` — deploy even if version matches or boot mismatch
 - `--download-only` — fetch and verify the image, don't deploy it yet
 - `-d`, `--dry-run` — simulate without making changes
-- `--set-channel` — persist a channel choice to `/etc/shani-channel`
+- `-v`, `--verbose` — detailed debug output
+- `--set-channel <chan>` — persist a channel choice to `/etc/shani-channel`
+- `--verify-existing` — verify current deployment integrity without updating
+- `--list-backups [--json]` — list available rollback backups with timestamps
+- `--channel-status` — show latest/stable versions available remotely
+- `--status --json` — print local deployment state as JSON (read-only, no root)
+- `--status --check --json` — add remote versions and `update_available` to the JSON status
+- `--skip-self-update` — skip auto-update of `shani-deploy` itself
 - `--no-home-snapshot` — skip the pre-deploy `/home` snapshot for this run
 - `--profile NAME` — deploy a different profile's image into the standby slot
   (updates `/etc/shani-profile` only after a successful deploy)
+- `--update-genefi` — download latest `gen-efi` from upstream and use it in the chroot (not installed to host)
 
 Auto-reboot is opt-in (`AUTO_REBOOT=yes`, default `no`). The candidate slot is fully deployed and bootable the moment the script finishes — nothing about correctness depends on rebooting promptly.
 
@@ -99,6 +109,17 @@ Clears a stale boot-failure marker after a successful boot. Triggered by the `ma
 ### `scripts/shani-health.sh`
 
 System health, security, and diagnostics — read-mostly, no deployment side effects. Run with no arguments for a full report, or scope it down with `--security`, `--boot`, `--network`, `--verify`, etc.
+
+### `scripts/shani-snapshot-home.sh`
+
+Takes a read-only pre-deploy snapshot of every home under `/home/.snapshots/`
+via `shani-backup home predeploy`. Invoked by `shani-deploy` before it mounts
+the disk; opt out with `home_snapshot=no` or `--no-home-snapshot`.
+
+### `scripts/shani-first-boot.sh`
+
+Runs early in boot (before the display manager) to re-arm the GNOME first-run
+wizard after a factory reset left no user accounts. A no-op on a healthy system.
 
 ### Shani Cassini integration
 
@@ -164,7 +185,8 @@ machine-readable output.
 `mark-boot-success.service` writes the success marker. If it's never
 reached, `check-boot-failure.timer`/`.service` (15 min post-boot) catches
 it. `bless-boot.service` handles systemd-boot's own boot-counting
-integration.
+integration. `shani-first-boot.service` runs before the display manager to
+re-arm the GNOME first-run wizard after a factory reset.
 
 **Updates:** Shani Cassini's **Updates & Rollback** page is the
 user-facing deploy and rollback interface. Its packaged

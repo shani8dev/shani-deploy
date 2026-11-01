@@ -17,19 +17,19 @@ Core deployment engine. Typical flow: self-update check, fetch manifest, verify 
 | `-c, --cleanup` | Manual cleanup: remove old backup snapshots and cached downloads | — |
 | `-o, --optimize` | Run manual deduplication via `duperemove` (maintenance only; `bees` handles continuous dedup) | — |
 | `-t, --channel <chan>` | Update channel: `stable` or `latest` | `stable` |
+| `--profile NAME` | Deploy a different profile's image into the standby slot (e.g. `gnome` → `plasma`); rewrites `/etc/shani-profile` only after a successful deploy | installed profile |
 | `-f, --force` | Deploy even if version matches or boot mismatch | — |
 | `--download-only` | Fetch and verify the update image, then exit without deploying | — |
 | `-d, --dry-run` | Simulate without making changes | — |
 | `-v, --verbose` | Detailed debug output | — |
 | `--set-channel <chan>` | Persistently set channel in `/etc/shani-channel` (`stable` or `latest`) | — |
 | `--verify-existing` | Verify current deployment integrity without updating | — |
-| `--list-backups` | List available rollback backups with timestamps | — |
+| `--list-backups [--json]` | List available rollback backups with timestamps (`--json` emits `{"slots":[...]}`; needs root) | — |
 | `--channel-status` | Show latest/stable versions available remotely | — |
 | `--status --json` | Print local deployment state as JSON (slots, version, channel, boot and recovery markers); read-only and no root | — |
 | `--status --check --json` | Add remote stable/latest versions and `update_available` to the JSON status; read-only and no root | — |
 | `--skip-self-update` | Skip auto-update of `shani-deploy` itself | — |
 | `--no-home-snapshot` | Do not snapshot `/home` before deploying (see below) | snapshot taken |
-| `--no-data-snapshot` | Do not snapshot `@data` before deploying (see below) | snapshot taken |
 | `--update-genefi` | Download latest `gen-efi` from upstream and use it in the chroot (not installed to host) | — |
 
 ### Pre-deploy `/home` snapshot

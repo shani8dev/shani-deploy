@@ -269,7 +269,7 @@ Rows marked **Match** mean ShaniOS already does it; **Take** = worth adding;
 | Dragon claim | ShaniOS reality | Verdict |
 |---|---|---|
 | pcrlock + signed PCR 11 (`.pcrsig`) | `gen-efi.sh` detects pcrlock policy and passes `--tpm2-pcrlock=`; no `systemd-measure`/`.pcrsig` anywhere; no pcrlock phase in initramfs (script says so) | Take (pcrlock phase) |
-| 6 LSMs in confidentiality mode | UKI cmdline enforces `lsm=landlock,lockdown,yama,integrity,apparmor,bpf`; `shani-health.sh:1870` recommends `lockdown=confidentiality` but the cmdline uses `lockdown=none`-equivalent (no confidentiality token) | Take (one token) |
+| 6 LSMs in confidentiality mode | UKI cmdline enforces `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` and now also `lockdown=confidentiality` (gen-efi.sh:638); `shani-health.sh` still advises it when Secure Boot is active and the running kernel reports `none` | Done (2026-10-31) |
 | MODULE_SIG_FORCE=y | Absent | Reject (custom kernel) |
 | 4-stage boot watchdog table | mark-boot-in-progress/success + check-boot-failure + auto-rollback; `systemd-bless-boot`/try-counter renaming inert on this systemd (documented) | Partial (marker path real) |
 | dm-verity on `/usr` | Absent | Reject (rearchitecture) |
@@ -317,7 +317,7 @@ Rows marked **Match** mean ShaniOS already does it; **Take** = worth adding;
 | Dragon claim | ShaniOS reality | Verdict |
 |---|---|---|
 | 4-phase atomic update (inhibit, space guard 1.5×, reflink seed, desync chunks, verity verify, atomic rename, pcrlock refresh) | ShaniOS: download → SHA256+GPG verify → extract to temp → atomic `subvolume snapshot` publish → UKI gen/sign → boot entry write; no reflink/chunk deltas; no dm-verity; pcrlock refresh not done | Reject deltas/verity; take 1.5× preflight; pcrlock refresh with pcrlock phase |
-| Edition swapping (Full vs Lite) | Profile is baked at install; deploy warns on mismatch but no `--profile` | Take `--profile` swap |
+| Edition swapping (Full vs Lite) | Profile is baked at install; `shani-deploy --profile NAME` overrides the download profile and rewrites `/etc/shani-profile` only after a successful deploy (2026-10-31) | Implemented, unverified |
 | Pre-deploy snapshot of `@home` + `@data` | `/home` done (2026-10-31, shani-backup). `@data` **not shipped**: @data snapshots would live inside @data, which `shani-reset --hard` wipes, and rollback does not restore @data — so there is no durable home and no automatic restore path. Kept as manual recovery only if ever needed; not a default | Partial (home only) |
 
 ### §10 Maintenance suite

@@ -89,8 +89,10 @@ out=$(printf '[realms]\n    ATHENA.MIT.EDU = {\n    notakeyvallue\n    }\n' | /s
 
 echo "  -- krb5_conf: sections required, includes preserved --"
 
-out=$(printf '[libdefaults]\ndefault_realm = EXAMPLE.COM\n' | "$H" --target krb5_conf >/tmp/k5.log 2>&1)
-[[ $? -eq 0 ]] && ok "a well-formed krb5.conf is accepted" || no "krb5 accepted" "$(tail -2 /tmp/k5.log)"
+printf '[libdefaults]\ndefault_realm = EXAMPLE.COM\n' | "$H" --target krb5_conf >/tmp/k5.log 2>&1
+rc=$?
+out=$(cat /tmp/k5.log)
+[[ $rc -eq 0 ]] && ok "a well-formed krb5.conf is accepted" || no "krb5 accepted" "$(tail -2 /tmp/k5.log)"
 grep -q "default_realm" /etc/krb5.conf 2>/dev/null && ok "  and installed to /etc/krb5.conf" || no "  installed" "missing"
 
 # The flattening case, which is the one that matters for a main file: a write

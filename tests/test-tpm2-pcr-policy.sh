@@ -75,6 +75,11 @@ extract_block() {
 
 HELPER="$(sed -n '/^_tpm2_enrolled_pcrs() {/,/^}/p' "$HEALTH")"
 [[ -n "$HELPER" ]] || { echo "FATAL: could not extract _tpm2_enrolled_pcrs()"; exit 1; }
+# The comparison block calls this helper too. Without it the eval below prints
+# "command not found" and treats every token as non-pcrlock, so the case it
+# exists for would pass for the wrong reason.
+PCRLOCK_HELPER="$(sed -n '/^_tpm2_uses_pcrlock() {/,/^}/p' "$HEALTH")"
+[[ -n "$PCRLOCK_HELPER" ]] || { echo "FATAL: could not extract _tpm2_uses_pcrlock()"; exit 1; }
 
 XC_ROW="$(extract_block '^                local _dump; _dump=')"
 XC_CHECK="$(extract_block '^                # Check PCR policy matches current Secure Boot state')"
@@ -106,7 +111,7 @@ fi
 
 TMP_HELPER="$(mktemp)"
 trap 'rm -f "$TMP_HELPER"' EXIT
-printf '%s\n' "$HELPER" > "$TMP_HELPER"
+printf '%s\n%s\n' "$HELPER" "$PCRLOCK_HELPER" > "$TMP_HELPER"
 
 # ------------------------------------------------------------------ harness --
 # $1 luksDump text, $2 mokutil --sb-state text, $3 systemd-cryptenroll list text.

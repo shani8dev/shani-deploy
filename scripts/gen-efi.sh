@@ -276,8 +276,22 @@ _mokutil_hash_enroll() {
     tmp_hash=$(mktemp)
     tmp_err=$(mktemp)
 
+    # MOK_ROOT_PW=1: use the root password from /etc/shadow, the same choice
+    # the installer's Secure Boot page offers (`mokutil --root-pw`).
+    if [[ "${MOK_ROOT_PW:-0}" == "1" ]]; then
+        if mokutil --import "$der_file" --root-pw >"$tmp_err" 2>&1; then
+            log "MOK enrollment staged — confirm with the root password in MokManager on first boot"
+            rm -f "$tmp_hash" "$tmp_err"
+            return 0
+        fi
+        log_warn "mokutil --import --root-pw failed: $(cat "$tmp_err" 2>/dev/null)"
+        rm -f "$tmp_hash" "$tmp_err"
+        return 1
+    fi
+
+    local mok_password="${MOK_PASSWORD:-shanios}"
     local hash_ok=0 import_ok=0
-    if mokutil --generate-hash=shanios > "$tmp_hash" 2>"$tmp_err"; then
+    if mokutil --generate-hash="$mok_password" > "$tmp_hash" 2>"$tmp_err"; then
         hash_ok=1
     else
         log_warn "mokutil --generate-hash failed: $(cat "$tmp_err" 2>/dev/null)"
@@ -286,7 +300,7 @@ _mokutil_hash_enroll() {
     if (( hash_ok )); then
         if mokutil --import "$der_file" --hash-file "$tmp_hash" >"$tmp_err" 2>&1; then
             import_ok=1
-            log "MOK enrollment staged — confirm with password 'shanios' in MokManager on first boot"
+            log "MOK enrollment staged — confirm with password '${mok_password}' in MokManager on first boot"
         else
             log_warn "mokutil --import failed: $(cat "$tmp_err" 2>/dev/null)"
         fi

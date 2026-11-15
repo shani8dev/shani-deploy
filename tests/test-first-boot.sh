@@ -377,4 +377,29 @@ else
     fail "N3 control could run" "no lost+found exclusion to remove"
 fi
 
+# ══ Naming: a machine with no name gets a unique one, a named one is kept ════
+# Run against the real function on temporary files. The installer leaves the
+# name to this, and a factory reset wipes /etc/hostname with /etc's overlay.
+NAME_FN=$(sed -n '/^name_machine() {/,/^}/p' "$SCRIPT")
+NAME_LINE=$(grep -n '^name_machine$' "$SCRIPT" | head -1 | cut -d: -f1)
+if [[ -n "$NAME_LINE" && -n "$GATE_LINE" && "$NAME_LINE" -lt "$GATE_LINE" ]]; then
+    ok "naming runs before the healthy-system exit (it must run with an account too)"
+else
+    fail "naming runs before the healthy-system exit" "name_machine at ${NAME_LINE:-none}, gate at ${GATE_LINE:-none}"
+fi
+HN=$(mktemp -d)
+name_case() { # <label> <initial content|ABSENT> <expect regex>
+    local f="$HN/$1"; [[ "$2" == ABSENT ]] || printf '%s' "$2" > "$f"
+    ( log(){ :; }; warn(){ :; }; run(){ "$@"; }; eval "$NAME_FN"; SHANI_HOSTNAME_FILE="$f" name_machine )
+    if grep -qxE "$3" "$f" 2>/dev/null; then ok "hostname: $1 -> $(cat "$f")"
+    else fail "hostname: $1" "got '$(cat "$f" 2>/dev/null)', want /$3/"; fi
+}
+name_case "no file (new install, after a reset)" ABSENT 'shanios-[0-9a-f]{4}'
+name_case "an empty file" "" 'shanios-[0-9a-f]{4}'
+name_case "a name someone chose is kept" $'my-laptop\n' 'my-laptop'
+name_case "an older install's shanios is kept" $'shanios\n' 'shanios'
+a=$(cat "$HN/no file (new install, after a reset)"); rm -f "$HN/x"; name_case x ABSENT 'shanios-[0-9a-f]{4}'
+[[ "$(cat "$HN/x")" != "$a" ]] && ok "two machines get two names" || fail "two machines get two names" "both $a"
+rm -rf "$HN"
+
 summary

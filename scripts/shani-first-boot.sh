@@ -98,6 +98,23 @@ has_regular_account() {
         END { exit(found ? 0 : 1) }'
 }
 
+# ── A machine with no name gets a unique one ─────────────────────────────────
+# A new install leaves /etc/hostname to this (the installer's `shanios-*`), and
+# a factory reset wipes it with the rest of /etc's overlay. Plain "shanios" on
+# every machine collided on the network (mDNS answers shanios.local for one of
+# them), so: shanios-<four hex digits>. A name that exists - typed in a setup,
+# or an older install's "shanios" - is never changed.
+name_machine() {
+    local file="${SHANI_HOSTNAME_FILE:-/etc/hostname}" name
+    [[ -s "$file" ]] && return 0
+    name="shanios-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+    log "this machine has no name - calling it ${name}"
+    run sh -c 'printf "%s\n" "$1" > "$2"' _ "$name" "$file" || { warn "could not write ${file}"; return 0; }
+    [[ "$file" == /etc/hostname ]] && { run hostnamectl set-hostname "$name" 2>/dev/null || run hostname "$name" 2>/dev/null || true; }
+    return 0
+}
+name_machine
+
 if has_regular_account; then
     log "an account exists — nothing to do"
     exit 0

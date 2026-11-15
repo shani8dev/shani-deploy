@@ -9,7 +9,8 @@ ERR=0
 
 # Fixture: simulated "oomctl present, oomd enabled, not active"
 # Matches verified state in session log (ConditionControlGroupController=memory missing)
-if ! grep -qE 'OOM killer' /home/shrinivaskumbhar/Documents/shani/shani-deploy/scripts/shani-health.sh; then
+H="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/shani-health.sh"
+if ! grep -qE 'OOM killer' "$H"; then
   echo "FAIL: oomctl row missing from shani-health.sh"
   ERR=1
 fi
@@ -17,7 +18,7 @@ fi
 # Negative control: no claim of "OK" when service is not running
 # The inserted block reports "enabled but not running (memory-cgroup missing?)"
 # rather than "OK". Confirm the guard is present.
-if grep -qE 'memory-cgroup missing\?' /home/shrinivaskumbhar/Documents/shani/shani-deploy/scripts/shani-health.sh; then
+if grep -qE 'memory-cgroup missing\?' "$H"; then
   echo "PASS: oomctl row correctly reports unavailable (memory-cgroup missing guard present)"
 else
   echo "FAIL: missing memory-cgroup unavailable guard"
@@ -25,7 +26,7 @@ else
 fi
 
 # Verify comment documents why parsing is deferred (session audit)
-if grep -qE 'get a real dump from a working slot' /home/shrinivaskumbhar/Documents/shani/shani-deploy/scripts/shani-health.sh; then
+if grep -qE 'get a real dump from a working slot' "$H"; then
   echo "PASS: comment defers parsing until real oomctl dump available"
 else
   echo "FAIL: missing audit reference in comment"
@@ -33,7 +34,7 @@ else
 fi
 
 # Syntax check the edited script still passes
-bash -n /home/shrinivaskumbhar/Documents/shani/shani-deploy/scripts/shani-health.sh || { echo "FAIL: bash -n"; ERR=1; }
+bash -n "$H" || { echo "FAIL: bash -n"; ERR=1; }
 
 echo "oomctl-health: ${ERR} failures (0 = all pass for unavailable-state contract)"
 exit $ERR

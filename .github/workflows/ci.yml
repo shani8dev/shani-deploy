@@ -63,6 +63,24 @@ jobs:
       - name: Run pre-deploy /home snapshot contract tests
         run: bash tests/test-home-snapshot.sh
 
+      - name: Run boot-default-entry-id contract tests
+        run: bash tests/test-boot-default-entry-id.sh
+
+      - name: Run boot-failure-timing contract tests
+        run: bash tests/test-boot-failure-timing.sh
+
+      - name: Run finalize-boot-efivars contract tests
+        run: bash tests/test-finalize-boot-efivars.sh
+
+      - name: Run gen-efi-mok-rotation contract tests
+        run: bash tests/test-gen-efi-mok-rotation.sh
+
+      - name: Run restore-candidate-trap contract tests
+        run: bash tests/test-restore-candidate-trap.sh
+
+      - name: Run rollback-decision contract tests
+        run: bash tests/test-rollback-decision.sh
+
   unit-files:
     name: Unit files (systemd-analyze verify)
     runs-on: ubuntu-latest

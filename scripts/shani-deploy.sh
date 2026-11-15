@@ -2194,7 +2194,7 @@ EOF
     # not: the fix has to clear the higher-precedence variables, and it has to
     # verify they are gone rather than trust an exit status (both the empty write
     # and `truncate -s 0` are silent no-ops on efivarfs - see
-    # shani-testbed/tests/efivar-proof.sh and shani-install-media's AGENTS.md).
+    # shani-testbed/boot-probes/efivar-proof.sh and shani-install-media's AGENTS.md).
     #
     # Cleared BEFORE the set-default, so the variable this function is about to
     # write is the only one that can decide the next boot.

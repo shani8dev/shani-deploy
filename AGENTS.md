@@ -382,6 +382,13 @@ replace the Cassini desktop test above.
 
 ## Audit-verified known issues (confirmed present)
 
+- **shani-first-boot names a machine that has none (2026-11-15).** The image
+  no longer ships /etc/hostname, the installer leaves it (`hostname:
+  'shanios-*'`), and a factory reset wipes /etc's overlay; `name_machine`
+  writes a unique `shanios-xxxx` when /etc/hostname is absent or empty, before
+  the healthy-system exit. An existing name - typed, or an older install's
+  "shanios" - is never changed (tests/test-first-boot.sh, 6 cases).
+
 - **A factory reset left GNOME machines unrecoverable, and four places in this
   repo documented the repair that did not exist. Added 2026-10-16.**
 
@@ -2421,7 +2428,7 @@ Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap
   efivarfs, found to be a silent no-op, and fixed by switching to `rm -f` —
   implying the clearing then worked.
 
-  **It does not.** `shani-testbed/tests/efivar-proof.sh`, run inside one
+  **It does not.** `shani-testbed/boot-probes/efivar-proof.sh`, run inside one
   `iso-install --boot-only` boot, measured both classes **in the same
   invocation** — same uid, capabilities, namespace and firmware:
 

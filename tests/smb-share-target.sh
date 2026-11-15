@@ -72,8 +72,13 @@ check "shani-settings ships the smb.conf.d directory" "yes" \
 
 smb_conf="$SETTINGS/etc/samba/smb.conf"
 if [[ -f "$smb_conf" ]]; then
-    check "smb.conf includes the drop-in directory" "1" \
-        "$(grep -c '^[[:space:]]*include = /etc/samba/smb.conf.d/\*.conf' "$smb_conf")"
+    # Named, not a wildcard: Samba 4.25's testparm reads `include = .../*.conf`
+    # as no include at all (shani-settings' smb.conf has the measurement), so
+    # the file the target writes must be named, and a wildcard is a FAIL.
+    check "smb.conf includes the file the target writes, by name" "1" \
+        "$(grep -c '^[[:space:]]*include = /etc/samba/smb.conf.d/50-shani-cassini.conf[[:space:]]*$' "$smb_conf")"
+    check "smb.conf has no wildcard include (Samba includes nothing for one)" "0" \
+        "$(grep -c '^[[:space:]]*include = .*\*' "$smb_conf")"
     # The reader must be a different file from the writer, or `pacman -u
     # shani-settings` would replace the file the GUI wrote.
     readme="$SETTINGS/etc/samba/smb.conf.d/00-shani-readme.conf"

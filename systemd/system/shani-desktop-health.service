@@ -1,0 +1,22 @@
+[Unit]
+Description=Shani OS Boot Health: the Login Screen (trial boots only)
+Documentation=file:///usr/local/bin/shani-desktop-health
+# Only on a boot systemd-boot is counting (a freshly deployed slot with tries
+# left) - the same gate bless-boot.service and systemd-bless-boot use. Skipped
+# otherwise, and a skipped unit satisfies mark-boot-success's Requires=.
+ConditionPathExists=/sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+After=graphical.target display-manager.service systemd-logind.service data.mount
+Wants=data.mount
+Before=mark-boot-success.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/shani-desktop-health
+# 90 s for the display manager + 90 s for the session + 15 s stable + slack.
+TimeoutStartSec=5min
+# Light sandboxing only: it reads logind/systemd over D-Bus, writes one marker
+# under /data and may call `systemctl reboot`.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes

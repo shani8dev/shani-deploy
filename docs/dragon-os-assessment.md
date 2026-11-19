@@ -414,3 +414,58 @@ Findings are ordered by severity.
 5. **gamescope home snapshots** (B.1 #5) — one line in Packages-Desktop.
 6. **Waydroid binder auto-load** (B.2 #9) — verify + modprobe.d if needed.
 7. **Drop or qualify the "+3-0 automatic fallback" and "Next-Gen Scheduling" claims** in docs until the mechanisms actually run.
+
+---
+
+## Appendix C: Ananta OS — Dragon OS, built (2026-11-19)
+
+Dragon OS shipped as **Ananta OS** (github.com/BVMDebuDev/ananta-os, Beta 5,
+GPL-3.0-or-later; its own history names the v0.7 Dragon documents and lists
+ShaniOS among the projects it studied). The architecture verdicts above stand
+(EROFS/verity, whole-disk, per-build keys: rejected). What was new is that it
+is now *built and tested*, and three of its measurements applied directly here.
+
+### Taken
+
+| Ananta item | What ShaniOS does now | Evidence |
+|---|---|---|
+| Boot counting works on systemd 262 (their history: "the risk noted by Shani OS ... did not happen") | **Cause found: the entry key.** systemd-boot does not count `efi`-keyed (LOADER_LINUX_EFI) entries — systemd/systemd#40405. Ananta writes `uki`. Entries now use `uki` when every systemd-boot on the ESP is ≥ 258 (`_uki_entry_key`, shani-deploy; `uki_entry_key`, os-installer-config), else `efi` | Firmware boots of a plasma install, systemd 262-1 (shani-testbed `boot-probes/boot-counting.sh`): `efi` → `LoaderBootCountPath` absent, entry stays `+3-0`; `uki` → `+3-0 → +2-1`, `LoaderBootCountPath` set |
+| A trial boot counts as good only once the login screen is up 15 s (`ananta-health desktop`) | `shani-desktop-health.service` (trial boots only: `ConditionPathExists=LoaderBootCountPath`); `mark-boot-success` `Requires=` it. Not judged: non-graphical default, no display manager, no connected display | Same boots: login screen up → PASS, `boot-ok`, entry **sealed** (`shanios-blue.conf`); display manager broken (negative control) → FAIL recorded in `/data/boot_desktop_failure`, no `boot-ok`, no bless, entry left at `+2-1` |
+| The ESP mounted in the same process as `systemd-bless-boot` (their Beta 5 fix) | `bless-boot.service` mounts `/boot/efi` (fstab `noauto`) itself under `PrivateMounts=`; upstream's generator-pulled `systemd-bless-boot.service` steps aside (drop-in), because it waits only for `boot-complete.target` and would bless every counted boot at sysinit | Before: both units FAILED on the first counted boot (no ESP). After: `bless-boot` active/success, upstream skipped |
+| Hardware watchdog + `panic=10` | `system.conf.d/watchdog.conf` (shani-settings: `RuntimeWatchdogSec=30s`, `RebootWatchdogSec=2min`); `panic=10` in both cmdline builders (configure.sh, gen-efi.sh) | Static only (validators pass); a freeze/panic test is not run |
+
+### Deliberately not taken: rebooting a failed trial boot
+
+Ananta reboots at once when a trial boot fails its check, so the three tries
+pass quickly. **Here that loops forever, measured:** with the display manager
+broken, the VM rebooted ~every 160 s, 10+ times, never falling back. ShaniOS's
+`loader.conf` names the entry (`default shanios-blue.conf`, which AGENTS.md
+says to keep), and systemd-boot keeps choosing a named entry even with no tries
+left; Ananta writes `default ananta-*`, where an exhausted entry sorts last.
+So a failed trial boot is simply not marked good, and the existing path takes
+over: `check-boot-failure` (15 min) → `shani-auto-rollback` (16 min) →
+`switch_to_sibling_slot` (loader.conf only, no data touched). That end-to-end
+15-minute path was not re-run for this change; its trigger (`boot_in_progress`
+left set) is the same one a hung boot already produces.
+
+### Behaviour change to know about
+
+Once a slot's entry is blessed it carries no `+N-M` counter, and the dracut
+hook's guard ("the default carries a tries counter") then treats it as proven:
+a *hard* initramfs failure of a long-proven slot no longer flips the default.
+Before, entries were never blessed, so every slot looked unproven forever and
+the hook was always armed. The guard was written for the new behaviour; the
+change is that it now actually happens.
+
+### Still open from Ananta
+
+- Restic restore test after each backup (`ananta-maintenanced/src/backup.rs`
+  `restore_test`: restore one random small file, compare its size) — for
+  shani-backup, which already has `restic.restore()`.
+- udisks hide rule for the system partitions (`UDISKS_SYSTEM=1`,
+  `UDISKS_IGNORE=1` on `shani_boot`, the root partition and the opened LUKS
+  device) — shani-settings.
+- Reference implementations for items already on this file's take list: 2 GB
+  `fallocate` ballast (no-compress), `max(10 GiB, 1.5 × size)` preflight, a
+  rescue UKI that runs from RAM; their `tests/boot-test.py` power-cut, crash
+  and freeze scenarios.

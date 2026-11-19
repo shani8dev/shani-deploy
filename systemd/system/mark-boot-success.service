@@ -2,6 +2,11 @@
 Description=Mark Boot Success for Shani OS
 After=multi-user.target data.mount
 Requires=data.mount
+# On a trial boot (systemd-boot counting a new slot) the boot is only good once
+# the login screen is up and stays up. On any other boot that unit is skipped
+# by its condition, which satisfies Requires=.
+After=shani-desktop-health.service
+Requires=shani-desktop-health.service
 ConditionPathExists=/data/boot_in_progress
 # Record a failure of this unit itself where shani-health will see it after
 # a reboot (see shani-boot-safety-failed@.service).

@@ -25,6 +25,13 @@ Type=oneshot
 # boot. The real mechanism for exactly this purpose already ships as part of
 # systemd itself (see systemd-bless-boot.service(8)/systemd-bless-boot(1)).
 #
+# UPDATE 2026-11-19: counting works when the entry uses the "uki" key
+# (shani-deploy's _uki_entry_key; #40405 is specific to "efi" entries) -
+# measured +3-0 -> +2-1 with LoaderBootCountPath set on systemd 262-1. On
+# that boot this unit FAILED: the ESP is noauto, so systemd-bless-boot could
+# not find it. It now mounts the ESP itself (ExecStart below). The record
+# that follows is about "efi" entries.
+#
 # Even with the right command, don't expect this to visibly do anything on
 # current systemd: verified live under a real UEFI boot (qemu+OVMF) that
 # systemd-boot never renames a +tries_left-tries_done loader entry or sets
@@ -40,7 +47,14 @@ Type=oneshot
 # primary mechanism is the boot_in_progress/boot_failure marker pair
 # (mark-boot-success.service, check-boot-failure.service), which is fully
 # independent of systemd-boot's native tries counter.
-ExecStart=/usr/lib/systemd/systemd-bless-boot good
+# The ESP is not mounted on a running system (fstab: LABEL=shani_boot
+# /boot/efi ... noauto), and systemd-bless-boot has to find it to rename the
+# entry. Mount it here, in this unit's own mount namespace (PrivateMounts=),
+# and run the program in the SAME process: every Exec*= line gets its own
+# namespace, so a mount in ExecStartPre= would be gone again (measured by
+# Ananta OS, Beta 5). The mount disappears with the unit.
+PrivateMounts=yes
+ExecStart=/bin/sh -c 'mountpoint -q /boot/efi || mount /boot/efi || exit 1; exec /usr/lib/systemd/systemd-bless-boot good'
 RemainAfterExit=yes
 # No ProtectSystem here — matches systemd's own upstream
 # systemd-bless-boot.service template, which ships with zero hardening
@@ -57,7 +71,8 @@ LockPersonality=yes
 RemoveIPC=yes
 KeyringMode=private
 SystemCallArchitectures=native
-SystemCallFilter=~@mount @raw-io @debug @reboot
+# @mount is allowed: the ESP is mounted above.
+SystemCallFilter=~@raw-io @debug @reboot
 UMask=0077
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=200

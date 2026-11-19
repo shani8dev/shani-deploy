@@ -2027,6 +2027,29 @@ generate_uki() {
     return $result
 }
 
+# _uki_entry_key ESP — the Type #1 key a boot entry uses to point at a UKI.
+#
+# "uki" when every systemd-boot binary on the ESP is 258 or newer (258 added the
+# key), else "efi". It matters for boot counting: systemd-boot only counts tries
+# for LOADER_LINUX / LOADER_UKI / LOADER_TYPE2_UKI entries, and an entry written
+# with "efi" is LOADER_LINUX_EFI, so its +3-0 counter is never decremented and
+# LoaderBootCountPath is never set (systemd/systemd#40405 - the cause, measured
+# by its reporter and confirmed by the boot-count probe on systemd 262-1:
+# LoaderBootCountPath ABSENT for a booted shanios-blue+3-0.conf with "efi").
+# Ananta OS, which writes "uki", measured counting working on 262.2. An older
+# systemd-boot does not know "uki" at all - an entry with only that key would
+# not boot - hence "efi" whenever the version cannot be read or is older.
+_uki_entry_key() {
+    local esp="$1" f v min=""
+    for f in "$esp/EFI/BOOT/grubx64.efi" "$esp/EFI/systemd/systemd-bootx64.efi"; do
+        [[ -f "$f" ]] || continue
+        v=$(grep -a -o -m1 '#### LoaderInfo: systemd-boot [0-9]*' "$f" 2>/dev/null | head -1 | grep -o '[0-9]*$' || true)
+        [[ -n "$v" ]] || { echo efi; return; }
+        [[ -z "$min" || "$v" -lt "$min" ]] && min="$v"
+    done
+    if [[ -n "$min" && "$min" -ge 258 ]]; then echo uki; else echo efi; fi
+}
+
 finalize_boot_entries() {
     local active_slot="$1"
     local candidate_slot="$2"
@@ -2047,6 +2070,9 @@ finalize_boot_entries() {
     fi
 
     mkdir -p "$ESP/loader/entries"
+    local entry_key
+    entry_key=$(_uki_entry_key "$ESP")
+    log "Boot entries use the '${entry_key}' key (systemd-boot on the ESP)"
 
     # Default slot — the new unproven slot being set as the next boot target.
     # Gets +3-0 boot-count tries on normal deploy so systemd-boot automatically
@@ -2056,6 +2082,20 @@ finalize_boot_entries() {
     # On rollback/restore both slots are known-good so no tries are needed.
     local active_filename active_conf
     if [[ "$use_tries" == "yes" ]]; then
+        # UPDATE 2026-11-19: the counter works once the entry uses the "uki" key
+        # (_uki_entry_key). #40405's cause is the "efi" key: systemd-boot does
+        # not count LOADER_LINUX_EFI entries. Measured in a firmware boot of a
+        # plasma install on systemd 262-1 (shani-testbed
+        # boot-probes/boot-counting.sh): "efi" -> LoaderBootCountPath absent,
+        # entry stays +3-0; "uki" -> entry renamed +3-0 -> +2-1 and
+        # LoaderBootCountPath set. bless-boot.service now mounts the ESP itself
+        # and seals the entry (plain name) once mark-boot-success wrote
+        # /data/boot-ok - which, on a trial boot, waits for the login screen
+        # (shani-desktop-health). A sealed, proven entry has no counter, so the
+        # dracut hook no longer treats it as an unproven candidate - its guard
+        # was written for exactly that. The 2026-10-18 record below describes
+        # the "efi" entries, which a systemd-boot older than 258 still gets.
+        #
         # +3-0 IS NOT A WORKING COUNTER ON THIS PLATFORM. Measured 2026-10-18 on
         # a real firmware boot of a machine whose ESP carried this exact suffix:
         #
@@ -2105,7 +2145,7 @@ finalize_boot_entries() {
     local active_tmp="$ESP/loader/entries/.${active_filename}.tmp"
     cat > "$active_tmp" <<EOF
 title   ${OS_NAME}-${active_slot} (Active)
-efi     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
+${entry_key}     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
 EOF
     mv -f "$active_tmp" "$active_conf" || {
         log_error "Could not write boot entry for @${active_slot} — boot entries left unchanged"
@@ -2117,7 +2157,7 @@ EOF
     local candidate_tmp="$ESP/loader/entries/.${candidate_filename}.tmp"
     cat > "$candidate_tmp" <<EOF
 title   ${OS_NAME}-${candidate_slot} (Candidate)
-efi     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
+${entry_key}     /EFI/${OS_NAME}/${OS_NAME}-${candidate_slot}.efi
 EOF
     mv -f "$candidate_tmp" "$candidate_conf" || {
         log_error "Could not write boot entry for @${candidate_slot} — @${active_slot} entry already updated, candidate left on its previous entry"

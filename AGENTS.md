@@ -558,6 +558,22 @@ replace the Cassini desktop test above.
   `ProtectHome=yes`, and the note described a unit that writes more than it
   said. When a unit's behaviour changes, its line here changes too.
 
+- **Boot counting works with the `uki` entry key — #40405 was the `efi` key
+  (2026-11-19).** systemd-boot does not count LOADER_LINUX_EFI entries, which
+  is what an `efi` line makes. `finalize_boot_entries()` now writes `uki` when
+  every systemd-boot on the ESP is ≥ 258 (`_uki_entry_key`; os-installer-config
+  does the same from the target's binary). Measured in firmware boots
+  (shani-testbed `boot-probes/boot-counting.sh`): `uki` → `+3-0 → +2-1` with
+  `LoaderBootCountPath`. Counting working exposed two things that were dormant:
+  `bless-boot.service` could not find the ESP (`noauto`) — it now mounts it
+  itself under `PrivateMounts=`; and upstream's generator-pulled
+  `systemd-bless-boot.service` would bless at `boot-complete.target`, before
+  anything proved the slot — a drop-in steps it aside. New
+  `shani-desktop-health.service` gates `mark-boot-success` on trial boots only
+  (login screen up 15 s). **It must not reboot on failure**: with the explicit
+  `default`, that looped forever (measured). Details and the behaviour change
+  for the dracut hook: `docs/dragon-os-assessment.md`, Appendix C.
+
 - **Keep writing the BASE ID — `loader_default="${OS_NAME}-${active_slot}.conf"`
   is correct, and a comment in `shani-install-media`'s dracut hook says the
   opposite (cross-reference, 2026-10-18).**
@@ -2572,3 +2588,13 @@ Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap
   counter. Settling it needs one boot of an entry that actually carries `+3-0`:
   does `LoaderBootCountPath` appear, does the counter decrement, and does
   `set-preferred` then hand over to the fallback.
+
+  **Answered in part (2026-11-19):** counting engages once the entry uses the
+  `uki` key (see "Boot counting works with the `uki` entry key" above):
+  `LoaderBootCountPath` appears and `+3-0` decrements. With an `efi` entry it
+  does not, even carrying `+3-0` — so the earlier measurements were of a
+  genuinely uncounted entry after all. **The `set-preferred` handover is still
+  unverified:** `boot-probes/boot-counting.sh` edits the ESP directly and sets
+  no `LoaderEntryPreferred`, and in that state (explicit `default`, no
+  Preferred) an exhausted entry kept being chosen — a reboot loop. Whether a
+  deploy-time Preferred makes systemd-boot fall through is the next boot to run.

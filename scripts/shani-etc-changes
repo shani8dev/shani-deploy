@@ -53,6 +53,7 @@ PROTECTED = {
     "machine-id": "This computer's identity, made once at the first start",
     "crypttab": "How this computer's disk is unlocked",
     "secureboot/*": "The key every boot image of this computer is signed with",
+    "ssh/ssh_host_*": "This computer's SSH identity - every client would warn that the host changed",
 }
 SECRET = ["shadow", "gshadow", "secureboot/*", "ssh/ssh_host_*_key",
           "*.key", "*.pem", "NetworkManager/system-connections/*", "wireguard/*",

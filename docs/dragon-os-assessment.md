@@ -489,3 +489,15 @@ on ShaniOS. Built from it, each measured:
 Found on the way, not from Ananta: the installer never added the recovery key
 and never enrolled the TPM (both ran on the opened mapping, not the LUKS
 partition) — fixed in os-installer-config, measured on a real LUKS volume.
+
+### Third pass (2026-11-19, evening)
+
+No new Ananta commits. From its acceptance tests: the installer now refuses a
+target that is mounted or holds the live medium (os-installer-config), and a
+new recovery key is proven to open the volume before it is shown (gen-efi and
+the installer). Checked and already covered here: pstore crash logs persist
+(/var/lib/systemd is bound to @data) and shani-health reports them; the
+keyboard layout for the passphrase is on the kernel command line; shani-reset,
+TPM re-enrolment with cleanup-tpm2. Not taken: the .antupd format, per-build
+keys, EROFS/verity, the rescue UKI and "Repair this computer" from USB (large;
+still on the take list above), a unified `ananta`-style CLI.

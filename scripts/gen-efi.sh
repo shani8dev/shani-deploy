@@ -1796,7 +1796,12 @@ recovery_key() {
         || error_exit "systemd-cryptenroll refused - is the passphrase right?"
     key=$(grep -oE '[cbdefghijklnrtuv]{8}(-[cbdefghijklnrtuv]{8}){7}' <<< "$out" | head -1)
     [[ -n "$key" ]] || error_exit "systemd-cryptenroll gave no recovery key"
-    log "A new recovery key was enrolled on ${dev}; older recovery keys no longer work"
+    # Prove the key opens the volume before anyone is told to write it down:
+    # a recovery key that does not work is worse than none (Ananta OS tests its
+    # recovery key right after enrolment for the same reason).
+    printf '%s' "$key" | cryptsetup open --test-passphrase "$dev" --key-file - 2>/dev/null \
+        || error_exit "The new recovery key was enrolled but does not open ${dev} - do not rely on it"
+    log "A new recovery key was enrolled on ${dev} and opens it; older recovery keys no longer work"
     printf 'RECOVERY_KEY=%s\n' "$key" >&3
 }
 

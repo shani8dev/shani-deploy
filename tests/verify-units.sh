@@ -23,8 +23,10 @@ fi
 src="${1:-.}"
 
 install -d /usr/lib/systemd/system /usr/lib/systemd/user /usr/local/bin
-cp "$src"/systemd/system/* /usr/lib/systemd/system/
-cp "$src"/systemd/user/*   /usr/lib/systemd/user/
+# -r: drop-in folders (<unit>.d/) for units another package ships, e.g.
+# systemd-bless-boot.service.d - a plain cp skipped them and failed the job
+cp -r "$src"/systemd/system/* /usr/lib/systemd/system/
+cp -r "$src"/systemd/user/*   /usr/lib/systemd/user/
 for s in "$src"/scripts/*.sh; do
     install -m755 /dev/null "/usr/local/bin/$(basename "$s" .sh)"
 done
@@ -46,6 +48,13 @@ for scope in system user; do
     fi
     units=()
     for f in "$src"/systemd/"$scope"/*; do
+        if [[ -d $f && $f == *.d ]]; then
+            # a drop-in: verify the unit it extends, which loads it
+            parent="/usr/lib/systemd/$scope/$(basename "$f" .d)"
+            if [[ -e $parent ]]; then units+=("$parent")
+            else echo "drop-in $(basename "$f") extends a unit this container lacks"; fail=1; fi
+            continue
+        fi
         units+=("/usr/lib/systemd/$scope/$(basename "$f")")
     done
     out=$(systemd-analyze verify "${flag[@]}" --man=no "${units[@]}" 2>&1) || fail=1

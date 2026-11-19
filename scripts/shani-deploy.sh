@@ -2040,14 +2040,25 @@ generate_uki() {
 # systemd-boot does not know "uki" at all - an entry with only that key would
 # not boot - hence "efi" whenever the version cannot be read or is older.
 _uki_entry_key() {
+    local v
+    v=$(_esp_sdboot_major "$1")
+    if (( v >= 258 )); then echo uki; else echo efi; fi
+}
+
+# _esp_sdboot_major ESP — the oldest major version among the systemd-boot
+# binaries on the ESP (the one shim chains, EFI/BOOT/grubx64.efi, and a
+# bootctl-installed EFI/systemd/systemd-bootx64.efi), read from the
+# "#### LoaderInfo: systemd-boot NNN" string every build carries. 0 when none is
+# there or one cannot be read, so every caller keeps the old behaviour.
+_esp_sdboot_major() {
     local esp="$1" f v min=""
     for f in "$esp/EFI/BOOT/grubx64.efi" "$esp/EFI/systemd/systemd-bootx64.efi"; do
         [[ -f "$f" ]] || continue
         v=$(grep -a -o -m1 '#### LoaderInfo: systemd-boot [0-9]*' "$f" 2>/dev/null | head -1 | grep -o '[0-9]*$' || true)
-        [[ -n "$v" ]] || { echo efi; return; }
+        [[ -n "$v" ]] || { echo 0; return; }
         [[ -z "$min" || "$v" -lt "$min" ]] && min="$v"
     done
-    if [[ -n "$min" && "$min" -ge 258 ]]; then echo uki; else echo efi; fi
+    echo "${min:-0}"
 }
 
 finalize_boot_entries() {
@@ -2339,7 +2350,9 @@ EOF
     # Order matters and is the whole point: the clearing above must run BEFORE
     # this, and LoaderEntryPreferred must NOT be in the clearing list, or the
     # two would fight over one variable.
+    local _preferred_ok=0
     if bootctl set-preferred "${loader_default}" 2>/dev/null; then
+        _preferred_ok=1
         log_verbose "bootctl set-preferred ${loader_default} (3rd priority, honours boot assessment)"
     else
         # Not fatal on its own - set-default and loader.conf both still follow -
@@ -2347,7 +2360,24 @@ EOF
         # counter and one that overrides it, so it is worth saying.
         log_warn "bootctl set-preferred failed - falling back to set-default, which IGNORES boot assessment"
     fi
-    bootctl set-default "${loader_default}" &>/dev/null || true
+    # CORRECTION 2026-11-19: Preferred alone does not give a fallback. When it
+    # skips an exhausted entry, selection moves on to Default - which ignores
+    # boot assessment - and if Default names the SAME entry, that entry is
+    # chosen again, forever. Measured in firmware boots, systemd 262-1, blue at
+    # +0-3 (shani-testbed boot-probes/boot-counting.sh arm-exhausted):
+    #   Preferred=blue  Default=green  -> booted @green
+    #   Preferred=blue  Default=blue   -> booted @blue again (+0-3 -> +0-4)
+    # So on a trial deploy Default names the FALLBACK slot: Preferred picks the
+    # new slot while it has tries left or once it is sealed, Default takes over
+    # when its tries are used up. Only with a systemd-boot that knows Preferred
+    # (>= 260, which added it) and only when set-preferred succeeded - a loader
+    # reading Default alone would boot the OLD slot straight away.
+    local _default_entry="${loader_default}"
+    if [[ "$use_tries" == "yes" && $_preferred_ok -eq 1 ]] && (( $(_esp_sdboot_major "$ESP") >= 260 )); then
+        _default_entry="${candidate_filename}"
+        log_verbose "bootctl set-default ${_default_entry} (taken once ${loader_default} has no tries left)"
+    fi
+    bootctl set-default "${_default_entry}" &>/dev/null || true
 
     if [[ $esp_mounted -eq 1 ]]; then
         umount "$ESP" 2>/dev/null || log_warn "Could not unmount ESP"

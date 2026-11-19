@@ -74,9 +74,15 @@ if [[ -f $DEP ]]; then
   grep -qE 'loader_default="\$\{OS_NAME\}-\$\{active_slot\}\.conf"' "$DEP" \
     && ok "$d: loader_default is the base entry id (.conf, no tries suffix)" \
     || no "$d: loader_default is the base entry id" "$(grep -m1 'loader_default=' "$DEP")"
-  grep -qE 'bootctl set-default "\$\{loader_default\}"' "$DEP" \
-    && ok "$d: set-default is given that id" \
-    || no "$d: set-default is given that id" "no bootctl set-default \${loader_default}"
+  # set-default is given a base id too: loader_default, or on a trial deploy the
+  # fallback slot's candidate_filename (also "${OS_NAME}-<slot>.conf") - Default
+  # is what systemd-boot takes once Preferred skips an exhausted entry.
+  grep -qE 'bootctl set-default "\$\{_default_entry\}"' "$DEP" \
+    && grep -qE '_default_entry="\$\{loader_default\}"' "$DEP" \
+    && grep -qE '_default_entry="\$\{candidate_filename\}"' "$DEP" \
+    && grep -qE 'candidate_filename="\$\{OS_NAME\}-\$\{candidate_slot\}\.conf"' "$DEP" \
+    && ok "$d: set-default is given a base id (the new slot, or the fallback on a trial)" \
+    || no "$d: set-default is given a base id" "set-default's argument is not loader_default / candidate_filename"
   # The comment that rejected the glob must stay, or the next reader reinvents it.
   grep -qiE 'glob' "$DEP" \
     && ok "$d: the comment still records why a glob does not work" \

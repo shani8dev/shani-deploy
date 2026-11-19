@@ -3399,8 +3399,11 @@ channel_status() {
 
 parse_fstab_subvolumes() {
     [[ -f "$1" ]] || return 1
+    # [-] in the class: @shani-chronoa parsed as "shani" before 2026-11-19, so a
+    # deploy never created @shani-chronoa on an older install (its models then
+    # lived on the /var tmpfs) and created a stray, empty @shani instead.
     awk '/LABEL=shani_root.*subvol=@/ && !/^[[:space:]]*#/ {
-        match($0, /subvol=@([a-zA-Z0-9_]+)/, a);
+        match($0, /subvol=@([a-zA-Z0-9_-]+)/, a);
         if (a[1] != "blue" && a[1] != "green") print a[1]
     }' "$1" | sort -u
 }

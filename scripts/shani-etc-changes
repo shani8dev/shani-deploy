@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""shani-etc-changes — what this machine changed in /etc, and putting one file back.
+
+/etc is an overlay: the lower layer is the booted slot's own /etc (the image's
+factory files), the upper layer is /data/overlay/etc/upper (every change made on
+this machine, kept across updates). This tool reads the two side by side:
+
+  shani-etc-changes list [--json]     changed, added and removed files
+  shani-etc-changes diff PATH         the change to one file, as a unified diff
+  shani-etc-changes restore PATH...   queue PATH(s) to go back to the factory version
+  shani-etc-changes cancel PATH...|--all
+                                      take PATH(s) off the queue
+
+A restore is never done to the live system. The upper layer must not be changed
+under a mounted overlay, so `restore` only queues the path in
+/data/etc-restore-pending, and the initramfs applies it at the next start, before
+it mounts /etc (dracut 99shanios/shanios-overlay-etc.sh). Done restores are
+logged in /data/etc-restore-done.
+
+Some files are never offered for a restore (PROTECTED): going back to the image's
+passwd/shadow/group would delete every account, machine-id and crypttab belong to
+this machine, and /etc/secureboot holds the key every boot image is signed with.
+Some are never shown as content (SECRET): password hashes, private keys, saved
+Wi-Fi and VPN credentials.
+
+Root only (Shani Cassini calls it through pkexec). The idea is Ananta OS's
+"System changes" page (Ananta Maintenance).
+"""
+import argparse
+import difflib
+import fnmatch
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+UPPER = os.environ.get("SHANI_ETC_UPPER", "/data/overlay/etc/upper")
+PENDING = os.environ.get("SHANI_ETC_PENDING", "/data/etc-restore-pending")
+DONE = os.environ.get("SHANI_ETC_DONE", "/data/etc-restore-done")
+# Tests point this at a plain directory; on a machine it is found by bind-mounting
+# / non-recursively, which shows the slot's /etc without the overlay on top.
+LOWER = os.environ.get("SHANI_ETC_LOWER", "")
+
+PROTECTED = {
+    "passwd": "Going back would delete every account made on this computer",
+    "shadow": "Going back would delete every account's password",
+    "group": "Going back would delete the groups made on this computer",
+    "gshadow": "Going back would delete the groups made on this computer",
+    "subuid": "Containers of the accounts made here depend on it",
+    "subgid": "Containers of the accounts made here depend on it",
+    "machine-id": "This computer's identity, made once at the first start",
+    "crypttab": "How this computer's disk is unlocked",
+    "secureboot/*": "The key every boot image of this computer is signed with",
+}
+SECRET = ["shadow", "gshadow", "secureboot/*", "ssh/ssh_host_*_key",
+          "*.key", "*.pem", "NetworkManager/system-connections/*", "wireguard/*",
+          "iwd/*", "wpa_supplicant/*", "sudoers.d/*"]
+DIFF_MAX_LINES = 400
+
+
+def _match(rel, patterns):
+    return any(fnmatch.fnmatchcase(rel, p) for p in patterns)
+
+
+def protected(rel):
+    for pat, why in PROTECTED.items():
+        if fnmatch.fnmatchcase(rel, pat):
+            return why
+    return ""
+
+
+def secret(rel):
+    return _match(rel, SECRET)
+
+
+class Lower:
+    """The factory /etc: SHANI_ETC_LOWER, or / bound non-recursively."""
+
+    def __enter__(self):
+        if LOWER:
+            self.path, self.mnt = LOWER, None
+            return self
+        self.mnt = tempfile.mkdtemp(prefix="shani-etc-lower-", dir="/run")
+        subprocess.run(["mount", "--bind", "-o", "ro", "/", self.mnt], check=True)
+        subprocess.run(["mount", "--make-private", self.mnt], check=False)
+        self.path = os.path.join(self.mnt, "etc")
+        return self
+
+    def __exit__(self, *_):
+        if self.mnt:
+            subprocess.run(["umount", self.mnt], check=False)
+            os.rmdir(self.mnt)
+
+
+def _whiteout(st):
+    return stat.S_ISCHR(st.st_mode) and st.st_rdev == 0
+
+
+def _same(a, b):
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+    except OSError:
+        return False
+    if stat.S_ISLNK(sa.st_mode) or stat.S_ISLNK(sb.st_mode):
+        return stat.S_ISLNK(sa.st_mode) and stat.S_ISLNK(sb.st_mode) and os.readlink(a) == os.readlink(b)
+    if sa.st_size != sb.st_size:
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(1 << 16), fb.read(1 << 16)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+def pending():
+    try:
+        with open(PENDING) as f:
+            return [ln.rstrip("\n") for ln in f if ln.strip()]
+    except OSError:
+        return []
+
+
+def changes(lower):
+    """Every file the upper layer holds, as {path, kind, protected, secret, pending}."""
+    queued = set(pending())
+    out = []
+    for root, dirs, files in os.walk(UPPER):
+        dirs.sort()
+        for name in sorted(files) + sorted(d for d in dirs if os.path.islink(os.path.join(root, d))):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, UPPER)
+            st = os.lstat(full)
+            low = os.path.join(lower, rel)
+            low_exists = os.path.lexists(low)
+            if _whiteout(st):
+                if not low_exists:
+                    continue                      # a whiteout over nothing changes nothing
+                kind = "removed"
+            elif not low_exists:
+                kind = "added"
+            elif _same(full, low):
+                lst = os.lstat(low)
+                if (st.st_mode, st.st_uid, st.st_gid) == (lst.st_mode, lst.st_uid, lst.st_gid):
+                    continue                      # copied up but identical: not a change
+                kind = "permissions"
+            else:
+                kind = "modified"
+            out.append({"path": rel, "kind": kind, "protected": protected(rel),
+                        "secret": secret(rel), "pending": rel in queued})
+    return out
+
+
+def _valid(rel):
+    return bool(rel) and not rel.startswith("/") and "\n" not in rel \
+        and ".." not in rel.split("/") and os.path.normpath(rel) == rel
+
+
+def cmd_list(args):
+    with Lower() as lo:
+        items = changes(lo.path)
+    if args.json:
+        print(json.dumps({"ok": True, "changes": items, "pending": pending(), "done": _done()}))
+    else:
+        for it in items:
+            flags = (" [queued]" if it["pending"] else "") + (" [protected]" if it["protected"] else "")
+            print(f"{it['kind']:<12}/etc/{it['path']}{flags}")
+    return 0
+
+
+def _done(n=20):
+    try:
+        with open(DONE) as f:
+            lines = f.read().splitlines()[-n:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        parts = ln.split(" ", 2)
+        if len(parts) == 3:
+            out.append({"at": int(parts[0]) if parts[0].isdigit() else 0, "path": parts[2]})
+    return out
+
+
+def _known(lower, rels):
+    by = {c["path"]: c for c in changes(lower)}
+    for rel in rels:
+        if not _valid(rel):
+            raise SystemExit(f"ERROR: not a path under /etc: {rel!r}")
+        if rel not in by:
+            raise SystemExit(f"ERROR: /etc/{rel} is not changed on this computer")
+    return by
+
+
+def cmd_diff(args):
+    rel = args.path.removeprefix("/etc/")
+    with Lower() as lo:
+        c = _known(lo.path, [rel])[rel]
+        if c["secret"]:
+            print(json.dumps({"ok": True, "path": rel, "kind": c["kind"], "hidden": True, "diff": ""}))
+            return 0
+        a, b = os.path.join(lo.path, rel), os.path.join(UPPER, rel)
+
+        def lines(p, exists):
+            if not exists:
+                return [], False
+            if os.path.islink(p):
+                return [f"-> {os.readlink(p)}\n"], False
+            with open(p, "rb") as f:
+                data = f.read(4 << 20)
+            if b"\0" in data:
+                return [], True
+            return data.decode("utf-8", "replace").splitlines(True), False
+        la, bin_a = lines(a, c["kind"] != "added")
+        lb, bin_b = lines(b, c["kind"] not in ("removed",))
+        if bin_a or bin_b:
+            text, binary = "", True
+        else:
+            d = list(difflib.unified_diff(la, lb, f"factory /etc/{rel}", f"this computer /etc/{rel}"))
+            more = len(d) - DIFF_MAX_LINES
+            text = "".join(d[:DIFF_MAX_LINES]) + (f"\n… {more} more lines\n" if more > 0 else "")
+            binary = False
+    print(json.dumps({"ok": True, "path": rel, "kind": c["kind"], "hidden": False,
+                      "binary": binary, "diff": text}))
+    return 0
+
+
+def _write_pending(paths):
+    os.makedirs(os.path.dirname(PENDING), exist_ok=True)
+    tmp = PENDING + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(p + "\n" for p in paths)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PENDING)
+    if not paths:
+        os.unlink(PENDING)
+
+
+def cmd_restore(args):
+    rels = [p.removeprefix("/etc/") for p in args.paths]
+    with Lower() as lo:
+        by = _known(lo.path, rels)
+    for rel in rels:
+        if by[rel]["protected"]:
+            raise SystemExit(f"ERROR: /etc/{rel} is not restored here: {by[rel]['protected']}")
+    queued = pending()
+    queued += [r for r in rels if r not in queued]
+    _write_pending(queued)
+    print(json.dumps({"ok": True, "pending": queued}))
+    return 0
+
+
+def cmd_cancel(args):
+    if args.all:
+        queued = []
+    else:
+        drop = {p.removeprefix("/etc/") for p in args.paths}
+        queued = [p for p in pending() if p not in drop]
+    if pending() or queued:
+        _write_pending(queued)
+    print(json.dumps({"ok": True, "pending": queued}))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="shani-etc-changes", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("list"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_list)
+    p = sub.add_parser("diff"); p.add_argument("path"); p.set_defaults(fn=cmd_diff)
+    p = sub.add_parser("restore"); p.add_argument("paths", nargs="+"); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser("cancel"); p.add_argument("paths", nargs="*"); p.add_argument("--all", action="store_true")
+    p.set_defaults(fn=cmd_cancel)
+    args = ap.parse_args()
+    if os.geteuid() != 0 and not os.environ.get("SHANI_ETC_UPPER"):
+        print("ERROR: shani-etc-changes needs root (pkexec shani-etc-changes ...)", file=sys.stderr)
+        return 1
+    if not os.path.isdir(UPPER):
+        print(json.dumps({"ok": False, "error": f"{UPPER} does not exist - /etc is not an overlay here"}))
+        return 1
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

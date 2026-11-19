@@ -2598,3 +2598,30 @@ Implementation priorities are per `../IMPLEMENTATION-ROADMAP.md` (master roadmap
   no `LoaderEntryPreferred`, and in that state (explicit `default`, no
   Preferred) an exhausted entry kept being chosen — a reboot loop. Whether a
   deploy-time Preferred makes systemd-boot fall through is the next boot to run.
+
+- **New root interfaces for Shani Cassini (2026-11-19), all measured.**
+  `scripts/shani-etc-changes` (Python; `python` added to the PKGBUILD's
+  depends): `list --json` / `diff` / `restore` / `cancel` over the /etc
+  overlay's upper layer against the booted slot's own /etc (read through a
+  non-recursive bind of `/`). `restore` only queues into
+  `/data/etc-restore-pending`; the initramfs applies it before mounting /etc
+  (shani-install-media `99shanios/shanios-overlay-etc.sh`). PROTECTED paths
+  (passwd/shadow/group/gshadow/subuid/subgid, machine-id, crypttab,
+  `secureboot/*`) are listed but refused; SECRET ones never show content.
+  Measured in a privileged container on a real overlay: modified/added/removed
+  (a real whiteout) all restored, traversal and `/etc/...` lines refused, an
+  identical copy-up and a whiteout over nothing not listed.
+  `gen-efi recovery-key --stdin` (`systemd-cryptenroll --recovery-key
+  --wipe-slot=recovery`; stdout only `RECOVERY_KEY=`) and
+  `gen-efi luks-header-backup` (header on stdout) — measured on a LUKS loop
+  device: wrong passphrase refused with no output, the new key opens the
+  volume and the previous recovery key no longer does, the header is a valid
+  LUKS header with the volume's UUID and no temp file is left.
+  `shani-health`'s scrub row now names the damaged files, from the kernel's
+  `scrub: checksum error ... (path: X)` lines — the format captured from a
+  real corrupted btrfs, not assumed.
+- **Harness regression to know about:** shani-testbed `db12414` (2026-10-18,
+  "fix the stale step count") also deleted the suite's
+  `rollback:esp-default-names-the-target` / `rollback:esp-entry-exists`
+  checks from `lib/suite.sh`. The suite still passes without them, so a
+  rollback that writes the wrong ESP default would go unnoticed there.

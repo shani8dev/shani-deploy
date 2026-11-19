@@ -469,3 +469,23 @@ change is that it now actually happens.
   `fallocate` ballast (no-compress), `max(10 GiB, 1.5 × size)` preflight, a
   rescue UKI that runs from RAM; their `tests/boot-test.py` power-cut, crash
   and freeze scenarios.
+
+### Second pass (2026-11-19, later): built
+
+All four bvmdebu repositories were checked (ananta-os, ananta-hub, nodexa — a
+GPL-2.0-only Android Tox client — and mealhub_webview). Only ananta-os bears
+on ShaniOS. Built from it, each measured:
+
+| Taken | Where |
+|---|---|
+| Fallback after the last try: `LoaderEntryDefault` names the previous slot on a trial deploy (systemd-boot ≥ 260, Preferred set) | shani-deploy `finalize_boot_entries`; firmware boots: Default=green → @green, Default=blue → @blue again (+0-3 → +0-4) |
+| System Changes: changed /etc files, their difference, restore one at the next start | shani-deploy `shani-etc-changes`, shani-install-media dracut hook, Shani Cassini page |
+| A new recovery key, older ones wiped; a copy of the LUKS header | `gen-efi recovery-key --stdin` / `luks-header-backup`, Shani Cassini Encryption page |
+| Restore test after every backup | shani-backup `restic.restore_test` (in-image pytest: pass, and fail on a damaged backup) |
+| Damaged files named after a scrub | `shani-health` |
+| System partitions hidden from file managers, admin to change them | shani-settings `60-shani-system-disk.rules` |
+| `kernel.split_lock_mitigate = 0` | shani-settings sysctl |
+
+Found on the way, not from Ananta: the installer never added the recovery key
+and never enrolled the TPM (both ran on the opened mapping, not the LUKS
+partition) — fixed in os-installer-config, measured on a real LUKS volume.

@@ -4146,6 +4146,21 @@ _section_storage() {
             co=$(  echo "$scrub_st" | awk '/corrected_errors:/{print $2}' | head -1 || echo "0")
             if [[ "${re:-0}" != "0" || "${ce:-0}" != "0" || "${co:-0}" != "0" ]]; then
                 _row "Scrub"    "!!  errors: read=${re} csum=${ce} corrected=${co}"
+                # Which files: a scrub names each file it could not read back in
+                # the kernel log, path relative to its subvolume. Captured from a
+                # real corrupted btrfs (2026-11-19):
+                #   BTRFS warning (device loop37): scrub: checksum error at logical
+                #   13631488 on dev /dev/loop37, physical 13631488 root 5 inode 258
+                #   offset 0 length 4096 links 1 (path: Documents/thesis (final).odt)
+                # Those are what to restore from a snapshot or a backup. The idea
+                # is Ananta OS's scrub report.
+                local _bad_files
+                _bad_files=$(journalctl -k --since "-30d" -o cat --no-pager 2>/dev/null \
+                    | sed -n 's/.*checksum error.*(path: \(.*\))[^)]*$/\1/p' | sort -u)
+                if [[ -n "$_bad_files" ]]; then
+                    _row "Scrub"    "!!  damaged files ($(wc -l <<< "$_bad_files")): $(head -5 <<< "$_bad_files" | paste -sd, | sed 's/,/, /g')"
+                    _rec "Restore the damaged files from a snapshot (/home/.snapshots) or a backup: $(head -5 <<< "$_bad_files" | paste -sd' ')"
+                fi
                 _rec "Btrfs scrub found errors — investigate: btrfs scrub status /"
             else
                 _row "Scrub"    "OK  last run clean"

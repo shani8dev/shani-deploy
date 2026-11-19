@@ -35,6 +35,10 @@ case "${1:-}" in
     tpm2-status|pcrlock-status)
         REQUIRED_CMDS=("cryptsetup" "jq" "grep" "awk" "sed" "date")
         ;;
+    # Key management on the LUKS volume only: no UKI, signing or boot state.
+    recovery-key|luks-header-backup)
+        REQUIRED_CMDS=("cryptsetup" "grep" "sed" "date" "mktemp" "cat")
+        ;;
     *)
         REQUIRED_CMDS=("blkid" "dracut" "sbsign" "sbverify" "bootctl" "ls" "grep" "sort" "tail" "awk" "mkdir" "cat" "cryptsetup" "stat" "btrfs" "lsblk" "findmnt" "df")
         ;;
@@ -58,12 +62,14 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" && "${1:-}" != "tpm2-status" && "${1:-}" != "pcrlock-status" ]]; then
+if [[ "${1:-}" != "configure" && "${1:-}" != "enroll-mok" && "${1:-}" != "enroll-tpm2" && "${1:-}" != "cleanup-mok" && "${1:-}" != "cleanup-tpm2" && "${1:-}" != "remove-tpm2" && "${1:-}" != "tpm2-status" && "${1:-}" != "pcrlock-status" && "${1:-}" != "recovery-key" && "${1:-}" != "luks-header-backup" ]]; then
     echo "Usage:"
     echo "  $0 configure <target_slot>    — generate UKI for blue or green slot"
     echo "  $0 enroll-mok                — stage MOK enrollment (re-signs EFI binaries, no UKI rebuild)"
     echo "  $0 enroll-tpm2               — enroll TPM2 for automatic LUKS unlock"
     echo "  $0 enroll-tpm2 --stdin [--with-pin]  — same, no prompts: passphrase (then PIN) on stdin"
+    echo "  $0 recovery-key --stdin      — a new recovery key (older recovery keys stop working); passphrase on stdin"
+    echo "  $0 luks-header-backup        — a copy of the LUKS header, written to stdout"
     echo "  $0 tpm2-status --json        — encryption / TPM2 / Secure Boot state as JSON"
     echo "  $0 pcrlock-status --json     — which PCR policy the volume is locked against (pcrlock or literal)"
     echo "  $0 cleanup-mok               — delete old MOK keys after new key is confirmed enrolled"
@@ -1759,6 +1765,60 @@ pcrlock_status_json() {
           luks_device: ($luks_device | if . == "" then null else . end)}'
 }
 
+_luks_underlying() {
+    # The LUKS partition under /dev/mapper/${ROOTLABEL}: cryptsetup and
+    # systemd-cryptenroll need the partition, which holds the header.
+    cryptsetup status "/dev/mapper/${ROOTLABEL}" 2>/dev/null | sed -n 's/^ *device: *//p' | head -1 | xargs
+}
+
+recovery_key() {
+    # --stdin: the current passphrase on stdin (any key that opens the volume).
+    # Enrols a systemd recovery key and wipes every OLDER recovery-type key in
+    # the same call (--wipe-slot=recovery never wipes the slot it just made).
+    # stdout carries one line, RECOVERY_KEY=<key>, and nothing else.
+    # Measured 2026-11-19 (systemd 262.1, loop device): systemd-cryptenroll
+    # prints only the key on stdout; a second run leaves the first key unable
+    # to open the volume, the new one and the passphrase able to.
+    # A recovery key the installer added before 2026-11-19 was a plain
+    # passphrase slot (cryptsetup luksAddKey), not a recovery-type one, so it is
+    # not wiped here - when it was added at all (see os-installer-config).
+    [[ "${1:-}" == "--stdin" ]] || error_exit "recovery-key needs --stdin (the current passphrase on stdin)"
+    IFS= read -r PASSWORD || true
+    [[ -n "${PASSWORD:-}" ]] || error_exit "recovery-key --stdin: no passphrase on stdin"
+    export PASSWORD
+    in_chroot && error_exit "recovery-key must run on the live booted system, not inside a chroot"
+    [[ -e "/dev/mapper/${ROOTLABEL}" ]] || error_exit "No LUKS mapper /dev/mapper/${ROOTLABEL} - the disk is not encrypted"
+    command -v systemd-cryptenroll &>/dev/null || error_exit "systemd-cryptenroll not found"
+    local dev out key
+    dev=$(_luks_underlying)
+    [[ -n "$dev" ]] || error_exit "Could not find the LUKS partition under /dev/mapper/${ROOTLABEL}"
+    out=$(systemd-cryptenroll --recovery-key --wipe-slot=recovery "$dev" 2>/dev/null) \
+        || error_exit "systemd-cryptenroll refused - is the passphrase right?"
+    key=$(grep -oE '[cbdefghijklnrtuv]{8}(-[cbdefghijklnrtuv]{8}){7}' <<< "$out" | head -1)
+    [[ -n "$key" ]] || error_exit "systemd-cryptenroll gave no recovery key"
+    log "A new recovery key was enrolled on ${dev}; older recovery keys no longer work"
+    printf 'RECOVERY_KEY=%s\n' "$key" >&3
+}
+
+luks_header_backup() {
+    # The LUKS header (keyslots, cipher, UUID) to stdout, for the person to keep
+    # off this disk: if the header is damaged, nothing else can open the volume.
+    # It holds no plaintext key, but with it any passphrase or key that worked
+    # when it was taken keeps working - so it is as sensitive as an old password.
+    [[ -e "/dev/mapper/${ROOTLABEL}" ]] || error_exit "No LUKS mapper /dev/mapper/${ROOTLABEL} - the disk is not encrypted"
+    local dev
+    dev=$(_luks_underlying)
+    [[ -n "$dev" ]] || error_exit "Could not find the LUKS partition under /dev/mapper/${ROOTLABEL}"
+    # Global, not local: the EXIT trap fires after this function has returned,
+    # when a local would be unbound (the lesson recorded at generate_uki's trap).
+    LUKS_HEADER_TMP=$(mktemp -u /run/shani-luks-header.XXXXXXXX)   # luksHeaderBackup refuses an existing file
+    trap 'rm -f "${LUKS_HEADER_TMP:-}"' EXIT
+    cryptsetup luksHeaderBackup "$dev" --header-backup-file "$LUKS_HEADER_TMP" >&2 \
+        || error_exit "cryptsetup could not back up the header of ${dev}"
+    cat "$LUKS_HEADER_TMP" >&3
+    log "Header of ${dev} written ($(stat -c %s "$LUKS_HEADER_TMP") bytes)"
+}
+
 case "${1:-}" in
     tpm2-status)
         [[ "${2:-}" == "--json" ]] || error_exit "tpm2-status currently needs --json"
@@ -1790,6 +1850,15 @@ case "${1:-}" in
         ;;
     remove-tpm2)
         remove_tpm2
+        ;;
+    recovery-key)
+        # log() writes to stdout: keep stdout for the key alone
+        exec 3>&1 1>&2
+        recovery_key "${@:2}"
+        ;;
+    luks-header-backup)
+        exec 3>&1 1>&2
+        luks_header_backup
         ;;
     *)
         echo "Usage:"

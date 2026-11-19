@@ -1961,6 +1961,16 @@ generate_uki() {
     # elsewhere in this codebase) — without this, cleanup_chroot would rerun
     # on every later function return for the rest of the script.
     trap 'cleanup_chroot; trap - RETURN' RETURN
+    # Can this slot's own image bless a counted boot? Only an image whose
+    # shani-deploy ships bless-boot's ESP mount and the drop-in that steps
+    # systemd's own blesser aside (2026-11-19). finalize_boot_entries turns boot
+    # counting on ("uki" entry) only then: a self-updated shani-deploy can deploy
+    # an OLDER image, and counting a slot that cannot be blessed would use up its
+    # tries over three good boots and fall back from a working update. Measured:
+    # a counted boot of a 2026-09 image failed systemd-bless-boot.service.
+    BLESS_READY_SLOT=""
+    [[ -f "$MOUNT_DIR/usr/lib/systemd/system/systemd-bless-boot.service.d/10-shani.conf" ]] \
+        && BLESS_READY_SLOT="$slot"
 
     [[ "${DRY_RUN}" == "yes" ]] && return 0
 
@@ -2081,9 +2091,17 @@ finalize_boot_entries() {
     fi
 
     mkdir -p "$ESP/loader/entries"
-    local entry_key
+    local entry_key active_key
     entry_key=$(_uki_entry_key "$ESP")
-    log "Boot entries use the '${entry_key}' key (systemd-boot on the ESP)"
+    active_key="$entry_key"
+    # The counted (+3-0) entry gets "uki" - boot counting - only when its image
+    # can bless a good boot (generate_uki sets BLESS_READY_SLOT); else "efi",
+    # which systemd-boot does not count: the behaviour before 2026-11-19.
+    if [[ "$use_tries" == "yes" && "$entry_key" == "uki" && "${BLESS_READY_SLOT:-}" != "$active_slot" ]]; then
+        active_key="efi"
+        log "@${active_slot}'s image cannot bless a counted boot yet - its entry is not counted ('efi' key)"
+    fi
+    log "Boot entries use the '${active_key}'/'${entry_key}' keys (systemd-boot on the ESP)"
 
     # Default slot — the new unproven slot being set as the next boot target.
     # Gets +3-0 boot-count tries on normal deploy so systemd-boot automatically
@@ -2156,7 +2174,7 @@ finalize_boot_entries() {
     local active_tmp="$ESP/loader/entries/.${active_filename}.tmp"
     cat > "$active_tmp" <<EOF
 title   ${OS_NAME}-${active_slot} (Active)
-${entry_key}     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
+${active_key}     /EFI/${OS_NAME}/${OS_NAME}-${active_slot}.efi
 EOF
     mv -f "$active_tmp" "$active_conf" || {
         log_error "Could not write boot entry for @${active_slot} — boot entries left unchanged"
@@ -2373,7 +2391,7 @@ EOF
     # (>= 260, which added it) and only when set-preferred succeeded - a loader
     # reading Default alone would boot the OLD slot straight away.
     local _default_entry="${loader_default}"
-    if [[ "$use_tries" == "yes" && $_preferred_ok -eq 1 ]] && (( $(_esp_sdboot_major "$ESP") >= 260 )); then
+    if [[ "$use_tries" == "yes" && "$active_key" == "uki" && $_preferred_ok -eq 1 ]] && (( $(_esp_sdboot_major "$ESP") >= 260 )); then
         _default_entry="${candidate_filename}"
         log_verbose "bootctl set-default ${_default_entry} (taken once ${loader_default} has no tries left)"
     fi

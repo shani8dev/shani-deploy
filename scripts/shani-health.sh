@@ -1508,10 +1508,16 @@ _section_immutability() {
             local opts_ok=1
             echo "$etc_mnt_opts" | grep -q 'index=off'    || opts_ok=0
             echo "$etc_mnt_opts" | grep -q 'metacopy=off' || opts_ok=0
+            # The lower /etc is a new tree after every deploy; the kernel only
+            # defines that when redirect_dir and xino are off too (see the
+            # dracut 99shanios/shanios-overlay-etc.sh comment). An initramfs
+            # built before 2026-11-19 lacks these until the next deploy.
+            echo "$etc_mnt_opts" | grep -q 'redirect_dir=follow' || opts_ok=0
+            echo "$etc_mnt_opts" | grep -q 'xino=off'            || opts_ok=0
             if (( opts_ok )); then _row "/etc"   "OK  overlay active, ${count} file(s) modified vs base"
             else
-                _row "/etc"   "!   overlay active but missing index=off or metacopy=off"
-                _rec "/etc overlay missing required options (index=off,metacopy=off) — check fstab"
+                _row "/etc"   "!   overlay active but missing index=off, metacopy=off, redirect_dir=follow or xino=off"
+                _rec "/etc overlay missing required options (index=off,metacopy=off,redirect_dir=follow,xino=off) — the next update's boot image sets them"
             fi
         else
             _row "/etc"   "!!  overlay NOT mounted — /etc from read-only root"
